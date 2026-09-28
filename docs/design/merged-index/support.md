@@ -2,13 +2,25 @@
 
 ## Storage differences from RocksDB
 
-A **trace** is the runtime interface for reading and updating retained state. `Spine` is its concrete
-implementation: a **spine** (LSM run collection and background merger) holds **batches** (immutable sorted
-runs of weighted updates, in memory or files) and merges them in the background
+> [!NOTE]
+> **Glossary**
+>
+> **spine** — LSM run collection and background merger.
+>
+> **batches** — immutable sorted runs of weighted updates, in memory or files.
+>
+> **layer file** — Feldera's immutable file format for nested sorted groups.
+>
+> **column** — storage level, not a SQL attribute.
+>
+> **Trace** — The runtime interface for reading and updating retained state.
+
+The **trace** interface exposes retained state. `Spine` is its concrete
+implementation: a **spine** holds **batches** and merges them in the background
 ([spine
 description](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7)).
-A **layer file** (Feldera's immutable file format for nested sorted groups) calls each nesting level a
-**column** (storage level, not a SQL attribute). Each level has a tree whose leaves are data blocks and whose
+A **layer file** calls each nesting level a
+**column**. Each level has a tree whose leaves are data blocks and whose
 interior nodes are index blocks ([file
 layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L54)).
 For an indexed weighted relation, the outer level contains search keys `K`; the inner level contains sorted
@@ -36,20 +48,34 @@ sorted weighted values within each key. RocksDB's ordinary writes enter a mutabl
 accepts already built immutable batches. See the official
 [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview).
 
-A **Z-set** (relation with signed tuple multiplicities) adds weights for identical complete tuples and omits zero totals
+> [!NOTE]
+> **Glossary**
+>
+> **Z-set** — relation with signed tuple multiplicities.
+
+A **Z-set** adds weights for identical complete tuples and omits zero totals
 ([read
 consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
 RocksDB's `Put`/`Delete` semantics differ, but its application-defined
 [merge operator](https://github.com/facebook/rocksdb/wiki/Merge-Operator) can combine updates too.
 The distinction is the collection contract, not an inability to express addition in RocksDB.
 
-`VecIndexedWSet` (in-memory indexed weighted relation) contains keys, offsets, values, and signed weights
+> [!NOTE]
+> **Glossary**
+>
+> **root circuit** — top-level operator graph.
+>
+> **`VecIndexedWSet`** — An in-memory indexed weighted relation.
+>
+> **`FallbackIndexedWSet`** — A batch type choosing memory or file storage.
+
+`VecIndexedWSet` contains keys, offsets, values, and signed weights
 ([memory
 layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199));
-`FallbackIndexedWSet` (batch type choosing memory or file storage) selects memory or file
+`FallbackIndexedWSet` selects memory or file
 representation
 ([variants](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58)).
-The **root circuit** (top-level operator graph) has only one timestamp value, `()` in Rust, selecting a batch
+The **root circuit** has only one timestamp value, `()` in Rust, selecting a batch
 without varying logical time ([timestamp
 mapping](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
 File indexed batches implement asynchronous key fetching
@@ -62,8 +88,13 @@ and storage/cache configuration.
 
 ## Folded keys require flat KV storage
 
+> [!NOTE]
+> **Glossary**
+>
+> **Folding** — record-type-specific encoding of key fields into bytes.
+
 The chosen merged-index representation is `byte_key → encoded_value`, with one value per complete physical
-key in each visible state. **Folding** (record-type-specific encoding of key fields into bytes) produces the
+key in each visible state. **Folding** produces the
 key. Customer, Orders, and extended Lineitem use different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
@@ -111,7 +142,12 @@ value per physical key, and consistent old/new views are required regardless of 
 
 ## Shared scan sessions bound ownership and memory
 
-A **scan session** owns one physical range cursor and the buffers used by its registered readers. A durable
+> [!NOTE]
+> **Glossary**
+>
+> **Scan session** — An owner of one physical range cursor and the buffers used by its registered readers.
+
+Each **scan session** has its own cursor position and reader buffers. A durable
 index handle may be shared; mutable cursor position belongs to a session. This follows the supplied
 [`mi_db` session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions): register readers
 before scanning, share one buffer per record type, and give same-type readers independent positions.
@@ -125,11 +161,23 @@ The cited document is modified working-tree content inspected on 2026-09-28, bas
 
 ### Batch owner and view lifetime
 
-A **view lease** is a reference that prevents releasing a batch's old/new source and parent-lookup views.
+> [!NOTE]
+> **Glossary**
+>
+> **rekeys** — moves to changed physical key prefixes.
+>
+> **View lease** — A reference preventing release of a batch's old/new source and parent-lookup views.
+
+Each reader holds a **view lease**.
 One owner stages the complete input update batch, including induced descendant rekeys, before opening any
 new-view reader. Publishing these views to operators is distinct from committing externally visible results.
 The runtime must report completion of all consumers, including output-state updates and work across steps.
 Physical cursor EOF alone does not establish that completion.
+
+> [!NOTE]
+> **Glossary**
+>
+> **Seal** — Make the complete pending update set immutable and readable.
 
 ```text
 process_batch(input, consumer_plan):
@@ -208,7 +256,12 @@ value-difference and retraction/insertion logic stays in the existing IVM operat
 
 ### Shared typed buffers and reader positions
 
-A **typed buffer** is a sequence of decoded records of one type, shared by all readers requesting that type.
+> [!NOTE]
+> **Glossary**
+>
+> **Typed buffer** — A sequence of decoded records of one type shared by all readers requesting that type.
+
+Readers requesting the same record type share a **typed buffer**.
 The session stores `{physical_cursor, range, view_lease, buffers_by_type, readers, eof, memory_account}`.
 A reader starts with `{type, next_sequence=0, outstanding_lease=empty, closed=false}`. Sequence numbers
 are absolute and remain valid after reclaiming prefixes. The scheduler serializes `next`, `release`, and
@@ -321,15 +374,26 @@ retained-state baseline; report high-water bytes and every spill, reread, sort, 
 
 ## Merged index reconstructs integrator outputs
 
-An **integrator** accumulates its input deltas into output state. The merged index replaces access to that
+> [!NOTE]
+> **Glossary**
+>
+> **Integrator** — An operator that accumulates its input deltas into output state.
+
+An **integrator** produces accumulated state. The merged index replaces access to that
 accumulated output; it does not reconstruct the integrator's input delta stream. Downstream IVM computation
 continues to receive deltas through the existing path and requests accumulated state through the provider.
 
-The lecture note [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276)
+> [!NOTE]
+> **Glossary**
+>
+> **delay** — `z^-1`, the previous batch's value.
+
+The lecture note [Maintaining a Query, One Change at a
+Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276)
 contains “Equivalent Q3 circuits” (Figure 4). Its panel (c) and Feldera's generic aggregate show different
 implementations of the same grouping semantics. **The lecture note's panel (c) has one integrator inside
 grouping**, for Count/Revenue state. The figure names that
-state `M`; this note calls it `H`. A **delay** (`z^-1`, the previous batch's value) supplies `H_old`, from which
+state `M`; this note calls it `H`. A **delay** supplies `H_old`, from which
 the old aggregate tuple is computed. The delay retains information but is not a second integrator.
 The `A` integrator appears in the subsequent Orders join. See the
 [actual figure source](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59) and
@@ -362,7 +426,8 @@ collection is necessary inside this grouping: `H_old` already contains the infor
 the old tuple. The following join integrates `Delta A` because it needs accumulated `A` when Orders changes.
 The five integrators remain `H`, `A`, eligible Orders, `B`, and eligible Customers; no sixth one is implied.
 
-Retaining the prior aggregate tuple serves the same old-state role as the delay in the lecture note's panel (c). The precise
+Retaining the prior aggregate tuple serves the same old-state role as the delay in the lecture note's panel (c). The
+precise
 objects differ: the figure delays the summary `H`, whereas output retention preserves the emitted tuple
 `A = E(H)`. For the fixed, pointwise group-emission function `E`, moving the delay across `E` preserves the
 value:
@@ -410,8 +475,10 @@ from an accumulated input collection `X` and retrieves the old aggregate tuple f
 Here `X` means whatever indexed collection that generic operator receives; it is not necessarily the raw
 Lineitem relation or the `H` in the lecture note's panel (c). The source lists recomputing old values as an
 alternative, but selects output retention
-([aggregate construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499),
-[design rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+([aggregate
+construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499),
+[design
+rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
 
 ```mermaid
 flowchart LR
@@ -430,9 +497,11 @@ flowchart LR
 
 `Upsert` here converts per-key replacement values into weighted tuple changes. Its source explicitly draws
 the output integrator and delayed feedback
-([output-state wiring](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/upsert.rs#L90-L109)).
+([output-state
+wiring](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/upsert.rs#L90-L109)).
 This diagram explains the runtime comment about two accumulated collections. Its old-output feedback serves
-the same semantic role as delaying and emitting the summary in the lecture note's panel (c). The different wiring is a choice
+the same semantic role as delaying and emitting the summary in the lecture note's panel (c). The different wiring is a
+choice
 of where to retain versus recompute information; it does not impose another physical copy on the merged index.
 
 For the chosen lecture-note circuit, the merged-index provider supplies `H_old`/`H_new` to the existing group-tuple
@@ -503,7 +572,7 @@ separate reconstruction routines must honor the requested view rather than choos
 
 For each requested relation `T` and key set `K`, require
 `reconstruct(T, source_s, K) = T(database_s) restricted to K`, including payloads, weights, and group existence.
-The supplied note identifies the five logical **integrators** (operators accumulating changes into current state)
+The supplied note identifies the five logical **integrators**
 ([five accumulations](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)) and their
 weighted reconstruction ([definitions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L508)).
 
@@ -544,16 +613,25 @@ assumptions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L
 The count/existence requirement also appears in the
 [operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39).
 
+> [!NOTE]
+> **Glossary**
+>
+> **support** — tuples with nonzero weight.
+
 The main note's replacement has two distinct complete line tuples at weights `-1` and `+1`. Their key weights
-sum to zero, but their **support** (tuples with nonzero weight) still marks the order as affected. Identical
+sum to zero, but their **support** still marks the order as affected. Identical
 complete-tuple changes that cancel
-can be discarded. Changed customers expand to descendant orders in either endpoint; **rekeys** (moves to changed
-physical key prefixes) include both
+can be discarded. Changed customers expand to descendant orders in either endpoint; **rekeys** include both
 prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L564)).
 
 ## Immutable batches preserve old reads
 
-`SpineSnapshot` (read view retaining a fixed set of immutable runs) owns reference-counted batches and supports
+> [!NOTE]
+> **Glossary**
+>
+> **`SpineSnapshot`** — A read view retaining a fixed set of immutable runs.
+
+`SpineSnapshot` owns reference-counted batches and supports
 constructing a view with additional batches
 ([snapshot ownership and
 composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L56-L153)).
@@ -565,8 +643,8 @@ visibility for encoded payloads; concatenating batches or overwriting equal byte
 of correct weighted reconstruction. Reads must resolve the pending changes without waiting for compaction.
 
 The integration must keep the old source snapshot and parent lookup alive, stage complete payload retractions
-and descendant rekeys, then **seal** the pending updates
-(make the complete set immutable and readable) for a consistent new view. Retire old ownership only when every consumer
+and descendant rekeys, then **seal** the pending updates for a consistent new view. Retire old ownership only when every
+consumer
 has
 finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
 ([transaction
@@ -582,7 +660,12 @@ retention and pending-update representation.
 
 ## Consumers determine the required payload
 
-Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** (eligibility filter) and
+> [!NOTE]
+> **Glossary**
+>
+> **gate** — eligibility filter.
+
+Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** and
 preserves
 supplier identifiers for later matching. A changing gate needs consistent old/new multiplicities and an
 expansion to affected customers; a boolean gate suffices only under the key assumptions
@@ -605,19 +688,33 @@ which need not equal calendar intervals.
 
 ## Refresh reads can serve reconstruction
 
-Existing **RF2** (TPC-H order-and-lines deletion refresh) discovery looks up the order's customer and scans native
+> [!NOTE]
+> **Glossary**
+>
+> **RF2** — TPC-H order-and-lines deletion refresh.
+>
+> **COL** — Customer–Orders–Lineitem index.
+>
+> **RF1** — TPC-H order-and-lines insertion refresh.
+
+Existing **RF2** discovery looks up the order's customer and scans native
 Lineitem for line numbers
 ([discovery](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/refresh.hpp#L143-L178));
-**COL** (Customer–Orders–Lineitem index) helpers perform direct insertions and erasures
+**COL** helpers perform direct insertions and erasures
 ([maintenance](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/col_pipeline.tpp#L150-L220)).
 These demonstrate the access paths, not old-payload
 retention or shared incremental reads. The proposed scanner must retain full required payloads, distribute
-them to consumers, and charge any repeated pass. **RF1** (TPC-H order-and-lines insertion refresh) requires verified
+them to consumers, and charge any repeated pass. **RF1** requires verified
 freshness for its new-key shortcut.
+
+> [!NOTE]
+> **Glossary**
+>
+> **Base-Merge** — that manuscript's baseline merge-join plan.
 
 The merged-index interesting-orderings manuscript's refresh experiment describes order-group insertion/deletion
 ([workload](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173)). Its LSM
-variant matches **Base-Merge** (that manuscript's baseline merge-join plan) rather than leading in that experiment
+variant matches **Base-Merge** rather than leading in that experiment
 ([backend comparison](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L229)).
 That result does not predict a benefit for Feldera; storage backend and total maintenance work matter.
 

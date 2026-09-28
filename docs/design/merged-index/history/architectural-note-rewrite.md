@@ -136,3 +136,10 @@ On 2026-09-28, explained why Q3 summaries contain both N and R: N determines gro
 revenue. Added the zero-revenue versus empty-group comparison and last-zero-line deletion example. Clarified
 that a scan deriving only A can detect existence directly, while reconstruction of H must preserve its
 count/revenue contract; no separate durable count is implied.
+
+## Glossary presentation
+
+On 2026-09-28, the user requested distinctive styling for nonstandard terminology. Use Markdown NOTE
+callouts labeled Glossary, with bold term labels and plain definitions beside first use. Group terms first
+introduced together, including terms previously defined inside table cells. Apply this consistently to the
+main note and supporting report; retain ordinary emphasis for technical conclusions.

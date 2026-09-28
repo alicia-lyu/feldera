@@ -2,27 +2,48 @@
 
 ## How Feldera stores indexed state
 
+> [!NOTE]
+> **Glossary**
+>
+> **root circuit** — top-level operator graph.
+
 Reuse Feldera's LSM machinery with a flat byte-key/value representation for the merged index. Reconstruct
 accumulated relations from that store while preserving join and aggregation algorithms. The adapter changes
 record representation and accumulated-state access; it does not require a separate LSM implementation.
-This note covers one nonrecursive **root circuit** (top-level operator graph) and Q3 before ordering/limit.
+This note covers one nonrecursive **root circuit** and Q3 before ordering/limit.
 Rust interfaces and implementation are subsequent work.
 
 Compared with RocksDB, the relevant differences are the update semantics and the representation supplied to
 storage:
 
+> [!NOTE]
+> **Glossary**
+>
+> **Z-set** — relation with signed tuple multiplicities.
+>
+> **batch** — immutable sorted run of weighted updates, in memory or a file.
+>
+> **spine** — Feldera's LSM run collection and background merger.
+
 | Aspect | RocksDB | Feldera |
 | --- | --- | --- |
-| Update semantics | `Put` replaces a key's value; `Delete` removes it. An application-defined `Merge` operator can combine updates. | A **Z-set** (relation with signed tuple multiplicities) adds weights for identical complete tuples and drops zero totals. An indexed Z-set groups weighted values by key. |
-| Unit supplied to accumulated storage | Ordinary writes enter a mutable memtable before becoming immutable sorted runs. | A **batch** (immutable sorted run of weighted updates, in memory or a file) enters a **spine** (Feldera's LSM run collection and background merger). A storage batch is distinct from an input update batch. |
+| Update semantics | `Put` replaces a key's value; `Delete` removes it. An application-defined `Merge` operator can combine updates. | A **Z-set** adds weights for identical complete tuples and drops zero totals. An indexed Z-set groups weighted values by key. |
+| Unit supplied to accumulated storage | Ordinary writes enter a mutable memtable before becoming immutable sorted runs. | A **batch** enters a **spine**. A storage batch is distinct from an input update batch. |
 | Indexed record layout | A sorted key-to-value mapping. | `K → {V → weight}`: each search key has a sorted group of weighted values; equivalently, `(K,V) → weight`. |
 
+> [!NOTE]
+> **Glossary**
+>
+> **columns** — storage nesting levels, not SQL attributes.
+>
+> **Trace** — Feldera's interface for reading and updating retained state.
+
 For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
-batch indexes keys and nested value groups. The format calls these levels **columns** (storage nesting
-levels, not SQL attributes). The outer level is ordered by `K`; within each fixed `K`, values are ordered
+batch indexes keys and nested value groups. The format calls these levels **columns**. The outer level is ordered by
+`K`; within each fixed `K`, values are ordered
 by `V`. Inner seeks compare `V`, and consolidation combines weights for identical `(K,V)` tuples across runs.
 This describes existing operator state.
-A **trace** is Feldera's interface for reading and updating retained state. `Spine` implements this interface
+Feldera exposes retained state through the **trace** interface. `Spine` implements this interface
 by holding immutable sorted runs and merging them in the background. See [Storage differences from
 RocksDB](support.md#storage-differences-from-rocksdb).
 
@@ -32,8 +53,13 @@ that optimization in the baseline comparison.
 
 ## What changes in our design
 
-The merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** means encoding
-key fields into a byte string using a record-type-specific rule. Customer, Orders, and extended Lineitem
+> [!NOTE]
+> **Glossary**
+>
+> **Folding** — Encoding key fields into a byte string using a record-type-specific rule.
+
+The merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** produces the byte key.
+Customer, Orders, and extended Lineitem
 have different rules; their logical customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. The storage
 layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
@@ -51,9 +77,14 @@ cannot implement weighted reconstruction. [Folded keys require flat KV
 storage](support.md#folded-keys-require-flat-kv-storage)
 defines this boundary and the remaining adapter work.
 
+> [!NOTE]
+> **Glossary**
+>
+> **integrator state** — retained results of accumulating changes.
+
 The integration boundary is **accumulated-state access**: for requested keys and an old/new view, return the
-same tuples, weights, ordering, and absence information that existing **integrator state** (retained results
-of accumulating changes) would supply. The provider scans encoded ranges to derive those tuples. Operator
+same tuples, weights, ordering, and absence information that existing **integrator state** would supply. The provider
+scans encoded ranges to derive those tuples. Operator
 code consumes them through the same access contract, whether they were retained or reconstructed.
 
 The existing incremental view maintenance (IVM) algorithm determines the output: an additive summary can
@@ -61,6 +92,11 @@ emit a tuple carrying a value difference; a replacement emits `-[[old_tuple]] + 
 denotes one copy of tuple `t`. The merged index can supply state for either algorithm. Choosing the delta
 form and computing it remain in the shared operator path. Returned tuples are streamed or buffered within
 a byte limit, without storing another complete accumulated relation.
+
+> [!NOTE]
+> **Glossary**
+>
+> **Sealing** — Making the complete pending update set immutable and available to readers.
 
 ```mermaid
 flowchart LR
@@ -146,14 +182,23 @@ The correct output delta retracts the revenue-100 result once. Feldera's join or
 Using old state on both branches would incorrectly introduce a revenue-110 contribution. Old/new selection
 must follow each operator's delta identity, including simultaneous changes.
 
+> [!NOTE]
+> **Glossary**
+>
+> **support** — tuples with nonzero weight.
+
 One traversal of the order range supplies both line summaries, both group tuples, and both joined tuples;
 it reuses the decoded parent payloads. A customer change expands the affected set to all descendant orders
-visible in either state. Discover affected identities from the **support** (tuples with nonzero weight) of
+visible in either state. Discover affected identities from the **support** of
 complete-tuple changes: projecting
 signed replacements to keys first can cancel their weights and hide a changed order. Consumers share decoded
 records but need independent positions. A slow consumer can pin buffers, so bounded sharing must account for
-spilling or rereading oversized ranges. Here **sealing** means making the complete pending update set
-immutable and available to readers; **rekeying** means moving records to a changed physical key prefix.
+spilling or rereading oversized ranges.
+
+> [!NOTE]
+> **Glossary**
+>
+> **Rekeying** — Moving records to a changed physical key prefix.
 
 ```mermaid
 flowchart LR
