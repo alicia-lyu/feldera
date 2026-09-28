@@ -79,7 +79,8 @@ separate index on each folded field.
 The proposed Q3 scan keeps the current order identifier, required old/new parent payloads, and four running
 scalars: old/new qualifying-line count and revenue. It advances through the order's encoded range and adds
 each qualifying line's weighted contribution to those scalars. Once the range ends, it produces the old/new
-aggregate tuples and combines them with the parent fields. The scan does not retain a vector or hash map of
+state tuples required by the selected access, including parent fields when reconstructing a joined state.
+The scan does not retain a vector or hash map of
 all line tuples. Its summary state does not grow with line count; storage pages, decoding buffers, variable
 payload sizes, and shared-consumer buffers still count toward the memory budget.
 
@@ -125,6 +126,19 @@ The incremental aggregate reads its accumulated input and passes aggregate resul
 The current implementation retains previous output to retract an old aggregate value
 ([output-state
 rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+
+The provider boundary is a request for an accumulated relation, keys, and old/new view. Its result must match
+ordinary retained-state access, including tuple values, multiplicities, group absence, ordering, and cursor
+behavior. Reconstruction can compute a summary or a prior output tuple to satisfy that request; it does not
+introduce another aggregate delta-emission algorithm. Both providers feed the same operator path.
+
+For example, if an existing additive-summary algorithm expects a value difference, a revenue change from
+100 to 110 produces a difference of 10 in that summary's value. If the algorithm replaces a relation tuple,
+it emits `-[[order,100]] + [[order,110]]`, where `[[t]]` means one copy of tuple `t`. These are different
+output contracts, not interchangeable wire formats: 10 is a revenue difference, whereas -1 and +1 are tuple
+multiplicities. Existing operator code chooses and computes the required form using its deltas and state
+accesses. The merged-index provider supplies the same requested state for either form. It must also preserve
+group existence when count changes, even if revenue does not.
 
 For this architecture, reconstruct the previous Q3 aggregate tuple from old `A` and supply it where the
 output-update path requests the prior value. Preserve the upsert/retraction algorithm. Simply reconstructing
@@ -261,7 +275,7 @@ semantics. They do not execute this access-layer design, recovery, Q5/Q10 recons
 
 | Acceptance question | Required evidence |
 | --- | --- |
-| Are operator inputs and results identical? | Compare both reconstructed endpoints and consolidated deltas with independent evaluation, including deletes, zero/empty groups, replacements, simultaneous changes, and rekeys. |
+| Are operator inputs and results identical? | Run the same operator path with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and old/new views, then check value-difference or retraction/insertion outputs against independent evaluation. |
 | Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and old/new visibility. |
 | Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify old payload retention, consistent lookup publication, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |

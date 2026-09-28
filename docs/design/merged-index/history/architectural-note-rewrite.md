@@ -78,3 +78,9 @@ On 2026-09-28, replaced the ambiguous phrase â€œtransient reconstructed batchesâ
 and byte-limited buffers retained until consumption. Distinguished these from intermediate delta streams and
 immutable storage batches. Any operator API that requires a batch object needs explicit budgeted storage;
 no complete reconstructed relation is assumed to fit in RAM.
+
+On 2026-09-28, the user clarified that reconstruction must be interchangeable with existing integrator-state
+access for requested keys. The existing IVM algorithm and output path remain shared, including additive
+value differences or old-tuple retraction/new-tuple insertion. Updated the integration boundary, diagram,
+aggregate evidence, and acceptance criteria. Distinguished value differences from tuple multiplicities;
+the merged-index provider must not select or duplicate aggregate delta-emission logic.

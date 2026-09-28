@@ -40,8 +40,8 @@ The encoding must preserve the intended cross-type ordering and let the access l
 
 Values retain payloads, weights, and record types. A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it scans one order's lines while updating old/new
-count and revenue accumulators, then emits the aggregate tuples. It does not build an in-memory relation
-containing all those lines.
+count and revenue accumulators, then returns the requested state tuples. It does not build an in-memory
+relation containing all those lines.
 A persistent native-order lookup resolves an order to its customer-leading position. Reuse the spine, run
 management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
 merge rules. Flat KV records do not require a different LSM, but the grouped indexed batch cannot be reused
@@ -51,13 +51,16 @@ cannot implement weighted reconstruction. [Folded keys require flat KV
 storage](support.md#folded-keys-require-flat-kv-storage)
 defines this boundary and the remaining adapter work.
 
-The central change is **reconstructed accumulated access**. A join still combines a delta with an accumulated
-relation and multiplies matching weights. An aggregate still applies its weighted summary and output-update
-logic. Their access layer derives the requested logical relation from the merged source ranges instead of
-reading a separately retained intermediate trace. For example, after scanning an order, the cursor returns
-its computed aggregate tuple and weight to the consumer. Intermediate deltas still flow between operators.
-Reconstructed tuples are streamed or held in byte-limited buffers until consumed; the design does not require
-building a complete reconstructed relation or storing it as another accumulated collection.
+The integration boundary is **accumulated-state access**: for requested keys and an old/new view, return the
+same tuples, weights, ordering, and absence information that existing **integrator state** (retained results
+of accumulating changes) would supply. The provider scans encoded ranges to derive those tuples. Operator
+code consumes them through the same access contract, whether they were retained or reconstructed.
+
+The existing incremental view maintenance (IVM) algorithm determines the output: an additive summary can
+emit a tuple carrying a value difference; a replacement emits `-[[old_tuple]] + [[new_tuple]]`, where `[[t]]`
+denotes one copy of tuple `t`. The merged index can supply state for either algorithm. Choosing the delta
+form and computing it remain in the shared operator path. Returned tuples are streamed or buffered within
+a byte limit, without storing another complete accumulated relation.
 
 ```mermaid
 flowchart LR
@@ -66,14 +69,15 @@ flowchart LR
     S --> M[Feldera spine and immutable runs]
     S --> V[Stable old and sealed new views]
     V --> R[Byte-range cursor and per-order accumulators]
-    R --> A[Accumulated-state access]
+    R --> A[Same accumulated-state access contract]
+    T[Existing retained integrator state] -. baseline provider .-> A
     X[Operator deltas] --> O[Existing join and aggregate algorithms]
     A --> O
     O --> Y[Weighted output changes]
 ```
 
 One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
-consumer. Operator-facing cursors seek encoded ranges and return computed keys, values, and weights. When
+consumer. Provider cursors seek encoded ranges and return the requested state through the shared contract. When
 byte-key order differs from the required operator order, use budgeted external sorting or a maintained access
 path and count its I/O. Each shared scan has a byte-limited buffer and per-consumer positions; a lagging
 consumer must cause backpressure, spilling, or rereading, rather than unbounded retention.
