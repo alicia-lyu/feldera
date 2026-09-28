@@ -38,8 +38,10 @@ have different rules; their logical customer-leading positions are `(c)`, `(c,o)
 layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
 
-Values retain the payload, weight, and type information needed for reconstruction. Type-specific decoding
-recovers logical records above storage; reconstructed operator inputs can still have grouped semantics.
+Values retain payloads, weights, and record types. A range cursor reads KV entries in byte-key order and
+decodes the fields needed by the requesting operator. For Q3, it scans one order's lines while updating old/new
+count and revenue accumulators, then emits the aggregate tuples. It does not build an in-memory relation
+containing all those lines.
 A persistent native-order lookup resolves an order to its customer-leading position. Reuse the spine, run
 management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
 merge rules. Flat KV records do not require a different LSM, but the grouped indexed batch cannot be reused
@@ -61,7 +63,7 @@ flowchart LR
     E --> S[Flat byte-key KV adapter]
     S --> M[Feldera spine and immutable runs]
     S --> V[Stable old and sealed new views]
-    V --> R[Shared byte-range scan and typed reconstruction]
+    V --> R[Byte-range cursor and per-order accumulators]
     R --> A[Accumulated-state access]
     X[Operator deltas] --> O[Existing join and aggregate algorithms]
     A --> O
@@ -69,9 +71,10 @@ flowchart LR
 ```
 
 One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
-consumer. Logical accessors provide the key order, seek behavior, values, and weights expected by their
-operators. Customer-leading storage can serve both customer ranges and order ranges through parent lookup;
-other required orderings may need bounded sorting or an additional access path. Account for those costs explicitly.
+consumer. Operator-facing cursors seek encoded ranges and return computed keys, values, and weights. When
+byte-key order differs from the required operator order, use budgeted external sorting or a maintained access
+path and count its I/O. Each shared scan has a byte-limited buffer and per-consumer positions; a lagging
+consumer must cause backpressure, spilling, or rereading, rather than unbounded retention.
 
 The access change also covers aggregation's retained output. Reconstructing aggregate input alone leaves
 state behind in the output-update path. Every replaced state object must therefore be assigned either a

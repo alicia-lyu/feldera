@@ -71,9 +71,25 @@ Encoding must distinguish records and preserve the required cross-type order. Me
 or putting a type tag first is not a specified encoding.
 
 This is a user-specified architectural requirement. Feldera's existing `K → {V → weight}` representation
-remains the baseline for operator state; it is not the physical layout chosen for the merged index. Logical
-groups are reconstructed by range access above flat KV storage. The backend does not need to understand the
-customer/order/line hierarchy or maintain a separate index on each folded field.
+remains the baseline for operator state; it is not the physical layout chosen for the merged index. An
+operator requests a key or range; the adapter computes encoded bounds, seeks the KV cursor, and decodes
+the required fields from the returned entries. The backend compares byte keys without maintaining a
+separate index on each folded field.
+
+The proposed Q3 scan keeps the current order identifier, required old/new parent payloads, and four running
+scalars: old/new qualifying-line count and revenue. It advances through the order's encoded range and adds
+each qualifying line's weighted contribution to those scalars. Once the range ends, it produces the old/new
+aggregate tuples and combines them with the parent fields. The scan does not retain a vector or hash map of
+all line tuples. Its summary state does not grow with line count; storage pages, decoding buffers, variable
+payload sizes, and shared-consumer buffers still count toward the memory budget.
+
+A consumer that requires individual line tuples receives them through the cursor as the scan advances.
+Sharing uses a byte-limited record buffer with a position for each consumer. Borrowed fields remain valid
+only while their backing buffer is retained; longer-lived values require budgeted copies. An oversized
+range or lagging consumer must trigger backpressure, spill, or a charged reread. If a consumer needs another
+ordering, an external sort or maintained access path must supply it; decoding alone does not change order.
+These are physical requirements for the adapter. Exact buffer ownership, limits, and fallback selection
+remain implementation work, and must be tested with a range larger than the memory budget.
 
 Reuse the same LSM machinery: the spine, immutable-run management, compaction scheduling, cache, and
 snapshot ownership. Flat KV changes the records and their comparison/merge rules, not the need for that

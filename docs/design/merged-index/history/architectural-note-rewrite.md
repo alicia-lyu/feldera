@@ -67,3 +67,9 @@ interface; Spine implements it by holding and merging immutable sorted runs.
 On 2026-09-28, clarified the comparator at each level of existing grouped state: the outer level compares
 K, and the inner level compares V within a fixed K. Consolidation matches complete (K,V) pairs across runs;
 inner ordering does not supply a global V index. Applied this follow-up clarification to both active docs.
+
+On 2026-09-28, the user rejected “recovers logical records above storage” as hiding physical execution and
+memory costs. Replaced it with byte-range cursors, field decoding, per-order old/new count/revenue scalars,
+and incremental tuple delivery. Specified bounded shared buffers, consumer positions, value lifetimes,
+and charged spill/reread or external ordering. Exact ownership and fallback choices remain implementation
+work; the architecture must not assume an entire reconstructed relation fits in memory.
