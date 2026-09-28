@@ -84,20 +84,10 @@ The scan does not retain a vector or hash map of
 all line tuples. Its summary state does not grow with line count; storage pages, decoding buffers, variable
 payload sizes, and shared-consumer buffers still count toward the memory budget.
 
-A consumer that requires individual line tuples receives them through the cursor as the scan advances.
-Sharing uses a byte-limited record buffer with a position for each consumer. Borrowed fields remain valid
-only while their backing buffer is retained; longer-lived values require budgeted copies. An oversized
-range or lagging consumer must trigger backpressure, spill, or a charged reread. If a consumer needs another
-ordering, an external sort or maintained access path must supply it; decoding alone does not change order.
-For Q3, a returned aggregate tuple such as `(order, revenue)` is a computed cursor result. A bounded buffer
-may hold several such tuples until consumers advance. Neither requires constructing a new immutable storage
-batch for the entire reconstructed relation. If an existing operator interface requires a batch object,
-the adapter must explicitly handle that requirement with budgeted storage, including spills where necessary;
-it cannot silently collect the full result in an unbounded in-memory batch. Buffers are released after their
-consumers finish; intermediate delta streams remain part of normal operator execution.
-
-These are physical requirements for the adapter. Exact buffer ownership, limits, and fallback selection
-remain implementation work, and must be tested with a range larger than the memory budget.
+A consumer that requires individual line tuples receives them incrementally through a cursor. Computed
+aggregate tuples are likewise cursor results; neither requires a complete reconstructed relation in memory.
+An operator API that requires an immutable batch object must receive explicitly budgeted storage, including
+spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
 
 Reuse the same LSM machinery: the spine, immutable-run management, compaction scheduling, cache, and
 snapshot ownership. Flat KV changes the records and their comparison/merge rules, not the need for that
@@ -118,6 +108,216 @@ same logical identity. The pending-update representation must retain those chang
 it cannot sum their weights by folded identity alone and discard the payload difference. Exact version and
 pending-record encoding remains implementation work. Complete-tuple weighted reconstruction, one visible
 value per physical key, and consistent old/new views are required regardless of that choice.
+
+## Shared scan sessions bound ownership and memory
+
+A **scan session** owns one physical range cursor and the buffers used by its registered readers. A durable
+index handle may be shared; mutable cursor position belongs to a session. This follows the supplied
+[`mi_db` session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions): register readers
+before scanning, share one buffer per record type, and give same-type readers independent positions.
+Its [buffer guard](../../../../mi_db/docs/architecture.md#pending-buffer-guard) warns at 80% and fails before
+an insertion reaches its limit; it does not implement spill or reread. The pseudocode below is a proposed
+Feldera adaptation with explicit overflow choices, not an implemented API or a claim about `mi_db` code.
+
+The cited document is modified working-tree content inspected on 2026-09-28, based on `mi_db` revision
+`d50d29dfe559258351c1071e59ca5365eacf09d0`. Its SHA-256 is
+`d043b9b28121fe044980fde032d95e4b00c331e1d7a137ce709bd70eb6914e79`.
+
+### Batch owner and view lifetime
+
+A **view lease** is a reference that prevents releasing a batch's old/new source and parent-lookup views.
+One owner stages the complete input update batch, including induced descendant rekeys, before opening any
+new-view reader. Publishing these views to operators is distinct from committing externally visible results.
+The runtime must report completion of all consumers, including output-state updates and work across steps.
+Physical cursor EOF alone does not establish that completion.
+
+```text
+process_batch(input, consumer_plan):
+    owner = begin_owner(input.batch_id, total_memory_budget)
+    try:
+        owner.old = pin_committed_source_and_parent_lookup()
+        owner.pending = stage_all_changes(input, owner.old)   # includes descendant rekeys
+        owner.new = seal_weighted_overlay(owner.old, owner.pending)
+        owner.publish_to(consumer_plan)                       # views no longer change
+
+        provider = ReconstructedStateProvider(owner)
+        run_existing_ivm_paths(input.deltas, provider, consumer_plan)
+        await consumer_plan.all_tasks_and_output_updates_finished()
+        provider.close_all_sessions_and_sorted_cursors()
+        assert owner.outstanding_view_leases == 0
+
+        commit_source_lookup_and_output_progress(owner)       # required atomic commit boundary
+    except failure:
+        cancel_and_join_all_consumers()                       # no concurrent reader left
+        close_all_cursors_and_release_returned_values()
+        abort_or_recover_at_commit_boundary(owner)
+        raise failure
+    finally:
+        owner.release_snapshot_references()
+```
+
+`seal_weighted_overlay` resolves complete-tuple signed updates; it must retain both payloads of a replacement
+at an unchanged folded identity. The commit/abort calls state required backend/runtime behavior, not a new
+WAL design. On a failure during commit, recovery must determine the committed endpoint before retry. Source
+records, parent lookup, and output progress must not advance independently. Compaction can replace runs while
+pinned snapshot references keep old reads valid.
+
+### Requests retain the existing operator contract
+
+A request identifies the accumulated relation, requested keys, old/new view, and required key/value order.
+The provider derives bounds with the record-type codecs. Sharing is chosen when the consumer plan is prepared,
+so every reader is registered before scanning. A session may scan a coalesced range and readers may filter
+within it, but two arbitrary overlapping requests do not automatically share a mutable cursor.
+
+```text
+prepare_access(requests, owner):
+    for group in choose_compatible_scan_groups(requests):
+        session = ScanSession(
+            view_lease = owner.acquire(group.view),
+            range = encode_bounds(group.covered_keys),
+            decode_fields = union_of_fields_needed_by_type(group),
+            memory = owner.reserve_child_budget(group.buffer_limit))
+        register_all_typed_readers(session, group)
+        session.seal_registration()
+
+        for request in group:
+            state_cursor = reconstruct_requested_state(request, session.readers_for(request))
+            if proves_required_order(state_cursor, request.key_and_value_comparator):
+                publish_cursor(request, state_cursor)
+            elif maintained_path_matches(request, owner):
+                close_unused_readers(state_cursor)
+                publish_cursor(request, open_versioned_access_path(request, owner))
+            else:
+                publish_cursor(request, external_sort_and_consolidate(
+                    state_cursor, request.key_and_value_comparator,
+                    owner.reserve_sort_budget(), account_all_temporary_io))
+```
+
+Compatibility includes batch/view identity, encoded range, decoder requirements, and forward traversal.
+Independent views or ranges use independent sessions in this minimal design. Sharing one traversal across
+old/new views requires an additional version-aware reader returning both weights and payloads; the lifecycle
+above permits it but does not imply it is already implemented. Readers needing an independent seek close
+and reopen their own access instead of repositioning a cursor under other consumers. Replayed reads are
+charged. Existing operator seek/order behavior must still be honored.
+
+External sorting writes bounded sorted runs and performs a bounded-fan-in merge. It orders by the requested
+operator comparator and consolidates identical output tuples, preserving weights and dropping zero totals.
+A maintained access path must expose the same batch view and include its maintenance cost. Merely decoding
+byte keys proves neither operator order nor consolidation. These choices happen inside state access;
+value-difference and retraction/insertion logic stays in the existing IVM operators.
+
+### Shared typed buffers and reader positions
+
+A **typed buffer** is a sequence of decoded records of one type, shared by all readers requesting that type.
+The session stores `{physical_cursor, range, view_lease, buffers_by_type, readers, eof, memory_account}`.
+A reader starts with `{type, next_sequence=0, outstanding_lease=empty, closed=false}`. Sequence numbers
+are absolute and remain valid after reclaiming prefixes. The scheduler serializes `next`, `release`, and
+`close` for one session; its physical cursor and buffer registry must not be mutated concurrently. A wait
+yields control without holding a lock that prevents another reader from progressing. Decoder projections
+are fixed before scanning; a record is decoded once to the union of required fields for that type.
+Predicates and relational reconstruction are outside this
+physical record distribution step, as in the
+[`mi_db` typed-buffer design](../../../../mi_db/docs/architecture.md#shared-typed-buffers).
+
+```text
+next(reader):
+    require not reader.closed and reader.outstanding_lease is empty
+    loop:
+        buffer = session.buffers[reader.type]
+        if buffer.contains(reader.next_sequence):
+            lease = buffer.borrow_with_budgeted_reload(reader.next_sequence)
+            if lease is WAIT or RESOURCE_LIMIT: return lease
+            reader.outstanding_lease = lease
+            return lease
+        if session.eof:
+            return EOF                                      # this reader has drained its suffix
+
+        record = session.physical_cursor.peek_bounded()      # cursor page is budgeted
+        if record == EOF:
+            session.eof = true
+            continue
+        if no_active_reader(record.type):
+            session.physical_cursor.advance()
+            continue
+
+        needed = bounded_decode_size(record) + queue_metadata_cost
+        if not session.memory.try_reserve(needed):
+            return handle_pressure_without_advancing_cursor(record, needed)
+        decoded = decode_registered_fields(record)           # allocation covered by reservation
+        session.buffers[record.type].append(decoded)
+        session.physical_cursor.advance()
+
+release(reader):
+    require reader.outstanding_lease exists
+    reader.outstanding_lease = empty
+    reader.next_sequence += 1
+    reclaim(reader.type)
+
+reclaim(type):
+    live = active_readers_of(type)
+    cut = min(r.next_sequence for r in live) if live else buffers[type].end_sequence
+    buffers[type].release_entries_before(cut)                # releases byte reservations too
+
+close(reader):
+    if reader.closed: return
+    require reader.outstanding_lease is empty
+    reader.closed = true
+    remove_reader_from_registry(reader)
+    reclaim(reader.type)
+    if no_active_readers(): close_physical_cursor_and_release_view_lease()
+```
+
+The caller releases each borrowed record before requesting another. Holding a field beyond release requires
+a copy charged to the consumer's budget. Closing is idempotent and requires releasing outstanding borrows
+first. Batch cancellation stops all consumers before cleanup; session shutdown cannot leave borrowed pointers
+into reclaimed storage. Reloading a spilled entry reserves memory before reading; it can yield or fail
+rather than exceed the budget. Physical EOF
+still permits every reader to drain buffered records. For two Lineitem readers starting at sequence zero,
+reader A consuming records 0–9 does not free them while B remains at zero. After B releases record 0, that
+record can be reclaimed. Closing B lets A's consumed prefix be reclaimed immediately. Other record types
+have separate buffers and positions but compete for the same session byte limit.
+
+### Overflow must have a progress path
+
+Charge unique decoded records once, plus allocated capacity, queue metadata, reader positions, and in-flight
+decode storage. Budget reservations precede allocation; a record larger than the entire budget requires a
+streamed/spilled representation or an explicit error. A size estimate must be conservative and enforced.
+Per-session limits are suballocations of a total budget also covering storage cache, operator state, sort
+runs, pending updates, and consumer copies. Spilling does not make its indexing metadata free.
+
+```text
+handle_pressure_without_advancing_cursor(record, needed):
+    reclaim_all_consumed_prefixes()
+    if room_for(needed): return RETRY
+    if scheduler_can_run_a_reader_that_will_release_space():
+        wake_that_reader()
+        return WAIT_FOR_RELEASE                             # yield; do not block its thread
+    if configured_policy == SPILL:
+        spill_unborrowed_unread_entries_preserving_sequences()
+        return RETRY if room_for(needed) else RESOURCE_LIMIT
+    if configured_policy == REREAD:
+        detach_lagging_reader_to_independent_pinned_view_scan()
+        return RETRY if room_for(needed) else RESOURCE_LIMIT
+    return RESOURCE_LIMIT
+```
+
+`RETRY` and `WAIT_FOR_RELEASE` are internal scheduler results, not tuples returned to the operator. The
+runtime adapter resumes the same request. Spilled entries keep their sequence identities, and later reads
+load them through budgeted buffers; borrowed entries remain pinned. A reread uses the same immutable view
+and exact continuation token, including position within a decoded version if one physical key yields several
+records. It must neither duplicate nor skip a record and must reserve its own cursor memory before detaching.
+If a continuation cannot be represented safely, reject that fallback rather than guessing a seek key.
+
+Backpressure alone cannot resolve a dependency cycle: the reader that pins data might be waiting for the
+reader currently requesting more. The scheduler must establish a runnable consumer that can free space;
+otherwise spill, reread, or fail the batch explicitly. Never drop required rows, silently enlarge the budget,
+or spin on `RETRY` without progress. Spill/reread are proposed extensions to the cited `mi_db` guard.
+
+Conformance checks should interleave same-type and different-type readers, drain buffered suffixes after
+physical EOF, close lagging readers, and hold borrowed values during pressure. Also test registration after
+sealing, independent seeks, cross-step view lifetime, oversized records, dependency cycles, external-order
+changes, and failure during commit. Compare both state-provider results and the shared IVM output with the
+retained-state baseline; report high-water bytes and every spill, reread, sort, and access-path write.
 
 ## Aggregation also retains output state
 

@@ -84,3 +84,18 @@ access for requested keys. The existing IVM algorithm and output path remain sha
 value differences or old-tuple retraction/new-tuple insertion. Updated the integration boundary, diagram,
 aggregate evidence, and acceptance criteria. Distinguished value differences from tuple multiplicities;
 the merged-index provider must not select or duplicate aggregate delta-emission logic.
+
+## Shared-scan pseudocode expansion
+
+On 2026-09-28, the user requested a detailed elaboration of storage ownership, provider cursors, ordering,
+and bounded shared scans, using the mi_db session design. Read its modified architecture document and record
+its revision/hash alongside the source links. Keep its fail-on-overflow policy distinct from proposed
+Feldera spill/reread extensions. Add pseudocode to the active supporting report and link it from the main
+note; replace repeated buffer prose. Verify lifecycle, reader positions, EOF, release, bounded allocation,
+ordering, and scheduler progress without adding runtime code or claiming executed conformance tests.
+
+Read-only protocol review confirmed the mi_db attribution and identified two fixes: serialize mutations of
+shared session state, and explicitly mark readers closed with idempotent close after borrowed values are
+released. Both are reflected in the pseudocode. Spilled-record reloads also reserve memory before reading.
+Markdown, active links/anchors, source line ranges, Mermaid diagrams, and whitespace checks passed; no runtime
+or conformance tests were added or claimed for this documentation-only design.

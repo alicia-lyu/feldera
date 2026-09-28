@@ -81,6 +81,8 @@ consumer. Provider cursors seek encoded ranges and return the requested state th
 byte-key order differs from the required operator order, use budgeted external sorting or a maintained access
 path and count its I/O. Each shared scan has a byte-limited buffer and per-consumer positions; a lagging
 consumer must cause backpressure, spilling, or rereading, rather than unbounded retention.
+[Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory)
+gives pseudocode for batch lifetime, provider requests, reader positions, ordering, and overflow handling.
 
 The access change also covers aggregation's retained output. Reconstructing aggregate input alone leaves
 state behind in the output-update path. Every replaced state object must therefore be assigned either a
