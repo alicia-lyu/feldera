@@ -20,8 +20,11 @@ The file-backed batch builder writes keys to level zero and values plus weights 
 one file-backed batch. Thus these trees belong to each immutable run, not to the entire LSM collection
 ([batch
 construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L982-L1016)).
-The operator's lookup key remains the outer key. Ordering values also supports consolidation of identical
-`(K,V)` tuples across runs; the inner tree allows seeking within the selected key's group. A scan-only
+The outer level compares `K`. After selecting a fixed `K`, the inner level compares `V`; it does not
+compare `K` again or order records by weight. Inner seeks use a target `V` within that group's sorted values.
+For example, `(K=7,V=order_a)` precedes `(K=7,V=order_b)` according to the order-tuple comparator. When runs
+are combined, equal `K` groups are matched and equal `V` values within them have their weights added.
+Ordering by `V` does not create a global lookup by `V` across different `K` groups. A scan-only
 consumer need not use that seek capability. The file-format goals explicitly distinguish seeking from
 sequential access and discuss disabling value indexing when unnecessary; that goal alone does not establish
 an implemented switch or a measured benefit

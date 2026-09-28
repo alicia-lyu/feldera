@@ -19,8 +19,9 @@ storage:
 
 For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
 batch indexes keys and nested value groups. The format calls these levels **columns** (storage nesting
-levels, not SQL attributes). Inner ordering supports seeks and consolidation within a key. This describes existing
-operator state.
+levels, not SQL attributes). The outer level is ordered by `K`; within each fixed `K`, values are ordered
+by `V`. Inner seeks compare `V`, and consolidation combines weights for identical `(K,V)` tuples across runs.
+This describes existing operator state.
 A **trace** is Feldera's interface for reading and updating retained state. `Spine` implements this interface
 by holding immutable sorted runs and merging them in the background. See [Storage differences from
 RocksDB](support.md#storage-differences-from-rocksdb).

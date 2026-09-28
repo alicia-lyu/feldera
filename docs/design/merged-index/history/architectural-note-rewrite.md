@@ -63,3 +63,7 @@ The user's subsequent follow-ups clarified that the same LSM machinery remains t
 The flat KV adapter changes representation and merge/comparison rules, not the spine/run-management design.
 Also replaced “implements that abstraction” with the concrete relationship: Trace is the retained-state
 interface; Spine implements it by holding and merging immutable sorted runs.
+
+On 2026-09-28, clarified the comparator at each level of existing grouped state: the outer level compares
+K, and the inner level compares V within a fixed K. Consolidation matches complete (K,V) pairs across runs;
+inner ordering does not supply a global V index. Applied this follow-up clarification to both active docs.
