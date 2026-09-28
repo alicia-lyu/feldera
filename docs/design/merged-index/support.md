@@ -88,6 +88,13 @@ Sharing uses a byte-limited record buffer with a position for each consumer. Bor
 only while their backing buffer is retained; longer-lived values require budgeted copies. An oversized
 range or lagging consumer must trigger backpressure, spill, or a charged reread. If a consumer needs another
 ordering, an external sort or maintained access path must supply it; decoding alone does not change order.
+For Q3, a returned aggregate tuple such as `(order, revenue)` is a computed cursor result. A bounded buffer
+may hold several such tuples until consumers advance. Neither requires constructing a new immutable storage
+batch for the entire reconstructed relation. If an existing operator interface requires a batch object,
+the adapter must explicitly handle that requirement with budgeted storage, including spills where necessary;
+it cannot silently collect the full result in an unbounded in-memory batch. Buffers are released after their
+consumers finish; intermediate delta streams remain part of normal operator execution.
+
 These are physical requirements for the adapter. Exact buffer ownership, limits, and fallback selection
 remain implementation work, and must be tested with a range larger than the memory budget.
 

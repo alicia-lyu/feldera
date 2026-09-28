@@ -73,3 +73,8 @@ memory costs. Replaced it with byte-range cursors, field decoding, per-order old
 and incremental tuple delivery. Specified bounded shared buffers, consumer positions, value lifetimes,
 and charged spill/reread or external ordering. Exact ownership and fallback choices remain implementation
 work; the architecture must not assume an entire reconstructed relation fits in memory.
+
+On 2026-09-28, replaced the ambiguous phrase “transient reconstructed batches” with computed cursor results
+and byte-limited buffers retained until consumption. Distinguished these from intermediate delta streams and
+immutable storage batches. Any operator API that requires a batch object needs explicit budgeted storage;
+no complete reconstructed relation is assumed to fit in RAM.

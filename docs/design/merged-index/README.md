@@ -54,8 +54,10 @@ defines this boundary and the remaining adapter work.
 The central change is **reconstructed accumulated access**. A join still combines a delta with an accumulated
 relation and multiplies matching weights. An aggregate still applies its weighted summary and output-update
 logic. Their access layer derives the requested logical relation from the merged source ranges instead of
-reading a separately retained intermediate trace. Intermediate deltas and transient reconstructed batches
-still exist; the goal is to avoid maintaining their accumulated contents as additional durable collections.
+reading a separately retained intermediate trace. For example, after scanning an order, the cursor returns
+its computed aggregate tuple and weight to the consumer. Intermediate deltas still flow between operators.
+Reconstructed tuples are streamed or held in byte-limited buffers until consumed; the design does not require
+building a complete reconstructed relation or storing it as another accumulated collection.
 
 ```mermaid
 flowchart LR
