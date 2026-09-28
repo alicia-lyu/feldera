@@ -48,3 +48,18 @@ Added the one-to-many search-key mapping, per-file-batch index scope, and the di
 storage levels and SQL attributes. Explained why the outer key follows the operator's access pattern and
 why inner ordering and optional use of inner seeks are separate concerns. Checked the file format and batch
 writer against the existing pinned source citations.
+
+## Flat KV requirement
+
+On 2026-09-28, the user specified that merged-index keys are opaque byte strings folded differently for each
+record type. The merged index must use standard flat KV storage, not Feldera's grouped key/value layout.
+Updated the recommendation, architecture diagram, lifecycle qualifications, and adapter acceptance criteria.
+Existing grouped storage now describes only the baseline. Reuse is at the lower storage-infrastructure level;
+byte ordering, weighted payload updates, and snapshot semantics require an adapter. Physical encoding and
+Rust interfaces remain future work. This supersedes any earlier implication that grouped batches can be reused
+unchanged for the merged index.
+
+The user's subsequent follow-ups clarified that the same LSM machinery remains the intended backend.
+The flat KV adapter changes representation and merge/comparison rules, not the spine/run-management design.
+Also replaced “implements that abstraction” with the concrete relationship: Trace is the retained-state
+interface; Spine implements it by holding and merging immutable sorted runs.

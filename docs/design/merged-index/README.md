@@ -2,12 +2,11 @@
 
 ## How Feldera stores indexed state
 
-Feldera already has the storage machinery needed for a disk-backed merged index. Reuse that backend to store
-weighted source records together, then reconstruct the accumulated relations requested by incremental
-operators. Preserve their join and aggregation algorithms; change where they obtain accumulated state.
-This note defines that architecture for one nonrecursive **root circuit** (top-level operator graph). Q3 supplies the
-complete relational example, before ordering and the ten-row limit. Rust interfaces and implementation
-are subsequent work.
+Reuse Feldera's LSM machinery with a flat byte-key/value representation for the merged index. Reconstruct
+accumulated relations from that store while preserving join and aggregation algorithms. The adapter changes
+record representation and accumulated-state access; it does not require a separate LSM implementation.
+This note covers one nonrecursive **root circuit** (top-level operator graph) and Q3 before ordering/limit.
+Rust interfaces and implementation are subsequent work.
 
 Compared with RocksDB, the relevant differences are the update semantics and the representation supplied to
 storage:
@@ -19,17 +18,12 @@ storage:
 | Indexed record layout | A sorted key-to-value mapping. | `K → {V → weight}`: each search key has a sorted group of weighted values; equivalently, `(K,V) → weight`. |
 
 For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
-batch has its own indexes over keys and nested value groups. The format calls these levels **columns**
-(storage nesting levels, not SQL attributes); it does not independently index each field of an order.
-The outer key matches the operator's lookup key. Inner ordering supports iteration, seeks within a group,
-and matching identical tuples during weight consolidation. A consumer that only scans matching groups does
-not inherently need inner seeks; the general format supports them.
-
-The logical relation is stored **in** these memory/file batches. Feldera calls its accumulated collection a
-**trace** (operator-facing accumulated state); a spine implements that abstraction. Weighted consolidation is
-built into Feldera's collection semantics; RocksDB offers application-defined combination through its merge
-operator. See [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) for both systems'
-source evidence.
+batch indexes keys and nested value groups. The format calls these levels **columns** (storage nesting
+levels, not SQL attributes). Inner ordering supports seeks and consolidation within a key. This describes existing
+operator state.
+A **trace** is Feldera's interface for reading and updating retained state. `Spine` implements this interface
+by holding immutable sorted runs and merging them in the background. See [Storage differences from
+RocksDB](support.md#storage-differences-from-rocksdb).
 
 In this root circuit, logical time has a single value, written `()` in Rust, so records need no varying
 logical timestamp. Feldera's file batches also support fetching multiple requested keys together; retain
@@ -37,10 +31,22 @@ that optimization in the baseline comparison.
 
 ## What changes in our design
 
-Store Customer, Orders, and extended Lineitem records in a shared customer-leading order: customer `(c)`,
-order `(c,o)`, and line `(c,o,l)`, with record tags and complete payloads. An extended line carries the customer
-prefix derived from its order. Weights remain explicit. A persistent native-order lookup resolves an order
-identifier to its customer prefix when an update does not supply that prefix.
+The merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** means encoding
+key fields into a byte string using a record-type-specific rule. Customer, Orders, and extended Lineitem
+have different rules; their logical customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. The storage
+layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
+The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
+
+Values retain the payload, weight, and type information needed for reconstruction. Type-specific decoding
+recovers logical records above storage; reconstructed operator inputs can still have grouped semantics.
+A persistent native-order lookup resolves an order to its customer-leading position. Reuse the spine, run
+management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
+merge rules. Flat KV records do not require a different LSM, but the grouped indexed batch cannot be reused
+unchanged.
+Payload replacement must preserve old/new values and signed changes; ordinary last-write-wins handling alone
+cannot implement weighted reconstruction. [Folded keys require flat KV
+storage](support.md#folded-keys-require-flat-kv-storage)
+defines this boundary and the remaining adapter work.
 
 The central change is **reconstructed accumulated access**. A join still combines a delta with an accumulated
 relation and multiplies matching weights. An aggregate still applies its weighted summary and output-update
@@ -50,10 +56,11 @@ still exist; the goal is to avoid maintaining their accumulated contents as addi
 
 ```mermaid
 flowchart LR
-    D[Weighted source changes] --> S[Shared source spine]
-    S --> M[Memory and tree-indexed file batches]
+    D[Weighted source changes] --> E[Type-specific key folding]
+    E --> S[Flat byte-key KV adapter]
+    S --> M[Feldera spine and immutable runs]
     S --> V[Stable old and sealed new views]
-    V --> R[Shared range reconstruction]
+    V --> R[Shared byte-range scan and typed reconstruction]
     R --> A[Accumulated-state access]
     X[Operator deltas] --> O[Existing join and aggregate algorithms]
     A --> O
@@ -63,8 +70,7 @@ flowchart LR
 One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
 consumer. Logical accessors provide the key order, seek behavior, values, and weights expected by their
 operators. Customer-leading storage can serve both customer ranges and order ranges through parent lookup;
-other required orderings may need bounded sorting or an additional access path. Such costs belong to the
-design, rather than being hidden behind a cursor abstraction.
+other required orderings may need bounded sorting or an additional access path. Account for those costs explicitly.
 
 The access change also covers aggregation's retained output. Reconstructing aggregate input alone leaves
 state behind in the output-update path. Every replaced state object must therefore be assigned either a
@@ -140,7 +146,8 @@ flowchart LR
 ```
 
 In the example, old reads retain the revenue-40 line and eligible customer payload even after pending
-retractions exist. New reads consolidate base plus pending. Immutable batch snapshots support this separation;
+retractions exist. New reads apply the pending weighted changes to the base. The flat KV adapter must preserve this
+separation;
 a per-record old/new bit is not required as a backend choice, and cannot replace signed weights or retention.
 An order reassignment also stages placement changes for unchanged descendant lines and preserves both parent
 paths. Publication and recovery must cover source records and lookup changes together. Ordinary compaction
@@ -151,14 +158,14 @@ requirements and what remains to implement.
 Q5 and Q10 add two useful constraints. Q5 needs a consistently versioned external Nation/Region eligibility filter and
 line
 supplier identifiers; a per-order revenue total would lose information needed downstream. Q10 needs returned
-line rows and customer output payloads, with its final customer aggregate downstream. These boundaries show
-why reconstruction must reproduce the consumer's exact relation, not just a convenient summary.
+line rows and customer output payloads, with its final customer aggregate downstream. Reconstruction must preserve the
+consumer's exact relation.
 See [Consumers determine the required payload](support.md#consumers-determine-the-required-payload).
 
 ## Why this could improve I/O
 
 The expected saving comes from avoiding retained intermediate collections and their writes. Source changes
-still enter a spine and incur consolidation and persistence work, but reconstructed `A` and `B` need not have
+still incur KV update, consolidation, and persistence work, but reconstructed `A` and `B` need not have
 separate accumulated storage. Co-location also lets several logical consumers use one physical range read.
 Neither benefit implies that every update becomes cheaper.
 

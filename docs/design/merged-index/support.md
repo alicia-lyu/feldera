@@ -2,8 +2,9 @@
 
 ## Storage differences from RocksDB
 
-A **spine** (LSM run collection and background merger) stores **batches** (immutable sorted runs of weighted
-updates, in memory or files) and merges them in the background
+A **trace** is the runtime interface for reading and updating retained state. `Spine` is its concrete
+implementation: a **spine** (LSM run collection and background merger) holds **batches** (immutable sorted
+runs of weighted updates, in memory or files) and merges them in the background
 ([spine
 description](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7)).
 A **layer file** (Feldera's immutable file format for nested sorted groups) calls each nesting level a
@@ -17,13 +18,15 @@ composite mapping `(K,V) → weight`, not secondary indexing of every SQL field.
 
 The file-backed batch builder writes keys to level zero and values plus weights to level one, then finishes
 one file-backed batch. Thus these trees belong to each immutable run, not to the entire LSM collection
-([batch construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L982-L1016)).
+([batch
+construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L982-L1016)).
 The operator's lookup key remains the outer key. Ordering values also supports consolidation of identical
 `(K,V)` tuples across runs; the inner tree allows seeking within the selected key's group. A scan-only
 consumer need not use that seek capability. The file-format goals explicitly distinguish seeking from
 sequential access and discuss disabling value indexing when unnecessary; that goal alone does not establish
 an implemented switch or a measured benefit
-([access goals](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L30-L36)).
+([access
+goals](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L30-L36)).
 
 This differs from RocksDB's key-to-value interface: an indexed Feldera relation exposes sorted keys and
 sorted weighted values within each key. RocksDB's ordinary writes enter a mutable memtable; Feldera's spine
@@ -54,6 +57,41 @@ path](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2
 A comparison must record the actual fetch setting
 and storage/cache configuration.
 
+## Folded keys require flat KV storage
+
+The chosen merged-index representation is `byte_key → encoded_value`, with one value per complete physical
+key in each visible state. **Folding** (record-type-specific encoding of key fields into bytes) produces the
+key. Customer, Orders, and extended Lineitem use different folding rules. Their logical positions `(c)`,
+`(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
+opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
+Encoding must distinguish records and preserve the required cross-type order. Merely concatenating fields
+or putting a type tag first is not a specified encoding.
+
+This is a user-specified architectural requirement. Feldera's existing `K → {V → weight}` representation
+remains the baseline for operator state; it is not the physical layout chosen for the merged index. Logical
+groups are reconstructed by range access above flat KV storage. The backend does not need to understand the
+customer/order/line hierarchy or maintain a separate index on each folded field.
+
+Reuse the same LSM machinery: the spine, immutable-run management, compaction scheduling, cache, and
+snapshot ownership. Flat KV changes the records and their comparison/merge rules, not the need for that
+machinery. `Spine` is generic over its batch type
+([generic trace
+implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L2085-L2090));
+the adapter must satisfy its batch contracts. This does not mean reusing `FileIndexedWSet` unchanged. The file layer
+separates key data from auxiliary data, and documents typed comparisons
+([file representation and
+ordering](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65)).
+That provides a place to investigate a flat byte-key representation; it does not establish an existing
+flat weighted-KV adapter. Select a byte-key type/comparator with the required lexicographic order and define
+how batches, merging, reads, and snapshots preserve the encoded values.
+
+Flat KV shape does not select update semantics. Values must preserve payloads, weights, and enough type
+information for decoding. A payload replacement can retract and insert different complete tuples at the
+same logical identity. The pending-update representation must retain those changes and the old snapshot;
+it cannot sum their weights by folded identity alone and discard the payload difference. Exact version and
+pending-record encoding remains implementation work. Complete-tuple weighted reconstruction, one visible
+value per physical key, and consistent old/new views are required regardless of that choice.
+
 ## Aggregation also retains output state
 
 The incremental aggregate reads its accumulated input and passes aggregate results through `upsert`
@@ -64,7 +102,8 @@ rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690
 
 For this architecture, reconstruct the previous Q3 aggregate tuple from old `A` and supply it where the
 output-update path requests the prior value. Preserve the upsert/retraction algorithm. Simply reconstructing
-Count/Revenue while leaving its old output **trace** (operator-facing accumulated state) populated would not remove all
+Count/Revenue while leaving its old output **trace** (retained state accessed through the runtime interface) populated
+would not remove all
 replaced accumulated state.
 The same inventory must cover delayed views and both join-side traces. This is a design obligation, not an
 existing configurable adapter. The runtime's join wiring uses left delta/current right and right delta/delayed
@@ -113,8 +152,9 @@ composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d6
 Combined cursors add matching
 weights and suppress zero totals
 ([consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
-Thus a pinned old
-batch set and that set plus a sealed delta can represent both endpoints without waiting for physical merges.
+These establish existing weighted-batch primitives. The flat KV adapter must implement equivalent old/new
+visibility for encoded payloads; concatenating batches or overwriting equal byte keys is not by itself proof
+of correct weighted reconstruction. Reads must resolve the pending changes without waiting for compaction.
 
 The integration must keep the old source snapshot and parent lookup alive, stage complete payload retractions
 and descendant rekeys, then **seal** the pending updates
@@ -129,7 +169,8 @@ flushing](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690a
 These primitives support the design but do not establish atomic publication or restart of the new shared
 index. Implementation must coordinate source batches, native-order lookup, and output progress so recovery
 exposes a complete endpoint and retry does not apply weights twice. Snapshot retention also has a memory and
-storage cost. No per-record phase bit is required by the chosen immutable-batch representation.
+storage cost. A per-record phase bit is not an architectural requirement; the flat KV adapter must specify its version
+retention and pending-update representation.
 
 ## Consumers determine the required payload
 
@@ -195,6 +236,7 @@ semantics. They do not execute this access-layer design, recovery, Q5/Q10 recons
 | Acceptance question | Required evidence |
 | --- | --- |
 | Are operator inputs and results identical? | Compare both reconstructed endpoints and consolidated deltas with independent evaluation, including deletes, zero/empty groups, replacements, simultaneous changes, and rekeys. |
+| Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and old/new visibility. |
 | Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify old payload retention, consistent lookup publication, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
 | Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
