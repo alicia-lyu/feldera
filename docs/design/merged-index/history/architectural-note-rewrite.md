@@ -131,3 +131,8 @@ The user also flagged the ambiguous attribution “the paper's Figure 4c.” Act
 lecture note Maintaining a Query, One Change at a Time, link its “Equivalent Q3 circuits” figure source,
 and refer to panel (c) thereafter. Distinguish that note from the interesting-orderings manuscript used for
 refresh-performance evidence.
+
+On 2026-09-28, explained why Q3 summaries contain both N and R: N determines group existence, while R is
+revenue. Added the zero-revenue versus empty-group comparison and last-zero-line deletion example. Clarified
+that a scan deriving only A can detect existence directly, while reconstruction of H must preserve its
+count/revenue contract; no separate durable count is implied.

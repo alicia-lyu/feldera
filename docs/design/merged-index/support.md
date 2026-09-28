@@ -515,8 +515,28 @@ deltaA = A_new - A_old
 delta(L join R) = deltaL join R_new + L_old join deltaR
 ```
 
-A live line with revenue zero gives `(N,R)=(1,0)` and a present aggregate row. Deleting that last line gives
-`(0,0)` and retracts the row. A generalized line bag of weight three contributes three times its revenue;
+`N_s(k)` and `R_s(k)` answer different questions: does the group exist, and what is its revenue? In this
+scope, complete endpoint states have nonnegative tuple multiplicities, so `N>0` means at least one qualifying
+line remains. Signed input changes are first applied to obtain that state.
+
+| Qualifying line state for key `k` | `N` | `R` | Required group relation |
+| --- | --- | --- | --- |
+| No lines | 0 | 0 | Absent |
+| One line with zero revenue | 1 | 0 | `(k,0)` at weight 1 |
+| Two lines with revenues 60 and 40 | 2 | 100 | `(k,100)` at weight 1 |
+
+Deleting the sole zero-revenue line changes `(N,R)` from `(1,0)` to `(0,0)`. The revenue difference is zero,
+but the aggregate relation must emit `-[[k,0]]`. A revenue-only summary would miss this deletion. This is
+grouped aggregation: an empty group emits no tuple. The count is not an extra query output column.
+
+When reconstructing only `A` by a full range scan, detecting any surviving qualifying line is sufficient for
+group existence; the provider need not separately persist a count. When supplying the requested summary `H`,
+it must return both `N` and `R` to match the existing integrator contract. Count is useful in an additive
+summary because insertion/deletion weights update it directly; a stored presence bit alone cannot tell
+whether deleting one line removes the last of several lines. Revenue could determine presence only under an
+additional strict-positivity guarantee, which this note does not assume.
+
+A generalized line bag of weight three contributes three times its revenue;
 retracting one copy changes its weight to two. This illustrates weighted reconstruction, not SQL equivalence
 of the aggregation-first rewrite with duplicate parent rows. That equivalence assumes valid primary/foreign
 keys and unit-weight parents ([query

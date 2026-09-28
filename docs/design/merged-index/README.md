@@ -107,6 +107,10 @@ Let `s` denote old or new state, `w_s(x)` the consolidated weight of complete tu
 `rho(l) = price(l) * (1 - discount(l))`. A qualifying line has ship date after the fixed cutoff; an eligible
 order has order date before it; an eligible customer has the requested segment. For order prefix `k`, define
 `N_s(k) = sum w_s(l)` and `R_s(k) = sum w_s(l) * rho(l)` over qualifying lines.
+`R` is the revenue value; `N` is the count, including multiplicity, used to decide whether to emit a group.
+One qualifying zero-revenue line gives `(N,R)=(1,0)` and emits `(k,0)`; no qualifying lines gives `(0,0)`
+and emits nothing. Revenue alone cannot distinguish these states. Deleting that last zero-revenue line
+therefore retracts `(k,0)` even though revenue does not change.
 
 | Logical accumulation | Reconstructed value | Source access |
 | --- | --- | --- |
@@ -118,8 +122,7 @@ order has order date before it; an eligible customer has the requested segment. 
 
 The final relation projects `B join C`. Projection adds weights of identical output tuples. Revenue is a
 field of the aggregate tuple, so changing revenue retracts the old tuple and inserts the new tuple; its weight
-is not the line count. A nonempty group with zero revenue must remain present. The count supplies group
-existence even when its sum is zero. The lecture note's panel (c) computes the old aggregate tuple from the delayed summary
+is not the line count. The lecture note's panel (c) computes the old aggregate tuple from the delayed summary
 `H_old`; it does not require another integrator to retain that tuple. The lecture note calls this summary `M`.
 [Weighted reconstruction preserves group existence](support.md#weighted-reconstruction-preserves-group-existence)
 records the algebra and the limits of the key assumptions.
