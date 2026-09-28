@@ -6,8 +6,8 @@ Feldera already has the storage machinery needed for a disk-backed merged index.
 weighted source records together, then reconstruct the accumulated relations requested by incremental
 operators. Preserve their join and aggregation algorithms; change where they obtain accumulated state.
 This note defines that architecture for one nonrecursive **root circuit** (top-level operator graph). Q3 supplies the
-complete relational
-example, before ordering and the ten-row limit. Exact Rust interfaces and implementation are subsequent work.
+complete relational example, before ordering and the ten-row limit. Rust interfaces and implementation
+are subsequent work.
 
 Compared with RocksDB, the relevant differences are the update semantics and the representation supplied to
 storage:
@@ -16,7 +16,14 @@ storage:
 | --- | --- | --- |
 | Update semantics | `Put` replaces a key's value; `Delete` removes it. An application-defined `Merge` operator can combine updates. | A **Z-set** (relation with signed tuple multiplicities) adds weights for identical complete tuples and drops zero totals. An indexed Z-set groups weighted values by key. |
 | Unit supplied to accumulated storage | Ordinary writes enter a mutable memtable before becoming immutable sorted runs. | A **batch** (immutable sorted run of weighted updates, in memory or a file) enters a **spine** (Feldera's LSM run collection and background merger). A storage batch is distinct from an input update batch. |
-| Indexed record layout | A sorted key-to-value mapping. | Sorted keys with groups of sorted, weighted values; file storage has a tree index per column. |
+| Indexed record layout | A sorted key-to-value mapping. | `K → {V → weight}`: each search key has a sorted group of weighted values; equivalently, `(K,V) → weight`. |
+
+For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
+batch has its own indexes over keys and nested value groups. The format calls these levels **columns**
+(storage nesting levels, not SQL attributes); it does not independently index each field of an order.
+The outer key matches the operator's lookup key. Inner ordering supports iteration, seeks within a group,
+and matching identical tuples during weight consolidation. A consumer that only scans matching groups does
+not inherently need inner seeks; the general format supports them.
 
 The logical relation is stored **in** these memory/file batches. Feldera calls its accumulated collection a
 **trace** (operator-facing accumulated state); a spine implements that abstraction. Weighted consolidation is

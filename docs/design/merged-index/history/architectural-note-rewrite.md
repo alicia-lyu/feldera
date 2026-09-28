@@ -39,3 +39,12 @@ On 2026-09-28, the user requested definitions beside the first occurrence of non
 an LSM description restricted to differences from RocksDB. Replaced the mixed logical/physical table with
 an update-semantics and storage-representation comparison, defined specialized terms inline in both active
 documents, and added official RocksDB sources. General LSM mechanics are assumed knowledge.
+
+## Follow-up clarifications
+
+On 2026-09-28, the user requested that follow-up questions trigger documentation edits that anticipate those
+questions. Apply this to subsequent revisions of this note, rather than leaving clarifications only in chat.
+Added the one-to-many search-key mapping, per-file-batch index scope, and the distinction between nested
+storage levels and SQL attributes. Explained why the outer key follows the operator's access pattern and
+why inner ordering and optional use of inner seeks are separate concerns. Checked the file format and batch
+writer against the existing pinned source citations.

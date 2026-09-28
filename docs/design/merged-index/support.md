@@ -6,10 +6,25 @@ A **spine** (LSM run collection and background merger) stores **batches** (immut
 updates, in memory or files) and merges them in the background
 ([spine
 description](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7)).
-A **layer file** (Feldera's immutable file format for nested sorted columns) contains sorted row groups;
-each column has a tree whose leaves are data blocks and whose interior nodes are index
-blocks ([file
+A **layer file** (Feldera's immutable file format for nested sorted groups) calls each nesting level a
+**column** (storage level, not a SQL attribute). Each level has a tree whose leaves are data blocks and whose
+interior nodes are index blocks ([file
 layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L54)).
+For an indexed weighted relation, the outer level contains search keys `K`; the inner level contains sorted
+values `V` grouped under each key, with associated weights. One `K` can have many values, while each distinct
+`(K,V)` has one consolidated weight. A whole SQL row can be one `V`. This is a nested representation of the
+composite mapping `(K,V) → weight`, not secondary indexing of every SQL field.
+
+The file-backed batch builder writes keys to level zero and values plus weights to level one, then finishes
+one file-backed batch. Thus these trees belong to each immutable run, not to the entire LSM collection
+([batch construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L982-L1016)).
+The operator's lookup key remains the outer key. Ordering values also supports consolidation of identical
+`(K,V)` tuples across runs; the inner tree allows seeking within the selected key's group. A scan-only
+consumer need not use that seek capability. The file-format goals explicitly distinguish seeking from
+sequential access and discuss disabling value indexing when unnecessary; that goal alone does not establish
+an implemented switch or a measured benefit
+([access goals](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L30-L36)).
+
 This differs from RocksDB's key-to-value interface: an indexed Feldera relation exposes sorted keys and
 sorted weighted values within each key. RocksDB's ordinary writes enter a mutable memtable; Feldera's spine
 accepts already built immutable batches. See the official
@@ -28,8 +43,8 @@ layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6
 `FallbackIndexedWSet` (batch type choosing memory or file storage) selects memory or file
 representation
 ([variants](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58)).
-The **root circuit** (top-level operator graph) has only one timestamp value, `()` in Rust; they select a batch without
-varying logical time ([timestamp
+The **root circuit** (top-level operator graph) has only one timestamp value, `()` in Rust, selecting a batch
+without varying logical time ([timestamp
 mapping](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
 File indexed batches implement asynchronous key fetching
 ([fetch](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L447-L478)),
