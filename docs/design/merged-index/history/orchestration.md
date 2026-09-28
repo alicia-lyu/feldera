@@ -1,6 +1,6 @@
 # Investigation orchestration
 
-Date: 2026-09-28. This file owns assignments and progress; the human entry point is [README.md](README.md).
+Date: 2026-09-28. This file owns assignments and progress; the human entry point is [README.md](../../../../TRASH/docs/design/merged-index/README.md).
 The [plan](investigation-plan.md) records acceptance.
 
 ## Assignments
@@ -82,7 +82,7 @@ the supplied checkouts. `git diff --check` passed. The overview is below 600
 prose words, excluding its table and diagram.
 
 Source revisions and reproducibility details belong in
-[source-map.md](evidence/source-map.md); future experiments belong in
-[validation-plan.md](evidence/validation-plan.md). No runtime prototype or I/O
+[source-map.md](../../../../TRASH/docs/design/merged-index/evidence/source-map.md); future experiments belong in
+[validation-plan.md](../../../../TRASH/docs/design/merged-index/evidence/validation-plan.md). No runtime prototype or I/O
 benchmark was executed. The intended `alicia-lyu/feldera` upstream is pending
 creation; these documentation commits remain local.

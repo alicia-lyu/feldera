@@ -73,8 +73,8 @@ per nonempty group, not the line count.
 group remains present because `N3>0`; an empty group does not emit. Both versions of these expressions are
 needed wherever a delayed branch reads old state. Five logical integrators therefore do not mean five stored
 copies or only five stateful runtime objects. The [DBSP note's five-integrator
-mapping](../../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405) and
-[support/group-existence rule](../../../../../DBSP_w_merged_index/operator-state.tex#L39) provide the supplied
+mapping](../../../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405) and
+[support/group-existence rule](../../../../../../DBSP_w_merged_index/operator-state.tex#L39) provide the supplied
 semantic derivation.
 
 For Q5 let `G5ˢ(n)` be the weight of nation key `n` in the externally computed, projected
@@ -178,7 +178,7 @@ independent sessions. A lagging consumer pins data; bounded buffering may requir
 explicitly charged spill/re-read, or rejection of an unsuitable schedule. It cannot silently skip rows.
 Customer or order ranges need not fit in RAM. The dirty, pinned `mi_db` design specifies these sessions but
 does not implement the proposed visibility protocol; see [source provenance](../evidence/source-map.md) and
-[scan-session proposal](../../../../../mi_db/docs/architecture.md#merged-index-scan-sessions).
+[scan-session proposal](../../../../../../mi_db/docs/architecture.md#merged-index-scan-sessions).
 
 Refresh processing belongs in the same access accounting:
 

@@ -86,7 +86,7 @@ relevant if that general operator path is reused, not a requirement to add histo
 
 ## Replay rebuilds retained state
 
-The [concurrent bootstrapping design](../../concurrent_bootstrapping.md) is useful precedent for defining a
+The [concurrent bootstrapping design](../../../../../docs/design/concurrent_bootstrapping.md) is useful precedent for defining a
 consistent cut, recording changes after that cut, and waiting for synchronization before state transfer. It is
 not an implementation of on-demand intermediate reconstruction.
 

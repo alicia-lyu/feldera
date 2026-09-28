@@ -1,0 +1,173 @@
+# Evidence for reconstructed accumulated state
+
+## Batches combine an LSM spine with tree indexes
+
+The spine appends batches, searches across them, and merges them in the background
+([spine
+description](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7)).
+File layers contain sorted row groups and are written as
+immutable files; each column has a tree whose leaves are data blocks and whose interior nodes are index
+blocks ([file
+layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L54)).
+These establish both parts of the storage description.
+
+`VecIndexedWSet` contains keys, offsets, values, and differences
+([memory
+layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199));
+`FallbackIndexedWSet` selects memory or file
+representation
+([variants](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58)).
+Unit timestamps select the ordinary
+batch ([timestamp
+mapping](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
+File indexed batches implement asynchronous key fetching
+([fetch](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L447-L478)),
+which joins can use
+([join fetch
+path](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L1653-L1687)).
+A comparison must record the actual fetch setting
+and storage/cache configuration.
+
+## Aggregation also retains output state
+
+The incremental aggregate reads its accumulated input and passes aggregate results through `upsert`
+([construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499)).
+The implementation explicitly explains that
+the current implementation retains previous output to retract an old aggregate value
+([output-state
+rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+
+For this architecture, reconstruct the previous Q3 aggregate tuple from old `A` and supply it where the
+output-update path requests the prior value. Preserve the upsert/retraction algorithm. Simply reconstructing
+Count/Revenue while leaving its old output trace populated would not remove all replaced accumulated state.
+The same inventory must cover delayed views and both join-side traces. This is a design obligation, not an
+existing configurable adapter. The runtime's join wiring uses left delta/current right and right delta/delayed
+left ([join
+construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749));
+accessors must preserve that orientation.
+
+## Weighted reconstruction preserves group existence
+
+For each requested relation `T` and key set `K`, require
+`reconstruct(T, source_s, K) = T(database_s) restricted to K`, including payloads, weights, and group existence.
+The supplied note identifies the five logical integrators
+([five accumulations](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)) and their
+weighted reconstruction ([definitions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L508)).
+
+```text
+N_s(k) = sum_l w_s(l) * [qualifying(l)]
+R_s(k) = sum_l w_s(l) * [qualifying(l)] * rho(l)
+A_s    = { (k, R_s(k)) -> 1 | N_s(k) > 0 }
+deltaA = A_new - A_old
+delta(L join R) = deltaL join R_new + L_old join deltaR
+```
+
+A live line with revenue zero gives `(N,R)=(1,0)` and a present aggregate row. Deleting that last line gives
+`(0,0)` and retracts the row. A generalized line bag of weight three contributes three times its revenue;
+retracting one copy changes its weight to two. This illustrates weighted reconstruction, not SQL equivalence
+of the aggregation-first rewrite with duplicate parent rows. That equivalence assumes valid primary/foreign
+keys and unit-weight parents ([query
+assumptions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L177)).
+The count/existence requirement also appears in the
+[operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39).
+
+The main note's replacement has two distinct complete line tuples at weights `-1` and `+1`. Their key weights
+sum to zero, but their support still marks the order as affected. Identical complete-tuple changes that cancel
+can be discarded. Changed customers expand to descendant orders in either endpoint; rekeys include both
+prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L564)).
+
+## Immutable batches preserve old reads
+
+`SpineSnapshot` owns reference-counted batches and supports constructing a view with additional batches
+([snapshot ownership and
+composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L56-L153)).
+Combined cursors add matching
+weights and suppress zero totals
+([consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
+Thus a pinned old
+batch set and that set plus a sealed delta can represent both endpoints without waiting for physical merges.
+
+The integration must keep the old source snapshot and parent lookup alive, stage complete payload retractions
+and descendant rekeys, then seal a consistent new view. Retire old ownership only when every consumer has
+finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
+([transaction
+scheduling](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/schedule.rs#L186-L226),
+[commit
+flushing](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/circuit_builder.rs#L7777-L7805)).
+
+These primitives support the design but do not establish atomic publication or restart of the new shared
+index. Implementation must coordinate source batches, native-order lookup, and output progress so recovery
+exposes a complete endpoint and retry does not apply weights twice. Snapshot retention also has a memory and
+storage cost. No per-record phase bit is required by the chosen immutable-batch representation.
+
+## Consumers determine the required payload
+
+Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region gate and preserves
+supplier identifiers for later matching. A changing gate needs consistent old/new multiplicities and an
+expansion to affected customers; a boolean gate suffices only under the key assumptions
+([Q5 consumer and
+gate](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q5/query.tpp#L219-L335)).
+
+Q10's selected expression produces returned-line join rows and full required customer payloads. Customer
+aggregation and Nation-name attachment remain downstream; a per-order revenue-only record cannot replace
+those join rows ([Q10 logical
+plan](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10/plans/family_logical.dot#L34-L69),
+[customer output
+consumption](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10_family/visitor.hpp#L126-L200)).
+These are analytical boundary checks, not
+executed Feldera reconstruction experiments. Any comparison must match actual date endpoints: the inspected
+implementations use day offsets ([Q5
+bounds](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q5/query.tpp#L307-L315),
+[Q10
+bounds](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10/query.tpp#L100-L107)),
+which need not equal calendar intervals.
+
+## Refresh reads can serve reconstruction
+
+Existing RF2 discovery looks up the order's customer and scans native Lineitem for line numbers
+([discovery](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/refresh.hpp#L143-L178));
+COL helpers perform direct insertions and erasures
+([maintenance](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/col_pipeline.tpp#L150-L220)).
+These demonstrate the access paths, not old-payload
+retention or shared incremental reads. The proposed scanner must retain full required payloads, distribute
+them to consumers, and charge any repeated pass. RF1's new-key shortcut requires verified freshness.
+
+The supplied paper's refresh experiment describes order-group insertion/deletion
+([workload](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173)). Its LSM
+variant matches Base-Merge rather than leading in that experiment
+([backend comparison](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L229)).
+That result does not predict a benefit for Feldera; storage backend and total maintenance work matter.
+
+## Evidence and measurements bound the claim
+
+The source links pin Feldera at `f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c` and LeanStore at
+`305ad0a98b147d048a37a1eba3787b35b1181b85`. Local manuscript/checker links assume sibling checkouts under the
+same parent as Feldera; their `#L` fragments are source-viewer line locators. The DBSP note and checkers are at
+`ac8380511fe4463b81651a3f6d6991b849577ff7`; the cited files are clean. The paper's cited experiment file is clean
+at `6c4c3a5d851c9044352da2aead6b419c45c77237`. Unrelated working-tree manuscript changes are not evidence here.
+
+Run the supplied models from the repository root:
+
+```sh
+python3 ../DBSP_w_merged_index/validation/check_q3.py
+python3 ../DBSP_w_merged_index/validation/check_operators.py
+```
+
+The Q3 suite has 12 test methods and the operator suite 8, including weighted changes, simultaneous changes,
+group existence, rekeys, and sequential updates
+([Q3 tests](../../../../DBSP_w_merged_index/validation/check_q3.py#L391)). Passing them demonstrates model
+semantics. They do not execute this access-layer design, recovery, Q5/Q10 reconstruction, or physical I/O.
+
+| Acceptance question | Required evidence |
+| --- | --- |
+| Are operator inputs and results identical? | Compare both reconstructed endpoints and consolidated deltas with independent evaluation, including deletes, zero/empty groups, replacements, simultaneous changes, and rekeys. |
+| Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify old payload retention, consistent lookup publication, and exactly-once batch advancement. |
+| Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
+| Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
+
+For equal-sized blocks, `unique footprint = block_bytes * size(union of all consumers' blocks)`.
+Actual read traffic is the sum of physical read events; eviction can cause repeat reads. Include RF1/RF2,
+parent lookup, all operator access, staging, merging, checkpointing, and spills in measured reads/writes.
+Report persistent and peak storage, CPU/decoding, memory high-water, fan-out, and complete-batch latency for
+clustered and scattered updates. Neither fewer unique blocks nor a resident scan speedup proves lower total
+maintenance I/O.
