@@ -99,3 +99,15 @@ shared session state, and explicitly mark readers closed with idempotent close a
 released. Both are reflected in the pseudocode. Spilled-record reloads also reserve memory before reading.
 Markdown, active links/anchors, source line ranges, Mermaid diagrams, and whitespace checks passed; no runtime
 or conformance tests were added or claimed for this documentation-only design.
+
+On 2026-09-28, clarified the provenance and scope of aggregate output-state discussion: the cited generic
+incremental aggregate explicitly chooses retained previous output over recomputation. Separate reconstruction
+routines can supply each input/output state request directly from merged source ranges; no materialized
+reconstruction chain is required. Added pseudocode for per-state routine bindings and distinguished this
+freedom from preserving the shared IVM output path. Re-read aggregate construction and its design comment.
+
+The user then corrected the terminology: the sole target is an integrator's accumulated output state, never
+its input delta stream. Replaced “input-state routine” wording and pseudocode with per-integrator H/A/O/B/C
+routines. An aggregate's input trace is itself an integrator output consumed downstream; its delta input
+remains unchanged. The generic runtime example is evidence about retained state, not the selected five-state
+Q3 graph. This supersedes the ambiguous wording in the preceding entry.

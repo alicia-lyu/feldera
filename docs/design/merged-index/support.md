@@ -319,13 +319,21 @@ sealing, independent seeks, cross-step view lifetime, oversized records, depende
 changes, and failure during commit. Compare both state-provider results and the shared IVM output with the
 retained-state baseline; report high-water bytes and every spill, reread, sort, and access-path write.
 
-## Aggregation also retains output state
+## Merged index reconstructs integrator outputs
 
-The incremental aggregate reads its accumulated input and passes aggregate results through `upsert`
+An **integrator** accumulates its input deltas into output state. The merged index replaces access to that
+accumulated output; it does not reconstruct the integrator's input delta stream. Downstream IVM computation
+continues to receive deltas through the existing path and requests accumulated state through the provider.
+
+This distinction explains the cited aggregate implementation. `AggregateIncremental` receives both `delta`
+and `input_trace`: the latter is an integrated collection, not the delta stream. It passes computed results
+through `upsert`, whose previous-output state supplies tuples to retract
 ([construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499)).
-The current implementation retains previous output to retract an old aggregate value
-([output-state
-rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+Its design comment explicitly contrasts recomputing old aggregate values with retaining the output collection
+([state and design rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+Both retained collections are accumulated outputs. Calling one an aggregate's “input trace” describes where
+it is consumed, not a different reconstruction target. This generic runtime example is not a claim that it
+has exactly the five integrators in the selected Q3 shape.
 
 The provider boundary is a request for an accumulated relation, keys, and old/new view. Its result must match
 ordinary retained-state access, including tuple values, multiplicities, group absence, ordering, and cursor
@@ -340,16 +348,49 @@ multiplicities. Existing operator code chooses and computes the required form us
 accesses. The merged-index provider supplies the same requested state for either form. It must also preserve
 group existence when count changes, even if revenue does not.
 
-For this architecture, reconstruct the previous Q3 aggregate tuple from old `A` and supply it where the
-output-update path requests the prior value. Preserve the upsert/retraction algorithm. Simply reconstructing
-Count/Revenue while leaving its old output **trace** (retained state accessed through the runtime interface) populated
-would not remove all
-replaced accumulated state.
-The same inventory must cover delayed views and both join-side traces. This is a design obligation, not an
-existing configurable adapter. The runtime's join wiring uses left delta/current right and right delta/delayed
-left ([join
+Register a computation routine for each required integrator output. For Q3, one routine scans weighted
+qualifying lines to derive Count/Revenue state `H`; another computes the group relation `A`, including its
+weight-one row or absence; another derives `B` using order payloads. Eligible Orders and Customers have their
+own routines. All derive requested accumulated state from source records in the specified old/new view.
+They do not regenerate operator input deltas or feed full reconstructed snapshots into incremental inputs.
+
+```text
+reconstructors = {
+    H: compute_count_and_revenue_state,
+    A: compute_aggregate_relation,
+    O: derive_eligible_orders,
+    B: derive_aggregate_orders_relation,
+    C: derive_eligible_customers
+}
+
+provider.open(integrator_id, requested_keys, view):
+    compute = reconstructors[integrator_id]
+    source_access = scan_owner.access(requested_keys, view)
+    return compute(source_access)          # same accumulated output as that integrator
+
+# Existing IVM path:
+# receive the existing input delta stream, unchanged
+# request the required integrator outputs and old/new views through provider.open
+# compute and emit changes using the existing operator algorithm
+```
+
+Each routine has its own computation algorithm. It can directly derive its requested state from merged
+source ranges instead of consuming an earlier materialized reconstruction. Routines may share decoded
+records or budgeted per-group summaries when keys and views agree. For example, deriving `A` can reuse the
+count/revenue scalars needed for `H`, but there is no requirement to materialize `H` or run its consumer first.
+Deriving `B` can use the same scan and parent payload. Shared reads are an optimization; the returned state
+must be identical with or without them.
+
+Previous aggregate output is therefore another required integrator state, not a special second stage of
+reconstruction. Supply it from the appropriate routine in the old view when existing output-update code
+requests it. If that accumulated output remains stored, the corresponding integrator has not been replaced.
+Only accumulated integrator outputs are substituted; delta generation and consumption remain in the shared
+IVM path. Concrete bindings to existing runtime state accesses remain implementation work.
+
+Delayed views and join-side accesses obey the same rule. Existing join wiring uses left delta/current right
+and right delta/delayed left ([join
 construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749));
-accessors must preserve that orientation.
+separate reconstruction routines must honor the requested view rather than choosing one themselves.
 
 ## Weighted reconstruction preserves group existence
 

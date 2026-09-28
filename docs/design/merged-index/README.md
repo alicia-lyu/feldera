@@ -84,13 +84,15 @@ consumer must cause backpressure, spilling, or rereading, rather than unbounded 
 [Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory)
 gives pseudocode for batch lifetime, provider requests, reader positions, ordering, and overflow handling.
 
-The access change also covers aggregation's retained output. Reconstructing aggregate input alone leaves
-state behind in the output-update path. Every replaced state object must therefore be assigned either a
-reconstruction provider or an explicit retained role. Feeding entire snapshots into ordinary incremental
-inputs would accumulate them again. The architectural boundary is at accumulated-state access, with new
-ownership and scheduling wiring required; the current APIs do not already implement this substitution.
-[Aggregation also retains output state](support.md#aggregation-also-retains-output-state) identifies the
-concrete runtime path and its obligations.
+The reconstruction target is each integrator's accumulated output state, not its input delta stream.
+Separate routines can derive Q3's Count/Revenue state, aggregate relation `A`, or joined relation `B` for
+requested keys and views. The existing IVM algorithm consumes these states alongside its unchanged delta
+stream. Feldera's generic aggregate illustrates two accumulated states: the integrated relation it reads
+and the previous aggregate output used for retractions. Both are integrator outputs, even though the first
+is an input to a downstream computation. Reconstruction routines can share source scans without constructing
+a chain of intermediate relations.
+[Merged index reconstructs integrator outputs](support.md#merged-index-reconstructs-integrator-outputs)
+explains the distinction and gives per-integrator reconstruction pseudocode.
 
 ## How Q3 works with reconstructed state
 
