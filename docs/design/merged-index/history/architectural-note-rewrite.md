@@ -111,3 +111,23 @@ its input delta stream. Replaced “input-state routine” wording and pseudocod
 routines. An aggregate's input trace is itself an integrator output consumed downstream; its delta input
 remains unchanged. The generic runtime example is evidence about retained state, not the selected five-state
 Q3 graph. This supersedes the ambiguous wording in the preceding entry.
+
+## Figure 4c and generic runtime state
+
+On 2026-09-28, the user pointed out that Figure 4c has only one integrator inside grouping. Read the actual
+TikZ source and the generic aggregate/upsert implementation. Corrected the conflation: the paper integrates
+Count/Revenue H (named M there), delays that summary, and emits both group tuples; its A integrator belongs
+to the Orders join. The generic runtime instead retains output for retractions. Added separate diagrams and
+removed the implication that generic runtime output retention adds another grouping integrator to Figure 4c.
+Bindings must follow the selected circuit, not the union of alternative implementations' state objects.
+
+The user clarified that prior-output retention serves the z^-1 role and can be reconstructed from timed
+weighted source tuples. Added the equivalence E(H[t-1]) = (z^-1 E(H))[t], a delay-placement diagram, and
+as-of weighted reconstruction formulas. Distinguish the figure's delayed summary from the runtime's delayed
+emitted tuple without implying another required physical state copy. Source batch versions are separate
+from root-circuit unit timestamps; previous payloads and parent placements remain readable until release.
+
+The user also flagged the ambiguous attribution “the paper's Figure 4c.” Active documents now name the
+lecture note Maintaining a Query, One Change at a Time, link its “Equivalent Q3 circuits” figure source,
+and refer to panel (c) thereafter. Distinguish that note from the interesting-orderings manuscript used for
+refresh-performance evidence.

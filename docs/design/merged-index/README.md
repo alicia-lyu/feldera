@@ -85,14 +85,16 @@ consumer must cause backpressure, spilling, or rereading, rather than unbounded 
 gives pseudocode for batch lifetime, provider requests, reader positions, ordering, and overflow handling.
 
 The reconstruction target is each integrator's accumulated output state, not its input delta stream.
-Separate routines can derive Q3's Count/Revenue state, aggregate relation `A`, or joined relation `B` for
-requested keys and views. The existing IVM algorithm consumes these states alongside its unchanged delta
-stream. Feldera's generic aggregate illustrates two accumulated states: the integrated relation it reads
-and the previous aggregate output used for retractions. Both are integrator outputs, even though the first
-is an input to a downstream computation. Reconstruction routines can share source scans without constructing
-a chain of intermediate relations.
+In [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276),
+panel (c) of “Equivalent Q3 circuits” (Figure 4) has one Count/Revenue integrator inside grouping and a delay
+supplying its old summary.
+The existing emit functions compute old/new aggregate tuples from those summaries. Timed weighted source
+records supply each requested version: retaining an old emitted tuple and computing it from the old summary
+serve the same old-state read. The integrator for `A`
+belongs to the following Orders join, not to grouping. Separate routines reconstruct `H`, `A`, and the other
+requested states without changing delta processing or adding another grouping integrator.
 [Merged index reconstructs integrator outputs](support.md#merged-index-reconstructs-integrator-outputs)
-explains the distinction and gives per-integrator reconstruction pseudocode.
+diagrams that panel and explains the equivalent placement of old-state retention in Feldera's generic aggregate.
 
 ## How Q3 works with reconstructed state
 
@@ -117,9 +119,9 @@ order has order date before it; an eligible customer has the requested segment. 
 The final relation projects `B join C`. Projection adds weights of identical output tuples. Revenue is a
 field of the aggregate tuple, so changing revenue retracts the old tuple and inserts the new tuple; its weight
 is not the line count. A nonempty group with zero revenue must remain present. The count supplies group
-existence even when its sum is zero. These five logical accumulations are not a count of runtime state objects:
-the aggregate's output-update machinery also needs the previous emitted value, which can be derived from old
-`A`. [Weighted reconstruction preserves group existence](support.md#weighted-reconstruction-preserves-group-existence)
+existence even when its sum is zero. The lecture note's panel (c) computes the old aggregate tuple from the delayed summary
+`H_old`; it does not require another integrator to retain that tuple. The lecture note calls this summary `M`.
+[Weighted reconstruction preserves group existence](support.md#weighted-reconstruction-preserves-group-existence)
 records the algebra and the limits of the key assumptions.
 
 For one worked update, an eligible customer's eligible order has two qualifying lines with revenues 60 and

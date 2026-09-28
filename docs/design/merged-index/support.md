@@ -325,15 +325,121 @@ An **integrator** accumulates its input deltas into output state. The merged ind
 accumulated output; it does not reconstruct the integrator's input delta stream. Downstream IVM computation
 continues to receive deltas through the existing path and requests accumulated state through the provider.
 
-This distinction explains the cited aggregate implementation. `AggregateIncremental` receives both `delta`
-and `input_trace`: the latter is an integrated collection, not the delta stream. It passes computed results
-through `upsert`, whose previous-output state supplies tuples to retract
-([construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499)).
-Its design comment explicitly contrasts recomputing old aggregate values with retaining the output collection
-([state and design rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
-Both retained collections are accumulated outputs. Calling one an aggregate's “input trace” describes where
-it is consumed, not a different reconstruction target. This generic runtime example is not a claim that it
-has exactly the five integrators in the selected Q3 shape.
+The lecture note [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276)
+contains “Equivalent Q3 circuits” (Figure 4). Its panel (c) and Feldera's generic aggregate show different
+implementations of the same grouping semantics. **The lecture note's panel (c) has one integrator inside
+grouping**, for Count/Revenue state. The figure names that
+state `M`; this note calls it `H`. A **delay** (`z^-1`, the previous batch's value) supplies `H_old`, from which
+the old aggregate tuple is computed. The delay retains information but is not a second integrator.
+The `A` integrator appears in the subsequent Orders join. See the
+[actual figure source](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59) and
+[five-integrator explanation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405).
+
+```mermaid
+flowchart LR
+    subgraph Grouping[Lecture note panel c - grouping]
+        DL[Line deltas] --> F[Filter and compute count-revenue deltas]
+        F --> IH[Integrator H - the only integrator in grouping]
+        IH --> HN[H new]
+        HN --> EN[Emit new group tuple]
+        HN --> Z[One-batch delay]
+        Z --> HO[H old]
+        HO --> EO[Emit old group tuple]
+        EN --> D[New tuple minus old tuple]
+        EO --> D
+        D --> DA[Delta A]
+    end
+    subgraph OrdersJoin[Following Orders join - other inputs omitted]
+        DA --> IA[Integrator A]
+        IA --> AN[A new for join lookup]
+        DA --> JD[Changed-left join branch]
+    end
+```
+
+For an order changing from count/revenue `(2,100)` to `(3,130)`, the grouping's two emit functions produce
+`(order,100)` and `(order,130)`. Subtraction produces `-[[order,100]] + [[order,130]]`. No retained aggregate-output
+collection is necessary inside this grouping: `H_old` already contains the information needed to compute
+the old tuple. The following join integrates `Delta A` because it needs accumulated `A` when Orders changes.
+The five integrators remain `H`, `A`, eligible Orders, `B`, and eligible Customers; no sixth one is implied.
+
+Retaining the prior aggregate tuple serves the same old-state role as the delay in the lecture note's panel (c). The precise
+objects differ: the figure delays the summary `H`, whereas output retention preserves the emitted tuple
+`A = E(H)`. For the fixed, pointwise group-emission function `E`, moving the delay across `E` preserves the
+value:
+
+```text
+E(H[t-1]) = (z^-1 E(H))[t] = A[t-1]
+```
+
+This follows directly from the definition of a one-batch delay. It does not require a new integrator or a
+separate durable output copy in the merged-index design. It requires access to the correct preceding state,
+including group absence. The two following old-value paths are equivalent:
+
+```mermaid
+flowchart LR
+    H[Summary H] --> ZH[Delay summary to H old]
+    ZH --> E1[Emit group tuple]
+    E1 --> O1[Old tuple A]
+    H --> E2[Emit group tuple]
+    E2 --> ZA[Retain previous emitted tuple]
+    ZA --> O2[Same old tuple A]
+```
+
+Timed weighted source tuples can satisfy either read. With `tau` denoting the input-batch version, resolve
+complete-tuple weights at the requested version before grouping:
+
+```text
+weight_at(tuple, t) = sum(change.weight for change of that complete tuple with change.time <= t)
+H_at(k, t) = sum(weight_at(line, t) * (1, revenue(line))
+                 for qualifying line tuples in order k at version t)
+A_at(k, t) = {(k, H_at(k,t).revenue) -> 1} if H_at(k,t).count > 0 else empty
+old_tuple = A_at(k, t-1)
+new_tuple = A_at(k, t)
+```
+
+This is the versioned-read contract, not a requirement to scan all historical changes on every access.
+Pinned runs, consolidated versions, and range cursors implement it. Source batch versions here are distinct
+from the unit timestamp of Feldera's root computation. Payload replacements and rekeys must retain enough
+information to resolve the complete tuples and parent lookup at both requested versions; compaction cannot
+discard information still needed by an old-view reader. A negative weight alone does not identify which
+batch it belongs to. Given the version and weighted payloads, the provider can reconstruct the delayed state
+without separately storing the old aggregate tuple.
+
+Feldera's generic aggregate makes a different computation/storage tradeoff. It computes new group values
+from an accumulated input collection `X` and retrieves the old aggregate tuple from accumulated output `A`.
+Here `X` means whatever indexed collection that generic operator receives; it is not necessarily the raw
+Lineitem relation or the `H` in the lecture note's panel (c). The source lists recomputing old values as an
+alternative, but selects output retention
+([aggregate construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499),
+[design rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
+
+```mermaid
+flowchart LR
+    DX[Input deltas] --> IX[Accumulate input X]
+    IX --> XN[Current accumulated X]
+    DX --> KEYS[Affected keys]
+    KEYS --> AG[Compute new aggregate values]
+    XN --> AG
+    AG --> U[Upsert - retract old tuple and insert new tuple]
+    U --> DA[Delta A]
+    DA --> IA[Accumulate output A]
+    IA --> Z[One-batch delay]
+    Z --> AO[Previous output A]
+    AO --> U
+```
+
+`Upsert` here converts per-key replacement values into weighted tuple changes. Its source explicitly draws
+the output integrator and delayed feedback
+([output-state wiring](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/upsert.rs#L90-L109)).
+This diagram explains the runtime comment about two accumulated collections. Its old-output feedback serves
+the same semantic role as delaying and emitting the summary in the lecture note's panel (c). The different wiring is a choice
+of where to retain versus recompute information; it does not impose another physical copy on the merged index.
+
+For the chosen lecture-note circuit, the merged-index provider supplies `H_old`/`H_new` to the existing group-tuple
+emitters and separately supplies accumulated `A` to the Orders join. It does not add an output integrator
+inside grouping. If adapting the generic runtime path instead, the provider must satisfy that path's `X`
+and previous-`A` state requests. Select bindings for the actual circuit rather than combining the state
+inventories of these two implementations. In either case, input delta streams remain unchanged.
 
 The provider boundary is a request for an accumulated relation, keys, and old/new view. Its result must match
 ordinary retained-state access, including tuple values, multiplicities, group absence, ordering, and cursor
@@ -381,11 +487,12 @@ count/revenue scalars needed for `H`, but there is no requirement to materialize
 Deriving `B` can use the same scan and parent payload. Shared reads are an optimization; the returned state
 must be identical with or without them.
 
-Previous aggregate output is therefore another required integrator state, not a special second stage of
-reconstruction. Supply it from the appropriate routine in the old view when existing output-update code
-requests it. If that accumulated output remains stored, the corresponding integrator has not been replaced.
-Only accumulated integrator outputs are substituted; delta generation and consumption remain in the shared
-IVM path. Concrete bindings to existing runtime state accesses remain implementation work.
+Bind routines to the state accesses present in the chosen circuit. The lecture note's grouping requests summaries;
+its Orders join requests accumulated `A`. A generic runtime path that reads previous output can request it
+from an `A` reconstruction routine at the preceding version, equivalently emitting the reconstructed old `H`.
+These are different consumers of reconstructible state, not a requirement
+to add every illustrated state object to the chosen circuit. Concrete runtime bindings remain implementation
+work; only accumulated-state access changes, while delta processing remains in the shared IVM path.
 
 Delayed views and join-side accesses obey the same rule. Existing join wiring uses left delta/current right
 and right delta/delayed left ([join
@@ -488,9 +595,9 @@ retention or shared incremental reads. The proposed scanner must retain full req
 them to consumers, and charge any repeated pass. **RF1** (TPC-H order-and-lines insertion refresh) requires verified
 freshness for its new-key shortcut.
 
-The supplied paper's refresh experiment describes order-group insertion/deletion
+The merged-index interesting-orderings manuscript's refresh experiment describes order-group insertion/deletion
 ([workload](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173)). Its LSM
-variant matches **Base-Merge** (the paper's baseline merge-join plan) rather than leading in that experiment
+variant matches **Base-Merge** (that manuscript's baseline merge-join plan) rather than leading in that experiment
 ([backend comparison](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L229)).
 That result does not predict a benefit for Feldera; storage backend and total maintenance work matter.
 
@@ -499,8 +606,9 @@ That result does not predict a benefit for Feldera; storage backend and total ma
 The source links pin Feldera at `f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c` and LeanStore at
 `305ad0a98b147d048a37a1eba3787b35b1181b85`. Local manuscript/checker links assume sibling checkouts under the
 same parent as Feldera; their `#L` fragments are source-viewer line locators. The DBSP note and checkers are at
-`ac8380511fe4463b81651a3f6d6991b849577ff7`; the cited files are clean. The paper's cited experiment file is clean
-at `6c4c3a5d851c9044352da2aead6b419c45c77237`. Unrelated working-tree manuscript changes are not evidence here.
+`ac8380511fe4463b81651a3f6d6991b849577ff7`; the cited files are clean. The interesting-orderings manuscript's
+cited experiment file is clean at `6c4c3a5d851c9044352da2aead6b419c45c77237`. Unrelated working-tree manuscript
+changes are not evidence here.
 
 Run the supplied models from the repository root:
 
