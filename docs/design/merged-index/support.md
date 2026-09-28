@@ -1,24 +1,35 @@
 # Evidence for reconstructed accumulated state
 
-## Batches combine an LSM spine with tree indexes
+## Storage differences from RocksDB
 
-The spine appends batches, searches across them, and merges them in the background
+A **spine** (LSM run collection and background merger) stores **batches** (immutable sorted runs of weighted
+updates, in memory or files) and merges them in the background
 ([spine
 description](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7)).
-File layers contain sorted row groups and are written as
-immutable files; each column has a tree whose leaves are data blocks and whose interior nodes are index
+A **layer file** (Feldera's immutable file format for nested sorted columns) contains sorted row groups;
+each column has a tree whose leaves are data blocks and whose interior nodes are index
 blocks ([file
 layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L54)).
-These establish both parts of the storage description.
+This differs from RocksDB's key-to-value interface: an indexed Feldera relation exposes sorted keys and
+sorted weighted values within each key. RocksDB's ordinary writes enter a mutable memtable; Feldera's spine
+accepts already built immutable batches. See the official
+[RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview).
 
-`VecIndexedWSet` contains keys, offsets, values, and differences
+A **Z-set** (relation with signed tuple multiplicities) adds weights for identical complete tuples and omits zero totals
+([read
+consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
+RocksDB's `Put`/`Delete` semantics differ, but its application-defined
+[merge operator](https://github.com/facebook/rocksdb/wiki/Merge-Operator) can combine updates too.
+The distinction is the collection contract, not an inability to express addition in RocksDB.
+
+`VecIndexedWSet` (in-memory indexed weighted relation) contains keys, offsets, values, and signed weights
 ([memory
 layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199));
-`FallbackIndexedWSet` selects memory or file
+`FallbackIndexedWSet` (batch type choosing memory or file storage) selects memory or file
 representation
 ([variants](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58)).
-Unit timestamps select the ordinary
-batch ([timestamp
+The **root circuit** (top-level operator graph) has only one timestamp value, `()` in Rust; they select a batch without
+varying logical time ([timestamp
 mapping](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
 File indexed batches implement asynchronous key fetching
 ([fetch](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L447-L478)),
@@ -32,14 +43,14 @@ and storage/cache configuration.
 
 The incremental aggregate reads its accumulated input and passes aggregate results through `upsert`
 ([construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499)).
-The implementation explicitly explains that
-the current implementation retains previous output to retract an old aggregate value
+The current implementation retains previous output to retract an old aggregate value
 ([output-state
 rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
 
 For this architecture, reconstruct the previous Q3 aggregate tuple from old `A` and supply it where the
 output-update path requests the prior value. Preserve the upsert/retraction algorithm. Simply reconstructing
-Count/Revenue while leaving its old output trace populated would not remove all replaced accumulated state.
+Count/Revenue while leaving its old output **trace** (operator-facing accumulated state) populated would not remove all
+replaced accumulated state.
 The same inventory must cover delayed views and both join-side traces. This is a design obligation, not an
 existing configurable adapter. The runtime's join wiring uses left delta/current right and right delta/delayed
 left ([join
@@ -50,7 +61,7 @@ accessors must preserve that orientation.
 
 For each requested relation `T` and key set `K`, require
 `reconstruct(T, source_s, K) = T(database_s) restricted to K`, including payloads, weights, and group existence.
-The supplied note identifies the five logical integrators
+The supplied note identifies the five logical **integrators** (operators accumulating changes into current state)
 ([five accumulations](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)) and their
 weighted reconstruction ([definitions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L508)).
 
@@ -72,13 +83,16 @@ The count/existence requirement also appears in the
 [operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39).
 
 The main note's replacement has two distinct complete line tuples at weights `-1` and `+1`. Their key weights
-sum to zero, but their support still marks the order as affected. Identical complete-tuple changes that cancel
-can be discarded. Changed customers expand to descendant orders in either endpoint; rekeys include both
+sum to zero, but their **support** (tuples with nonzero weight) still marks the order as affected. Identical
+complete-tuple changes that cancel
+can be discarded. Changed customers expand to descendant orders in either endpoint; **rekeys** (moves to changed
+physical key prefixes) include both
 prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L564)).
 
 ## Immutable batches preserve old reads
 
-`SpineSnapshot` owns reference-counted batches and supports constructing a view with additional batches
+`SpineSnapshot` (read view retaining a fixed set of immutable runs) owns reference-counted batches and supports
+constructing a view with additional batches
 ([snapshot ownership and
 composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L56-L153)).
 Combined cursors add matching
@@ -88,7 +102,9 @@ Thus a pinned old
 batch set and that set plus a sealed delta can represent both endpoints without waiting for physical merges.
 
 The integration must keep the old source snapshot and parent lookup alive, stage complete payload retractions
-and descendant rekeys, then seal a consistent new view. Retire old ownership only when every consumer has
+and descendant rekeys, then **seal** the pending updates
+(make the complete set immutable and readable) for a consistent new view. Retire old ownership only when every consumer
+has
 finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
 ([transaction
 scheduling](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/schedule.rs#L186-L226),
@@ -102,7 +118,8 @@ storage cost. No per-record phase bit is required by the chosen immutable-batch 
 
 ## Consumers determine the required payload
 
-Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region gate and preserves
+Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** (eligibility filter) and
+preserves
 supplier identifiers for later matching. A changing gate needs consistent old/new multiplicities and an
 expansion to affected customers; a boolean gate suffices only under the key assumptions
 ([Q5 consumer and
@@ -124,17 +141,19 @@ which need not equal calendar intervals.
 
 ## Refresh reads can serve reconstruction
 
-Existing RF2 discovery looks up the order's customer and scans native Lineitem for line numbers
+Existing **RF2** (TPC-H order-and-lines deletion refresh) discovery looks up the order's customer and scans native
+Lineitem for line numbers
 ([discovery](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/refresh.hpp#L143-L178));
-COL helpers perform direct insertions and erasures
+**COL** (Customer–Orders–Lineitem index) helpers perform direct insertions and erasures
 ([maintenance](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/tpch_family/col_pipeline.tpp#L150-L220)).
 These demonstrate the access paths, not old-payload
 retention or shared incremental reads. The proposed scanner must retain full required payloads, distribute
-them to consumers, and charge any repeated pass. RF1's new-key shortcut requires verified freshness.
+them to consumers, and charge any repeated pass. **RF1** (TPC-H order-and-lines insertion refresh) requires verified
+freshness for its new-key shortcut.
 
 The supplied paper's refresh experiment describes order-group insertion/deletion
 ([workload](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173)). Its LSM
-variant matches Base-Merge rather than leading in that experiment
+variant matches **Base-Merge** (the paper's baseline merge-join plan) rather than leading in that experiment
 ([backend comparison](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L229)).
 That result does not predict a benefit for Feldera; storage backend and total maintenance work matter.
 

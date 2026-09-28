@@ -5,32 +5,28 @@
 Feldera already has the storage machinery needed for a disk-backed merged index. Reuse that backend to store
 weighted source records together, then reconstruct the accumulated relations requested by incremental
 operators. Preserve their join and aggregation algorithms; change where they obtain accumulated state.
-This note defines that architecture for one nonrecursive root circuit. Q3 supplies the complete relational
+This note defines that architecture for one nonrecursive **root circuit** (top-level operator graph). Q3 supplies the
+complete relational
 example, before ordering and the ten-row limit. Exact Rust interfaces and implementation are subsequent work.
 
-A Z-set maps complete tuples to signed integer weights. Inserts add weight, deletions subtract it, and equal
-tuples consolidate by addition. An indexed Z-set groups values under sorted keys. Neither a Z-set nor its
-logical index implies that the data lives entirely in memory.
+Compared with RocksDB, the relevant differences are the update semantics and the representation supplied to
+storage:
 
-Feldera retains indexed changes in a **spine of immutable batches**. New batches enter the spine; background
-merges combine batches, consolidating weights. This is LSM-style organization across batches. Within a file
-batch, tree indexes direct seeks into sorted data blocks. The tree inside an immutable batch and the spine
-across batches solve different problems: locating records and maintaining accumulated updates, respectively.
-The design does not require a mutable B-tree replacing Feldera's storage system.
-
-| Layer | Existing representation | Role in the proposed design |
+| Aspect | RocksDB | Feldera |
 | --- | --- | --- |
-| Logical collection | Indexed keys, values, signed weights | Preserve tuple multiplicity and cancellation. |
-| Memory batch | Sorted key offsets and weighted value leaves | Build and read small batches without file I/O. |
-| File batch | Immutable sorted records with tree-indexed blocks | Seek and scan source ranges beyond RAM. |
-| Spine | Collection and merging of immutable batches | Accumulate source changes and consolidate reads. |
+| Update semantics | `Put` replaces a key's value; `Delete` removes it. An application-defined `Merge` operator can combine updates. | A **Z-set** (relation with signed tuple multiplicities) adds weights for identical complete tuples and drops zero totals. An indexed Z-set groups weighted values by key. |
+| Unit supplied to accumulated storage | Ordinary writes enter a mutable memtable before becoming immutable sorted runs. | A **batch** (immutable sorted run of weighted updates, in memory or a file) enters a **spine** (Feldera's LSM run collection and background merger). A storage batch is distinct from an input update batch. |
+| Indexed record layout | A sorted key-to-value mapping. | Sorted keys with groups of sorted, weighted values; file storage has a tree index per column. |
 
-The fallback indexed batch supports memory and file representations. A cursor combines relevant batches to
-read their accumulated contents; a single logical seek need not touch only one file. Root-circuit timestamps
-are unit values, so the generic timed-spine name does not imply historical timestamp lists for this scope.
-Root file batches also support batched key fetching, an existing capability that must remain in the baseline.
-See [Batches combine an LSM spine with tree indexes](support.md#batches-combine-an-lsm-spine-with-tree-indexes)
-for the representation and fetch evidence.
+The logical relation is stored **in** these memory/file batches. Feldera calls its accumulated collection a
+**trace** (operator-facing accumulated state); a spine implements that abstraction. Weighted consolidation is
+built into Feldera's collection semantics; RocksDB offers application-defined combination through its merge
+operator. See [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) for both systems'
+source evidence.
+
+In this root circuit, logical time has a single value, written `()` in Rust, so records need no varying
+logical timestamp. Feldera's file batches also support fetching multiple requested keys together; retain
+that optimization in the baseline comparison.
 
 ## What changes in our design
 
@@ -57,7 +53,7 @@ flowchart LR
     O --> Y[Weighted output changes]
 ```
 
-One storage owner stages each source batch, publishes consistent views, and keeps them alive for every
+One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
 consumer. Logical accessors provide the key order, seek behavior, values, and weights expected by their
 operators. Customer-leading storage can serve both customer ranges and order ranges through parent lookup;
 other required orderings may need bounded sorting or an additional access path. Such costs belong to the
@@ -120,10 +116,12 @@ must follow each operator's delta identity, including simultaneous changes.
 
 One traversal of the order range supplies both line summaries, both group tuples, and both joined tuples;
 it reuses the decoded parent payloads. A customer change expands the affected set to all descendant orders
-visible in either state. Discover affected identities from the support of complete-tuple changes: projecting
+visible in either state. Discover affected identities from the **support** (tuples with nonzero weight) of
+complete-tuple changes: projecting
 signed replacements to keys first can cancel their weights and hide a changed order. Consumers share decoded
 records but need independent positions. A slow consumer can pin buffers, so bounded sharing must account for
-spilling or rereading oversized ranges.
+spilling or rereading oversized ranges. Here **sealing** means making the complete pending update set
+immutable and available to readers; **rekeying** means moving records to a changed physical key prefix.
 
 ```mermaid
 flowchart LR
@@ -143,7 +141,8 @@ may run independently; it must not determine logical batch completion.
 [Immutable batches preserve old reads](support.md#immutable-batches-preserve-old-reads) explains the lifecycle
 requirements and what remains to implement.
 
-Q5 and Q10 add two useful constraints. Q5 needs a consistently versioned external Nation/Region gate and line
+Q5 and Q10 add two useful constraints. Q5 needs a consistently versioned external Nation/Region eligibility filter and
+line
 supplier identifiers; a per-order revenue total would lose information needed downstream. Q10 needs returned
 line rows and customer output payloads, with its final customer aggregate downstream. These boundaries show
 why reconstruction must reproduce the consumer's exact relation, not just a convenient summary.

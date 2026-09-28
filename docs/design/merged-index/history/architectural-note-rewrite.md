@@ -32,3 +32,10 @@ links and source line ranges passed checks, and all seven supporting headings ar
 note. Markdown lint and `git diff --check` passed. A second source review checked the example, aggregate
 output access, and immutable snapshot lifecycle. The tracking branch was fetched and merged before commit
 (already up to date). Historical reports are preserved outside the active reading path.
+
+## Terminology refinement
+
+On 2026-09-28, the user requested definitions beside the first occurrence of nonstandard terminology and
+an LSM description restricted to differences from RocksDB. Replaced the mixed logical/physical table with
+an update-semantics and storage-representation comparison, defined specialized terms inline in both active
+documents, and added official RocksDB sources. General LSM mechanics are assumed knowledge.
