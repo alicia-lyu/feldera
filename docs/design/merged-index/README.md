@@ -5,6 +5,16 @@
 > [!NOTE]
 > **Glossary**
 >
+> **Retained state** — An integrator's accumulated output stored and maintained across input updates.
+> Reads obtain its tuples from that maintained collection, which may reside in memory or files.
+>
+> **Reconstructed state** — The same integrator output computed for requested keys and an old/new version
+> from stored, timed weighted source records, instead of maintaining that output as a separate collection.
+>
+> Both supply the same tuples, weights, group presence/absence, and cursor ordering to the existing IVM
+> path. Neither term refers to reconstructing input deltas. Reconstructed state still depends on retained
+> source data and may use bounded temporary buffers; the distinction is how the integrator output is supplied.
+>
 > **root circuit** — top-level operator graph.
 
 Reuse Feldera's LSM machinery with a flat byte-key/value representation for the merged index. Reconstruct

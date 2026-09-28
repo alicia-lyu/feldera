@@ -156,3 +156,8 @@ The user subsequently requested a Next Steps section in the main README. Added f
 concrete Q3 state bindings, the flat KV/LSM adapter, bounded reconstruction sessions, end-to-end correctness,
 and beyond-memory measurement. This intentionally extends the original four-section outline to five sections.
 The trace pseudocode and next steps remain documentation; no runtime implementation is claimed.
+
+On 2026-09-28, codified Retained state and Reconstructed state as paired glossary definitions at the start
+of both active documents. Retained state is a maintained integrator output; reconstructed state computes the
+same requested output from versioned weighted sources. Both obey the same state-access contract, neither
+reconstructs input deltas, and reconstruction still uses retained source data and bounded temporary memory.
