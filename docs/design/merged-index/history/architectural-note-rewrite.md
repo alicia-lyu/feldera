@@ -161,3 +161,12 @@ On 2026-09-28, codified Retained state and Reconstructed state as paired glossar
 of both active documents. Retained state is a maintained integrator output; reconstructed state computes the
 same requested output from versioned weighted sources. Both obey the same state-access contract, neither
 reconstructs input deltas, and reconstruction still uses retained source data and bounded temporary memory.
+
+## Opening reference guide
+
+On 2026-09-28, the user requested all references at the beginning of the README with an explanation of each.
+Added an opening guide covering every source file cited by the active documents, the companion operator
+checker used by the recorded validation commands, and all supporting-report sections. Group repeated line
+citations by source file while retaining inline evidence links. Explain each source's role and distinguish
+semantic evidence, implemented behavior, proposed design, and unmeasured performance. The README now has a
+reference section followed by the existing five main sections.
