@@ -230,6 +230,16 @@ concrete Rust types and full method compatibility remain implementation work.
 
 ## Folded keys require flat KV storage
 
+The primary general-design source is the
+[interesting-orderings manuscript](../../../../merged_index_interesting_orderings/main.tex#L357):
+record types have different folded key fields and separately interpreted payloads. Its
+[concrete encoding and backend reuse](../../../../merged_index_interesting_orderings/main.tex#L545)
+explain why an existing B-tree or LSM can manage these byte keys. LeanStore supplies working
+[B-tree](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/LeanStoreMergedAdapter.hpp#L25)
+and [RocksDB LSM](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/RocksDBMergedAdapter.hpp#L22)
+merged-index adapters. This is implementation evidence for the physical design; the weighted/versioned
+Feldera adapter below remains to be implemented.
+
 > [!NOTE]
 > **Glossary**
 >
@@ -290,12 +300,14 @@ value per physical key, and consistent old/new views are required regardless of 
 > **Scan session** — An owner of one physical range cursor and the buffers used by its registered readers.
 
 Each **scan session** has its own cursor position and reader buffers. A durable
-index handle may be shared; mutable cursor position belongs to a session. This follows the supplied
+index handle may be shared; mutable cursor position belongs to a session. This follows the validated
 [`mi_db` session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions): register readers
 before scanning, share one buffer per record type, and give same-type readers independent positions.
-Its [buffer guard](../../../../mi_db/docs/architecture.md#pending-buffer-guard) warns at 80% and fails before
-an insertion reaches its limit; it does not implement spill or reread. The pseudocode below is a proposed
-Feldera adaptation with explicit overflow choices, not an implemented API or a claim about `mi_db` code.
+Validation applies to the scan-session section, not the entire architecture document. The separate
+[buffer guard](../../../../mi_db/docs/architecture.md#pending-buffer-guard) warns at 80% and fails before
+an insertion reaches its limit; that section describes no spill or reread and is not assumed validated.
+The pseudocode below is a proposed Feldera adaptation with explicit overflow choices, not an implemented
+API or a claim about `mi_db` code.
 
 The cited document is modified working-tree content inspected on 2026-09-28, based on `mi_db` revision
 `d50d29dfe559258351c1071e59ca5365eacf09d0`. Its SHA-256 is
@@ -805,6 +817,30 @@ retention and pending-update representation.
 > [!NOTE]
 > **Glossary**
 >
+> **Order-sharing pipeline** — Consecutive query operators that use compatible tuple orderings.
+>
+> **Residual execution** — Query work over the maintained pipeline result that produces the final query result.
+
+We maintain the output view of one **order-sharing pipeline**. The merged index stores its sources;
+reconstruction replaces selected internal integrator collections, while the pipeline result is still
+maintained. The primary manuscript distinguishes
+[stored sources from materialized output](../../../../merged_index_interesting_orderings/main.tex#L783)
+and explicitly places [remaining query work beyond the pipeline](../../../../merged_index_interesting_orderings/main.tex#L751).
+For Q3 this includes final ranking/limit and projection. LeanStore's
+[Q3 execution](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q3/query.tpp#L446)
+includes both the pipeline scan and top-10 selection; its full query execution is not the maintenance boundary.
+Q5/Q10 below illustrate why **residual execution** may need richer view rows than revenue summaries.
+
+LeanStore implements merged-index storage and Q3/Q5/Q10 query execution, plus source/index refresh paths.
+These do not implement the reconstructed-state IVM proposed here. Do not confuse maintaining index records
+with incrementally maintaining the selected pipeline result. Comparisons must use the same pipeline boundary,
+include result-view writes, and hold residual work constant while reporting its query-time cost separately.
+The [multi-pipeline manuscript](../../../../query_execution_using_MI/main.tex#L125) composes pipelines through
+intermediate views; that composition is future work, for which this project provides maintenance groundwork.
+
+> [!NOTE]
+> **Glossary**
+>
 > **gate** — eligibility filter.
 
 Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** and
@@ -863,23 +899,19 @@ That result does not predict a benefit for Feldera; storage backend and total ma
 ## Evidence and measurements bound the claim
 
 The source links pin Feldera at `f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c` and LeanStore at
-`305ad0a98b147d048a37a1eba3787b35b1181b85`. Local manuscript/checker links assume sibling checkouts under the
-same parent as Feldera; their `#L` fragments are source-viewer line locators. The DBSP note and checkers are at
+`305ad0a98b147d048a37a1eba3787b35b1181b85`. Local manuscript links assume sibling checkouts under the
+same parent as Feldera; their `#L` fragments are source-viewer line locators. The DBSP note is at
 `ac8380511fe4463b81651a3f6d6991b849577ff7`; the cited files are clean. The interesting-orderings manuscript's
-cited experiment file is clean at `6c4c3a5d851c9044352da2aead6b419c45c77237`. Unrelated working-tree manuscript
-changes are not evidence here.
+experiment file is clean at `6c4c3a5d851c9044352da2aead6b419c45c77237`; its general-design citations refer to
+the modified `main.tex` inspected on 2026-09-28, SHA-256
+`44bf60963e6b94f6aaad04cdacea3ecc31e248a95cb10dd1118ff2e6fa17a9c2`.
+The future multi-pipeline manuscript is clean at `e485dd5b5775cabf9cfbf0aa44a0e5bd64a8f925`.
+The interesting-orderings manuscript is the primary architectural reference; LeanStore supplies working
+storage/query evidence. The `mi_db` scan-session section is validated design input, without implying
+validation of its other sections or implementation of this report's Feldera-specific extensions.
 
-Run the supplied models from the repository root:
-
-```sh
-python3 ../DBSP_w_merged_index/validation/check_q3.py
-python3 ../DBSP_w_merged_index/validation/check_operators.py
-```
-
-The Q3 suite has 12 test methods and the operator suite 8, including weighted changes, simultaneous changes,
-group existence, rekeys, and sequential updates
-([Q3 tests](../../../../DBSP_w_merged_index/validation/check_q3.py#L391)). Passing them demonstrates model
-semantics. They do not execute this access-layer design, recovery, Q5/Q10 reconstruction, or physical I/O.
+The design sources specify the intended semantics. The following checks are implementation acceptance
+criteria; this report does not claim they have been met.
 
 | Acceptance question | Required evidence |
 | --- | --- |

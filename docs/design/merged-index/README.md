@@ -3,21 +3,23 @@
 ## References and how each helps
 
 This guide lists all sources used by this note and its supporting report, grouped by source file. Detailed
-line-level citations remain beside the claims they support. Start with the lecture note for Q3 semantics,
-the Feldera sources for existing behavior, and the shared-scan design for the proposed coordination model.
+line-level citations remain beside the claims they support. Start with the interesting-orderings manuscript
+for general merged-index design, LeanStore for working storage and query execution, and the lecture note
+for Q3 maintenance semantics. The validated `mi_db` scan-session section supplies the sharing design;
+validation does not extend to its other sections.
 Local links assume the sibling checkout layout; public code links pin the inspected revisions. The modified
 `mi_db` design is identified by revision and content hash in the supporting report.
 
-### Design documents and semantic checks
+### Design documents
 
 | Reference | How it helps |
 | --- | --- |
+| [Interesting-orderings manuscript — general design](../../../../merged_index_interesting_orderings/main.tex#L515) | Primary design reference for order-sharing pipelines, heterogeneous folded keys, backend reuse, and the distinction between pipeline output and remaining query work. |
+| [Multi-pipeline query execution manuscript](../../../../query_execution_using_MI/main.tex#L88) | Future direction: composing pipelines through intermediate views. Outside this project’s scope; single-pipeline maintenance provides groundwork. |
 | [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276) | Defines the selected Q3 circuit, its five accumulated states, old/new algebra, reconstruction formulas, key assumptions, and affected-key discovery. Figure 4, “Equivalent Q3 circuits,” panel (c), is the circuit referenced here. |
 | [Equivalent Q3 circuits — figure source](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59) | Shows the exact grouping, delay, and join wiring, so the location of each integrator can be checked. |
 | [Operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39) | Explains support and group existence: a nonempty zero-revenue group differs from an empty group. |
-| [Q3 semantic checker](../../../../DBSP_w_merged_index/validation/check_q3.py#L391) | Exercises weighted reconstruction, simultaneous changes, group existence, rekeys, and update sequences; establishes model correctness, not runtime or I/O performance. |
-| [Operator semantic checker](../../../../DBSP_w_merged_index/validation/check_operators.py) | Provides the companion weighted-operator checks reported in the validation record; it does not test the proposed storage adapter. |
-| [mi_db architecture](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | Supplies independent scan sessions, shared typed buffers, per-reader positions, and a fail-at-limit guard. Spill/reread and Feldera batch-lifetime pseudocode are extensions proposed here. |
+| [mi_db validated scan-session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | The scan-session section is validated. Other sections, including the separate buffer guard, require independent assessment. Spill/reread and Feldera batch-lifetime pseudocode are extensions proposed here. |
 | [Interesting-orderings manuscript — experiments](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173) | Defines the refresh workload and reports backend-dependent results, including the LSM comparison. It motivates measuring total maintenance cost rather than assuming a Feldera speedup. |
 
 ### Existing Feldera storage and operator behavior
@@ -40,12 +42,15 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [Transaction scheduling — circuit/schedule.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/schedule.rs#L186-L226) | Shows why a transaction may span multiple runtime steps and why one exhausted cursor is not a completion barrier. |
 | [Commit handling — circuit/circuit_builder.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/circuit_builder.rs#L7777-L7805) | Provides the commit-flushing behavior that must be considered when retiring old views and publishing batch progress. |
 
-### RocksDB comparison and LeanStore query/refresh evidence
+### RocksDB comparison and LeanStore implementation evidence
 
 | Reference | How it helps |
 | --- | --- |
 | [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview) | Supplies the familiar memtable/SST and key-value baseline for the storage comparison. |
 | [RocksDB merge operator](https://github.com/facebook/rocksdb/wiki/Merge-Operator) | Explains application-defined update combination; prevents treating weighted addition as a capability RocksDB lacks. |
+| [LeanStore B-tree merged-index adapter](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/LeanStoreMergedAdapter.hpp#L25) | Working B-tree storage with record-specific folded byte keys and payloads. |
+| [LeanStore RocksDB merged-index adapter](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/RocksDBMergedAdapter.hpp#L22) | Working LSM storage for the same merged-index design. |
+| [LeanStore Q3 execution](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q3/query.tpp#L446) | Executes the Customer–Orders–Lineitem scan, per-order aggregation, and final top-10 selection; does not establish the proposed incremental maintenance. |
 | [LeanStore Q5 implementation](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q5/query.tpp#L219-L335) | Shows the external Nation/Region eligibility check, supplier-field use, and actual date bounds that a Q5 comparison must preserve. |
 | [LeanStore Q10 logical plan](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10/plans/family_logical.dot#L34-L69) | Establishes the selected join boundary and downstream aggregation, without assuming a stored per-order summary. |
 | [LeanStore Q10 visitor](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10_family/visitor.hpp#L126-L200) | Shows the customer and returned-line payloads needed by downstream consumers. |
@@ -66,7 +71,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [Immutable batches preserve old reads](support.md#immutable-batches-preserve-old-reads) | Separates existing snapshot primitives from the publication/recovery behavior the adapter must implement. |
 | [Consumers determine the required payload](support.md#consumers-determine-the-required-payload) | Summarizes Q5/Q10 requirements that prevent replacing every requested relation with a revenue total. |
 | [Refresh reads can serve reconstruction](support.md#refresh-reads-can-serve-reconstruction) | Identifies shareable RF1/RF2 work and the limits of existing refresh evidence. |
-| [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) | Records source provenance, semantic-check commands, acceptance criteria, and the measurements still needed. |
+| [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) | Records source provenance, acceptance criteria, and the measurements still needed. |
 
 ## How Feldera stores indexed state
 
@@ -84,12 +89,21 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 > source data and may use bounded temporary buffers; the distinction is how the integrator output is supplied.
 >
 > **root circuit** — top-level operator graph.
+>
+> **Order-sharing pipeline** — Consecutive query operators that use compatible tuple orderings.
+>
+> **Residual execution** — Query work performed over the maintained pipeline result to produce the final result.
 
 Reuse Feldera's LSM machinery with a flat byte-key/value representation for the merged index. Reconstruct
 accumulated relations from that store while preserving join and aggregation algorithms. The adapter changes
 record representation and accumulated-state access; it does not require a separate LSM implementation.
-This note covers one nonrecursive **root circuit** and Q3 before ordering/limit.
-Rust interfaces and implementation are subsequent work.
+The target is maintenance of the result of one **order-sharing pipeline** in a nonrecursive **root circuit**.
+Its maintained view may still need **residual execution**, such as Q3's final ordering/limit and projection.
+The [interesting-orderings design](../../../../merged_index_interesting_orderings/main.tex#L751)
+explicitly allows a pipeline to be only part of a query. Internal integrator reconstruction does not remove
+the maintained pipeline result. Rust interfaces and implementation are subsequent work.
+Composing multiple pipelines is outside scope; this project provides groundwork for the
+[multi-pipeline query execution design](../../../../query_execution_using_MI/main.tex#L88).
 
 Compared with RocksDB, the relevant differences are the update semantics and the representation supplied to
 storage:
@@ -138,7 +152,8 @@ that optimization in the baseline comparison.
 >
 > **Folding** — Encoding key fields into a byte string using a record-type-specific rule.
 
-The merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** produces the byte key.
+Following the [primary folded-key design](../../../../merged_index_interesting_orderings/main.tex#L545),
+the merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** produces the byte key.
 Customer, Orders, and extended Lineitem
 have different rules; their logical customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. The storage
 layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
@@ -189,7 +204,10 @@ flowchart LR
     T[Existing retained integrator state] -. baseline provider .-> A
     X[Operator deltas] --> O[Existing join and aggregate algorithms]
     A --> O
-    O --> Y[Weighted output changes]
+    O --> Y[Weighted pipeline-output changes]
+    Y --> P[Maintained pipeline result view]
+    P --> Q[Residual query execution]
+    Q --> F[Final query result]
 ```
 
 One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
@@ -199,6 +217,8 @@ path and count its I/O. Each shared scan has a byte-limited buffer and per-consu
 consumer must cause backpressure, spilling, or rereading, rather than unbounded retention.
 [Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory)
 gives pseudocode for batch lifetime, provider requests, reader positions, ordering, and overflow handling.
+Its scan-sharing basis is the validated `mi_db` scan-session section; the Feldera lifecycle and overflow
+extensions remain proposals.
 
 The reconstruction target is each integrator's accumulated output state, not its input delta stream.
 In [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276),
@@ -330,15 +350,17 @@ probes more cheaply, especially with cached or batched fetches.
 Judge the design against unmodified Feldera with identical results, updates, memory budgets, and comparable
 durability. Measure actual read/write bytes, repeated reads, seeks, decoded records, CPU, peak memory and
 storage, and complete-batch latency. Include refresh discovery, parent lookup, staging, compaction,
-checkpointing, and spills. The union of touched blocks describes potential reuse; device read events measure
-realized traffic. Test beyond-memory state with both localized refresh groups and scattered updates, including
+checkpointing, spills, and writes to the maintained pipeline result. Hold residual query execution constant
+and report its cost separately from maintenance. The union of touched blocks describes potential reuse;
+device read events measure realized traffic. Test beyond-memory state with both localized refresh groups
+and scattered updates, including
 large descendant ranges.
 
-Weighted reconstruction has semantic model evidence; storage integration, recovery, and the I/O improvement
-remain unmeasured. First verify reconstructed integrator outputs and IVM deltas against independent evaluation, then
-verify snapshot and scheduling behavior, and finally measure total maintenance cost.
+The design sources specify weighted reconstruction semantics; implementation correctness, recovery, and
+the I/O improvement remain to be established. First verify reconstructed integrator outputs and IVM deltas
+against independent evaluation, then verify snapshot and scheduling behavior, and finally measure total maintenance cost.
 [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) gives the
-existing checks and the compact acceptance criteria.
+source provenance and implementation acceptance criteria.
 
 ## Next Steps
 
@@ -348,16 +370,18 @@ existing checks and the compact acceptance criteria.
    streams and IVM computation shared between retained and reconstructed state providers.
 2. **Implement flat KV storage on the existing LSM.** Define each record type's folded key, range bounds,
    payload/weight encoding, and source-batch version handling. Implement the batch and merge contracts needed
-   by the spine, plus persistent parent lookup. Verify byte order, payload replacements, signed updates,
+   by the spine, plus persistent parent lookup. Use the primary manuscript and working LeanStore adapters
+   as encoding and access-path references. Verify byte order, payload replacements, signed updates,
    descendant rekeys, and old-view retention before integrating operators.
 3. **Implement reconstruction and bounded scan sharing.** Supply per-integrator routines, then connect them
    through the [session protocol](support.md#shared-scan-sessions-bound-ownership-and-memory). Choose explicit
    buffer limits, overflow handling, and ordering paths. Verify consumer progress, borrowed-value lifetimes,
    batch publication, and commit/recovery behavior with ranges larger than the memory budget.
 4. **Verify the complete Q3 path.** Run identical updates through retained and reconstructed providers.
-   Compare each requested state and final weighted output against independent evaluation. Include empty and
+   Compare each requested state and maintained pipeline view against independent evaluation. Include empty and
    zero-revenue groups, simultaneous source changes, replacements, and rekeys. Confirm that replaced
-   integrator state is not still being accumulated elsewhere. Keep ordering/limit outside this boundary.
+   integrator state is not still being accumulated elsewhere. Verify residual execution over the view
+   separately; keep ordering/limit outside the maintenance boundary.
 5. **Measure total maintenance cost.** Benchmark against unmodified Feldera beyond RAM with equal total
    memory and comparable durability. Include RF1/RF2, scattered line updates, customer fan-out, and rekeys.
    Account for all reads, writes, sorting, spill, repeated scans, and background work using the

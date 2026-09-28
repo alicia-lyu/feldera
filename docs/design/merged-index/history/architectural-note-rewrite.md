@@ -170,3 +170,22 @@ checker used by the recorded validation commands, and all supporting-report sect
 citations by source file while retaining inline evidence links. Explain each source's role and distinguish
 semantic evidence, implemented behavior, proposed design, and unmeasured performance. The README now has a
 reference section followed by the existing five main sections.
+
+## Primary design, implementation evidence, and pipeline scope
+
+On 2026-09-28, promoted the interesting-orderings manuscript to the primary general-design reference and
+added LeanStore's working B-tree/LSM adapters and Q3 execution to the opening guide. Distinguished those
+implementations and index refresh from the proposed reconstructed-state IVM. Defined the maintained output
+as one order-sharing pipeline's view, with residual query execution outside the maintenance boundary;
+updated the diagram, next steps, and accounting accordingly. Multi-pipeline composition is future work,
+with query_execution_using_MI cited only for that direction.
+
+The user clarified that mi_db's architecture.md#merged-index-scan-sessions is validated. Preserve that
+section's authority; do not generalize validation to other sections, including the separate buffer guard.
+Feldera lifetime and spill/reread extensions remain this report's proposals. Record source provenance for
+the locally modified primary manuscript rather than presenting its working tree as a clean revision.
+
+The user subsequently excluded the Q3 and operator semantic checkers: they are unvalidated agent execution
+byproducts. Removed their references, commands, and passing-test claims from the active reading path.
+Earlier execution records in this history are not evidence for the architecture. Implementation acceptance
+criteria remain future verification work.
