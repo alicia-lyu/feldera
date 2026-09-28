@@ -46,6 +46,8 @@ This describes existing operator state.
 Feldera exposes retained state through the **trace** interface. `Spine` implements this interface
 by holding immutable sorted runs and merging them in the background. See [Storage differences from
 RocksDB](support.md#storage-differences-from-rocksdb).
+[Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values)
+shows interface pseudocode, array layout, cursor traversal, and the flat merged-index adapter.
 
 In this root circuit, logical time has a single value, written `()` in Rust, so records need no varying
 logical timestamp. Feldera's file batches also support fetching multiple requested keys together; retain
@@ -255,7 +257,31 @@ realized traffic. Test beyond-memory state with both localized refresh groups an
 large descendant ranges.
 
 Weighted reconstruction has semantic model evidence; storage integration, recovery, and the I/O improvement
-remain unmeasured. First verify reconstructed inputs and output deltas against independent evaluation, then
+remain unmeasured. First verify reconstructed integrator outputs and IVM deltas against independent evaluation, then
 verify snapshot and scheduling behavior, and finally measure total maintenance cost.
 [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) gives the
 existing checks and the compact acceptance criteria.
+
+## Next Steps
+
+1. **Bind the Q3 state requests.** Map the selected circuit's `H`, `A`, `O`, `B`, and `C` accesses to concrete
+   runtime read sites, including old/new views and cursor operations. Specify the Rust adapter interfaces
+   from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
+   streams and IVM computation shared between retained and reconstructed state providers.
+2. **Implement flat KV storage on the existing LSM.** Define each record type's folded key, range bounds,
+   payload/weight encoding, and source-batch version handling. Implement the batch and merge contracts needed
+   by the spine, plus persistent parent lookup. Verify byte order, payload replacements, signed updates,
+   descendant rekeys, and old-view retention before integrating operators.
+3. **Implement reconstruction and bounded scan sharing.** Supply per-integrator routines, then connect them
+   through the [session protocol](support.md#shared-scan-sessions-bound-ownership-and-memory). Choose explicit
+   buffer limits, overflow handling, and ordering paths. Verify consumer progress, borrowed-value lifetimes,
+   batch publication, and commit/recovery behavior with ranges larger than the memory budget.
+4. **Verify the complete Q3 path.** Run identical updates through retained and reconstructed providers.
+   Compare each requested state and final weighted output against independent evaluation. Include empty and
+   zero-revenue groups, simultaneous source changes, replacements, and rekeys. Confirm that replaced
+   integrator state is not still being accumulated elsewhere. Keep ordering/limit outside this boundary.
+5. **Measure total maintenance cost.** Benchmark against unmodified Feldera beyond RAM with equal total
+   memory and comparable durability. Include RF1/RF2, scattered line updates, customer fan-out, and rekeys.
+   Account for all reads, writes, sorting, spill, repeated scans, and background work using the
+   [measurement criteria](support.md#evidence-and-measurements-bound-the-claim). Report correctness and
+   performance separately; extend to the stated Q5/Q10 boundaries after the Q3 path is validated.

@@ -86,6 +86,138 @@ path](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2
 A comparison must record the actual fetch setting
 and storage/cache configuration.
 
+## Trace access traverses keys then weighted values
+
+> [!NOTE]
+> **Glossary**
+>
+> **`BatchReader`** — Feldera's read interface for an ordered weighted collection.
+>
+> **`Cursor`** — A movable read position with separate key and value navigation and seek operations.
+>
+> **`WithSnapshot`** — The interface for obtaining a stable, read-only view of current trace contents.
+
+`Trace` extends `BatchReader` with insertion of immutable update batches. Snapshot creation is a separate
+interface implemented by the spine. The following is a deliberately reduced pseudocode view of these APIs
+for root-circuit state (`Time = ()`); it omits factories, persistence, reverse navigation, and other methods.
+`insert` appends signed updates, not replacement snapshots. Sources:
+[`Trace` and insertion](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace.rs#L231-L308),
+[`BatchReader`](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace.rs#L468-L496),
+[`WithSnapshot`](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L23-L43).
+
+```text
+interface BatchReader<K, V, R>:
+    cursor() -> Cursor<K, V, R>                 # starts at first key and its first value
+
+interface Trace<K, V, R> extends BatchReader<K, V, R>:
+    async insert(batch: ImmutableWeightedBatch<K, V, R>)
+
+interface WithSnapshot<K, V, R>:
+    ro_snapshot() -> Snapshot<K, V, R>          # snapshot implements BatchReader
+
+interface Cursor<K, V, R>:
+    key_valid() -> bool
+    val_valid() -> bool
+    key() -> borrowed K                        # requires valid key
+    val() -> borrowed V                        # requires valid key and value
+    weight() -> borrowed R                     # consolidated weight of current (K,V)
+    step_key()                                # next K; reset V to first value of that K
+    step_val()                                # next V within current K only
+    seek_key(target: K)                        # forward lower-bound seek by K
+    seek_val(target: V)                        # forward lower-bound seek within current K
+    rewind_keys()                             # restart at first K and first V
+```
+
+`K → {V → weight}` describes the contents exposed by those methods, not a required nested map allocation.
+For example, one memory batch can represent this content with sorted arrays and offsets into the values:
+
+```text
+Exposed content:                  One memory-batch layout:
+7 -> { order_a -> 1,              keys    = [7, 9]
+       order_b -> 2 }            offsets = [0, 2, 3]
+9 -> { order_c -> 1 }             values  = [order_a, order_b, order_c]
+                                 weights = [      1,       2,       1]
+
+For keys[i], its values occupy [offsets[i], offsets[i+1]).
+At key index i and value index j:
+    key()    = keys[i]
+    val()    = values[j]
+    weight() = weights[j]
+```
+
+This is the structure of the existing
+[memory batch](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199).
+A file batch instead locates the key and its value group through file indexes and block reads. Both expose
+cursor navigation; the consumer does not unpack the entire group into another container.
+
+A snapshot can contain several runs. Its cursor combines their ordered contents: for matching `(K,V)` pairs,
+sum the weights and omit zero totals; omit a key if all its values cancel. For example, appending updates
+`((7,order_a),-1)`, `((7,order_d),+1)`, and `((9,order_c),-1)` to the batch above leaves
+`7 → {order_b → 2, order_d → 1}`. The old snapshot still exposes the original contents. The running merge
+keeps cursor positions in its member runs; it does not need to materialize the entire accumulated relation.
+See [snapshot cursor construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L196-L215)
+and [weight consolidation and zero suppression](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174).
+
+The following traversal unpacks the exposed groups into weighted tuples one at a time. A weight of two stays
+one weighted tuple; the consumer does not have to expand it into two copies.
+
+```text
+with trace.ro_snapshot() as snapshot:
+    cursor = snapshot.cursor()
+    while cursor.key_valid():
+        while cursor.val_valid():
+            consume(cursor.key(), cursor.val(), cursor.weight())
+            cursor.step_val()
+        cursor.step_key()
+
+# Lookup instead of a full traversal:
+with trace.ro_snapshot() as snapshot:
+    cursor = snapshot.cursor()
+    cursor.seek_key(requested_key)
+    if cursor.key_valid() and cursor.key() == requested_key:
+        while cursor.val_valid():
+            consume(cursor.key(), cursor.val(), cursor.weight())
+            cursor.step_val()
+    # A lower-bound seek may land on a larger key: that means the requested key is absent.
+```
+
+`step_val()` never advances into the next key. `seek_val(v)` compares values inside the selected group;
+it cannot locate `v` globally across keys. Forward seeks do not rewind a cursor already beyond their target;
+use a fresh or rewound cursor for an earlier key. Borrowed fields must be consumed before movement, or copied
+into explicitly budgeted storage. The snapshot remains alive until its readers finish. These semantics follow
+the [cursor navigation contract](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L42-L109)
+and [seek methods](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L197-L245).
+
+With non-unit runtime timestamps the underlying shape is `K → V → (time, weight)` entries; one scalar weight
+requires choosing which times to combine. Feldera provides `map_times` and `map_times_through` for that case
+([time and weight access](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L158-L177)).
+Do not assume time entries are sorted or unique. The merged-index provider separately resolves its source
+batch versions to the requested old/new state before exposing that state's weighted tuples to root operators.
+
+The proposed integration substitutes the read side of this contract. Only the storage owner writes source
+updates; reconstructed integrator outputs are not inserted into a fresh trace.
+
+```text
+interface IntegratorStateAccess<K, V, R>:       # proposed adapter interface
+    open(integrator_id, requested_keys, view) -> Cursor<K, V, R>
+
+RetainedStateAccess.open(id, keys, view):
+    return scoped_cursor(pin_integrator_trace(id, view), keys)
+
+MergedStateAccess.open(id, keys, view):
+    source = owner.open_versioned_byte_ranges(encode_ranges(id, keys), view)
+    tuples = reconstructors[id].stream(source) # derive (K,V,weight) tuples for this state
+    ordered = ensure_requested_order_and_consolidation(tuples)
+    return grouped_navigation_cursor(ordered)  # same key/value operations as the retained path
+```
+
+`grouped_navigation_cursor` identifies key boundaries in an ordered tuple stream and exposes the current
+value group without collecting the group in a map. A `step_key` can drain/skip the remainder of the current
+group. Seeks use an available physical access path, a budgeted sorted run, or a charged scan; the interface
+does not promise equal seek costs for both providers. Copies, lookahead, shared buffers, and external ordering
+consume the budgets described in the shared-session protocol. The proposed signatures illustrate the boundary;
+concrete Rust types and full method compatibility remain implementation work.
+
 ## Folded keys require flat KV storage
 
 > [!NOTE]

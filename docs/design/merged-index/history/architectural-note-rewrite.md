@@ -143,3 +143,16 @@ On 2026-09-28, the user requested distinctive styling for nonstandard terminolog
 callouts labeled Glossary, with bold term labels and plain definitions beside first use. Group terms first
 introduced together, including terms previously defined inside table cells. Apply this consistently to the
 main note and supporting report; retain ordinary emphasis for technical conclusions.
+
+## Trace interface and grouped traversal
+
+On 2026-09-28, the user requested interface pseudocode and how K -> {V -> weight} is unpacked. Read Trace,
+BatchReader, Cursor, and WithSnapshot source. Added a source-backed reduced interface, a sorted-array/offset
+example, cross-run weight consolidation, nested cursor traversal, exact-key lookup, and proposed interchangeable
+read providers. Keep actual APIs distinct from adapter pseudocode and keep reconstructed integrator outputs
+off the write path. Explain timestamp scope, borrowed-value lifetime, and bounded navigation without maps.
+
+The user subsequently requested a Next Steps section in the main README. Added five ordered steps covering
+concrete Q3 state bindings, the flat KV/LSM adapter, bounded reconstruction sessions, end-to-end correctness,
+and beyond-memory measurement. This intentionally extends the original four-section outline to five sections.
+The trace pseudocode and next steps remain documentation; no runtime implementation is claimed.
