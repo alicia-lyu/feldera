@@ -191,9 +191,12 @@ An unchanged record is present in both accumulated states. Their stored contribu
 | Before state `R_minus` | Snapshot taken before appending the delta |
 | After state `R_plus` | Snapshot taken after appending the delta; includes prior state plus delta |
 
-The [upsert implementation](../../../crates/dbsp/src/operator/dynamic/input_upsert.rs#L628) emits signed
-replacements. [Trace integration](../../../crates/dbsp/src/operator/dynamic/trace.rs#L591) connects
-`Z1Trace` feedback to [append](../../../crates/dbsp/src/operator/dynamic/trace.rs#L820).
+Feldera's [upsert input](../../../crates/dbsp/src/operator/dynamic/input_upsert.rs#L628) already emits a
+negative weight for the previous row and a positive weight for its replacement. Its
+[retained-state code](../../../crates/dbsp/src/operator/dynamic/trace.rs#L820) inserts weighted batches.
+The merged-index batch must preserve both signed rows, and integration must append that batch once before
+taking the after-state snapshot. The internal trace wiring is an implementation reference, not another
+concept required to understand the storage layout.
 [Delayed access](../../../crates/dbsp/src/operator/dynamic/trace.rs#L745) returns a snapshot of delayed
 accumulated state. The adapter supplies identical tuples and weights at those state-access sites.
 
