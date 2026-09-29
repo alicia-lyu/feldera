@@ -390,6 +390,9 @@ and shared scan sessions follow in Step 3.
 
 ### Phase 1: Encoding and one readable layer-file batch
 
+- **Status:** Implemented and verified on 2026-09-29; see the
+  [Phase 1 implementation note](phase-1-implementation-note.md) for the encoding,
+  file mapping, and test evidence.
 - **Plan:** Confirm the folded-key bytes, payload serialization, and two-column file mapping.
 - **Build:** Implement the generic `MergedIndex<D>` folding base, its
   Customer–Orders–Lineitem definition, and a small readable two-column layer-file fixture.

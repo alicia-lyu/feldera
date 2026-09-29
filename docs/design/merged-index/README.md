@@ -184,6 +184,8 @@ that optimization in the baseline comparison.
 The [Step 2 storage plan](folded-key-layer-file-plan.md) records the current implementation contract and the
 user's clarifications: folded keys, weighted payload rows, transaction-supplied related-row
 changes, and temporary read handles without multi-versioning or expiration policies.
+The [Phase 1 implementation note](phase-1-implementation-note.md) records the verified
+encoding and two-column layer-file fixture.
 
 > [!NOTE]
 > **Glossary**
