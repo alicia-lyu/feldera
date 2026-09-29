@@ -115,6 +115,39 @@ these definitions. `CustomerOrdersLineitemIndex` wraps
 `MergedIndex<CustomerOrdersLineitemDefinition>`. Source row types have no global folding
 operation; the merged index retains that behavior and the common file mapping.
 
+### Future static code generation
+
+The declarations above are a tentative way to express the required metadata, not a committed
+SQL compiler grammar. A future SQL compiler extension should bind each source index to a
+source row type, validate its field selection and key domains, and emit the static Rust
+definitions now handwritten for Customer–Orders–Lineitem. The generator can adapt the syntax
+to the compiler's input and IR conventions while preserving the distinction between logical
+source-index fields and merged-index byte-tag assignments.
+
+Feldera already has a static generation path to extend. A
+[`DBSPSourceTableOperator`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/circuit/operator/DBSPSourceTableOperator.java#L26)
+retains the source's named-column `originalRowType` and column metadata.
+[`ToRustVisitor`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/rust/ToRustVisitor.java#L684)
+builds a `DBSPStructItem` from that row type and emits Rust input registration;
+[`RustFileWriter`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/rust/RustFileWriter.java#L126)
+discovers and emits required struct declarations. The
+[pipeline manager](../../../crates/pipeline-manager/src/compiler/sql_compiler.rs#L827)
+requests generated Rust for its regular runtime path, while Gen-2 consumes circuit IR and
+skips Rust generation. These existing paths generate source and circuit code, not merged-index
+definitions. Gen-2 needs a separate integration decision before it can use generated indexes.
+
+The compiler should resolve every selected field against its base relation's row schema,
+including the provenance of propagated fields in extended Lineitem. It should reject overlap
+between key and payload fields, incompatible key-domain primitive types, source key-domain
+paths that do not form the required prefix hierarchy, and ambiguous or reserved byte-tag
+assignments. From the validated definition, it should emit `KeyDomain`, `SourceIndexSpec`,
+`MergedIndexDefinition`, typed key projection and reconstruction, and payload types and codecs
+for the Rust runtime. The generic `MergedIndex<D>` folding and storage base remains handwritten.
+
+Replace the handwritten Q3 definitions only after generated and handwritten versions agree on
+the exact folded bytes, payload serialization, and layer-file fixture reads. This generation
+work is separate from the completed Phase 1 and Phase 2 storage evidence below.
+
 ## Record representation
 
 ### K: the paper's folded key

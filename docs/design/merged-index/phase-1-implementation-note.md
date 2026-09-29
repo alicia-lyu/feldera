@@ -15,6 +15,9 @@ Lineitem constitution. Source row types do not own a global folding operation.
 source-index descriptors. Their base-relation IDs are symbolic; generated row
 types and field-provenance checks belong to later code generation. The same
 source-index descriptor can receive different byte tags in another merged index.
+The [future static code-generation plan](folded-key-layer-file-plan.md#future-static-code-generation)
+describes how SQL compiler output would eventually replace these handwritten Q3 definitions.
+This note records the implementation and tests that generated output must match.
 
 Each signed `i32` key field is encoded as big-endian bytes after flipping its sign
 bit. The ordered domain tags are `0x01` for customer, `0x02` for order, and `0x03`
