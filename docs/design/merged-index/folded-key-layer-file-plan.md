@@ -25,8 +25,10 @@ folding/unfolding, weighted batches, snapshots, and raw cursors. Typed reconstru
 view-operator wiring, and runtime transaction recovery follow in Step 3.
 
 > [!NOTE]
-> **Reading guide:** The main text defines behavior. “Implementer detail” callouts identify Feldera
-> methods, traits, and file paths; they can be skipped on a first read.
+> **Reading guide:** The main text states the intended behavior. “Implementer suggestion”
+> callouts identify possible Feldera API choices and can be skipped on a first read. Each
+> suggestion is provisional: it has not been comprehensively audited or reviewed by a
+> human expert.
 
 ## What trace and batch mean, and where their data lives
 
@@ -56,7 +58,10 @@ index but is not part of the merged index until appended. An appended memory bat
 first becoming a file. Staging must have a memory bound and spill when needed.
 
 > [!NOTE]
-> **Implementer detail:** [Feldera's accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295)
+> **Implementer suggestion — provisional.** The details in this block have not been
+> comprehensively audited or reviewed by a human expert.
+>
+> [Feldera's accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295)
 > inserts batches into a spine; [fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445)
 > can choose memory or storage. The new adapter must implement the bounded staging choice explicitly.
 
@@ -196,7 +201,10 @@ signed delta; unchanged records appear in both states.
 | `R_plus` | Snapshot taken after appending it; includes prior state plus delta |
 
 > [!NOTE]
-> **Implementer detail:** [Feldera's root time is `()`](../../../crates/dbsp/src/time.rs#L214).
+> **Implementer suggestion — provisional.** The details in this block have not been
+> comprehensively audited or reviewed by a human expert.
+>
+> [Feldera's root time is `()`](../../../crates/dbsp/src/time.rs#L214).
 > Other circuit timestamp semantics are outside this root-circuit adapter.
 
 For example, the [root join](../../../crates/dbsp/src/operator/dynamic/join.rs#L499) computes:
@@ -229,7 +237,10 @@ releases references; it does not purge records or use an expiration date. This p
 historical-version catalog or file-retention policy.
 
 > [!NOTE]
-> **Implementer detail:** [`Spine::ro_snapshot`](../../../crates/dbsp/src/trace/spine_async.rs#L2524)
+> **Implementer suggestion — provisional.** The details in this block have not been
+> comprehensively audited or reviewed by a human expert.
+>
+> [`Spine::ro_snapshot`](../../../crates/dbsp/src/trace/spine_async.rs#L2524)
 > constructs a [`SpineSnapshot`](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L56)
 > from the [batch inventory](../../../crates/dbsp/src/trace/spine_async.rs#L467) by cloning
 > `Arc<B>` references ([conversion](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L170)).
@@ -292,7 +303,10 @@ The second-level row groups and payload index also exist for singleton groups; m
 their file-size, cache, and read costs before making performance claims.
 
 > [!NOTE]
-> **Implementer detail:** Write child payload rows with `write1`, then their parent K with
+> **Implementer suggestion — provisional.** The details in this block have not been
+> comprehensively audited or reviewed by a human expert.
+>
+> Write child payload rows with `write1`, then their parent K with
 > `write0`. The file format requires unique keys within each group, so it needs no repeated-K
 > writer mode or seek change. Reuse level-0 seek/next and child-group cursors. The index
 > identifier selects the payload decoder. The [batch cursor contract](../../../crates/dbsp/src/trace/cursor.rs#L42)
@@ -313,7 +327,10 @@ reader returns only `(K, P120, +1)`; unrelated keys are not materialized. Typed 
 and shared scan sessions follow in Step 3.
 
 > [!NOTE]
-> **Implementer detail:** Implement `MergedIndexBatch` under
+> **Implementer suggestion — provisional.** The details in this block have not been
+> comprehensively audited or reviewed by a human expert.
+>
+> Implement `MergedIndexBatch` under
 > `crates/dbsp/src/trace/ord/merged_index/`; put Q3 codecs and the storage owner under
 > `crates/dbsp/src/trace/merged_index/`. The [Batch contract](../../../crates/dbsp/src/trace.rs#L846)
 > uses `FoldedKey` as `Key`, `PayloadBytes` as `Val`, `DynZWeight` as `R`, and `()` as
@@ -327,8 +344,9 @@ and shared scan sessions follow in Step 3.
 ## Verification and implementation sequence
 
 > [!NOTE]
-> **Implementer checklist:** The cases below are acceptance tests and build milestones. They
-> are not additional concepts needed to understand the record layout or snapshot behavior.
+> **Proposed implementer checklist.** These tests and milestones have not been
+> comprehensively audited or reviewed by a human expert. They are not additional concepts
+> needed to understand the record layout or snapshot behavior.
 
 Use Rust tests with an independent `BTreeMap<(Key, Payload), Weight>` oracle for signed
 consolidation. The map is an algebraic oracle, not the search-key definition. Test supplied
