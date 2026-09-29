@@ -8,8 +8,8 @@
 > **Retained state** — An integrator's accumulated output stored and maintained across input updates.
 > Reads obtain its tuples from that maintained collection, which may reside in memory or files.
 >
-> **Reconstructed state** — The same integrator output computed for requested keys and an old/new version
-> from stored, timed weighted source records, instead of maintaining that output as a separate collection.
+> **Reconstructed state** — The same integrator output computed for requested keys and a before/after view
+> from stored weighted source records, instead of maintaining that output as a separate collection.
 >
 > Both supply the same tuples, weights, group presence/absence, and cursor ordering to the existing IVM
 > path. Neither term refers to reconstructing input deltas. Reconstructed state still depends on retained
@@ -202,7 +202,7 @@ With non-unit runtime timestamps the underlying shape is `K → V → (time, wei
 requires choosing which times to combine. Feldera provides `map_times` and `map_times_through` for that case
 ([time and weight access](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L158-L177)).
 Do not assume time entries are sorted or unique. The merged-index provider separately resolves its source
-batch versions to the requested old/new state before exposing that state's weighted tuples to root operators.
+batch contributions to the requested old/new state before exposing that state's weighted tuples to root operators.
 
 The proposed integration substitutes the read side of this contract. Only the storage owner writes source
 updates; reconstructed integrator outputs are not inserted into a fresh trace.
@@ -215,7 +215,7 @@ RetainedStateAccess.open(id, keys, view):
     return scoped_cursor(pin_integrator_trace(id, view), keys)
 
 MergedStateAccess.open(id, keys, view):
-    source = owner.open_versioned_byte_ranges(encode_ranges(id, keys), view)
+    source = owner.open_source_byte_ranges(encode_ranges(id, keys), view)
     tuples = reconstructors[id].stream(source) # derive (K,V,weight) tuples for this state
     ordered = ensure_requested_order_and_consolidation(tuples)
     return grouped_navigation_cursor(ordered)  # same key/value operations as the retained path
@@ -237,7 +237,7 @@ record types have different folded key fields and separately interpreted payload
 explain why an existing B-tree or LSM can manage these byte keys. LeanStore supplies working
 [B-tree](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/LeanStoreMergedAdapter.hpp#L25)
 and [RocksDB LSM](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/shared/adapter-scanner/RocksDBMergedAdapter.hpp#L22)
-merged-index adapters. This is implementation evidence for the physical design; the weighted/versioned
+merged-index adapters. This is implementation evidence for the physical design; the weighted
 Feldera adapter below remains to be implemented.
 
 > [!NOTE]
@@ -245,13 +245,18 @@ Feldera adapter below remains to be implemented.
 >
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
-The chosen merged-index representation is `byte_key → encoded_value`, with one value per complete physical
-key in each visible state. **Folding** produces the
-key. Customer, Orders, and extended Lineitem use different folding rules. Their logical positions `(c)`,
+The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
+value contains one regular payload, a signed weight, and an old/new contribution bit. Distinct records may
+have equal folded keys; payload replacements must preserve these separate rows. No auxiliary payload list
+or extra key suffix is permitted. **Folding** produces the key. Customer, Orders, and extended Lineitem use
+different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
-Encoding must distinguish records and preserve the required cross-type order. Merely concatenating fields
-or putting a type tag first is not a specified encoding.
+The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
+value kind field is needed. Encoding must preserve the required cross-type order. The
+[Step 2 plan](flat-kv-storage-plan.md#flat-record-representation) specifies the concrete prototype bytes and
+the repeated-key file/seek support needed by Feldera. Prefix scans seek and step until the prefix changes;
+they do not need a function computing the next existing key.
 
 This is a user-specified architectural requirement. Feldera's existing `K → {V → weight}` representation
 remains the baseline for operator state; it is not the physical layout chosen for the merged index. An
@@ -285,12 +290,13 @@ That provides a place to investigate a flat byte-key representation; it does not
 flat weighted-KV adapter. Select a byte-key type/comparator with the required lexicographic order and define
 how batches, merging, reads, and snapshots preserve the encoded values.
 
-Flat KV shape does not select update semantics. Values must preserve payloads, weights, and enough type
-information for decoding. A payload replacement can retract and insert different complete tuples at the
-same logical identity. The pending-update representation must retain those changes and the old snapshot;
-it cannot sum their weights by folded identity alone and discard the payload difference. Exact version and
-pending-record encoding remains implementation work. Complete-tuple weighted reconstruction, one visible
-value per physical key, and consistent old/new views are required regardless of that choice.
+Flat KV shape does not select update semantics. The index identifier selects the payload schema. A
+replacement appends two flat records at the same folded key: `(old_payload, -1, NEW)` and
+`(new_payload, +1, NEW)`. The prior positive contribution remains readable through the OLD view. The bit
+marks contribution timing, not weight sign or the payload's before/after origin. Consolidation matches
+complete `(key, payload)` identity, not folded key alone. The transaction supplies all intended related-row
+changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
+or relational-consistency enforcement. The plan defines bit reuse across batches without a whole-index rewrite.
 
 ## Shared scan sessions bound ownership and memory
 
@@ -320,11 +326,13 @@ The cited document is modified working-tree content inspected on 2026-09-28, bas
 >
 > **rekeys** — moves to changed physical key prefixes.
 >
-> **View lease** — A reference preventing release of a batch's old/new source and parent-lookup views.
+> **View lease** — Ownership of the temporary source read handles used by a computation.
 
 Each reader holds a **view lease**.
-One owner stages the complete input update batch, including induced descendant rekeys, before opening any
-new-view reader. Publishing these views to operators is distinct from committing externally visible results.
+One owner appends the complete transaction-supplied delta to the same merged index before opening any
+new-view reader. If related Lineitem locations must change, the transaction supplies those row changes;
+the storage adapter does not infer them from an Order change. Publishing these views to operators is
+distinct from committing externally visible results.
 The runtime must report completion of all consumers, including output-state updates and work across steps.
 Physical cursor EOF alone does not establish that completion.
 
@@ -337,9 +345,9 @@ Physical cursor EOF alone does not establish that completion.
 process_batch(input, consumer_plan):
     owner = begin_owner(input.batch_id, total_memory_budget)
     try:
-        owner.old = pin_committed_source_and_parent_lookup()
-        owner.pending = stage_all_changes(input, owner.old)   # includes descendant rekeys
-        owner.new = seal_weighted_overlay(owner.old, owner.pending)
+        owner.old = reference_current_source_batches()
+        update_base_storage_and_indexes(input.supplied_changes)  # appends to this index exactly once
+        owner.new = reference_source_batches_after_complete_append()
         owner.publish_to(consumer_plan)                       # views no longer change
 
         provider = ReconstructedStateProvider(owner)
@@ -348,7 +356,7 @@ process_batch(input, consumer_plan):
         provider.close_all_sessions_and_sorted_cursors()
         assert owner.outstanding_view_leases == 0
 
-        commit_source_lookup_and_output_progress(owner)       # required atomic commit boundary
+        complete_source_and_output_transaction(owner)         # no second weighted insertion
     except failure:
         cancel_and_join_all_consumers()                       # no concurrent reader left
         close_all_cursors_and_release_returned_values()
@@ -358,11 +366,11 @@ process_batch(input, consumer_plan):
         owner.release_snapshot_references()
 ```
 
-`seal_weighted_overlay` resolves complete-tuple signed updates; it must retain both payloads of a replacement
-at an unchanged folded identity. The commit/abort calls state required backend/runtime behavior, not a new
-WAL design. On a failure during commit, recovery must determine the committed endpoint before retry. Source
-records, parent lookup, and output progress must not advance independently. Compaction can replace runs while
-pinned snapshot references keep old reads valid.
+The new view resolves complete-tuple signed updates already appended to the index; it must preserve both
+payloads of a replacement at an unchanged folded identity. The completion/abort calls state required runtime
+transaction behavior, not a new WAL design. On failure, recovery must determine the committed endpoint before
+retry. Source records and output progress must not advance independently. Temporary read handles reference
+existing batches; they create no tuple copies, historical-version catalog, or expiration policy.
 
 ### Requests retain the existing operator contract
 
@@ -388,7 +396,7 @@ prepare_access(requests, owner):
                 publish_cursor(request, state_cursor)
             elif maintained_path_matches(request, owner):
                 close_unused_readers(state_cursor)
-                publish_cursor(request, open_versioned_access_path(request, owner))
+                publish_cursor(request, open_source_access_path(request, owner))
             else:
                 publish_cursor(request, external_sort_and_consolidate(
                     state_cursor, request.key_and_value_comparator,
@@ -397,7 +405,7 @@ prepare_access(requests, owner):
 
 Compatibility includes batch/view identity, encoded range, decoder requirements, and forward traversal.
 Independent views or ranges use independent sessions in this minimal design. Sharing one traversal across
-old/new views requires an additional version-aware reader returning both weights and payloads; the lifecycle
+old/new views requires an additional reader distinguishing both endpoints and returning weights and payloads; the lifecycle
 above permits it but does not imply it is already implemented. Readers needing an independent seek close
 and reopen their own access instead of repositioning a cursor under other consumers. Replayed reads are
 charged. Existing operator seek/order behavior must still be honored.
@@ -511,7 +519,7 @@ handle_pressure_without_advancing_cursor(record, needed):
 `RETRY` and `WAIT_FOR_RELEASE` are internal scheduler results, not tuples returned to the operator. The
 runtime adapter resumes the same request. Spilled entries keep their sequence identities, and later reads
 load them through budgeted buffers; borrowed entries remain pinned. A reread uses the same immutable view
-and exact continuation token, including position within a decoded version if one physical key yields several
+and exact continuation token, including position within decoded contributions if one physical key yields several
 records. It must neither duplicate nor skip a record and must reserve its own cursor memory before detaching.
 If a continuation cannot be represented safely, reject that fallback rather than guessing a seek key.
 
@@ -604,25 +612,26 @@ flowchart LR
     ZA --> O2[Same old tuple A]
 ```
 
-Timed weighted source tuples can satisfy either read. With `tau` denoting the input-batch version, resolve
-complete-tuple weights at the requested version before grouping:
+Weighted source tuples can satisfy either read. Resolve complete-tuple weights at the requested endpoint
+of the current transaction before grouping:
 
 ```text
-weight_at(tuple, t) = sum(change.weight for change of that complete tuple with change.time <= t)
-H_at(k, t) = sum(weight_at(line, t) * (1, revenue(line))
-                 for qualifying line tuples in order k at version t)
-A_at(k, t) = {(k, H_at(k,t).revenue) -> 1} if H_at(k,t).count > 0 else empty
-old_tuple = A_at(k, t-1)
-new_tuple = A_at(k, t)
+weight_old(tuple) = sum(weight of that tuple in effective OLD contributions)
+weight_new(tuple) = weight_old(tuple) + sum(weight of that tuple in effective NEW contributions)
+H_at(k, endpoint) = sum(weight_endpoint(line) * (1, revenue(line))
+                       for qualifying line tuples in order k)
+A_at(k, endpoint) = {(k, H_at(k,endpoint).revenue) -> 1} if H_at(k,endpoint).count > 0 else empty
+old_tuple = A_at(k, OLD)
+new_tuple = A_at(k, NEW)
 ```
 
-This is the versioned-read contract, not a requirement to scan all historical changes on every access.
-Pinned runs, consolidated versions, and range cursors implement it. Source batch versions here are distinct
-from the unit timestamp of Feldera's root computation. Payload replacements and rekeys must retain enough
-information to resolve the complete tuples and parent lookup at both requested versions; compaction cannot
-discard information still needed by an old-view reader. A negative weight alone does not identify which
-batch it belongs to. Given the version and weighted payloads, the provider can reconstruct the delayed state
-without separately storing the old aggregate tuple.
+NEW accumulated state includes both OLD and NEW contributions; selecting only NEW records would return the
+delta. Read handles, the batch-relative contribution bit, and range cursors implement these two endpoint
+reads. No per-record timestamp history is required; Feldera's root computation still uses unit time.
+Payload replacements and supplied key changes preserve the complete tuples needed at both endpoints.
+This is one computation's before/after access, not a multi-versioning feature. A negative weight alone does
+not identify which batch it belongs to. Given the endpoint and weighted payloads, the provider can reconstruct
+the delayed state without separately storing the old aggregate tuple.
 
 Feldera's generic aggregate makes a different computation/storage tradeoff. It computes new group values
 from an accumulated input collection `X` and retrieves the old aggregate tuple from accumulated output `A`.
@@ -712,7 +721,7 @@ must be identical with or without them.
 
 Bind routines to the state accesses present in the chosen circuit. The lecture note's grouping requests summaries;
 its Orders join requests accumulated `A`. A generic runtime path that reads previous output can request it
-from an `A` reconstruction routine at the preceding version, equivalently emitting the reconstructed old `H`.
+from an `A` reconstruction routine at the before endpoint, equivalently emitting the reconstructed old `H`.
 These are different consumers of reconstructible state, not a requirement
 to add every illustrated state object to the chosen circuit. Concrete runtime bindings remain implementation
 work; only accumulated-state access changes, while delta processing remains in the shared IVM path.
@@ -783,9 +792,14 @@ prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-
 > [!NOTE]
 > **Glossary**
 >
-> **`SpineSnapshot`** — A read view retaining a fixed set of immutable runs.
+> **`SpineSnapshot`** — A temporary read handle owning references to a fixed set of immutable batches.
 
-`SpineSnapshot` owns reference-counted batches and supports
+`Spine::ro_snapshot()` collects existing `Arc` references into a vector; it does not copy tuples, memory
+batches, or files. It performs no writes, creates no persistent historical version, and sets no expiration
+date. Dropping the handle releases references. Existing backend resource cleanup is separate from the
+snapshot operation and does not depend on the old/new bit. See the
+[exact call-path audit](flat-kv-storage-plan.md#snapshot-ownership-does-not-copy-the-database).
+`SpineSnapshot` supports
 constructing a view with additional batches
 ([snapshot ownership and
 composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L56-L153)).
@@ -796,21 +810,26 @@ These establish existing weighted-batch primitives. The flat KV adapter must imp
 visibility for encoded payloads; concatenating batches or overwriting equal byte keys is not by itself proof
 of correct weighted reconstruction. Reads must resolve the pending changes without waiting for compaction.
 
-The integration must keep the old source snapshot and parent lookup alive, stage complete payload retractions
-and descendant rekeys, then **seal** the pending updates for a consistent new view. Retire old ownership only when every
-consumer
-has
-finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
+The integration keeps a read handle to pre-append source batches, appends all supplied flat signed records
+once, then **seals** the complete batch for the new view before maintenance. The transaction supplies related
+row changes; the storage layer does not cascade them. Release computation-owned read handles when every
+consumer has finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
 ([transaction
 scheduling](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/schedule.rs#L186-L226),
 [commit
 flushing](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/circuit_builder.rs#L7777-L7805)).
 
 These primitives support the design but do not establish atomic publication or restart of the new shared
-index. Implementation must coordinate source batches, native-order lookup, and output progress so recovery
-exposes a complete endpoint and retry does not apply weights twice. Snapshot retention also has a memory and
-storage cost. A per-record phase bit is not an architectural requirement; the flat KV adapter must specify its version
-retention and pending-update representation.
+index. Integration must coordinate source batches and output progress so recovery exposes a complete endpoint
+and retry does not apply weights twice. Feldera's root Z-sets have no per-record old/new boolean: incoming
+signed delta batches and delayed/current traces provide that distinction. The required physical bit is
+merged-index adapter metadata whose interpretation must follow those existing operator boundaries; both
+signed records of a replacement belong to the incoming delta. Existing operators receive reconstructed
+weighted tuples, not a new bit to interpret. See the
+[runtime mapping and join equation](flat-kv-storage-plan.md#feldera-determines-oldnew-semantics).
+The bit is independent of signed weight and does not imply multi-versioning, time travel, or expiration of old
+records/files. The [storage plan](flat-kv-storage-plan.md#reusing-the-bit-over-successive-batches) specifies
+batch-relative interpretation and metadata rebinding without a full data copy or whole-index bit rewrite.
 
 ## Consumers determine the required payload
 
@@ -917,13 +936,13 @@ criteria; this report does not claim they have been met.
 | --- | --- |
 | Are operator inputs and results identical? | Run the same operator path with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and old/new views, then check value-difference or retraction/insertion outputs against independent evaluation. |
 | Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and old/new visibility. |
-| Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify old payload retention, consistent lookup publication, and exactly-once batch advancement. |
+| Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify before/after source reads, reference-only snapshots, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
 | Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
 
 For equal-sized blocks, `unique footprint = block_bytes * size(union of all consumers' blocks)`.
 Actual read traffic is the sum of physical read events; eviction can cause repeat reads. Include RF1/RF2,
-parent lookup, all operator access, staging, merging, checkpointing, and spills in measured reads/writes.
+any workload-side discovery, all operator access, staging, merging, checkpointing, and spills in measured reads/writes.
 Report persistent and peak storage, CPU/decoding, memory high-water, fan-out, and complete-batch latency for
 clustered and scattered updates. Neither fewer unique blocks nor a resident scan speedup proves lower total
 maintenance I/O.

@@ -189,3 +189,31 @@ The user subsequently excluded the Q3 and operator semantic checkers: they are u
 byproducts. Removed their references, commands, and passing-test claims from the active reading path.
 Earlier execution records in this history are not evidence for the architecture. Implementation acceptance
 criteria remain future verification work.
+
+## Step 2 storage clarifications
+
+On 2026-09-28, the user requested a detailed linked plan and corrected the proposed physical representation
+and ownership assumptions. The new [Step 2 plan](../flat-kv-storage-plan.md) records every clarification.
+It supersedes earlier proposals in this history that made the phase bit optional, added persistent parent
+lookup, or made the storage layer generate descendant moves.
+
+K remains the paper's domain-tagged key ending in the INDEX domain and its identifier. Each flat V contains
+one regular payload, a signed weight, and the required old/new bit. Equal keys may occur in separate flat
+records; packing a payload list or adding payload/phase to K is rejected. File support must therefore handle
+duplicate keys and seeks across block boundaries. Prefix iteration uses seek/next rather than a successor API.
+
+The transaction supplies complete extended changes, including any intended related-row updates. Storage
+adds neither an OrderParent record nor relational-consistency checks or automatic child movement. Both
+negative and positive records of an incoming replacement are NEW contributions. The user clarified that
+this meaning must follow existing Feldera operators, rather than an independent preference. Source review
+confirmed that root Z-sets have no old/new boolean: delta batches and delayed/current traces carry that
+context. The physical bit is adapter metadata, with promotion governed by existing accumulation/flush
+boundaries. Append changes to the same merged index before view maintenance and do not apply them again
+on completion.
+
+The user also excluded multi-versioning and record/file expiration policies. A source audit traced
+Spine::ro_snapshot through From<&Spine> and get_batches: it allocates a vector of Arc references and clones
+factories, without copying tuples/files, registering persistent versions, scheduling compaction, or setting
+expiration dates. Existing last-owner backend cleanup is distinct from this operation. The active plan and
+supporting note now describe temporary computation read handles and batch-relative phase interpretation.
+The full typed-return/scan-session interface remains subsequent work. No Rust code was changed in this revision.

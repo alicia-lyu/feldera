@@ -81,8 +81,8 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 > **Retained state** — An integrator's accumulated output stored and maintained across input updates.
 > Reads obtain its tuples from that maintained collection, which may reside in memory or files.
 >
-> **Reconstructed state** — The same integrator output computed for requested keys and an old/new version
-> from stored, timed weighted source records, instead of maintaining that output as a separate collection.
+> **Reconstructed state** — The same integrator output computed for requested keys and a before/after view
+> from stored weighted source records, instead of maintaining that output as a separate collection.
 >
 > Both supply the same tuples, weights, group presence/absence, and cursor ordering to the existing IVM
 > path. Neither term refers to reconstructing input deltas. Reconstructed state still depends on retained
@@ -147,6 +147,10 @@ that optimization in the baseline comparison.
 
 ## What changes in our design
 
+The [Step 2 storage plan](flat-kv-storage-plan.md) records the current implementation contract and the
+user's clarifications: flat tuple records, an old/new contribution bit, transaction-supplied related-row
+changes, and temporary read handles without multi-versioning or expiration policies.
+
 > [!NOTE]
 > **Glossary**
 >
@@ -159,11 +163,15 @@ have different rules; their logical customer-leading positions are `(c)`, `(c,o)
 layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
 
-Values retain payloads, weights, and record types. A range cursor reads KV entries in byte-key order and
+Each value contains one regular payload, its signed weight, and an old/new contribution bit. The index
+identifier in the folded key determines the record type; `INDEX` is its domain tag, not an extra end marker.
+Different complete tuples can have the same folded key and must remain separate flat records, without a
+payload list or an added key suffix. A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it scans one order's lines while updating old/new
 count and revenue accumulators, then returns the requested state tuples. It does not build an in-memory
 relation containing all those lines.
-A persistent native-order lookup resolves an order to its customer-leading position. Reuse the spine, run
+The transaction supplies complete extended records and any intended related-row changes. Storage does not
+add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, run
 management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
 merge rules. Flat KV records do not require a different LSM, but the grouped indexed batch cannot be reused
 unchanged.
@@ -210,7 +218,8 @@ flowchart LR
     Q --> F[Final query result]
 ```
 
-One storage owner stages each input update batch, publishes consistent views, and keeps them alive for every
+One storage owner appends each complete input delta to the same index before view maintenance, publishes
+consistent views, and keeps them alive for every
 consumer. Provider cursors seek encoded ranges and return the requested state through the shared contract. When
 byte-key order differs from the required operator order, use budgeted external sorting or a maintained access
 path and count its I/O. Each shared scan has a byte-limited buffer and per-consumer positions; a lagging
@@ -224,8 +233,8 @@ The reconstruction target is each integrator's accumulated output state, not its
 In [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276),
 panel (c) of “Equivalent Q3 circuits” (Figure 4) has one Count/Revenue integrator inside grouping and a delay
 supplying its old summary.
-The existing emit functions compute old/new aggregate tuples from those summaries. Timed weighted source
-records supply each requested version: retaining an old emitted tuple and computing it from the old summary
+The existing emit functions compute old/new aggregate tuples from those summaries. Weighted source records
+with the contribution bit supply each requested endpoint: retaining an old emitted tuple and computing it from the old summary
 serve the same old-state read. The integrator for `A`
 belongs to the following Orders join, not to grouping. Separate routines reconstruct `H`, `A`, and the other
 requested states without changing delta processing or adding another grouping integrator.
@@ -302,20 +311,23 @@ spilling or rereading oversized ranges.
 
 ```mermaid
 flowchart LR
-    S[Pin committed source snapshot] --> P[Stage all signed changes and rekeys]
-    P --> N[Seal pending batch and parent lookup]
-    N --> R[Read old base and new base plus pending]
+    S[Reference existing source batches] --> P[Append transaction-supplied signed changes once]
+    P --> N[Seal complete source batch]
+    N --> R[Read before and after views of the same index]
     R --> F[All consumers finish]
     F --> C[Commit new source state and release old view]
 ```
 
-In the example, old reads retain the revenue-40 line and eligible customer payload even after pending
-retractions exist. New reads apply the pending weighted changes to the base. The flat KV adapter must preserve this
-separation;
-a per-record old/new bit is not required as a backend choice, and cannot replace signed weights or retention.
-An order reassignment also stages placement changes for unchanged descendant lines and preserves both parent
-paths. Publication and recovery must cover source records and lookup changes together. Ordinary compaction
-may run independently; it must not determine logical batch completion.
+In the example, old reads expose the revenue-40 line and eligible customer payload after the incoming
+retractions have been appended. New reads include those weighted changes. Each flat value carries the required
+old/new bit: both the old-payload retraction and the new-payload insertion are NEW contributions to this batch.
+Feldera represents this distinction through delta batches and delayed/current traces, without a root-record
+old/new boolean. The physical bit must follow those existing operator boundaries; see the
+[runtime compatibility contract](flat-kv-storage-plan.md#feldera-determines-oldnew-semantics).
+Signed weights still determine insertion/retraction. The transaction explicitly supplies any intended
+Lineitem placement changes; storage neither invents related-row updates nor enforces relational consistency.
+Completion must not append the same delta again. Snapshots reference existing batches without copying their
+tuples or files; this is not multi-versioning or an expiration policy. Compaction does not determine logical completion.
 [Immutable batches preserve old reads](support.md#immutable-batches-preserve-old-reads) explains the lifecycle
 requirements and what remains to implement.
 
@@ -334,22 +346,23 @@ separate accumulated storage. Co-location also lets several logical consumers us
 Neither benefit implies that every update becomes cheaper.
 
 Refresh processing offers another sharing opportunity. RF1 inserts an order and its lines: customer reads
-can serve both validation and eligibility, and staged rows can supply new-state reconstruction. RF2 deletes
-an order and its lines: native-order lookup and the old range scan can supply deletion payloads and old
-operator inputs together. This requires retaining full decoded payloads until consumption; discovery that
+can serve eligibility, and appended rows can supply new-state reconstruction. RF2 supplies deletion changes
+for an order and its lines: old range reads can supply old operator inputs. The cited LeanStore workload
+also performs native-order discovery; that is reference behavior, not a required lookup in this Q3 adapter.
+Sharing reads requires keeping full decoded payloads until consumption; discovery that
 collects only identifiers does not achieve that reuse.
 [Refresh reads can serve reconstruction](support.md#refresh-reads-can-serve-reconstruction) distinguishes the
 existing refresh behavior from the proposed sharing.
 
 Reconstruction trades writes and persistent intermediate bytes for reads, decoding, and computation. A single
-line change may rescan all `f` lines of its order; a customer change may visit every descendant. Rekeying
-writes placement changes for unchanged lines. Old snapshots, pending batches, shared buffers, lookup storage,
+line change may rescan all `f` lines of its order; a customer change may visit every descendant. Transaction-supplied
+key changes write the affected old/new placements. Temporary read handles, incoming batches, shared buffers,
 and any additional ordering increase memory or peak storage. Existing Feldera traces may answer selective
 probes more cheaply, especially with cached or batched fetches.
 
 Judge the design against unmodified Feldera with identical results, updates, memory budgets, and comparable
 durability. Measure actual read/write bytes, repeated reads, seeks, decoded records, CPU, peak memory and
-storage, and complete-batch latency. Include refresh discovery, parent lookup, staging, compaction,
+storage, and complete-batch latency. Include any workload-side refresh discovery, staging, compaction,
 checkpointing, spills, and writes to the maintained pipeline result. Hold residual query execution constant
 and report its cost separately from maintenance. The union of touched blocks describes potential reuse;
 device read events measure realized traffic. Test beyond-memory state with both localized refresh groups
@@ -368,11 +381,12 @@ source provenance and implementation acceptance criteria.
    runtime read sites, including old/new views and cursor operations. Specify the Rust adapter interfaces
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
-2. **Implement flat KV storage on the existing LSM.** Define each record type's folded key, range bounds,
-   payload/weight encoding, and source-batch version handling. Implement the batch and merge contracts needed
-   by the spine, plus persistent parent lookup. Use the primary manuscript and working LeanStore adapters
-   as encoding and access-path references. Verify byte order, payload replacements, signed updates,
-   descendant rekeys, and old-view retention before integrating operators.
+2. **Implement flat KV storage on the existing LSM.** Follow the [detailed storage plan](flat-kv-storage-plan.md):
+   paper-defined folded keys and flat values containing one payload, weight, and old/new bit. Implement
+   repeated-key file rows, iterator seeks, and the spine's batch/merge contracts. Append the supplied delta
+   once before view maintenance; use reference-only read handles. Verify replacements, signed updates,
+   transaction-supplied key changes, and bit reuse across batches. No parent lookup, storage-generated
+   child moves, multi-versioning, or expiry mechanism is part of this step. Typed scan sessions follow in Step 3.
 3. **Implement reconstruction and bounded scan sharing.** Supply per-integrator routines, then connect them
    through the [session protocol](support.md#shared-scan-sessions-bound-ownership-and-memory). Choose explicit
    buffer limits, overflow handling, and ordering paths. Verify consumer progress, borrowed-value lifetimes,
