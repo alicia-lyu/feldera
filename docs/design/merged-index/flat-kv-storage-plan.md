@@ -306,30 +306,38 @@ until consumers finish, not forbidding compaction from combining prior state wit
 
 ### Physical mapping to Feldera layer files
 
-The logical FlatKV record has exactly one search key K and one value V; it has no inner or outer key.
-The current physical mapping uses Feldera's two-column layer file: `Writer2` stores folded K at level 0
-and sorted payload rows at level 1. This is a file-format grouping, not a change to the FlatKV key.
-Payload is **not** appended to K. This reuses
-Feldera's existing indexed Z-set file and generic `BatchReader`/`Spine` merger, so pending replacements
-with different payloads can occupy one batch without changing the layer-file format.
+FlatKV has one logical search key K and one value V. For every batch, use Feldera's existing two-column
+layer-file layout: [`Writer2`](../../../crates/dbsp/src/storage/file/writer.rs#L1564) stores folded K at
+level 0 and payload with its signed weight at level 1. These levels are physical row groups, not an
+inner or outer key in the merged-index design. Payload is never appended to K.
 
-The cost is an inner tree/index, a row-group boundary for each K, and comparisons and sorting of payloads
-within K during batch construction and compaction. Payload bytes may also appear in inner index blocks;
-large or variable-length payloads can increase file size, cache pressure, and I/O. Even a base K with
-one payload pays for an inner row and its group metadata. A lookup by K seeks the outer tree, then reads
-its inner group; for m active contributions at K, a full group scan is O(m). The inner payload index
-permits value seeks within that group, but Q3 does not need them. The backend requires a stable comparison
-for payload equality and merging even though queries order and seek only by K. Measure
-bytes per record, index-block bytes, compaction bytes, seek latency, and cache use against a one-column
-prototype; do not assume the overhead is negligible.
+The **same batch type and file layout** serve consolidated state and incoming deltas:
 
-`Writer2` checks uniqueness of folded K at level 0 **within one batch** and of payload within
-that K's level-1 group.
-It does not prove uniqueness of active K across all batches. A one-column file-local K check would not
-prove that either, because another LSM batch may contain the same K. The committed base invariant must be
-checked against the consolidated state (or guaranteed by the source relation's transaction-level key
-constraint). There is no stored base/pending bit: the pre-append snapshot is base, and the post-append
-snapshot includes the pending delta.
+```text
+Consolidated batch: K -> { (P100,+1) }
+Incoming delta:     K -> { (P100,-1), (P120,+1) }
+After full merge:   K -> { (P120,+1) }
+```
+
+Each child row represents one logical `(K, V)` contribution; V contains one payload and weight, not a
+list. A delta can have different payloads under the same folded K. Z-set consolidation matches equal
+complete `(K, payload)` contributions, so the `P100` weights cancel while `P120` remains. The file
+format's payload ordering serves batch construction and merging; queries seek by folded K.
+
+After maintenance, the immutable delta batch is part of incorporated base state without changing its
+physical rows. It may still contain both replacement contributions. Normal compaction can merge it with
+prior batches and produce a singleton group when it reads all contributions for K. A partial merge can
+still output several rows under K. There is no stored base/pending bit or special compaction barrier.
+
+The second-level row groups and payload index also exist in batches with one payload per K. Measure their
+file-size, cache, and read costs in the performance gate; this plan does not introduce another file format.
+
+### Base-key validation
+
+`Writer2` checks folded K uniqueness at level 0 within one batch and payload uniqueness within each K
+group. It cannot establish uniqueness of the accumulated base relation across LSM batches. The committed
+state must have at most one active payload per K, either by a direct check or by a proven source-relation
+key constraint. A delta's two replacement rows do not violate this state invariant.
 
 For a direct transaction-level check, take the distinct K values appearing in the signed delta before
 projecting or summing their weights. Unchanged keys were already valid by induction. For each changed K,
@@ -341,38 +349,6 @@ Step 3 binds the check to source/view commit. The scan costs one LSM seek per ch
 traversal of its contributions across batches. Step 3 uses this check unless it proves that
 existing source keyed storage enforces the same uniqueness invariant for all three indexed
 relations; only then can it omit the redundant scan.
-
-### One batch type; singleton and multiple-payload groups
-
-Use one Feldera two-column batch type for both consolidated batches and incoming delta batches. A
-consolidated batch produced from valid base state has at most one payload row under each K. An incoming
-signed delta can have more than one payload row under a K. Both expose the same logical flat weighted
-tuples, and neither adds payload to the paper's folded K:
-
-```text
-Consolidated batch: K -> { (P100,+1) }             # one child row under K
-Incoming batch:     K -> { (P100,-1), (P120,+1) } # two child rows under K
-```
-
-There is no different batch type, format dispatch, or heterogeneous spine merger. A normal merge of two
-batches of this type also produces the same type; if all signed contributions at a K cancel except one,
-its output group has one row. If the merge sees only part of the contributions at K, its output may still
-have several rows. [`Spine<B>`](../../../crates/dbsp/src/trace/spine_async.rs#L2080) can use one B
-throughout, and [generic merging](../../../crates/dbsp/src/trace.rs#L1384) preserves that type.
-
-"Base state" means contributions already incorporated into the maintained view. A "consolidated base
-batch" describes a physical batch whose K groups contain at most one payload row; it is the same batch
-type as a delta batch. When maintenance finishes, an immutable delta batch becomes part of base state
-without rewriting its file; its physical rows may still include both replacement contributions. It can
-retain the name "delta batch" to describe its origin and shape even though its contents are no longer
-pending. The **accumulated base relation** has unique K after signed contributions across batches are
-summed. Requiring every individual incorporated batch to have only one child row per K would instead
-require immediate consolidation across overlapping batches and new immutable-file writes at each
-maintenance boundary. This plan does not impose that extra compaction.
-
-The folded K can be equal for *different payloads* during a replacement. What cancels under Z-set algebra
-is equal complete `(K, payload)` contributions with opposite weights. Distinct payloads under the same K
-are not the same record merely because their folded search keys match.
 
 ### Append before view maintenance
 
