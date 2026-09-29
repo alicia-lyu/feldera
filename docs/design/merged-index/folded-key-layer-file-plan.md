@@ -411,11 +411,15 @@ and shared scan sessions follow in Step 3.
 
 ### Phase 2: Batches and cursors
 
-- **Plan:** Audit the batch interfaces and choose how memory-backed and file-backed batches
-  expose the same ordered cursor, including bounded staging.
-- **Build:** Add both batch forms and reads over multiple keys and batches.
-- **Evidence to advance:** The cursor returns requested signed contributions after spill and
-  reopen; file-backed reads fetch needed blocks without materializing the whole index.
+- **Status:** Implemented and verified on 2026-09-29; see the
+  [Phase 2 implementation note](phase-2-implementation-note.md).
+- **Plan:** Use Feldera's in-memory indexed batch for folded keys, payload bytes, and signed
+  weights. Sort small arbitrary-order inputs in memory and expose a raw cursor over batches.
+- **Build:** Add in-memory batches and reads over multiple keys and batches. Combine duplicate
+  `(K, payload)` rows within each batch, but retain contributions from separate batches.
+- **Evidence to advance:** The cursor returns requested signed contributions across in-memory
+  batches, including equal `(K, payload)` pairs from different batches. This phase's test inputs
+  are below 100 MiB; that is a workload assumption, not an enforced memory limit.
 
 ### Phase 3: Signed merging and K uniqueness
 
@@ -428,13 +432,16 @@ and shared scan sessions follow in Step 3.
   contributions for a valid K leaves one active payload. Use an independent signed-weight
   oracle when checking these outcomes.
 
-### Phase 4: Append and snapshots
+### Phase 4: File-backed batches, append, and snapshots
 
-- **Plan:** Specify ownership and lifetime of the before, delta, and after handles using the
-  existing append and snapshot APIs.
-- **Build:** Append the delta once and expose the two accumulated-state reads to storage callers.
-- **Evidence to advance:** Each handle returns its intended rows while normal compaction merges
-  earlier and delta batches; snapshot creation does not copy the relation.
+- **Plan:** Add file-backed batch construction and a bounded staging policy, including explicit
+  limits for in-memory batch size and the number of in-memory batches. Specify ownership and
+  lifetime of the before, delta, and after handles using the existing append and snapshot APIs.
+- **Build:** Add on-disk batches, append the delta once, and expose the two accumulated-state
+  reads to storage callers.
+- **Evidence to advance:** File-backed batches survive reopen and fetch requested blocks without
+  materializing the whole index. Each handle returns its intended rows while normal compaction
+  merges earlier and delta batches; snapshot creation does not copy the relation.
 
 ### Step 3 handoff
 

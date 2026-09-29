@@ -74,8 +74,8 @@ The `rkyv` serializer's error needs debug formatting rather than `Display`.
 
 ## Phase 2 handoff
 
-The next phase must decide how memory-backed and file-backed batches expose one
-ordered cursor, including bounded staging and spill. It must preserve the
-crate-internal key and payload representation while adding reads across batches.
-Signed consolidation, accumulated-key uniqueness, snapshots, and runtime wiring
-remain separate later phases.
+The subsequent [Phase 2 plan](phase-2-in-memory-batches-implementation-plan.md) narrows the next
+implementation increment to in-memory batches and raw reads across batches. File-backed batch
+integration, bounded staging, and spill move to Phase 4. Phase 2 must preserve the crate-internal
+key and payload representation. Signed consolidation, accumulated-key uniqueness, snapshots,
+and runtime wiring remain separate later phases.
