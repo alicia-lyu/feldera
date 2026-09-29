@@ -73,6 +73,34 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [Refresh reads can serve reconstruction](support.md#refresh-reads-can-serve-reconstruction) | Identifies shareable RF1/RF2 work and the limits of existing refresh evidence. |
 | [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) | Records source provenance, acceptance criteria, and the measurements still needed. |
 
+## Feldera pipelines and intermediate views
+
+A **Feldera pipeline** is a compiled SQL program of input tables and dependent views, together with its
+connectors and runtime configuration. Views can refer to other views in the same program, and Feldera
+incrementally maintains the resulting computation as input tables change. This is distinct from the
+**order-sharing pipeline** in this note: a portion of a query whose operators share compatible tuple
+orderings. Maintaining one such portion inside a Feldera pipeline does not require composing multiple
+Feldera pipelines. See the [Feldera pipeline API](https://docs.feldera.com/api/) and the
+[repository overview](../../../README.md).
+
+Feldera permits explicit, named intermediate SQL views. `CREATE LOCAL VIEW` defines an intermediate
+calculation for dependent views without exposing its change stream as a pipeline output. `CREATE VIEW`
+exposes output changes; `CREATE MATERIALIZED VIEW` also retains the complete current result for ad-hoc
+queries and snapshots. Thus the logical `B = O ⋈ C` below could be a named local view consumed by a view
+for `J = B ⋈ L`. Naming `B` does not require materializing its full result. See the
+[SQL view grammar](https://docs.feldera.com/sql/grammar/) and
+[materialized-view behavior](https://docs.feldera.com/sql/materialized/).
+
+An incremental join still needs accumulated, keyed state for its inputs so that new changes can match
+existing rows. Feldera's compiler creates the required join indexes and its runtime maintains input
+traces internally; declaring a materialized SQL view or SQL `CREATE INDEX` is not required for this
+purpose. An input trace represents the state needed for future maintenance, not necessarily an event log
+of every update. This design proposes reconstructing selected accumulated integrator outputs from the
+merged index instead of retaining separate traces. That proposed storage substitution is separate from
+the user's choice to name intermediate SQL views or materialize queryable results. See the
+[join implementation](../../../crates/dbsp/src/operator/dynamic/join.rs#L663) and the
+[SQL index rules](https://docs.feldera.com/sql/grammar/#creating-indexes).
+
 ## How Feldera stores indexed state
 
 > [!NOTE]
