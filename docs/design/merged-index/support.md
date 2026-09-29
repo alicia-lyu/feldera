@@ -202,7 +202,7 @@ With non-unit runtime timestamps the underlying shape is `K → V → (time, wei
 requires choosing which times to combine. Feldera provides `map_times` and `map_times_through` for that case
 ([time and weight access](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L158-L177)).
 Do not assume time entries are sorted or unique. The merged-index provider separately resolves its source
-batch contributions to the requested old/new state before exposing that state's weighted tuples to root operators.
+contributions to the requested before/after maintenance state before exposing weighted tuples to root operators.
 
 The proposed integration substitutes the read side of this contract. Only the storage owner writes source
 updates; reconstructed integrator outputs are not inserted into a fresh trace.
@@ -246,8 +246,8 @@ Feldera adapter below remains to be implemented.
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
 The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
-value contains one regular payload, a signed weight, and an old/new contribution bit. K alone identifies
-a record and is unique in each accumulated endpoint. Signed delta contributions may share K when replacing
+value contains one regular payload and a signed weight. K alone identifies
+a record and is unique in accumulated state before or after maintenance. Signed delta contributions may share K when replacing
 a payload. No packed payload list or extra key suffix is permitted. Physical columns may split record fields.
 **Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
@@ -261,21 +261,17 @@ they do not need a function computing the next existing key.
 
 The flat KV access contract is a user-specified architectural requirement. Feldera's existing
 `K → {V → weight}` representation remains the baseline for operator state. The storage adapter reuses
-its physical group structure with folded K and payload/weight/bit rows, and exposes flat KV contributions. An
+its physical group structure with folded K and payload/weight rows, and exposes flat KV contributions. An
 operator requests a key or range; the adapter computes encoded bounds, seeks the KV cursor, and decodes
 the required fields from the returned entries. The backend compares byte keys without maintaining a
 separate index on each folded field.
 
-The proposed Q3 scan keeps the current order identifier, required old/new parent payloads, and four running
-scalars: old/new qualifying-line count and revenue. It advances through the order's encoded range and adds
-each qualifying line's weighted contribution to those scalars. Once the range ends, it produces the old/new
-state tuples required by the selected access, including parent fields when reconstructing a joined state.
-The scan does not retain a vector or hash map of
-all line tuples. Its summary state does not grow with line count; storage pages, decoding buffers, variable
+The proposed Q3 scan keeps the current order identifier and the required parent payloads. It advances
+through the order's encoded range and emits the accumulated line or joined rows requested by the operator.
+It does not retain a vector or hash map of all line tuples. Storage pages, decoding buffers, variable
 payload sizes, and shared-consumer buffers still count toward the memory budget.
 
-A consumer that requires individual line tuples receives them incrementally through a cursor. Computed
-aggregate tuples are likewise cursor results; neither requires a complete reconstructed relation in memory.
+A consumer that requires individual line or joined tuples receives them incrementally through a cursor.
 An operator API that requires an immutable batch object must receive explicitly budgeted storage, including
 spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
 
@@ -293,15 +289,16 @@ flat weighted-KV adapter. Select a byte-key type/comparator with the required le
 how batches, merging, reads, and snapshots preserve the encoded values.
 
 Flat KV shape does not select update semantics. The index identifier selects the payload schema. A
-replacement appends two flat records at the same folded key: `(old_payload, -1, NEW)` and
-`(new_payload, +1, NEW)`. The prior positive contribution remains readable through the OLD view. The bit
-marks contribution timing, not weight sign or the payload's before/after origin. K is the record identity.
+replacement appends two flat records at the same folded key: `(old_payload, -1)` and
+`(new_payload, +1)`. The prior positive contribution remains visible in the snapshot taken before append.
+The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
-alone would lose a payload replacement whose net weight change is zero. Each resolved endpoint remains
+alone would lose a payload replacement whose net weight change is zero. Each resolved state remains
 unique by K. The generic spine internally orders same-K delta values; this does not require an
 order-preserving payload encoding or add V to the merged-index search key. The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
-or relational-consistency enforcement. The plan defines bit reuse across batches without a whole-index rewrite.
+or relational-consistency enforcement. Snapshot membership selects before or after state; no stored status
+bit or clearing pass is needed.
 
 ## Shared scan sessions bound ownership and memory
 
@@ -335,7 +332,7 @@ The cited document is modified working-tree content inspected on 2026-09-28, bas
 
 Each reader holds a **view lease**.
 One owner appends the complete transaction-supplied delta to the same merged index before opening any
-new-view reader. If related Lineitem locations must change, the transaction supplies those row changes;
+after-maintenance reader. If related Lineitem locations must change, the transaction supplies those row changes;
 the storage adapter does not infer them from an Order change. Publishing these views to operators is
 distinct from committing externally visible results.
 The runtime must report completion of all consumers, including output-state updates and work across steps.
@@ -348,11 +345,11 @@ Physical cursor EOF alone does not establish that completion.
 
 ```text
 process_batch(input, consumer_plan):
-    owner = begin_owner(input.batch_id, total_memory_budget)
+    owner = begin_owner(total_memory_budget)
     try:
-        owner.old = reference_current_source_batches()
+        owner.before = reference_current_source_batches()
         update_base_storage_and_indexes(input.supplied_changes)  # appends to this index exactly once
-        owner.new = reference_source_batches_after_complete_append()
+        owner.after = reference_source_batches_after_complete_append()
         owner.publish_to(consumer_plan)                       # views no longer change
 
         provider = ReconstructedStateProvider(owner)
@@ -371,15 +368,16 @@ process_batch(input, consumer_plan):
         owner.release_snapshot_references()
 ```
 
-The new view resolves complete-tuple signed updates already appended to the index; it must preserve both
+The after-maintenance read resolves complete-tuple signed updates already appended to the index; it must preserve both
 payloads of a replacement at an unchanged folded identity. The completion/abort calls state required runtime
-transaction behavior, not a new WAL design. On failure, recovery must determine the committed endpoint before
+transaction behavior, not a new WAL design. On failure, recovery must determine which changes entered the
+maintained view before
 retry. Source records and output progress must not advance independently. Temporary read handles reference
 existing batches; they create no tuple copies, historical-version catalog, or expiration policy.
 
 ### Requests retain the existing operator contract
 
-A request identifies the accumulated relation, requested keys, old/new view, and required key/value order.
+A request identifies the accumulated relation, requested keys, before/after maintenance state, and required key/value order.
 The provider derives bounds with the record-type codecs. Sharing is chosen when the consumer plan is prepared,
 so every reader is registered before scanning. A session may scan a coalesced range and readers may filter
 within it, but two arbitrary overlapping requests do not automatically share a mutable cursor.
@@ -408,9 +406,9 @@ prepare_access(requests, owner):
                     owner.reserve_sort_budget(), account_all_temporary_io))
 ```
 
-Compatibility includes batch/view identity, encoded range, decoder requirements, and forward traversal.
-Independent views or ranges use independent sessions in this minimal design. Sharing one traversal across
-old/new views requires an additional reader distinguishing both endpoints and returning weights and payloads; the lifecycle
+Compatibility includes read-state identity, encoded range, decoder requirements, and forward traversal.
+Independent states or ranges use independent sessions in this minimal design. Sharing one traversal across
+before/after states requires access to both immutable snapshot inventories and their weighted payloads; the lifecycle
 above permits it but does not imply it is already implemented. Readers needing an independent seek close
 and reopen their own access instead of repositioning a cursor under other consumers. Replayed reads are
 charged. Existing operator seek/order behavior must still be honored.
@@ -541,256 +539,111 @@ retained-state baseline; report high-water bytes and every spill, reread, sort, 
 
 ## Merged index reconstructs integrator outputs
 
-> [!NOTE]
-> **Glossary**
->
-> **Integrator** — An operator that accumulates its input deltas into output state.
-
-An **integrator** produces accumulated state. The merged index replaces access to that
-accumulated output; it does not reconstruct the integrator's input delta stream. Downstream IVM computation
-continues to receive deltas through the existing path and requests accumulated state through the provider.
-
-> [!NOTE]
-> **Glossary**
->
-> **delay** — `z^-1`, the previous batch's value.
-
-The lecture note [Maintaining a Query, One Change at a
-Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276)
-contains “Equivalent Q3 circuits” (Figure 4). Its panel (c) and Feldera's generic aggregate show different
-implementations of the same grouping semantics. **The lecture note's panel (c) has one integrator inside
-grouping**, for Count/Revenue state. The figure names that
-state `M`; this note calls it `H`. A **delay** supplies `H_old`, from which
-the old aggregate tuple is computed. The delay retains information but is not a second integrator.
-The `A` integrator appears in the subsequent Orders join. See the
-[actual figure source](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59) and
-[five-integrator explanation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405).
+The selected Q3 maintenance target is the unfiltered, unaggregated join `J = (O ⋈ C) ⋈ L`.
+Here `O`, `C`, and `L` are accumulated Orders, Customers, and extended Lineitems; `B = O ⋈ C`
+is the intermediate join. The join equalities match customer and order identities. They are part
+of the relation definition. Market-segment and date predicates belong to a query consuming `J`.
+The maintained `J` includes customer, order, and line identities, segment, order and ship dates,
+ship priority, price, and discount, with the joined weight. Keeping line identity prevents two
+otherwise identical Q3-visible lines from being collapsed before the query groups them.
 
 ```mermaid
 flowchart LR
-    subgraph Grouping[Lecture note panel c - grouping]
-        DL[Line deltas] --> F[Filter and compute count-revenue deltas]
-        F --> IH[Integrator H - the only integrator in grouping]
-        IH --> HN[H new]
-        HN --> EN[Emit new group tuple]
-        HN --> Z[One-batch delay]
-        Z --> HO[H old]
-        HO --> EO[Emit old group tuple]
-        EN --> D[New tuple minus old tuple]
-        EO --> D
-        D --> DA[Delta A]
-    end
-    subgraph OrdersJoin[Following Orders join - other inputs omitted]
-        DA --> IA[Integrator A]
-        IA --> AN[A new for join lookup]
-        DA --> JD[Changed-left join branch]
-    end
+    DO[Order changes] --> O[Accumulated O]
+    DC[Customer changes] --> C[Accumulated C]
+    O --> B[Join B = O join C]
+    C --> B
+    DL[Extended line changes] --> L[Accumulated L]
+    B --> J[Maintained J = B join L]
+    L --> J
+    J --> Q[Q3 query: filter, group, order, limit]
 ```
 
-For an order changing from count/revenue `(2,100)` to `(3,130)`, the grouping's two emit functions produce
-`(order,100)` and `(order,130)`. Subtraction produces `-[[order,100]] + [[order,130]]`. No retained aggregate-output
-collection is necessary inside this grouping: `H_old` already contains the information needed to compute
-the old tuple. The following join integrates `Delta A` because it needs accumulated `A` when Orders changes.
-The five integrators remain `H`, `A`, eligible Orders, `B`, and eligible Customers; no sixth one is implied.
-
-Retaining the prior aggregate tuple serves the same old-state role as the delay in the lecture note's panel (c). The
-precise
-objects differ: the figure delays the summary `H`, whereas output retention preserves the emitted tuple
-`A = E(H)`. For the fixed, pointwise group-emission function `E`, moving the delay across `E` preserves the
-value:
+The merged-index provider supplies requested accumulated state to the **existing** incremental join
+operators. Its reads of before-maintenance state exclude pending contributions. Reads of after-maintenance
+state include them. With `ΔO`, `ΔC`, and `ΔL` as signed input changes, the selected join orientation gives:
 
 ```text
-E(H[t-1]) = (z^-1 E(H))[t] = A[t-1]
+B_before = O_before ⋈ C_before
+B_after  = O_after  ⋈ C_after
+ΔB       = O_before ⋈ ΔC + ΔO ⋈ C_after
+
+J_before = B_before ⋈ L_before
+J_after  = B_after  ⋈ L_after
+ΔJ       = B_before ⋈ ΔL + ΔB ⋈ L_after
 ```
 
-This follows directly from the definition of a one-batch delay. It does not require a new integrator or a
-separate durable output copy in the merged-index design. It requires access to the correct preceding state,
-including group absence. The two following old-value paths are equivalent:
-
-```mermaid
-flowchart LR
-    H[Summary H] --> ZH[Delay summary to H old]
-    ZH --> E1[Emit group tuple]
-    E1 --> O1[Old tuple A]
-    H --> E2[Emit group tuple]
-    E2 --> ZA[Retain previous emitted tuple]
-    ZA --> O2[Same old tuple A]
-```
-
-Weighted source tuples can satisfy either read. Resolve complete-tuple weights at the requested endpoint
-of the current transaction before grouping:
+These are the same old/current-trace choices made by Feldera's
+[incremental join](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749).
+The provider supplies state tuples; the operator computes `ΔB` and `ΔJ`. The circuit binding must identify
+its actual accumulated read sites and preserve their key/value ordering and weighted cursor behavior.
+The provider reads the appropriate snapshot and returns weighted tuples to join operators. The input
+delta is retained separately and supplied to their existing delta ports.
 
 ```text
-weight_old(tuple) = sum(weight of that tuple in effective OLD contributions)
-weight_new(tuple) = weight_old(tuple) + sum(weight of that tuple in effective NEW contributions)
-H_at(k, endpoint) = sum(weight_endpoint(line) * (1, revenue(line))
-                       for qualifying line tuples in order k)
-A_at(k, endpoint) = {(k, H_at(k,endpoint).revenue) -> 1} if H_at(k,endpoint).count > 0 else empty
-old_tuple = A_at(k, OLD)
-new_tuple = A_at(k, NEW)
+provider.open(relation, requested_keys, state):
+    assert relation in {O, C, L, B}
+    assert state in {BEFORE_MAINTENANCE, AFTER_MAINTENANCE}
+    source = scan_owner.access(requested_keys, state)
+    return reconstruct_requested_relation(relation, source)
+
+# Existing IVM path receives ΔO, ΔC, and ΔL unchanged.
+# It requests accumulated O, C, L, or B from provider.open as needed.
+# It computes and applies ΔJ to the maintained J exactly once.
 ```
 
-NEW accumulated state includes both OLD and NEW contributions; selecting only NEW records would return the
-delta. Read handles, the batch-relative contribution bit, and range cursors implement these two endpoint
-reads. No per-record timestamp history is required; Feldera's root computation still uses unit time.
-Payload replacements and supplied key changes preserve the complete tuples needed at both endpoints.
-This is one computation's before/after access, not a multi-versioning feature. A negative weight alone does
-not identify which batch it belongs to. Given the endpoint and weighted payloads, the provider can reconstruct
-the delayed state without separately storing the old aggregate tuple.
+`O`, `C`, and `L` reconstruct by decoding and consolidating their source records. `B` reconstructs
+matching order/customer rows, multiplying their weights. A range cursor can stream the rows needed for a
+requested order without materializing all of `J`. Shared sessions may reuse decoded rows across compatible
+requests; they still return the same tuples, weights, and ordering to each operator. The maintained `J`
+remains a separate output relation; reconstruction does not feed a full snapshot back into a delta input.
 
-Feldera's generic aggregate makes a different computation/storage tradeoff. It computes new group values
-from an accumulated input collection `X` and retrieves the old aggregate tuple from accumulated output `A`.
-Here `X` means whatever indexed collection that generic operator receives; it is not necessarily the raw
-Lineitem relation or the `H` in the lecture note's panel (c). The source lists recomputing old values as an
-alternative, but selects output retention
-([aggregate
-construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L452-L499),
-[design
-rationale](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)).
-
-```mermaid
-flowchart LR
-    DX[Input deltas] --> IX[Accumulate input X]
-    IX --> XN[Current accumulated X]
-    DX --> KEYS[Affected keys]
-    KEYS --> AG[Compute new aggregate values]
-    XN --> AG
-    AG --> U[Upsert - retract old tuple and insert new tuple]
-    U --> DA[Delta A]
-    DA --> IA[Accumulate output A]
-    IA --> Z[One-batch delay]
-    Z --> AO[Previous output A]
-    AO --> U
-```
-
-`Upsert` here converts per-key replacement values into weighted tuple changes. Its source explicitly draws
-the output integrator and delayed feedback
-([output-state
-wiring](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/upsert.rs#L90-L109)).
-This diagram explains the runtime comment about two accumulated collections. Its old-output feedback serves
-the same semantic role as delaying and emitting the summary in the lecture note's panel (c). The different wiring is a
-choice
-of where to retain versus recompute information; it does not impose another physical copy on the merged index.
-
-For the chosen lecture-note circuit, the merged-index provider supplies `H_old`/`H_new` to the existing group-tuple
-emitters and separately supplies accumulated `A` to the Orders join. It does not add an output integrator
-inside grouping. If adapting the generic runtime path instead, the provider must satisfy that path's `X`
-and previous-`A` state requests. Select bindings for the actual circuit rather than combining the state
-inventories of these two implementations. In either case, input delta streams remain unchanged.
-
-The provider boundary is a request for an accumulated relation, keys, and old/new view. Its result must match
-ordinary retained-state access, including tuple values, multiplicities, group absence, ordering, and cursor
-behavior. Reconstruction can compute a summary or a prior output tuple to satisfy that request; it does not
-introduce another aggregate delta-emission algorithm. Both providers feed the same operator path.
-
-For example, if an existing additive-summary algorithm expects a value difference, a revenue change from
-100 to 110 produces a difference of 10 in that summary's value. If the algorithm replaces a relation tuple,
-it emits `-[[order,100]] + [[order,110]]`, where `[[t]]` means one copy of tuple `t`. These are different
-output contracts, not interchangeable wire formats: 10 is a revenue difference, whereas -1 and +1 are tuple
-multiplicities. Existing operator code chooses and computes the required form using its deltas and state
-accesses. The merged-index provider supplies the same requested state for either form. It must also preserve
-group existence when count changes, even if revenue does not.
-
-Register a computation routine for each required integrator output. For Q3, one routine scans weighted
-qualifying lines to derive Count/Revenue state `H`; another computes the group relation `A`, including its
-weight-one row or absence; another derives `B` using order payloads. Eligible Orders and Customers have their
-own routines. All derive requested accumulated state from source records in the specified old/new view.
-They do not regenerate operator input deltas or feed full reconstructed snapshots into incremental inputs.
-
-```text
-reconstructors = {
-    H: compute_count_and_revenue_state,
-    A: compute_aggregate_relation,
-    O: derive_eligible_orders,
-    B: derive_aggregate_orders_relation,
-    C: derive_eligible_customers
-}
-
-provider.open(integrator_id, requested_keys, view):
-    compute = reconstructors[integrator_id]
-    source_access = scan_owner.access(requested_keys, view)
-    return compute(source_access)          # same accumulated output as that integrator
-
-# Existing IVM path:
-# receive the existing input delta stream, unchanged
-# request the required integrator outputs and old/new views through provider.open
-# compute and emit changes using the existing operator algorithm
-```
-
-Each routine has its own computation algorithm. It can directly derive its requested state from merged
-source ranges instead of consuming an earlier materialized reconstruction. Routines may share decoded
-records or budgeted per-group summaries when keys and views agree. For example, deriving `A` can reuse the
-count/revenue scalars needed for `H`, but there is no requirement to materialize `H` or run its consumer first.
-Deriving `B` can use the same scan and parent payload. Shared reads are an optimization; the returned state
-must be identical with or without them.
-
-Bind routines to the state accesses present in the chosen circuit. The lecture note's grouping requests summaries;
-its Orders join requests accumulated `A`. A generic runtime path that reads previous output can request it
-from an `A` reconstruction routine at the before endpoint, equivalently emitting the reconstructed old `H`.
-These are different consumers of reconstructible state, not a requirement
-to add every illustrated state object to the chosen circuit. Concrete runtime bindings remain implementation
-work; only accumulated-state access changes, while delta processing remains in the shared IVM path.
-
-Delayed views and join-side accesses obey the same rule. Existing join wiring uses left delta/current right
-and right delta/delayed left ([join
-construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749));
-separate reconstruction routines must honor the requested view rather than choosing one themselves.
+The [lecture note's Q3 figure](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59)
+and [five-state account](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)
+illustrate a filtered, aggregate-first circuit with `H` and `A` states. They document another maintenance
+boundary and are not the active `O`/`C`/`B`/`L`/`J` circuit. Feldera's generic
+[aggregation implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)
+remains relevant when Q3's consuming query groups the maintained joined rows.
 
 ## Weighted reconstruction preserves group existence
 
-For each requested relation `T` and key set `K`, require
-`reconstruct(T, source_s, K) = T(database_s) restricted to K`, including payloads, weights, and group existence.
-The supplied note identifies the five logical **integrators**
-([five accumulations](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)) and their
-weighted reconstruction ([definitions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L508)).
+For each requested accumulated relation `T` and key set `K`, reconstruction must return the same
+consolidated tuples and weights as ordinary retained state, restricted to `K`. Signed replacements with
+the same folded K can have different payloads; do not sum by K before resolving the complete signed
+changes. The snapshot taken before append excludes the delta; the snapshot taken after append includes it:
 
 ```text
-N_s(k) = sum_l w_s(l) * [qualifying(l)]
-R_s(k) = sum_l w_s(l) * [qualifying(l)] * rho(l)
-A_s    = { (k, R_s(k)) -> 1 | N_s(k) > 0 }
-deltaA = A_new - A_old
-delta(L join R) = deltaL join R_new + L_old join deltaR
+weight_before(K, payload) = sum(weights for this K and payload in before_snapshot)
+weight_after(K, payload)  = sum(weights for this K and payload in after_snapshot)
+                            = weight_before(K, payload) + weight_delta(K, payload)
+weight(B row)             = weight(O row) * weight(C row)
+weight(J row)             = weight(B row) * weight(L row)
 ```
 
-`N_s(k)` and `R_s(k)` answer different questions: does the group exist, and what is its revenue? In this
-scope, complete endpoint states have nonnegative tuple multiplicities, so `N>0` means at least one qualifying
-line remains. Signed input changes are first applied to obtain that state.
+The resolved before and after states each have at most one active payload per folded K under the
+transaction's key invariant. During a replacement, the delta can contain both
+`(K, old_payload, -1)` and `(K, new_payload, +1)`. Its net weight by K is zero, but its two complete
+changes must survive until they are combined with the preexisting record. Distinct line identities remain
+separate in `J`, even if their dates, price, and discount happen to match.
 
-| Qualifying line state for key `k` | `N` | `R` | Required group relation |
-| --- | --- | --- | --- |
-| No lines | 0 | 0 | Absent |
-| One line with zero revenue | 1 | 0 | `(k,0)` at weight 1 |
-| Two lines with revenues 60 and 40 | 2 | 100 | `(k,100)` at weight 1 |
-
-Deleting the sole zero-revenue line changes `(N,R)` from `(1,0)` to `(0,0)`. The revenue difference is zero,
-but the aggregate relation must emit `-[[k,0]]`. A revenue-only summary would miss this deletion. This is
-grouped aggregation: an empty group emits no tuple. The count is not an extra query output column.
-
-When reconstructing only `A` by a full range scan, detecting any surviving qualifying line is sufficient for
-group existence; the provider need not separately persist a count. When supplying the requested summary `H`,
-it must return both `N` and `R` to match the existing integrator contract. Count is useful in an additive
-summary because insertion/deletion weights update it directly; a stored presence bit alone cannot tell
-whether deleting one line removes the last of several lines. Revenue could determine presence only under an
-additional strict-positivity guarantee, which this note does not assume.
-
-A generalized line bag of weight three contributes three times its revenue;
-retracting one copy changes its weight to two. This illustrates weighted reconstruction, not SQL equivalence
-of the aggregation-first rewrite with duplicate parent rows. That equivalence assumes valid primary/foreign
-keys and unit-weight parents ([query
-assumptions](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L177)).
-The count/existence requirement also appears in the
-[operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39).
+Grouping is performed by the consuming Q3 query, after applying its segment and date predicates. For
+example, one qualifying joined row with zero revenue produces a group with revenue zero; no qualifying
+rows produce no group. This distinction is handled by the query's aggregate operator over `J`, not by a
+Count/Revenue summary stored in the merged index. The historical
+[operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39)
+explains the same group-existence rule for its aggregate-first circuit.
 
 > [!NOTE]
 > **Glossary**
 >
-> **support** — tuples with nonzero weight.
+> **support** — changed complete tuples with nonzero signed weight.
 
-The main note's replacement has two distinct complete line tuples at weights `-1` and `+1`. Their key weights
-sum to zero, but their **support** still marks the order as affected. Identical
-complete-tuple changes that cancel
-can be discarded. Changed customers expand to descendant orders in either endpoint; **rekeys** include both
-prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L564)).
+Affected-key discovery inspects the support of complete signed changes before projecting to folded keys.
+A payload replacement has a `-1` and `+1` at the same K, whose key-only sum would hide the change.
+Customer changes affect matching orders and lines in the before and after states. Physical key moves
+appear only when the transaction supplies both old and new extended keys; the adapter does not synthesize
+them. The historical [affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L564)
+provides related algebra, subject to this transaction-supplied update contract.
 
 ## Immutable batches preserve old reads
 
@@ -802,7 +655,7 @@ prefixes ([affected-key derivation](../../../../DBSP_w_merged_index/dbsp-merged-
 `Spine::ro_snapshot()` collects existing `Arc` references into a vector; it does not copy tuples, memory
 batches, or files. It performs no writes, creates no persistent historical version, and sets no expiration
 date. Dropping the handle releases references. Existing backend resource cleanup is separate from the
-snapshot operation and does not depend on the old/new bit. See the
+snapshot operation does not alter any record. See the
 [exact call-path audit](flat-kv-storage-plan.md#snapshot-ownership-does-not-copy-the-database).
 `SpineSnapshot` supports
 constructing a view with additional batches
@@ -811,12 +664,12 @@ composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d6
 Combined cursors add matching
 weights and suppress zero totals
 ([consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
-These establish existing weighted-batch primitives. The flat KV adapter must implement equivalent old/new
+These establish existing weighted-batch primitives. The flat KV adapter must implement equivalent before/after
 visibility for encoded payloads; concatenating batches or overwriting equal byte keys is not by itself proof
 of correct weighted reconstruction. Reads must resolve the pending changes without waiting for compaction.
 
 The integration keeps a read handle to pre-append source batches, appends all supplied flat signed records
-once, then **seals** the complete batch for the new view before maintenance. The transaction supplies related
+once, then **seals** the complete update set for after-maintenance reads. The transaction supplies related
 row changes; the storage layer does not cascade them. Release computation-owned read handles when every
 consumer has finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
 ([transaction
@@ -824,17 +677,14 @@ scheduling](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d69
 [commit
 flushing](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/circuit/circuit_builder.rs#L7777-L7805)).
 
-These primitives support the design but do not establish atomic publication or restart of the new shared
-index. Integration must coordinate source batches and output progress so recovery exposes a complete endpoint
-and retry does not apply weights twice. Feldera's root Z-sets have no per-record old/new boolean: incoming
-signed delta batches and delayed/current traces provide that distinction. The required physical bit is
-merged-index adapter metadata whose interpretation must follow those existing operator boundaries; both
-signed records of a replacement belong to the incoming delta. Existing operators receive reconstructed
-weighted tuples, not a new bit to interpret. See the
-[runtime mapping and join equation](flat-kv-storage-plan.md#feldera-determines-oldnew-semantics).
-The bit is independent of signed weight and does not imply multi-versioning, time travel, or expiration of old
-records/files. The [storage plan](flat-kv-storage-plan.md#reusing-the-bit-over-successive-batches) specifies
-batch-relative interpretation and metadata rebinding without a full data copy or whole-index bit rewrite.
+These primitives support the design but do not establish atomic publication or restart of the shared
+index. Integration must coordinate source changes and output progress so retry does not apply weights twice.
+Feldera's root Z-sets use incoming signed delta batches and delayed/current accumulated state. The adapter
+keeps the same delta available to operators, takes one snapshot before inserting it into the merged index,
+and takes another afterward. The second snapshot includes the delta; the first does not. No per-record
+status bit or phase change is required. Ordinary compaction can consolidate batches while the immutable
+batches referenced by a snapshot remain readable. See the
+[runtime mapping and join equation](flat-kv-storage-plan.md#compatibility-with-feldera-operators).
 
 ## Consumers determine the required payload
 
@@ -850,7 +700,7 @@ reconstruction replaces selected internal integrator collections, while the pipe
 maintained. The primary manuscript distinguishes
 [stored sources from materialized output](../../../../merged_index_interesting_orderings/main.tex#L783)
 and explicitly places [remaining query work beyond the pipeline](../../../../merged_index_interesting_orderings/main.tex#L751).
-For Q3 this includes final ranking/limit and projection. LeanStore's
+For Q3 this includes segment/date filtering, revenue aggregation, final ranking/limit, and projection. LeanStore's
 [Q3 execution](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q3/query.tpp#L446)
 includes both the pipeline scan and top-10 selection; its full query execution is not the maintenance boundary.
 Q5/Q10 below illustrate why **residual execution** may need richer view rows than revenue summaries.
@@ -867,10 +717,10 @@ intermediate views; that composition is future work, for which this project prov
 >
 > **gate** — eligibility filter.
 
-Q5's selected Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** and
-preserves
-supplier identifiers for later matching. A changing gate needs consistent old/new multiplicities and an
-expansion to affected customers; a boolean gate suffices only under the key assumptions
+The historical Q5 Customer–Orders–Lineitem expression consumes an external Nation/Region **gate** and
+preserves supplier identifiers for later matching. Extending the predicate-free maintained-view design
+to Q5 would retain the fields needed by that gate and apply it in the consuming query. A changing gate
+still needs consistent before/after multiplicities under the historical design
 ([Q5 consumer and
 gate](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q5/query.tpp#L219-L335)).
 
@@ -881,7 +731,7 @@ plan](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787
 [customer output
 consumption](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q10_family/visitor.hpp#L126-L200)).
 These are analytical boundary checks, not
-executed Feldera reconstruction experiments. Any comparison must match actual date endpoints: the inspected
+executed Feldera reconstruction experiments. Any comparison must match actual date bounds: the inspected
 implementations use day offsets ([Q5
 bounds](https://github.com/alicia-lyu/leanstore/blob/305ad0a98b147d048a37a1eba3787b35b1181b85/frontend/tpch/q5/query.tpp#L307-L315),
 [Q10
@@ -939,8 +789,8 @@ criteria; this report does not claim they have been met.
 
 | Acceptance question | Required evidence |
 | --- | --- |
-| Are operator inputs and results identical? | Run the same operator path with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and old/new views, then check value-difference or retraction/insertion outputs against independent evaluation. |
-| Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and old/new visibility. |
+| Are operator inputs and results identical? | Run the same join operators with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and before/after maintenance reads, then check retraction/insertion outputs against independent evaluation. |
+| Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and before/after snapshot reads. |
 | Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify before/after source reads, reference-only snapshots, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
 | Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |

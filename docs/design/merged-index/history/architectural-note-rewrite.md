@@ -231,3 +231,25 @@ are permitted. V is data, and its fields use the existing serializer without an 
 The generic spine's internal ordering of same-K delta values is documented separately from K-only endpoint
 identity and ordering. The plan also explains that source records are stored before Q3 predicates: unchanged
 Orders and Lineitems remain necessary when a Customer changes segment.
+
+### Operator read handles replace stored status bits
+
+On 2026-09-28, further review clarified that base/pending describes whether changes have been incorporated
+into a maintained view. The user then chose Feldera's existing operator wiring and removed the storage-bit
+requirement entirely. This supersedes the plan's old/new and base/pending row bits, `Delta(batch_id)` roles,
+transaction counters, metadata rebinding, status-aware merging, and bit-clearing compaction. The batch-role
+workaround originated in the plan, not in user requirements or existing Feldera behavior.
+
+The index appends the delta before view maintenance. Operators retain separate handles for the signed
+delta and accumulated source state before/after append. A compaction output may combine prior-state and
+delta contributions: original immutable batches remain readable through retained handles. References do
+not block compaction or load entire files into memory. No batch must remain exclusively base or pending.
+Normal immutable-file replacement, write amplification, and file cleanup remain unchanged. Completion
+releases computation-owned handles and never appends the delta a second time. Active explanations now
+say before/after state rather than "endpoint."
+
+The user also confirmed that maintained view definitions exclude selection predicates. The active Q3
+example now maintains an unfiltered, unaggregated Customer–Orders–Lineitem join with the fields needed by
+the consuming query. That query applies segment/date filters, revenue aggregation, ordering, and limit.
+This supersedes the filtered aggregate-first five-state example as the active design; attached manuscripts
+remain references and are not modified. Equality join conditions continue to define the joined view.
