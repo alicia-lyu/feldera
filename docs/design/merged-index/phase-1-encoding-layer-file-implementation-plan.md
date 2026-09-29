@@ -1,6 +1,10 @@
 # Phase 1 implementation plan: index-owned folding and one layer-file batch
 
-Date: 2026-09-29. Status: ready for implementation; no Phase 1 code is claimed.
+Date: 2026-09-29. Status: historical implementation plan; see the
+[Phase 1 implementation note](phase-1-implementation-note.md) for the current code and tests.
+The later code-generation preparation separates source-index field selection from the merged
+index's tag assignments, as specified by the current
+[constitution](folded-key-layer-file-plan.md#merged-index-constitution).
 
 ## Boundary and source of truth
 

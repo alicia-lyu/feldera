@@ -195,8 +195,9 @@ encoding and two-column layer-file fixture.
 
 Following the [primary folded-key design](../../../../merged_index_interesting_orderings/main.tex#L545),
 the merged index uses standard KV storage: `index.fold(source, record) → encoded_value`.
-**Folding** produces the byte key. The Customer–Orders–Lineitem index defines each source's
-source roster, ordered key fields, and shared domains in its
+**Folding** produces the byte key. Static source indexes select base relations, ordered key
+fields, and payload fields; the Customer–Orders–Lineitem merged index assigns shared domain
+and source tags in its
 [constitution](folded-key-layer-file-plan.md#merged-index-constitution). Its logical
 customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. Another merged index may fold
 one of these sources differently. A generic `MergedIndex<D>` base will hold shared folding and

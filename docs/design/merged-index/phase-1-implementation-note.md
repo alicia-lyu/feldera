@@ -5,10 +5,16 @@ Date: 2026-09-29.
 ## Encoding and ownership
 
 `crates/dbsp/src/trace/merged_index/` contains the crate-internal
-`MergedIndex<D>` base. A static `MergedIndexDefinition` supplies the source roster,
-ordered key fields, shared domain tags, and typed key projection and reconstruction.
+`MergedIndex<D>` base. Static source-index descriptors supply logical base-relation
+IDs, ordered key fields and key-domain IDs, and payload field IDs. A
+`MergedIndexDefinition` selects those source indexes, assigns domain and source
+byte tags, and supplies typed key projection and reconstruction.
 `CustomerOrdersLineitemIndex` wraps the base for the Customer, Orders, and extended
 Lineitem constitution. Source row types do not own a global folding operation.
+`CustomerPrimary`, `OrdersByCustomer`, and `LineitemByCustomer` name the three
+source-index descriptors. Their base-relation IDs are symbolic; generated row
+types and field-provenance checks belong to later code generation. The same
+source-index descriptor can receive different byte tags in another merged index.
 
 Each signed `i32` key field is encoded as big-endian bytes after flipping its sign
 bit. The ordered domain tags are `0x01` for customer, `0x02` for order, and `0x03`
@@ -16,6 +22,8 @@ for line; `0x00` marks the terminal index identifier. Complete keys have lengths
 7, 12, or 17 bytes. Unfolding validates the length, each domain tag, and the
 terminal source identifier before reconstructing a typed key. Prefixes omit the
 terminal index identifier and can end before a complete key.
+The code-generation example's `i64` keys and index tag `255` are illustrative.
+This implementation retains its `i32` keys and terminal index tag `0x00`.
 
 The three payload types match the [Step 2 payload contract](folded-key-layer-file-plan.md#payload-signed-weight-and-replacement).
 They use Feldera's `rkyv` serializer. Decoding validates the folded key before
@@ -33,9 +41,10 @@ sorter, consolidation, `Batch`, or `Trace` implementation.
 
 ## Verification
 
-On 2026-09-29, `cargo fmt --check` passed. The focused merged-index tests passed
-(5/5), covering exact key bytes, malformed keys, signed ordering and boundaries,
-payload round trips and corruption, the generic base with a second definition,
+On 2026-09-29, `cargo fmt --check` passed. After the source-index descriptor
+refactor, the focused merged-index tests passed (6/6), covering exact key bytes,
+malformed keys, signed ordering and boundaries, payload round trips and
+corruption, source-index metadata, the generic base with a second definition,
 and seeks and child-row reads in a temporary layer file. The existing two-column
 storage tests also passed (8/8). The fixture checks a present key, a missing key
 between records, a customer prefix that stops at the next customer, and a seek

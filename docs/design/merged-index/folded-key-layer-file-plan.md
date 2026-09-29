@@ -67,42 +67,53 @@ first becoming a file. Staging must have a memory bound and spill when needed.
 
 ## Merged-index constitution
 
-The constitution defines **which sources belong to this merged index**, **which ordered fields
-form each source's key**, and **which fields across sources share a domain**. A domain name
-denotes the same logical identity across those fields and assigns them one byte tag. The
-folding rule belongs to the merged index and source together; another merged index may use a
-different key path for the same source. Use this small notation for the constitution. Phase 1
-may represent it as a static Rust declaration rather than implementing a parser or macro:
+The constitution separates logical key domains, source indexes over base relations, and the
+merged index's byte-tag assignments. A key domain names the same logical identity across
+fields, not merely a shared primitive type. Each source index selects ordered key fields and
+payload fields from one base relation. The merged index chooses its participating source
+indexes and assigns their domain and source tags. Another merged index can assign different
+tags to the same source index. These declarations are static Rust metadata in Phase 1; the
+notation does not imply a parser or macro:
 
 ```text
-merged_index CustomerOrdersLineitem {
-    domain customer = 0x01
-    domain order    = 0x02
-    domain line     = 0x03
+key_domain customer : i32;
+key_domain order    : i32;
+key_domain line     : i32;
 
-    source Customer         id 0x01 key (customer_id: customer)
-    source Orders           id 0x02 key (customer_id: customer, order_id: order)
-    source ExtendedLineitem id 0x03 key (customer_id: customer, order_id: order,
-                                          line_id: line)
+source_index CustomerPrimary on Customer {
+    keys { customer_id as customer }
+    payload { segment }
+}
+
+source_index OrdersByCustomer on Orders {
+    keys { customer_id as customer, order_id as order }
+    payload { order_day, ship_priority }
+}
+
+source_index LineitemByCustomer on ExtendedLineitem {
+    keys { customer_id as customer, order_id as order, line_id as line }
+    payload { ship_day, extended_price_cents, discount_hundredths }
+}
+
+merged_index CustomerOrdersLineitem {
+    key_domain_tags { customer = 0x01, order = 0x02, line = 0x03 }
+    sources {
+        CustomerPrimary    = 0x01,
+        OrdersByCustomer   = 0x02,
+        LineitemByCustomer = 0x03,
+    }
 }
 ```
 
-The three `source` entries are the source roster. Within each entry, the ordered `key` fields
-name the source fields used for this index. The `customer` domain groups `customer_id` from all
-three sources under tag `0x01`; the `order` domain groups `order_id` from Orders and extended
-Lineitem under tag `0x02`. This definition states relationships among source fields; the
-record encoding below puts their tags into K. The `id` distinguishes the source in the final
-key bytes and is separate from the domain tags. Domain sharing is explicit: fields can share a
-domain despite different names, and matching names alone do not establish one.
-Field names here describe logical fields in the supplied extended records; typed source adapters
-bind their actual Rust fields. In Rust, use a generic `MergedIndex<D>` base whose shared methods
-fold and unfold keys, construct prefixes, and later own the common batch/file machinery. The
-`MergedIndexDefinition` parameter `D` supplies the source roster, ordered key fields, domain
-tags, typed source-key projection, and payload schemas. `CustomerOrdersLineitemIndex` is a
-concrete wrapper around `MergedIndex<CustomerOrdersLineitemDefinition>`; its definition supplies
-the constitution above. The generic base must take all source-specific choices from `D`, so
-another merged index can reuse it with a different definition and fold the same source
-differently. This is composition rather than class inheritance in Rust.
+The three entries in `sources` are the merged-index roster. Each source index owns its base
+relation ID and field selection; the merged definition owns the byte tags. Shared domain IDs,
+rather than field-name similarity, establish shared ordering. The source discriminator follows
+the terminal `INDEX` tag and is distinct from a field-domain tag. The base-relation link is a
+symbolic ID until generated row types exist, so field provenance is checked by future codegen.
+In Rust, the generic `MergedIndex<D>` base folds and unfolds keys and constructs prefixes from
+these definitions. `CustomerOrdersLineitemIndex` wraps
+`MergedIndex<CustomerOrdersLineitemDefinition>`. Source row types have no global folding
+operation; the merged index retains that behavior and the common file mapping.
 
 ## Record representation
 
