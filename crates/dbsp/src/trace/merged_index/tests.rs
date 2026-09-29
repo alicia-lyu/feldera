@@ -1,3 +1,7 @@
+use super::customer_orders_lineitem::{
+    CUSTOMER, CUSTOMER_DOMAIN, CUSTOMER_KEY_DOMAIN, CUSTOMER_PRIMARY,
+    CustomerOrdersLineitemDefinition,
+};
 use super::*;
 use crate::{
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
@@ -120,29 +124,27 @@ struct Alternative;
 
 impl MergedIndexDefinition for Alternative {
     type Key = SourceKey;
-    const DOMAINS: &'static [Domain] = &[Domain {
-        name: "customer_alt",
+    const KEY_DOMAINS: &'static [KeyDomain] = &[CUSTOMER_KEY_DOMAIN];
+    const SOURCE_INDEX_SPECS: &'static [SourceIndexSpec] = &[CUSTOMER_PRIMARY];
+    const DOMAIN_BYTE_TAGS: &'static [DomainByteTag] = &[DomainByteTag {
+        domain: CUSTOMER_DOMAIN,
         tag: 9,
     }];
-    const SOURCES: &'static [Source] = &[Source {
-        name: "Customer",
-        id: 1,
-        key_fields: &[KeyField {
-            name: "customer_id",
-            domain: 0,
-        }],
+    const SOURCE_BYTE_TAGS: &'static [SourceByteTag] = &[SourceByteTag {
+        source_index: CUSTOMER,
+        tag: 8,
     }];
 
-    fn project(key: &Self::Key) -> (u8, Vec<i32>) {
+    fn project(key: &Self::Key) -> (SourceIndexId, Vec<i32>) {
         match key {
-            SourceKey::Customer(id) => (1, vec![*id]),
+            SourceKey::Customer(id) => (CUSTOMER, vec![*id]),
             _ => panic!("alternative definition only owns Customer"),
         }
     }
 
-    fn construct(id: u8, fields: &[i32]) -> Option<Self::Key> {
+    fn construct(id: SourceIndexId, fields: &[i32]) -> Option<Self::Key> {
         match (id, fields) {
-            (1, [customer]) => Some(SourceKey::Customer(*customer)),
+            (CUSTOMER, [customer]) => Some(SourceKey::Customer(*customer)),
             _ => None,
         }
     }
@@ -154,8 +156,96 @@ fn generic_base_uses_definition_domains() {
     let key = SourceKey::Customer(7);
     let bytes = alternative.fold(&key).unwrap();
     assert_eq!(bytes.as_bytes()[0], 9);
+    assert_eq!(bytes.as_bytes().last(), Some(&8));
     assert_eq!(alternative.unfold(bytes.as_bytes()), Ok(key.clone()));
     assert_ne!(bytes, index().fold(&key).unwrap());
+}
+
+#[test]
+fn q3_descriptors_keep_logical_fields_separate_from_tags() {
+    let specs = CustomerOrdersLineitemDefinition::SOURCE_INDEX_SPECS;
+    assert_eq!(
+        specs.iter().map(|spec| spec.id.0).collect::<Vec<_>>(),
+        ["CustomerPrimary", "OrdersByCustomer", "LineitemByCustomer"]
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|spec| spec.base_relation.0)
+            .collect::<Vec<_>>(),
+        ["Customer", "Orders", "ExtendedLineitem"]
+    );
+    assert_eq!(
+        CustomerOrdersLineitemDefinition::KEY_DOMAINS
+            .iter()
+            .map(|domain| (domain.id.0, domain.primitive))
+            .collect::<Vec<_>>(),
+        [
+            ("customer", KeyPrimitive::I32),
+            ("order", KeyPrimitive::I32),
+            ("line", KeyPrimitive::I32)
+        ]
+    );
+    for spec in specs {
+        for field in spec.key_fields {
+            assert!(
+                CustomerOrdersLineitemDefinition::KEY_DOMAINS
+                    .iter()
+                    .any(|domain| domain.id == field.domain)
+            );
+            assert!(!spec.payload_fields.contains(&field.name));
+        }
+        assert!(
+            spec.payload_fields
+                .iter()
+                .all(|field| !spec.key_fields.iter().any(|key| key.name == *field))
+        );
+    }
+    assert_eq!(
+        specs[0]
+            .key_fields
+            .iter()
+            .map(|field| field.domain.0)
+            .collect::<Vec<_>>(),
+        ["customer"]
+    );
+    assert_eq!(
+        specs[1]
+            .key_fields
+            .iter()
+            .map(|field| field.domain.0)
+            .collect::<Vec<_>>(),
+        ["customer", "order"]
+    );
+    assert_eq!(
+        specs[2]
+            .key_fields
+            .iter()
+            .map(|field| field.domain.0)
+            .collect::<Vec<_>>(),
+        ["customer", "order", "line"]
+    );
+    assert_eq!(specs[0].payload_fields, ["segment"]);
+    assert_eq!(specs[1].payload_fields, ["order_day", "ship_priority"]);
+    assert_eq!(
+        specs[2].payload_fields,
+        ["ship_day", "extended_price_cents", "discount_hundredths"]
+    );
+
+    let index = index();
+    let customer = index.customer_prefix(12);
+    let order = index.order_prefix(12, -4);
+    let line = index.line_prefix(12, -4);
+    assert!(order.starts_with(&customer));
+    assert!(line.starts_with(&order));
+    assert_eq!(line.last(), Some(&3));
+    assert_eq!(
+        index
+            .fold(&SourceKey::Lineitem(12, -4, 7))
+            .unwrap()
+            .as_bytes()[..line.len()],
+        line
+    );
 }
 
 fn test_buffer_cache() -> Option<std::sync::Arc<crate::storage::buffer_cache::BufferCache>> {

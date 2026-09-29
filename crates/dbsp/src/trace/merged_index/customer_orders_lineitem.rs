@@ -1,42 +1,79 @@
 use rkyv::{Archive, Deserialize, Serialize, bytecheck};
 
 use super::{
-    Domain, FoldedKey, KeyField, MergedIndex, MergedIndexDefinition, PayloadBytes, Source,
+    BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
+    MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
+    SourceIndexSpec,
 };
 use crate::storage::file::{Deserializer, to_bytes};
 
-const CUSTOMER: u8 = 1;
-const ORDERS: u8 = 2;
-const LINEITEM: u8 = 3;
+pub(super) const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
+const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");
+const LINEITEM: SourceIndexId = SourceIndexId("LineitemByCustomer");
+pub(super) const CUSTOMER_DOMAIN: KeyDomainId = KeyDomainId("customer");
+const ORDER_DOMAIN: KeyDomainId = KeyDomainId("order");
+const LINE_DOMAIN: KeyDomainId = KeyDomainId("line");
 
 const CUSTOMER_FIELDS: &[KeyField] = &[KeyField {
     name: "customer_id",
-    domain: 0,
+    domain: CUSTOMER_DOMAIN,
 }];
 const ORDERS_FIELDS: &[KeyField] = &[
     KeyField {
         name: "customer_id",
-        domain: 0,
+        domain: CUSTOMER_DOMAIN,
     },
     KeyField {
         name: "order_id",
-        domain: 1,
+        domain: ORDER_DOMAIN,
     },
 ];
 const LINEITEM_FIELDS: &[KeyField] = &[
     KeyField {
         name: "customer_id",
-        domain: 0,
+        domain: CUSTOMER_DOMAIN,
     },
     KeyField {
         name: "order_id",
-        domain: 1,
+        domain: ORDER_DOMAIN,
     },
     KeyField {
         name: "line_id",
-        domain: 2,
+        domain: LINE_DOMAIN,
     },
 ];
+
+pub(super) const CUSTOMER_KEY_DOMAIN: KeyDomain = KeyDomain {
+    id: CUSTOMER_DOMAIN,
+    primitive: KeyPrimitive::I32,
+};
+const ORDER_KEY_DOMAIN: KeyDomain = KeyDomain {
+    id: ORDER_DOMAIN,
+    primitive: KeyPrimitive::I32,
+};
+const LINE_KEY_DOMAIN: KeyDomain = KeyDomain {
+    id: LINE_DOMAIN,
+    primitive: KeyPrimitive::I32,
+};
+
+pub(super) const CUSTOMER_PRIMARY: SourceIndexSpec = SourceIndexSpec {
+    id: CUSTOMER,
+    base_relation: BaseRelationId("Customer"),
+    key_fields: CUSTOMER_FIELDS,
+    payload_fields: &["segment"],
+};
+const ORDERS_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
+    id: ORDERS,
+    base_relation: BaseRelationId("Orders"),
+    key_fields: ORDERS_FIELDS,
+    payload_fields: &["order_day", "ship_priority"],
+};
+const LINEITEM_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
+    id: LINEITEM,
+    base_relation: BaseRelationId("ExtendedLineitem"),
+    key_fields: LINEITEM_FIELDS,
+    payload_fields: &["ship_day", "extended_price_cents", "discount_hundredths"],
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SourceKey {
@@ -50,39 +87,42 @@ pub(crate) struct CustomerOrdersLineitemDefinition;
 impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
     type Key = SourceKey;
 
-    const DOMAINS: &'static [Domain] = &[
-        Domain {
-            name: "customer",
+    const KEY_DOMAINS: &'static [KeyDomain] =
+        &[CUSTOMER_KEY_DOMAIN, ORDER_KEY_DOMAIN, LINE_KEY_DOMAIN];
+    const SOURCE_INDEX_SPECS: &'static [SourceIndexSpec] =
+        &[CUSTOMER_PRIMARY, ORDERS_BY_CUSTOMER, LINEITEM_BY_CUSTOMER];
+
+    const DOMAIN_BYTE_TAGS: &'static [DomainByteTag] = &[
+        DomainByteTag {
+            domain: CUSTOMER_DOMAIN,
             tag: 1,
         },
-        Domain {
-            name: "order",
+        DomainByteTag {
+            domain: ORDER_DOMAIN,
             tag: 2,
         },
-        Domain {
-            name: "line",
+        DomainByteTag {
+            domain: LINE_DOMAIN,
             tag: 3,
         },
     ];
-    const SOURCES: &'static [Source] = &[
-        Source {
-            name: "Customer",
-            id: CUSTOMER,
-            key_fields: CUSTOMER_FIELDS,
+
+    const SOURCE_BYTE_TAGS: &'static [SourceByteTag] = &[
+        SourceByteTag {
+            source_index: CUSTOMER,
+            tag: 1,
         },
-        Source {
-            name: "Orders",
-            id: ORDERS,
-            key_fields: ORDERS_FIELDS,
+        SourceByteTag {
+            source_index: ORDERS,
+            tag: 2,
         },
-        Source {
-            name: "ExtendedLineitem",
-            id: LINEITEM,
-            key_fields: LINEITEM_FIELDS,
+        SourceByteTag {
+            source_index: LINEITEM,
+            tag: 3,
         },
     ];
 
-    fn project(key: &SourceKey) -> (u8, Vec<i32>) {
+    fn project(key: &SourceKey) -> (SourceIndexId, Vec<i32>) {
         match *key {
             SourceKey::Customer(c) => (CUSTOMER, vec![c]),
             SourceKey::Orders(c, o) => (ORDERS, vec![c, o]),
@@ -90,8 +130,8 @@ impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
         }
     }
 
-    fn construct(source_id: u8, fields: &[i32]) -> Option<SourceKey> {
-        match (source_id, fields) {
+    fn construct(source_index: SourceIndexId, fields: &[i32]) -> Option<SourceKey> {
+        match (source_index, fields) {
             (CUSTOMER, [c]) => Some(SourceKey::Customer(*c)),
             (ORDERS, [c, o]) => Some(SourceKey::Orders(*c, *o)),
             (LINEITEM, [c, o, l]) => Some(SourceKey::Lineitem(*c, *o, *l)),
@@ -151,9 +191,9 @@ impl CustomerOrdersLineitemIndex {
     }
 
     pub fn line_prefix(&self, customer_id: i32, order_id: i32) -> Vec<u8> {
-        let mut prefix = self.order_prefix(customer_id, order_id);
-        prefix.push(CustomerOrdersLineitemDefinition::DOMAINS[2].tag);
-        prefix
+        self.base
+            .prefix_with_next_tag(LINEITEM, &[customer_id, order_id])
+            .unwrap()
     }
 
     pub fn encode_payload(&self, payload: &SourcePayload) -> Result<PayloadBytes, String> {
@@ -167,12 +207,12 @@ impl CustomerOrdersLineitemIndex {
     }
 
     pub fn decode_payload(&self, key: &[u8], bytes: &[u8]) -> Result<SourcePayload, String> {
-        self.unfold(key)?;
-        match key.last().copied().unwrap() {
+        let (source_index, _) = CustomerOrdersLineitemDefinition::project(&self.unfold(key)?);
+        match source_index {
             CUSTOMER => decode::<CustomerPayload>(bytes).map(SourcePayload::Customer),
             ORDERS => decode::<OrdersPayload>(bytes).map(SourcePayload::Orders),
             LINEITEM => decode::<LineitemPayload>(bytes).map(SourcePayload::Lineitem),
-            _ => unreachable!("unfold checked the source identifier"),
+            _ => unreachable!("unfold returned a declared source index"),
         }
     }
 }
