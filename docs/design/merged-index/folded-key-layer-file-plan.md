@@ -344,30 +344,44 @@ and shared scan sessions follow in Step 3.
 ## Verification and implementation sequence
 
 > [!NOTE]
-> **Proposed implementer checklist.** These tests and milestones have not been
-> comprehensively audited or reviewed by a human expert. They are not additional concepts
-> needed to understand the record layout or snapshot behavior.
+> **Provisional sequence.** These phases are suggestions, not a comprehensively audited or
+> human-expert-reviewed implementation program. Each phase should begin with a focused plan
+> that checks the relevant Feldera APIs, then implement only its stated boundary and record
+> evidence before starting the next phase.
 
-Use Rust tests with an independent `BTreeMap<(Key, Payload), Weight>` oracle for signed
-consolidation. The map is an algebraic oracle, not the search-key definition. Test supplied
-related-row changes as given, without storage-generated moves or foreign-key checks.
+### Phase 1: Encoding and one readable layer-file batch
 
-1. **Codecs:** golden K bytes, fold/unfold, malformed keys, payload round trips, prefix scans,
-   no END/LOOKUP tag or status/kind fields.
-2. **Batches and files:** many K groups across blocks, same-K signed rows, forward/reverse/exact
-   seeks, memory/file agreement, persistence/reopen, spilled staging, and normal merge output.
-3. **Replacement and uniqueness:** `−P100/+P120` at one K, signed multiplicity, zero key-net
-   weight with changed payload, multiple post-append payloads after an incomplete replacement,
-   rejection before incorporation, and one active payload after valid full compaction.
-4. **Snapshots and I/O:** no snapshot-triggered data copy or file I/O; small range reads fetch
-   needed blocks. Compact B and D while before/after/delta handles remain live, then check all
-   three results. Test files larger than the cache and measure resident memory.
-5. **Append and integration:** delta indexed before view maintenance, distinct before/after
-   handles, one append, and consecutive inputs. In Step 3, compare operator read sites and the
-   unfiltered maintained join with independent evaluation; test simultaneous changes, consumers
-   finishing at different times, and the consuming Q3 query's filters and aggregation.
+- **Plan:** Confirm the folded-key bytes, payload serialization, and two-column file mapping.
+- **Build:** Implement the codecs and a small layer-file fixture that can be written and read.
+- **Evidence to advance:** Keys and payloads round-trip; a seek finds the intended records.
 
-Implement in three milestones: codecs and layer-file layout; memory/file batches and weighted
-merging; append/snapshot/I/O tests. Each includes focused tests and rustdocs. Run formatting,
-crate checks, and affected storage/spine tests. Step 3 integrates typed reconstruction and
-runtime recovery. Preserve normal immutable-file compaction and its write amplification.
+### Phase 2: Batches and cursors
+
+- **Plan:** Audit the batch interfaces and choose how memory-backed and file-backed batches
+  expose the same ordered cursor, including bounded staging.
+- **Build:** Add both batch forms and reads over multiple keys and batches.
+- **Evidence to advance:** The cursor returns requested signed contributions after spill and
+  reopen; file-backed reads fetch needed blocks without materializing the whole index.
+
+### Phase 3: Signed merging and K uniqueness
+
+- **Plan:** Locate the consolidation and uniqueness-check boundaries; confirm whether source
+  key constraints can establish the accumulated-state invariant.
+- **Build:** Merge signed contributions and provide a changed-K validation helper for Step 3.
+- **Evidence to advance:** A valid replacement leaves one active payload, an incomplete one is
+  detected, and ordinary compaction preserves the same accumulated state. Use an independent
+  signed-weight oracle when checking these outcomes.
+
+### Phase 4: Append and snapshots
+
+- **Plan:** Specify ownership and lifetime of the before, delta, and after handles using the
+  existing append and snapshot APIs.
+- **Build:** Append the delta once and expose the two accumulated-state reads to storage callers.
+- **Evidence to advance:** Each handle returns its intended rows while normal compaction merges
+  earlier and delta batches; snapshot creation does not copy the relation.
+
+### Step 3 handoff
+
+Plan operator read-site wiring, typed reconstruction, and runtime completion/rollback separately.
+Step 2's storage evidence does not establish those integration properties. Each phase should
+leave a short implementation note, focused tests, and any API findings for the next planner.
