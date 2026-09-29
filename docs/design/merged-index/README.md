@@ -153,7 +153,7 @@ that optimization in the baseline comparison.
 
 ## What changes in our design
 
-The [Step 2 storage plan](flat-kv-storage-plan.md) records the current implementation contract and the
+The [Step 2 storage plan](folded-key-layer-file-plan.md) records the current implementation contract and the
 user's clarifications: folded keys, weighted payload rows, transaction-supplied related-row
 changes, and temporary read handles without multi-versioning or expiration policies.
 
@@ -320,7 +320,7 @@ the existing operators. No record status bit is needed: snapshot membership dete
 each read sees. If `B` is the pre-append index state and `D` the signed delta, the manuscript's `R−`
 is read from `B` and `R+` from `B + D`. A negative weight in `D` retracts an old payload in `R+`;
 it does not place that delta record in `R−`. See the
-[runtime compatibility contract](flat-kv-storage-plan.md#compatibility-with-feldera-operators).
+[runtime compatibility contract](folded-key-layer-file-plan.md#compatibility-with-feldera-operators).
 The transaction explicitly supplies any intended Lineitem placement changes; storage neither invents
 related-row updates nor enforces relational consistency. Completion does not append the same delta again.
 Snapshots reference existing batches without copying their tuples or files.
@@ -375,7 +375,7 @@ source provenance and implementation acceptance criteria.
    runtime read sites, including before/after maintenance state and cursor operations. Specify the Rust adapter interfaces
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
-2. **Implement folded-key batches on the existing LSM.** Follow the [detailed storage plan](flat-kv-storage-plan.md):
+2. **Implement folded-key batches on the existing LSM.** Follow the [detailed storage plan](folded-key-layer-file-plan.md):
    paper-defined folded keys and values containing one payload and signed weight. Reuse
    existing file columns; implement record cursor access and the spine's batch/merge contracts. Append the supplied delta
    once before view maintenance; use reference-only read handles. Verify replacements, signed updates,

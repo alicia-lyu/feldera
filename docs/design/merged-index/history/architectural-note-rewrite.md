@@ -193,7 +193,7 @@ criteria remain future verification work.
 ## Step 2 storage clarifications
 
 On 2026-09-28, the user requested a detailed linked plan and corrected the proposed physical representation
-and ownership assumptions. The new [Step 2 plan](../flat-kv-storage-plan.md) records every clarification.
+and ownership assumptions. The new [Step 2 plan](../folded-key-layer-file-plan.md) records every clarification.
 It supersedes earlier proposals in this history that made the phase bit optional, added persistent parent
 lookup, or made the storage layer generate descendant moves.
 

@@ -257,7 +257,7 @@ different folding rules. Their logical positions `(c)`,
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
 value kind field is needed. Encoding must preserve the required cross-type order. The
-[Step 2 plan](flat-kv-storage-plan.md#record-representation) specifies the concrete prototype bytes and
+[Step 2 plan](folded-key-layer-file-plan.md#record-representation) specifies the concrete prototype bytes and
 the mapping to Feldera's existing file columns and cursors. Prefix scans seek and step until the prefix changes;
 they do not need a function computing the next existing key.
 
@@ -660,7 +660,7 @@ provides related algebra, subject to this transaction-supplied update contract.
 batches, or files. It performs no writes, creates no persistent historical version, and sets no expiration
 date. Dropping the handle releases references. Existing backend resource cleanup is separate from the
 snapshot operation does not alter any record. See the
-[exact call-path audit](flat-kv-storage-plan.md#snapshot-ownership-does-not-copy-the-database).
+[exact call-path audit](folded-key-layer-file-plan.md#snapshot-ownership-does-not-copy-the-database).
 `SpineSnapshot` supports
 constructing a view with additional batches
 ([snapshot ownership and
@@ -688,7 +688,7 @@ keeps the same delta available to operators, takes one snapshot before inserting
 and takes another afterward. The second snapshot includes the delta; the first does not. No per-record
 status bit or phase change is required. Ordinary compaction can consolidate batches while the immutable
 batches referenced by a snapshot remain readable. See the
-[runtime mapping and join equation](flat-kv-storage-plan.md#compatibility-with-feldera-operators).
+[runtime mapping and join equation](folded-key-layer-file-plan.md#compatibility-with-feldera-operators).
 
 ## Consumers determine the required payload
 
