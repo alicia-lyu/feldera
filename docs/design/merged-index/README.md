@@ -171,8 +171,9 @@ The encoding must preserve the intended cross-type ordering and let the access l
 
 Each value contains one regular payload and its signed weight. The index
 identifier in the folded key determines the record type; `INDEX` is its domain tag, not an extra end marker.
-K alone identifies a record and is unique in the accumulated state before or after maintenance. A replacement delta can carry
-negative and positive contributions with the same K. Physical columns may store their fields separately;
+Base records have unique K. A replacement delta can carry negative and positive contributions with the
+same K; a post-append read can return multiple nonzero payloads for that K. The adapter does not enforce
+post-append K uniqueness. Physical columns may store their fields separately;
 the adapter exposes flat KV contributions with no packed payload list or added key suffix.
 A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it streams one order's source rows to supply

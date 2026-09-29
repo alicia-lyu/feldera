@@ -41,8 +41,9 @@ historical implementation proposals are not additional user instructions.
    before and after appending it. There is no old/new or base/pending bit in stored records.
 10. Snapshot handles own references to immutable batches. They introduce no transaction timestamp,
     historical version catalog, expiration policy, or batch-role override. Normal LSM compaction continues.
-11. K alone identifies a record and is unique in the accumulated source state both before and after
-    applying the supplied delta. Signed delta contributions may share K.
+11. K identifies base records, which have unique K. A signed delta may contain several payloads at the
+    same K. The post-append weighted state is not required to be unique by K; storage must return all
+    nonzero `(K, payload, weight)` results without enforcing a key constraint.
 12. Maintained view definitions contain no selection predicates. Q3's segment/date filters, aggregation,
     ordering, and limit belong to the query consuming the unfiltered joined view.
 
@@ -129,39 +130,47 @@ payload and its weight data slot.
 The earlier wording incorrectly made that API terminology sound like a property of the merged-index data.
 A physical layout must preserve the K-only identity and lookup contract, regardless of how it stores V's fields.
 
-### Unique records and signed replacement deltas
+### Base key uniqueness and signed replacement deltas
 
-In the source state before and after applying a delta, `state[K]` is absent or contains one payload and
-its nonzero weight. A payload change updates the same identity. Here `P100` and `P120` differ in price:
+Base records have unique K. The incoming signed delta may contain several payloads for that K. For one
+valid replacement, `P100` and `P120` differ in price:
 
 ```text
-Existing batch B:
+Existing base batch B:
   K -> { payload=P100, weight=+1 }
 
 Supplied delta batch D:
   K -> { payload=P100, weight=-1 }
   K -> { payload=P120, weight=+1 }
 
-before snapshot references B:       K -> P100, weight +1
-snapshot after append references B,D: K -> P120, weight +1
+before snapshot references B:         (K, P100, +1)
+after snapshot references B and D:   (K, P120, +1)
 ```
 
-K-only identity does not allow summing weights for K while discarding its data: the delta's weights sum
-to zero, but its payload changes. A retraction cancels the matching payload contribution. Payload equality
-serves signed-change algebra; it does not introduce another record identity.
+The replacement example happens to leave one active payload at K. This is an outcome of those weights,
+not an invariant of the post-append state. Another delta, such as `(K, P120, +1)` without a matching
+retraction, leaves both `(K, P100, +1)` and `(K, P120, +1)` in the after snapshot. The storage reader
+returns both. It neither selects one payload nor rejects the update. Any constraint on the transaction's
+result belongs to the source relation/runtime contract, not this merged-index read path.
+
+K-only record identity does not mean summing every weight for K and discarding the payload: the replacement
+delta's key-only weight is zero, yet its payload changes. Feldera's Z-set consolidation sums weights for
+equal complete `(K, payload)` contributions. This is an algebraic matching rule; payload is not added to
+the folded search key or the base-record identity.
 
 ```text
 read_source_state(snapshot, K):
-    rows = all contributions for K in snapshot.batches
-    totals = sum weights separately for each equal payload
-    discard payloads whose total is zero
-    require at most one remaining payload    # source primary-key assumption, checked in tests
-    return absent or (K, remaining_payload, its_weight)
+    totals = map from payload to signed weight
+    for (payload, weight) in snapshot.contributions_at(K):
+        totals[payload] += weight
+    for (payload, weight) in totals:
+        if weight != 0:
+            yield (K, payload, weight)     # zero, one, or several rows
 ```
 
-A partially merged batch need not contain the complete source state. Test key uniqueness only after
-combining all contributions in the requested snapshot. The delta is a separate signed input collection;
-reading it alone does not return accumulated state.
+The before snapshot uses only batches present before the append; the after snapshot includes the delta.
+A partially merged batch need not contain a complete state. The delta is also retained separately as an
+operator input; reading it alone does not return accumulated state.
 
 ## Accumulated state, snapshots, and maintenance
 
@@ -344,8 +353,8 @@ column 1: P100 -> -1
 
 Every second-level row contains exactly one payload and weight. Its associated parent supplies K.
 The raw cursor flattens this physical grouping into `(K, V)` contributions. No V contains a packed list.
-The accumulated source state, before or after applying the delta, has at most one payload for K. Multiple
-physical columns are an implementation choice that reuses the file format; the logical index has one folded search key.
+Base records are unique by K; a delta or post-append read may expose several weighted payloads for K.
+Multiple physical columns reuse the file format; the logical index has one folded search key.
 
 Both writer levels already require unique keys within each group. Write payload rows with `write1`, then
 write their parent K with `write0`. Consolidate contributions with equal K and payload
@@ -401,16 +410,18 @@ The Q3 codec's decoded enum is a utility for validation, not a typed query-acces
 
 ## Verification and implementation sequence
 
-Use Rust tests and an independent `BTreeMap<Key, (Payload, Weight)>` source-state oracle. Represent input
-changes separately as signed contributions. Apply the complete change set per K before checking uniqueness;
-its ordering must not cause a false violation. Test supplied related-row changes exactly as given.
+Use Rust tests and an independent `BTreeMap<(Key, Payload), Weight>` Z-set oracle. This map is an
+algebraic test oracle, not the search-key or record-identity definition. Seed base records with unique K,
+then apply the complete signed delta by `(K, payload)` equality. Permit multiple nonzero payloads at K
+in the post-append result. Test supplied related-row changes exactly as given.
 
 1. **Key and payload codecs:** golden key bytes, fold/unfold, malformed keys, serializer round trips,
    prefix scans, no extra END/LOOKUP tags, kind fields, or status bits, and one payload per contribution row.
 2. **File layout and cursors:** many outer keys across blocks; same-K signed contributions; forward,
    reverse, and exact seeks; flattened cursor agreement; ordinary payload/weight consolidation.
-3. **Weighted state:** replacements, cancellation, signed multiplicity, unique K in before/after source
-   states, zero net weight with a changed payload, repeated updates to one K, persistence, and reopen.
+3. **Weighted state:** unique K in base input; several same-K delta rows; replacements, cancellation,
+   signed multiplicity, zero net key weight with changed payload, multiple active post-append payloads at
+   one K, persistence, and reopen. Readers must return all nonzero results.
 4. **References and I/O:** snapshots perform no file-block reads or writes. Seeking a small range reads
    needed blocks. Force compaction of prior batches plus delta while before, after, and delta handles
    remain referenced; all three must retain their distinct intended results. Use files larger than the

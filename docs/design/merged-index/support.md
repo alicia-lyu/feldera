@@ -246,9 +246,10 @@ Feldera adapter below remains to be implemented.
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
 The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
-value contains one regular payload and a signed weight. K alone identifies
-a record and is unique in accumulated state before or after maintenance. Signed delta contributions may share K when replacing
-a payload. No packed payload list or extra key suffix is permitted. Physical columns may split record fields.
+value contains one regular payload and a signed weight. Base records have unique K. Signed delta
+contributions may share K, and a post-append read may contain multiple nonzero payloads at K. Storage
+returns all such weighted rows; it does not enforce a post-append key constraint. No packed payload
+list or extra key suffix is permitted. Physical columns may split record fields.
 **Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
@@ -293,9 +294,10 @@ replacement appends two flat records at the same folded key: `(old_payload, -1)`
 `(new_payload, +1)`. The prior positive contribution remains visible in the snapshot taken before append.
 The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
-alone would lose a payload replacement whose net weight change is zero. Each resolved state remains
-unique by K. The generic spine internally orders same-K delta values; this does not require an
-order-preserving payload encoding or add V to the merged-index search key. The transaction supplies all intended related-row
+alone would lose a payload replacement whose net weight change is zero. The base records are unique by K;
+the post-append weighted state need not be. The generic spine internally orders same-K delta values;
+this does not require an order-preserving payload encoding or add V to the merged-index search key.
+The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
 or relational-consistency enforcement. Snapshot membership selects before or after state; no stored status
 bit or clearing pass is needed.
@@ -620,8 +622,8 @@ weight(B row)             = weight(O row) * weight(C row)
 weight(J row)             = weight(B row) * weight(L row)
 ```
 
-The resolved before and after states each have at most one active payload per folded K under the
-transaction's key invariant. During a replacement, the delta can contain both
+Base records have unique K. The after-state reader yields every nonzero weighted payload for K; it does
+not assume the transaction leaves only one. During a replacement, the delta can contain both
 `(K, old_payload, -1)` and `(K, new_payload, +1)`. Its net weight by K is zero, but its two complete
 changes must survive until they are combined with the preexisting record. Distinct line identities remain
 separate in `J`, even if their dates, price, and discount happen to match.

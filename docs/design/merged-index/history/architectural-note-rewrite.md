@@ -253,3 +253,12 @@ example now maintains an unfiltered, unaggregated Customer–Orders–Lineitem j
 the consuming query. That query applies segment/date filters, revenue aggregation, ordering, and limit.
 This supersedes the filtered aggregate-first five-state example as the active design; attached manuscripts
 remain references and are not modified. Equality join conditions continue to define the joined view.
+
+### Uniqueness applies to base records only
+
+On 2026-09-28, the user clarified that only base records are guaranteed unique by folded K. The prior
+plan incorrectly asserted that applying any signed delta must leave exactly one active payload per K.
+The active plan removes this assertion. Its read cursor consolidates weights for equal `(K, payload)`
+contributions and yields every nonzero result, including several payloads at one K after append. Equality
+of payloads is the Z-set matching rule, not an additional search key or base-record identity. The revised
+tests use a `(K, payload)` map solely as a signed-weight oracle and permit multiple post-append results.
