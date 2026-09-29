@@ -24,6 +24,10 @@ move descendants, enforce relational consistency, or add an `OrderParent` lookup
 folding/unfolding, weighted batches, snapshots, and raw cursors. Typed reconstruction, shared scan sessions,
 view-operator wiring, and runtime transaction recovery follow in Step 3.
 
+> [!NOTE]
+> **Reading guide:** The main text defines behavior. “Implementer detail” callouts identify Feldera
+> methods, traits, and file paths; they can be skipped on a first read.
+
 ## What trace and batch mean, and where their data lives
 
 **Trace** is Feldera's name for an indexed collection of accumulated weighted updates; see its
@@ -49,9 +53,12 @@ Compaction is not a maintenance barrier. It may happen earlier or later than the
 A merge that sees only some contributions for K can still output several payload rows; when it sees
 all contributions for a valid K, its output has one surviving row. A staging file has an on-disk
 index but is not part of the merged index until appended. An appended memory batch is indexed without
-first becoming a file. [Feldera's accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295)
-inserts batches into a spine; [fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445)
-can choose memory or storage. This adapter must explicitly bound staging and spill when needed.
+first becoming a file. Staging must have a memory bound and spill when needed.
+
+> [!NOTE]
+> **Implementer detail:** [Feldera's accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295)
+> inserts batches into a spine; [fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445)
+> can choose memory or storage. The new adapter must implement the bounded staging choice explicitly.
 
 ## Record representation
 
@@ -180,14 +187,17 @@ aggregate-first circuit is a historical comparison, not this view definition.
 The [DBSP notation](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L213) is:
 `R_minus` (R⁻) is accumulated state before the delta, `R_plus` (R⁺) is accumulated state after
 it, and `deltaR = R_plus - R_minus`. These are not the negative and positive parts of the
-signed delta; unchanged records appear in both states. [Feldera's root time is `()`](../../../crates/dbsp/src/time.rs#L214);
-other circuit timestamp semantics are outside this root-circuit adapter.
+signed delta; unchanged records appear in both states.
 
 | Operator input | Read handle |
 | --- | --- |
 | `deltaR` | Retained input delta batches |
 | `R_minus` | Snapshot taken before appending the delta |
 | `R_plus` | Snapshot taken after appending it; includes prior state plus delta |
+
+> [!NOTE]
+> **Implementer detail:** [Feldera's root time is `()`](../../../crates/dbsp/src/time.rs#L214).
+> Other circuit timestamp semantics are outside this root-circuit adapter.
 
 For example, the [root join](../../../crates/dbsp/src/operator/dynamic/join.rs#L499) computes:
 
@@ -206,24 +216,27 @@ not establish maintenance completion.
 
 ### Snapshot ownership does not copy the database
 
-[`Spine::ro_snapshot`](../../../crates/dbsp/src/trace/spine_async.rs#L2524) constructs a
-[`SpineSnapshot`](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L56) with a vector of
-`Arc<B>` batch references and factories. Its [conversion](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L170)
-uses the spine's [batch inventory](../../../crates/dbsp/src/trace/spine_async.rs#L467).
-It clones references, not tuples, memory batches, or layer files, and does not write files or
-schedule compaction. Its metadata work scales with batch count. A file-backed reference holds
-a reader and metadata; the [file reader](../../../crates/dbsp/src/storage/file/reader.rs#L605)
-loads blocks through the cache when a cursor reaches them. Existing memory batches remain
-resident while referenced; readers, buffers, and cached blocks still consume memory.
+A snapshot copies references to immutable batches, not their tuples or layer files. Creating it
+does not read file blocks, write files, or schedule compaction; its metadata work scales with
+batch count. A file-backed reference holds a reader and metadata. Cursors load requested blocks
+through the cache as they advance. Existing memory batches remain resident while referenced;
+readers, buffers, and cached blocks still consume memory.
 
 A snapshot keeps its original immutable batches readable while the live spine compacts them.
 For example, a before snapshot can keep B, an after snapshot can keep B and D, and the live
 index can replace B and D with M. The snapshot does not lock compaction. Dropping a handle
-releases Rust references; it does not purge records or use an expiration date. Existing backend
-cleanup can delete an uncheckpointed file after its last owner disappears (see the
-[file-reader contract](../../../crates/storage/src/lib.rs#L404) and
-[POSIX destructor](../../../crates/dbsp/src/storage/backend/posixio_impl.rs#L615)). This plan
-adds no historical-version catalog or file-retention policy.
+releases references; it does not purge records or use an expiration date. This plan adds no
+historical-version catalog or file-retention policy.
+
+> [!NOTE]
+> **Implementer detail:** [`Spine::ro_snapshot`](../../../crates/dbsp/src/trace/spine_async.rs#L2524)
+> constructs a [`SpineSnapshot`](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L56)
+> from the [batch inventory](../../../crates/dbsp/src/trace/spine_async.rs#L467) by cloning
+> `Arc<B>` references ([conversion](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L170)).
+> The [file reader](../../../crates/dbsp/src/storage/file/reader.rs#L605) loads blocks on demand.
+> Backend cleanup can delete an uncheckpointed file after its final owner disappears; see the
+> [file-reader contract](../../../crates/storage/src/lib.rs#L404) and
+> [POSIX destructor](../../../crates/dbsp/src/storage/backend/posixio_impl.rs#L615).
 
 ### Append before view maintenance
 
@@ -272,48 +285,50 @@ column 1: P100 -> -1
           P120 -> +1
 ```
 
-K remains the paper's folded key; payload is never appended to it. `write1` writes payload
-rows, then `write0` writes their parent K. Consolidate equal `(K, payload)` contributions
-before writing a batch. The two levels require unique keys within each group, so there is
-no repeated-K writer mode or file-seek change. Reuse level-0 seek/next and child-group
-cursors; prefix termination checks K. The index identifier selects the payload decoder.
+K remains the paper's folded key; payload is never appended to it. Consolidate equal
+`(K, payload)` contributions before writing a batch. File scans seek K and stop when its
+prefix changes. Payload order is internal to batch merging, not a query-level range order.
+The second-level row groups and payload index also exist for singleton groups; measure
+their file-size, cache, and read costs before making performance claims.
 
-The [batch cursor contract](../../../crates/dbsp/src/trace/cursor.rs#L42) and
-[spine merger](../../../crates/dbsp/src/trace/spine_async/list_merger.rs#L197) compare payloads
-within a K group. Use a deterministic `PayloadBytes` comparison and encode equal payloads
-identically with Feldera's serializer. Weight is excluded from payload comparison. This
-ordering is internal: no SQL field order, big-endian payload encoding, or query-level payload
-range is required. The second-level row groups and payload index also exist for singleton
-groups; measure their file-size, cache, and read costs before making performance claims.
+> [!NOTE]
+> **Implementer detail:** Write child payload rows with `write1`, then their parent K with
+> `write0`. The file format requires unique keys within each group, so it needs no repeated-K
+> writer mode or seek change. Reuse level-0 seek/next and child-group cursors. The index
+> identifier selects the payload decoder. The [batch cursor contract](../../../crates/dbsp/src/trace/cursor.rs#L42)
+> and [spine merger](../../../crates/dbsp/src/trace/spine_async/list_merger.rs#L197)
+> compare payloads within K. Use deterministic `PayloadBytes` comparison and serialize equal
+> payloads identically; weight is excluded from the comparison. No SQL field order or
+> big-endian payload encoding is required.
 
 ### Batch and raw-cursor contracts
 
-Implement `MergedIndexBatch` under `crates/dbsp/src/trace/ord/merged_index/`. Put Q3 codecs
-and the storage owner under `crates/dbsp/src/trace/merged_index/`; expose crate-internal APIs.
+Expose `fold`, `unfold`, `append`, `snapshot`, and a cursor with `seek_ge`/`next`.
+For a requested K or range, the cursor advances through the relevant immutable batches in
+key order and yields their stored `(K, payload, weight)` contributions. The state reader
+then sums contributions with equal `(K, payload)`. This reads the requested rows and file
+blocks as needed; it does not load the entire accumulated relation into memory. For the
+replacement above, a lookup of K reads the relevant rows from B and D, then the state
+reader returns only `(K, P120, +1)`; unrelated keys are not materialized. Typed query access
+and shared scan sessions follow in Step 3.
 
-```text
-raw batch row:       (FoldedKey, MergedIndexValue { payload, weight })
-BatchReader::Key:   dynamic FoldedKey
-BatchReader::Val:   dynamic PayloadBytes
-BatchReader::R:     DynZWeight
-BatchReader::Time:  ()
-```
-
-The [Batch contract](../../../crates/dbsp/src/trace.rs#L846) supplies a key/value cursor;
-the raw cursor yields K, payload, and weight from each child row. Generic merging sums
-weights for equal `(K, payload)` across batches. Implement memory and file variants,
-ordered builders, chunked `MergeBatcher` staging, cursor navigation, metadata counts and
-bounds, `persisted`/`from_path`, and storage-destination merges for spilled chunks.
-`key_count()` counts K groups; `len()` counts contribution rows. Reuse `FallbackValBatch`
-for required `Timed<T>`; this prototype uses unit time. Follow dynamic-data/factory
-conventions, order byte wrappers lexicographically, and report no roaring compatibility.
-
-Expose `fold`, `unfold`, `append`, `snapshot`, and raw `seek_ge`/`next`. The cursor returns
-borrowed key/payload bytes and signed weight; advancing invalidates its borrowed row. A raw
-cursor combines immutable batches without materializing the accumulated relation. Typed
-query access and shared scan sessions follow in Step 3.
+> [!NOTE]
+> **Implementer detail:** Implement `MergedIndexBatch` under
+> `crates/dbsp/src/trace/ord/merged_index/`; put Q3 codecs and the storage owner under
+> `crates/dbsp/src/trace/merged_index/`. The [Batch contract](../../../crates/dbsp/src/trace.rs#L846)
+> uses `FoldedKey` as `Key`, `PayloadBytes` as `Val`, `DynZWeight` as `R`, and `()` as
+> `Time`. Implement memory/file variants, ordered builders, chunked `MergeBatcher` staging,
+> cursor navigation, metadata counts/bounds, `persisted`/`from_path`, and storage-destination
+> merges for spills. `key_count()` counts K groups; `len()` counts contribution rows. Reuse
+> `FallbackValBatch` for required `Timed<T>`; follow dynamic-data/factory conventions, order
+> byte wrappers lexicographically, and report no roaring compatibility. The cursor returns
+> borrowed row bytes that become invalid when it advances. Keep these APIs crate-internal.
 
 ## Verification and implementation sequence
+
+> [!NOTE]
+> **Implementer checklist:** The cases below are acceptance tests and build milestones. They
+> are not additional concepts needed to understand the record layout or snapshot behavior.
 
 Use Rust tests with an independent `BTreeMap<(Key, Payload), Weight>` oracle for signed
 consolidation. The map is an algebraic oracle, not the search-key definition. Test supplied
