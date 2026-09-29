@@ -246,20 +246,22 @@ Feldera adapter below remains to be implemented.
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
 The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
-value contains one regular payload, a signed weight, and an old/new contribution bit. Distinct records may
-have equal folded keys; payload replacements must preserve these separate rows. No auxiliary payload list
-or extra key suffix is permitted. **Folding** produces the key. Customer, Orders, and extended Lineitem use
+value contains one regular payload, a signed weight, and an old/new contribution bit. K alone identifies
+a record and is unique in each accumulated endpoint. Signed delta contributions may share K when replacing
+a payload. No packed payload list or extra key suffix is permitted. Physical columns may split record fields.
+**Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
 value kind field is needed. Encoding must preserve the required cross-type order. The
 [Step 2 plan](flat-kv-storage-plan.md#flat-record-representation) specifies the concrete prototype bytes and
-the repeated-key file/seek support needed by Feldera. Prefix scans seek and step until the prefix changes;
+the mapping to Feldera's existing file columns and cursors. Prefix scans seek and step until the prefix changes;
 they do not need a function computing the next existing key.
 
-This is a user-specified architectural requirement. Feldera's existing `K → {V → weight}` representation
-remains the baseline for operator state; it is not the physical layout chosen for the merged index. An
+The flat KV access contract is a user-specified architectural requirement. Feldera's existing
+`K → {V → weight}` representation remains the baseline for operator state. The storage adapter reuses
+its physical group structure with folded K and payload/weight/bit rows, and exposes flat KV contributions. An
 operator requests a key or range; the adapter computes encoded bounds, seeks the KV cursor, and decodes
 the required fields from the returned entries. The backend compares byte keys without maintaining a
 separate index on each folded field.
@@ -283,7 +285,7 @@ machinery. `Spine` is generic over its batch type
 ([generic trace
 implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L2085-L2090));
 the adapter must satisfy its batch contracts. This does not mean reusing `FileIndexedWSet` unchanged. The file layer
-separates key data from auxiliary data, and documents typed comparisons
+provides per-level search keys with associated data and documents typed comparisons
 ([file representation and
 ordering](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65)).
 That provides a place to investigate a flat byte-key representation; it does not establish an existing
@@ -293,8 +295,11 @@ how batches, merging, reads, and snapshots preserve the encoded values.
 Flat KV shape does not select update semantics. The index identifier selects the payload schema. A
 replacement appends two flat records at the same folded key: `(old_payload, -1, NEW)` and
 `(new_payload, +1, NEW)`. The prior positive contribution remains readable through the OLD view. The bit
-marks contribution timing, not weight sign or the payload's before/after origin. Consolidation matches
-complete `(key, payload)` identity, not folded key alone. The transaction supplies all intended related-row
+marks contribution timing, not weight sign or the payload's before/after origin. K is the record identity.
+Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
+alone would lose a payload replacement whose net weight change is zero. Each resolved endpoint remains
+unique by K. The generic spine internally orders same-K delta values; this does not require an
+order-preserving payload encoding or add V to the merged-index search key. The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
 or relational-consistency enforcement. The plan defines bit reuse across batches without a whole-index rewrite.
 

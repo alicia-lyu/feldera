@@ -165,8 +165,10 @@ The encoding must preserve the intended cross-type ordering and let the access l
 
 Each value contains one regular payload, its signed weight, and an old/new contribution bit. The index
 identifier in the folded key determines the record type; `INDEX` is its domain tag, not an extra end marker.
-Different complete tuples can have the same folded key and must remain separate flat records, without a
-payload list or an added key suffix. A range cursor reads KV entries in byte-key order and
+K alone identifies a record and is unique in each accumulated endpoint. A replacement delta can carry
+negative and positive contributions with the same K. Physical columns may store their fields separately;
+the adapter exposes flat KV contributions with no packed payload list or added key suffix.
+A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it scans one order's lines while updating old/new
 count and revenue accumulators, then returns the requested state tuples. It does not build an in-memory
 relation containing all those lines.
@@ -382,8 +384,8 @@ source provenance and implementation acceptance criteria.
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
 2. **Implement flat KV storage on the existing LSM.** Follow the [detailed storage plan](flat-kv-storage-plan.md):
-   paper-defined folded keys and flat values containing one payload, weight, and old/new bit. Implement
-   repeated-key file rows, iterator seeks, and the spine's batch/merge contracts. Append the supplied delta
+   paper-defined folded keys and flat values containing one payload, weight, and old/new bit. Reuse
+   existing file columns; implement flat cursor access and the spine's batch/merge contracts. Append the supplied delta
    once before view maintenance; use reference-only read handles. Verify replacements, signed updates,
    transaction-supplied key changes, and bit reuse across batches. No parent lookup, storage-generated
    child moves, multi-versioning, or expiry mechanism is part of this step. Typed scan sessions follow in Step 3.

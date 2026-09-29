@@ -25,8 +25,9 @@ historical implementation proposals are not additional user instructions.
    Numeric tag values are encoding choices; parent-before-child order constrains their relative values.
 2. There is no `OrderParent` record, lookup namespace, or required reverse-parent lookup in this adapter.
 3. Scans seek a prefix and advance the storage iterator until the prefix changes. No `successor` API is needed.
-4. Each physical row is one flat `(K, V)` pair. `V` contains one regular payload, a signed weight, and one
-   old/new bit. There are no payload lists, per-record `format` fields, or redundant `kind` fields.
+4. Each logical record is one flat `(K, V)` pair; physical columns may split its fields. `V` contains one
+   regular payload, a signed weight, and one old/new bit. There are no payload lists, per-record `format`
+   fields, or redundant `kind` fields.
 5. An **immutable batch** contains many records and keys; it can reside in memory or in a **layer file**.
    Examples showing one key are excerpts from batches, not one file per key.
 6. Existing state and the incoming delta belong to the same merged index. Append the complete delta before
@@ -41,6 +42,8 @@ historical implementation proposals are not additional user instructions.
    required physical bit is adapter metadata; existing root Z-sets do not contain this bit.
 10. This is not a multi-version database. OLD/NEW describe one transaction's computation. There is no
     historical-version catalog, time-travel API, record/file expiration date, or new deletion policy.
+11. K alone identifies a record and is unique in each accumulated endpoint. Signed delta contributions may
+    share K. Physical columns and backend delta grouping do not change this identity.
 
 ## Flat record representation
 
@@ -91,53 +94,82 @@ FlatValue {
     is_new: bool,                      # serialized as one byte: 0=OLD, 1=NEW
 }
 
-Customer payload = segment_length:u32 | segment:UTF8
-Orders payload   = order_day:i32 | ship_priority:i32
-Lineitem payload = ship_day:i32 | extended_price_cents:i64 | discount_hundredths:i64
+Customer payload = { segment: String }
+Orders payload   = { order_day: i32, ship_priority: i32 }
+Lineitem payload = { ship_day: i32, extended_price_cents: i64, discount_hundredths: i64 }
 ```
 
-Payload scalar encodings are big-endian, dates are integer days since the Unix epoch, and price/discount
-use exact scale-two integers for the Q3 prototype. The index identifier in K selects the payload schema.
-The file serializer provides record framing; `FlatValue` adds no format or kind column. Keep query-ineligible
-records, since later updates can make them eligible.
+Dates use integer days since the Unix epoch; price and discount use exact scale-two integers.
+The payload fields above specify logical types. Use Feldera's existing serializer for V; only K needs an
+order-preserving byte encoding. V has no query-visible comparison order or application-defined endianness
+requirement. The internal ordering required by Feldera's delta-batch merger is specified below.
+The index identifier in K selects the payload schema. `FlatValue` adds no format or kind field.
 
-Each file row contains K and exactly one `FlatValue` as auxiliary data in a single file column. Multiple
-rows may have the same K. Among equal keys, order rows by canonical payload bytes and then phase for
-deterministic iteration. This tie ordering does not add fields to the storage key or index payload columns.
+This index stores the supplied base-relation records before Q3's predicates. For example, a Customer whose
+segment is `AUTOMOBILE` is a valid stored row but does not pass Q3's `segment = BUILDING` predicate.
+Its Orders and Lineitems can still contribute to intermediate states, such as per-order line revenue.
+If only the Customer's segment changes to `BUILDING`, reconstruction needs those unchanged Orders and
+Lineitems. The index therefore does not discard source records because their current joined result fails
+a query predicate. Query filtering belongs to the reconstruction/operator layer. This follows the
+[manuscript's source-index scope](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L120).
+The earlier phrase "query-ineligible" meant "currently fails a query predicate"; it did not mean invalid
+input or a deleted record. A separately designed filtered index would have a different input contract.
 
-The algebraic identity is `(K, payload)`. Weight and phase are not tuple-identity fields. Only identical
-complete tuples consolidate by summing weights; zero sums disappear. Phase distinguishes when a contribution
-entered the active batch, independently of its sign. The incoming batch is a Z-set of complete signed changes.
+Each record associates K with one V containing the data, weight, and bit. K alone is the record identity;
+a payload replacement updates that same identity. Endpoint traversal orders records by K alone. V does not
+extend K or participate in endpoint lookup.
+Physical field placement may use multiple columns. The logical flat KV contract does not require packing
+all fields into one physical column.
 
-### Same-key replacement, with no packed value
+Feldera uses the word **column** for a level of its layer-file hierarchy: a row in one level can own a
+group of rows in the next. These are not ordinary independent field arrays; see the
+[file-format definition](../../../crates/dbsp/src/storage/file.rs#L3). Its name `auxiliary data` denotes
+the data slot attached to a level's search key. The layout below splits V between the second-level
+payload and its weight/bit data slot.
+The earlier wording incorrectly made that API terminology sound like a property of the merged-index data.
+A physical layout must preserve the K-only identity and lookup contract, regardless of how it stores V's fields.
 
-Here `P100` and `P120` denote complete line payloads differing in extended price:
+### Unique endpoint records and signed replacement deltas
+
+For each endpoint, `state[K]` is absent or contains one payload and its nonzero weight. A payload change
+updates the same record identity. Here `P100` and `P120` differ in extended price:
 
 ```text
-Existing immutable batch B0, excerpt:
-  K -> { payload=P100, weight=+1, is_new=0 }
+OLD accumulated endpoint:
+  K -> { payload=P100, weight=+1 }
 
-Incoming immutable batch D1, excerpt:      # two distinct flat rows with the same K
+Incoming delta D1, logical signed contributions:
   K -> { payload=P100, weight=-1, is_new=1 }
   K -> { payload=P120, weight=+1, is_new=1 }
 
-OLD endpoint: P100 has weight +1.
-NEW endpoint: P100 has weight +1-1=0; P120 has weight +1.
+NEW accumulated endpoint:
+  K -> { payload=P120, weight=+1 }
 ```
 
-A deletion is a negative complete-tuple contribution, even though it is NEW to the current batch.
-An insertion and a retraction of the identical tuple in the same incoming batch cancel before storage.
-Changes with different payloads must never cancel merely because their folded keys are equal.
+The two delta contributions describe one record's replacement. They are not two records in either
+accumulated endpoint. Immutable batches may retain contributions from several updates until merging;
+physical contributions must not be mistaken for the visible endpoint map.
 
-The bit selects contributions, not disjoint endpoint relations. For each complete tuple `x = (K, payload)`:
+K-only identity does not allow summing all weights for K while discarding the associated data: the delta's
+weights sum to zero, but its payload changes. Feldera cancels a retraction against the matching payload
+contribution. Payload equality is needed to apply signed changes correctly; it does not create another
+record identity. Insertion and retraction of the same payload cancel; different payloads do not.
 
 ```text
-weight_old(x) = sum(weight of x in effective OLD records)
-weight_new(x) = weight_old(x) + sum(weight of x in effective NEW records)
+resolve_endpoint(K, contributing_batches):
+    totals = sum signed weights separately for each equal payload at K
+    discard payloads with zero total
+    require at most one remaining payload       # guaranteed by the input's endpoint uniqueness
+    return absent or (K, remaining_payload, its_weight)
+
+OLD = resolve using pre-append contributions
+NEW = resolve using pre-append contributions plus all current delta contributions
 ```
 
-Suppress zero totals when exposing either endpoint. NEW-state reconstruction must include both phases;
-reading only NEW-marked records would return the input delta, not accumulated state.
+The endpoint-uniqueness assertion belongs in adapter validation tests; it is not FK enforcement or permission
+to manufacture related-row changes. A partially merged batch need not itself be a complete endpoint and
+must not be subjected to this assertion. Both signs of the current delta are NEW contributions. Reading only
+NEW-marked records returns the delta, not the NEW accumulated endpoint.
 
 ## Snapshots, append order, and the old/new bit
 
@@ -306,23 +338,41 @@ Durable rollback and atomic publication with base storage/output progress remain
 
 ## Necessary changes to Feldera storage
 
-### Equal folded keys must remain separate flat rows
+### Reuse existing file columns for signed contributions
 
-The current [one-column writer](../../../crates/dbsp/src/storage/file/writer.rs#L1481) requires
-strictly increasing keys. Its [index search](../../../crates/dbsp/src/storage/file/reader.rs#L1222)
-can return an arbitrary matching child on equal bounds. These contracts do not support the replacement
-example as-is. Relaxing the writer assertion alone would risk skipping records across block boundaries.
+Use Feldera's existing [two-column writer](../../../crates/dbsp/src/storage/file/writer.rs#L1564).
+Here a column means a hierarchy level as described above, not one SQL field. Keep the folded K in the
+first level and store each signed payload contribution as a separate second-level row:
 
-Add an explicit repeated-key mode to the flat one-column writer/reader. Keep the default unique-key mode
-for existing batches. Record the mode in file metadata; old files retain unique-key behavior.
+```text
+column 0: search key = FoldedKey; data = ()
+column 1: search key = PayloadBytes; data = (weight: ZWeight, is_new: bool)
 
-- Accept nondecreasing K in repeated-key mode. The flat batch builder validates payload tie ordering.
-- Forward seek chooses the earliest eligible child and first row with `K >= target`; reverse seek chooses
-  the latest eligible child and last row with `K <= target`. Respect the cursor's remaining row range.
-- Handle equal keys spanning data blocks and several index levels, including exact-key and batched fetch paths.
-  Use the ordinary cursor fallback until optimized batched fetch has equivalent duplicate-aware tests.
-- `next`/`previous` advance one physical row, even when K remains equal. Prefix/exact scans consume every such row.
-- Preserve existing file/cache/checksum and ordinary unique-key behavior. No hidden payload/phase suffix in K.
+# Logical D1 above, represented by one parent row and two contribution rows:
+column 0: K -> child rows [a, b)
+column 1: P100 -> (-1, NEW)
+          P120 -> (+1, NEW)
+```
+
+Every second-level row contains exactly one payload, weight, and bit. Its associated parent supplies K.
+The raw cursor flattens this physical grouping into `(K, V)` contributions. No V contains a packed list.
+The complete accumulated endpoint still has at most one payload for K. Multiple physical columns are an
+implementation choice that reuses the file format; the logical index has one folded search key.
+
+Both writer levels already require unique keys within each group. Write payload rows with `write1`, then
+write their parent K with `write0`. Consolidate identical payload contributions in a homogeneous phase
+before writing. The index identifier in K selects the payload decoder; no extra kind field is needed.
+Do not add a repeated-key writer mode or change file seek algorithms. Reuse existing outer-key
+seek/next and child-group cursors; prefix termination is checked against the folded parent K.
+
+There is one backend requirement beyond endpoint ordering: the existing
+[batch cursor contract](../../../crates/dbsp/src/trace/cursor.rs#L42) orders values within a key, and
+[the spine merger](../../../crates/dbsp/src/trace/spine_async/list_merger.rs#L197) compares those values.
+Use `PayloadBytes`' ordinary byte comparison for this internal delta grouping. No SQL field order,
+numeric order, or big-endian payload encoding is required. Encode equal payloads identically with the
+existing serializer, so its byte equality agrees with payload equality. Weight and phase are excluded
+from that comparison. This internal order is needed only to reuse Feldera's batch/merge contract; queries
+cannot request a range or ordering by it. Eliminating it entirely would require replacing that contract.
 
 ### Batch and raw-cursor contracts
 
@@ -338,17 +388,31 @@ BatchReader::Time:  ()
 ```
 
 The [Batch contract](../../../crates/dbsp/src/trace.rs#L846) can retain its logical key/value cursor:
-the custom cursor groups adjacent equal-K flat rows for `step_key`/`step_val`, but never packs payloads into
-one stored value. Phase belongs to the raw view interface and batch role, not to generic tuple equality.
+the custom cursor traverses the outer K and its contribution rows with `step_key`/`step_val`.
+The raw cursor exposes one flat contribution at a time, with K resolved from the parent row. Phase belongs
+to the raw view interface and batch role, not to generic tuple equality.
 Generic consolidation runs on homogeneous effective phase: incoming NEW chunks during staging or Base
 batches between transactions. The active combined raw scan merges ordered iterators without cancelling
 OLD and NEW contributions irreversibly in storage during the active batch. Endpoint reconstruction may
 sum/cancel both phases for the NEW endpoint, as specified above; OLD reads still have the base contributions.
 
+The generic tuple cursor omits phase, so the custom builders must preserve it explicitly:
+
+- Delta staging constructors, including `Batcher::new_batcher` and `dyn_from_tuples`, stamp NEW.
+- `Builder::for_merge` reads input batch roles, rejects mixed effective phases, and stamps every output
+  row with their common effective bit. Merge NEW staging chunks only with NEW; merge Base only with Base.
+- Persistence/conversion paths preserve the source role and effective bit. Override generic conversion
+  defaults that would route Base data through a NEW-stamping constructor.
+- Completion rebinds all active handles to Base before resuming generic compaction. A Base-output builder
+  writes OLD even when its input files retain physical NEW bits from earlier transactions.
+
+The raw cursor exposes the stored/effective bit as specified above; the generic tuple cursor exposes only
+payload and weight. Test construction, conversion, spill, and merge paths separately for phase preservation.
+
 Implement memory and file variants; ordered builders; chunked `MergeBatcher` staging; cursor navigation;
 metadata counts/bounds; `persisted`/`from_path`; and storage-destination merging for spilled staging chunks.
-Count distinct K values for `key_count()` and physical tuple rows for `len()`; repeated-key files cannot
-use their row count as their distinct-key count. Builders write each payload/weight as one flat row.
+Count outer K rows for `key_count()` and signed contribution rows for `len()`; they can differ in delta
+batches. Builders write one payload/weight/bit per contribution row.
 Reuse `FallbackValBatch` for the required `Timed<T>`
 associated type; the prototype itself uses unit time. Use existing dynamic-data/factory conventions and
 implement byte-wrapper ordering as lexicographic bytes. Report no roaring compatibility for these keys.
@@ -360,16 +424,21 @@ The Q3 codec's decoded enum is a utility for validation, not a typed query-acces
 
 ## Verification and implementation sequence
 
-Use new Rust tests and an independent `BTreeMap<(key, payload), weight>` endpoint oracle. Earlier excluded
-semantic-checker scripts are not acceptance evidence. Test transaction-supplied changes exactly as given;
+Use new Rust tests and an independent `BTreeMap<Key, (Payload, Weight)>` endpoint oracle.
+Represent input changes separately as signed contributions. Group the complete delta by K and apply its
+matching-payload cancellations before validating the resulting endpoint; input ordering must not cause a
+false uniqueness violation. Cover cancellation and multiple updates within one transaction. Earlier
+excluded semantic-checker scripts are not acceptance evidence. Test transaction-supplied changes exactly as given;
 do not introduce storage-layer FK checks or automatic child moves in test helpers.
 
 1. **Codec and storage format:** golden key bytes, fold/unfold, malformed records, prefix scans, no END/LOOKUP
-   fields, no per-record format/kind fields, and one physical tuple per file row.
-2. **Duplicate-key file support:** many equal keys across data/index-block boundaries; forward/reverse/exact
-   seeks; lower/upper extremes; prefix termination; many different keys per file; unique-key regression tests.
-3. **Batch algebra:** same-key payload replacement, signed multiplicity, cancellation only by complete tuple,
-   memory/file agreement, more than two equal-K rows, spilled staging, and persistence/reopen.
+   fields, no per-record format/kind fields, and one payload per contribution row.
+2. **File layout and cursors:** existing unique outer keys across data/index-block boundaries; multiple
+   signed payload contributions under one K; forward/reverse/exact seeks; prefix termination; flattened
+   cursor agreement with logical KV contributions; payload serializer round trips without field-order encoding.
+3. **Batch algebra:** same-key payload replacement, signed multiplicity, matching-payload cancellation,
+   unique K in both endpoints, memory/file agreement, several updates to the same K, spilled staging, and
+   persistence/reopen. A zero net weight change must still preserve a changed payload.
 4. **Snapshot ownership:** verify shared data/file identity before/after snapshot (`Arc`/file identity), no
    snapshot-triggered writes, unchanged old reads after append, and old reads surviving later compaction.
 5. **Phase lifecycle:** both replacement contributions are NEW; old/new endpoint oracle agreement; two or
@@ -387,7 +456,7 @@ do not introduce storage-layer FK checks or automatic child moves in test helper
 8. **Scope checks:** no `OrderParent` data, parent lookup, relational validation, typed scan session,
    reconstructed integrator, or operator rewiring is introduced by this storage step.
 
-Implement in three reviewable milestones: codecs and duplicate-key file mode; flat batches and merger
+Implement in three reviewable milestones: key codecs and existing-file layout; flat KV access and batch/merger
 conformance; batch ownership/phase protocol. Each milestone includes focused tests and relevant rustdocs.
 Run formatting, crate checks, and affected storage/spine tests. End-to-end Q3 equivalence, shared-reader
 memory limits, crash recovery across source/output state, and performance measurement remain later gates.

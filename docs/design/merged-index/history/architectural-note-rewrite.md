@@ -217,3 +217,17 @@ factories, without copying tuples/files, registering persistent versions, schedu
 expiration dates. Existing last-owner backend cleanup is distinct from this operation. The active plan and
 supporting note now describe temporary computation read handles and batch-relative phase interpretation.
 The full typed-return/scan-session interface remains subsequent work. No Rust code was changed in this revision.
+
+### Endpoint identity and physical columns clarified
+
+On 2026-09-28, review clarified that K alone identifies a record and is unique in each accumulated endpoint;
+signed replacement deltas may contain multiple contributions for K. This supersedes the earlier claim
+that `(K, payload)` is record identity and the proposed repeated-key file-format extension. Payload equality
+still matters when cancelling signed contributions for a replacement.
+
+The plan now reuses Feldera's existing two-level file layout, exposing each contribution as a flat KV pair.
+One outer K can reference separate payload/weight/bit rows; V never contains a packed list. Physical columns
+are permitted. V is data, and its fields use the existing serializer without an order-preserving encoding.
+The generic spine's internal ordering of same-K delta values is documented separately from K-only endpoint
+identity and ordering. The plan also explains that source records are stored before Q3 predicates: unchanged
+Orders and Lineitems remain necessary when a Customer changes segment.
