@@ -9,7 +9,7 @@ use crate::{
 };
 
 mod customer_orders_lineitem;
-mod memory_batch;
+pub(crate) mod memory_batch;
 
 pub(crate) use memory_batch::MergedIndexBatch;
 
