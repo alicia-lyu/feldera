@@ -65,18 +65,17 @@ first becoming a file. Staging must have a memory bound and spill when needed.
 > inserts batches into a spine; [fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445)
 > can choose memory or storage. The new adapter must implement the bounded staging choice explicitly.
 
-## Record representation
+## Merged-index constitution
 
-### K: the paper's folded key
-
-The folding rule belongs to the **merged index and source together**. The same source can use a
-different key path in another merged index. Define this index's constitution in one place using
-the following small notation; Phase 1 may represent it as a static Rust declaration rather than
-implementing a parser or macro:
+The constitution defines **which sources belong to this merged index**, **which ordered fields
+form each source's key**, and **which fields across sources share a domain**. A domain name
+denotes the same logical identity across those fields and assigns them one byte tag. The
+folding rule belongs to the merged index and source together; another merged index may use a
+different key path for the same source. Use this small notation for the constitution. Phase 1
+may represent it as a static Rust declaration rather than implementing a parser or macro:
 
 ```text
 merged_index CustomerOrdersLineitem {
-    domain INDEX    = 0x00
     domain customer = 0x01
     domain order    = 0x02
     domain line     = 0x03
@@ -88,14 +87,21 @@ merged_index CustomerOrdersLineitem {
 }
 ```
 
-The ordered `key` entries name source fields and their domains. Reusing `customer` across all
-three entries means those fields carry the same `0x01` domain tag, regardless of source field
-name. `id` is the terminal index identifier, distinct from a key-field domain. Field names here
-describe the supplied extended records; typed source adapters map their actual Rust fields to
-these entries. A `CustomerOrdersLineitemIndex` Rust type owns this declaration, source-key
-extraction, checked fold/unfold methods, and prefix construction. It must not put a global
-`fold` method on `Customer`, `Orders`, or `Lineitem` types. A later implementation can lift the
-declaration into reusable definitions without changing the stored key bytes.
+The three `source` entries are the source roster. Within each entry, the ordered `key` fields
+name the source fields used for this index. The `customer` domain groups `customer_id` from all
+three sources under tag `0x01`; the `order` domain groups `order_id` from Orders and extended
+Lineitem under tag `0x02`. This definition states relationships among source fields; the
+record encoding below puts their tags into K. The `id` distinguishes the source in the final
+key bytes and is separate from the domain tags. Domain sharing is explicit: fields can share a
+domain despite different names, and matching names alone do not establish one.
+Field names here describe logical fields in the supplied extended records; typed source adapters
+bind their actual Rust fields. A `CustomerOrdersLineitemIndex` Rust type owns this constitution,
+source-key extraction, checked fold/unfold methods, and prefix construction. A later
+implementation can make the declaration reusable without changing the stored bytes.
+
+## Record representation
+
+### K: the paper's folded key
 
 Use this prototype encoding. Numeric tags are local choices, not requirements of the paper or a claim
 of LeanStore binary compatibility:

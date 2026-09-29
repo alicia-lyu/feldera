@@ -18,16 +18,23 @@ staging and spill, multi-batch cursors, signed compaction, accumulated-K validat
 and runtime integration have their own later phases. A fixture's write/read success is evidence
 for the file mapping, not for those behaviors.
 
-## Index definition and folding
+## Merged-index constitution
 
-The [index constitution](folded-key-layer-file-plan.md#k-the-papers-folded-key) uses the simple
-`source S id N key (field: domain, ...)` syntax to declare each source's ordered key fields.
-Named domains make equality across sources explicit: `Customer.customer_id`,
-`Orders.customer_id`, and `ExtendedLineitem.customer_id` all use `customer`; the corresponding
-order fields use `order`. For Phase 1, represent that syntax as one small static Rust definition
-owned by `CustomerOrdersLineitemIndex`, with source identifiers, ordered field/domain entries,
-and domain-to-byte mappings. A parser, macro, schema registry, and general index framework are
-unnecessary.
+The [constitution](folded-key-layer-file-plan.md#merged-index-constitution) answers three
+questions for this particular merged index:
+
+1. **Sources:** Customer, Orders, and extended Lineitem.
+2. **Key fields:** Customer uses `(customer_id)`; Orders uses `(customer_id, order_id)`;
+   extended Lineitem uses `(customer_id, order_id, line_id)`, in that order.
+3. **Shared domains:** All three `customer_id` fields use the `customer` tag. The two
+   `order_id` fields use the `order` tag. The line field uses the `line` tag.
+
+The notation `source S id N key (field: domain, ...)` expresses those choices in one place.
+For Phase 1, represent it as a small static Rust definition owned by
+`CustomerOrdersLineitemIndex`, with a source roster, ordered field/domain entries, and domain
+tags. A parser, macro, or general index framework is unnecessary.
+
+### Folding from the constitution
 
 > **Ownership:** Rust has structs and `impl` blocks rather than classes. Put the definition and
 > `fold`, `unfold`, and prefix methods on `CustomerOrdersLineitemIndex`. A generic helper may
@@ -46,7 +53,7 @@ CustomerOrdersLineitemIndex.fold(source_key):
     for (field, value) in zip(spec.key_fields, values):
         K.append(constitution.domains[field.domain])
         K.extend(fold_i32(value))
-    K.append(constitution.domains[INDEX])
+    K.append(INDEX_TAG)  # record-layout marker, not a source-field domain
     K.append(spec.id)
     return K
 
