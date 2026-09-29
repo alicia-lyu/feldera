@@ -54,6 +54,7 @@ use std::{fmt::Debug, hash::Hash};
 pub mod cursor;
 pub mod filter;
 pub mod layers;
+pub(crate) mod merged_index;
 pub mod ord;
 mod sampling;
 pub mod spine_async;
