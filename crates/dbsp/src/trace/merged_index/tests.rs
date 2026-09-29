@@ -2,6 +2,7 @@ use super::customer_orders_lineitem::{
     CUSTOMER, CUSTOMER_DOMAIN, CUSTOMER_KEY_DOMAIN, CUSTOMER_PRIMARY,
     CustomerOrdersLineitemDefinition,
 };
+use super::memory_batch::RawBatchCursor;
 use super::*;
 use crate::{
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
@@ -15,6 +16,166 @@ use tempfile::tempdir;
 
 fn index() -> CustomerOrdersLineitemIndex {
     CustomerOrdersLineitemIndex::default()
+}
+
+fn customer_row(id: i32, segment: &str, weight: i64) -> (SourceKey, SourcePayload, i64) {
+    (
+        SourceKey::Customer(id),
+        SourcePayload::Customer(CustomerPayload {
+            segment: segment.into(),
+        }),
+        weight,
+    )
+}
+
+#[test]
+fn memory_batch_sorts_and_consolidates_within_batch() {
+    use crate::trace::BatchReader;
+
+    let index = index();
+    let batch = index
+        .build_batch([
+            customer_row(2, "B", 1),
+            customer_row(1, "A", 3),
+            customer_row(2, "B", -2),
+            customer_row(1, "A", -1),
+            customer_row(3, "gone", 1),
+            customer_row(3, "gone", -1),
+            customer_row(2, "A", 4),
+        ])
+        .unwrap();
+    assert_eq!(batch.key_count(), 2);
+    assert_eq!(batch.len(), 3);
+    let batches = [batch];
+    let mut cursor = RawBatchCursor::new(&batches);
+    let mut rows = Vec::new();
+    while let Some((key, payload, weight)) = cursor.row() {
+        rows.push((
+            index.unfold(key).unwrap(),
+            index.decode_payload(key, payload).unwrap(),
+            weight,
+        ));
+        cursor.next();
+    }
+    assert_eq!(
+        rows,
+        vec![
+            customer_row(1, "A", 2),
+            customer_row(2, "A", 4),
+            customer_row(2, "B", -1)
+        ]
+    );
+}
+
+#[test]
+fn raw_cursor_seeks_and_keeps_cross_batch_contributions() {
+    let index = index();
+    let batches = [
+        index
+            .build_batch([customer_row(3, "A", -1), customer_row(1, "A", 1)])
+            .unwrap(),
+        index
+            .build_batch([customer_row(3, "A", 2), customer_row(2, "B", 1)])
+            .unwrap(),
+    ];
+    let mut cursor = RawBatchCursor::new(&batches);
+    cursor.seek_ge(index.fold(&SourceKey::Customer(3)).unwrap().as_bytes());
+    assert_eq!(cursor.row().unwrap().2, -1);
+    cursor.next();
+    assert_eq!(cursor.row().unwrap().2, 2);
+    cursor.next();
+    assert!(cursor.row().is_none());
+
+    cursor.seek_ge(index.fold(&SourceKey::Customer(2)).unwrap().as_bytes());
+    assert_eq!(cursor.row().unwrap().2, 1);
+    cursor.seek_ge(index.fold(&SourceKey::Customer(4)).unwrap().as_bytes());
+    assert!(cursor.row().is_none());
+}
+
+#[test]
+fn raw_cursor_stops_at_prefix_boundary() {
+    let index = index();
+    let batches = [
+        index
+            .build_batch([
+                customer_row(6, "other", 1),
+                (
+                    SourceKey::Orders(5, 2),
+                    SourcePayload::Orders(OrdersPayload {
+                        order_day: 1,
+                        ship_priority: 0,
+                    }),
+                    1,
+                ),
+            ])
+            .unwrap(),
+        index
+            .build_batch([(
+                SourceKey::Orders(5, 1),
+                SourcePayload::Orders(OrdersPayload {
+                    order_day: 2,
+                    ship_priority: 0,
+                }),
+                -1,
+            )])
+            .unwrap(),
+    ];
+    let prefix = index.customer_prefix(5);
+    let mut cursor = RawBatchCursor::new(&batches);
+    cursor.seek_ge(&prefix);
+    let mut keys = Vec::new();
+    while let Some((key, _, _)) = cursor.row() {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        keys.push(index.unfold(key).unwrap());
+        cursor.next();
+    }
+    assert_eq!(keys, [SourceKey::Orders(5, 1), SourceKey::Orders(5, 2)]);
+}
+
+#[test]
+fn empty_batches_and_cancelled_rows_are_skipped() {
+    use crate::trace::BatchReader;
+
+    let index = index();
+    let batches = [
+        index.build_batch([]).unwrap(),
+        index
+            .build_batch([customer_row(1, "A", 1), customer_row(1, "A", -1)])
+            .unwrap(),
+        index.build_batch([customer_row(2, "B", -3)]).unwrap(),
+    ];
+    assert_eq!(batches[0].len(), 0);
+    assert_eq!(batches[1].key_count(), 0);
+    let mut cursor = RawBatchCursor::new(&batches);
+    assert_eq!(cursor.row().unwrap().2, -3);
+    cursor.next();
+    assert!(cursor.row().is_none());
+    cursor.seek_ge(index.fold(&SourceKey::Customer(1)).unwrap().as_bytes());
+    assert_eq!(cursor.row().unwrap().2, -3);
+}
+
+#[test]
+fn batch_rejects_weight_overflow_and_mismatched_payload() {
+    let index = index();
+    assert!(
+        index
+            .build_batch([customer_row(1, "A", i64::MAX), customer_row(1, "A", 1),])
+            .is_err()
+    );
+    assert!(
+        index
+            .build_batch([(
+                SourceKey::Customer(1),
+                SourcePayload::Orders(OrdersPayload {
+                    order_day: 1,
+                    ship_priority: 0,
+                }),
+                1,
+            )])
+            .is_err()
+    );
 }
 
 #[test]

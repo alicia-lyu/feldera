@@ -9,6 +9,9 @@ use crate::{
 };
 
 mod customer_orders_lineitem;
+mod memory_batch;
+
+pub(crate) use memory_batch::MergedIndexBatch;
 
 pub(crate) use customer_orders_lineitem::{
     CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,

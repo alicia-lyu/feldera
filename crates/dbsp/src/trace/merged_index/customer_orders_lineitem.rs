@@ -174,6 +174,24 @@ pub(crate) struct CustomerOrdersLineitemIndex {
 }
 
 impl CustomerOrdersLineitemIndex {
+    pub fn build_batch(
+        &self,
+        rows: impl IntoIterator<Item = (SourceKey, SourcePayload, i64)>,
+    ) -> Result<super::MergedIndexBatch, String> {
+        let encoded = rows
+            .into_iter()
+            .map(|(key, payload, weight)| {
+                let folded = self.fold(&key)?;
+                let bytes = self.encode_payload(&payload)?;
+                if self.decode_payload(folded.as_bytes(), bytes.as_bytes())? != payload {
+                    return Err("payload does not match source key".into());
+                }
+                Ok((folded, bytes, weight))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        super::memory_batch::build_batch(encoded)
+    }
+
     pub fn fold(&self, key: &SourceKey) -> Result<FoldedKey, String> {
         self.base.fold(key)
     }
