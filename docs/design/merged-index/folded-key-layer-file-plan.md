@@ -69,6 +69,34 @@ first becoming a file. Staging must have a memory bound and spill when needed.
 
 ### K: the paper's folded key
 
+The folding rule belongs to the **merged index and source together**. The same source can use a
+different key path in another merged index. Define this index's constitution in one place using
+the following small notation; Phase 1 may represent it as a static Rust declaration rather than
+implementing a parser or macro:
+
+```text
+merged_index CustomerOrdersLineitem {
+    domain INDEX    = 0x00
+    domain customer = 0x01
+    domain order    = 0x02
+    domain line     = 0x03
+
+    source Customer         id 0x01 key (customer_id: customer)
+    source Orders           id 0x02 key (customer_id: customer, order_id: order)
+    source ExtendedLineitem id 0x03 key (customer_id: customer, order_id: order,
+                                          line_id: line)
+}
+```
+
+The ordered `key` entries name source fields and their domains. Reusing `customer` across all
+three entries means those fields carry the same `0x01` domain tag, regardless of source field
+name. `id` is the terminal index identifier, distinct from a key-field domain. Field names here
+describe the supplied extended records; typed source adapters map their actual Rust fields to
+these entries. A `CustomerOrdersLineitemIndex` Rust type owns this declaration, source-key
+extraction, checked fold/unfold methods, and prefix construction. It must not put a global
+`fold` method on `Customer`, `Orders`, or `Lineitem` types. A later implementation can lift the
+declaration into reusable definitions without changing the stored key bytes.
+
 Use this prototype encoding. Numeric tags are local choices, not requirements of the paper or a claim
 of LeanStore binary compatibility:
 

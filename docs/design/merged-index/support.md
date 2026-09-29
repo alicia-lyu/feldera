@@ -243,7 +243,8 @@ Feldera adapter below remains to be implemented.
 > [!NOTE]
 > **Glossary**
 >
-> **Folding** — record-type-specific encoding of key fields into bytes.
+> **Folding** — encoding a source's key fields into bytes under a particular merged index's
+> source rule.
 
 The merged index uses folded byte keys and weighted payload rows in Feldera's two-column layer files.
 Each value contains one regular payload and a signed weight. At a completed transaction boundary,
@@ -252,8 +253,9 @@ post-append read may contain multiple nonzero payloads at K. Storage returns all
 The transaction checks K uniqueness before completion; appending the delta does not by itself complete
 view maintenance. No packed payload list or extra key suffix is permitted. The two file levels store
 folded K and its payload/weight rows.
-**Folding** produces the key. Customer, Orders, and extended Lineitem use
-different folding rules. Their logical positions `(c)`,
+**Folding** produces the key. The Customer–Orders–Lineitem index assigns ordered key fields and
+shared domains to Customer, Orders, and extended Lineitem; another index can assign a different
+rule to the same source. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant

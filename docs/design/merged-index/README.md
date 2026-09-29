@@ -160,12 +160,16 @@ changes, and temporary read handles without multi-versioning or expiration polic
 > [!NOTE]
 > **Glossary**
 >
-> **Folding** — Encoding key fields into a byte string using a record-type-specific rule.
+> **Folding** — Encoding a source's key fields into bytes using a rule owned by a particular
+> merged index.
 
 Following the [primary folded-key design](../../../../merged_index_interesting_orderings/main.tex#L545),
-the merged index uses standard KV storage: `fold_type(record) → encoded_value`. **Folding** produces the byte key.
-Customer, Orders, and extended Lineitem
-have different rules; their logical customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. The storage
+the merged index uses standard KV storage: `index.fold(source, record) → encoded_value`.
+**Folding** produces the byte key. The Customer–Orders–Lineitem index defines each source's
+ordered key fields and named domains in its
+[constitution](folded-key-layer-file-plan.md#k-the-papers-folded-key). Its logical
+customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. Another merged index may fold
+one of these sources differently. The storage
 layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
 
@@ -214,7 +218,7 @@ a byte limit, without storing another complete accumulated relation.
 
 ```mermaid
 flowchart LR
-    D[Weighted source changes] --> E[Type-specific key folding]
+    D[Weighted source changes] --> E[Merged-index key folding]
     E --> S[Folded-key batch adapter]
     S --> M[Feldera spine and immutable batches]
     S --> V[Before and after maintenance reads]
