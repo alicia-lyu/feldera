@@ -95,9 +95,14 @@ record encoding below puts their tags into K. The `id` distinguishes the source 
 key bytes and is separate from the domain tags. Domain sharing is explicit: fields can share a
 domain despite different names, and matching names alone do not establish one.
 Field names here describe logical fields in the supplied extended records; typed source adapters
-bind their actual Rust fields. A `CustomerOrdersLineitemIndex` Rust type owns this constitution,
-source-key extraction, checked fold/unfold methods, and prefix construction. A later
-implementation can make the declaration reusable without changing the stored bytes.
+bind their actual Rust fields. In Rust, use a generic `MergedIndex<D>` base whose shared methods
+fold and unfold keys, construct prefixes, and later own the common batch/file machinery. The
+`MergedIndexDefinition` parameter `D` supplies the source roster, ordered key fields, domain
+tags, typed source-key projection, and payload schemas. `CustomerOrdersLineitemIndex` is a
+concrete wrapper around `MergedIndex<CustomerOrdersLineitemDefinition>`; its definition supplies
+the constitution above. The generic base must take all source-specific choices from `D`, so
+another merged index can reuse it with a different definition and fold the same source
+differently. This is composition rather than class inheritance in Rust.
 
 ## Record representation
 
@@ -386,7 +391,8 @@ and shared scan sessions follow in Step 3.
 ### Phase 1: Encoding and one readable layer-file batch
 
 - **Plan:** Confirm the folded-key bytes, payload serialization, and two-column file mapping.
-- **Build:** Implement the codecs and a small layer-file fixture that can be written and read.
+- **Build:** Implement the generic `MergedIndex<D>` folding base, its
+  Customer–Orders–Lineitem definition, and a small readable two-column layer-file fixture.
 - **Evidence to advance:** Keys and payloads round-trip; a seek finds the intended records.
 
 ### Phase 2: Batches and cursors

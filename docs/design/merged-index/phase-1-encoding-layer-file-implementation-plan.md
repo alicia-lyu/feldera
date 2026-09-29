@@ -30,44 +30,51 @@ questions for this particular merged index:
    `order_id` fields use the `order` tag. The line field uses the `line` tag.
 
 The notation `source S id N key (field: domain, ...)` expresses those choices in one place.
-For Phase 1, represent it as a small static Rust definition owned by
-`CustomerOrdersLineitemIndex`, with a source roster, ordered field/domain entries, and domain
-tags. A parser, macro, or general index framework is unnecessary.
+For Phase 1, represent it as a small static Rust definition, with a source roster, ordered
+field/domain entries, and domain tags. Implement the shared behavior in a generic base now;
+no parser or macro is needed.
 
 ### Folding from the constitution
 
-> **Ownership:** Rust has structs and `impl` blocks rather than classes. Put the definition and
-> `fold`, `unfold`, and prefix methods on `CustomerOrdersLineitemIndex`. A generic helper may
-> encode an `i32`; source types do not own a universal folding rule. Another index may fold the
-> same source differently.
+> **Ownership:** Rust uses composition and generic types instead of class inheritance. Make
+> `MergedIndex<D>` the reusable base. `D: MergedIndexDefinition` supplies the constitution and
+> typed source-key projection. `CustomerOrdersLineitemIndex` wraps
+> `MergedIndex<CustomerOrdersLineitemDefinition>`. Source row types have no global fold method.
 
 ```text
-CustomerOrdersLineitemIndex.fold(source_key):
-    source, values = match source_key:
+CustomerOrdersLineitemDefinition.project(source_key):
+    match source_key:
         Customer(c)       -> Customer, [c]
         Orders(c, o)      -> Orders, [c, o]
         Lineitem(c, o, l) -> ExtendedLineitem, [c, o, l]
-    spec = constitution.sources[source]
+
+MergedIndex<D>.fold(source_key):
+    source, values = D.project(source_key)
+    spec = D.constitution.sources[source]
     require len(values) == len(spec.key_fields)
     K = []
     for (field, value) in zip(spec.key_fields, values):
-        K.append(constitution.domains[field.domain])
+        K.append(D.constitution.domains[field.domain])
         K.extend(fold_i32(value))
     K.append(INDEX_TAG)  # record-layout marker, not a source-field domain
     K.append(spec.id)
     return K
 
-CustomerOrdersLineitemIndex.unfold(K):
+MergedIndex<D>.unfold(K):
     require K has an INDEX tag and a recognized terminal source identifier
-    select spec using that source identifier
+    select spec from D.constitution using that source identifier
     require exact length and each domain tag in spec.key_fields' order
-    decode each i32 and construct that source's typed key
+    decode each i32; call D.construct_key(source, values)
+
+CustomerOrdersLineitemIndex.fold(source_key):
+    return self.base.fold(source_key)
 ```
 
-The match extracts typed field values in declaration order. The definition supplies domain tags
-and the terminal identifier, so the shared byte-writing path does not repeat source-specific
-tag sequences. Checked unfolding validates against the same definition. Prefix methods use the
-leading field/domain entries without appending `INDEX` and the source identifier.
+The definition extracts and reconstructs typed keys. The generic base uses its ordered fields,
+domain tags, and source identifier to fold, validate, unfold, and construct prefixes. A second
+merged index can reuse that base with a different `D`, including different folding for a source
+it shares with this index. Prefixes use leading field/domain entries without appending `INDEX`
+and the source identifier.
 
 > **Visibility:** “Crate-internal” means visible to code inside the `dbsp` Rust crate, using
 > `pub(crate)` where needed, but absent from the public API used by other crates.
@@ -94,8 +101,9 @@ layer-file column 1: payload -> signed weight
 ```
 
 1. Define a `FoldedKey` whose ordering compares the raw bytes lexicographically.
-   Implement checked folding and unfolding on `CustomerOrdersLineitemIndex` for
-   `Customer(c)`, `Orders(c, o)`, and `Lineitem(c, o, l)`. Use domain tags `0x00` through `0x03`
+   Implement checked folding and unfolding in `MergedIndex<D>`, exercised through
+   `CustomerOrdersLineitemIndex` for `Customer(c)`, `Orders(c, o)`, and `Lineitem(c, o, l)`.
+   Use domain tags `0x00` through `0x03`
    and identifiers `0x01` through `0x03` as specified in the
    [Step 2 encoding](folded-key-layer-file-plan.md#k-the-papers-folded-key).
    Encode each signed `i32` as big-endian `((x as u32) ^ 0x8000_0000)`. The only valid complete
@@ -122,12 +130,14 @@ Do not alter the generic layer-file format for this phase.
 
 ## Implementation steps
 
-1. Add `CustomerOrdersLineitemIndex` and its small static constitution under
+1. Add `MergedIndex<D>` and a small `MergedIndexDefinition` trait under
    `crates/dbsp/src/trace/merged_index/`, exposed only within the crate. Register the module
-   in `trace.rs`. Define source-key variants and field-to-domain mappings, then implement
-   index-owned `fold`, `unfold`, and prefix methods using that definition. Keep the generic
-   signed-integer byte helper separate from the index-specific path. Put payload schemas and
-   decode errors nearby so later batch code has one source of truth.
+   in `trace.rs`. The base implements checked fold, unfold, and prefix construction using D's
+   source roster, ordered key fields, and domain tags. Add
+   `CustomerOrdersLineitemDefinition` for this constitution, its typed source-key projection,
+   and payload schemas; make `CustomerOrdersLineitemIndex` wrap the generic base. Put the
+   two-column weighted-row mapping used by the Phase 1 fixture in the generic base, with Q3
+   supplying only its folded keys and payloads. Leave full `Batch` integration for Phase 2.
 2. Add focused tests beside that module. Check that each declared source emits tags in its
    stated field order, that shared customer and order domains use identical tags across sources,
    and that the source identifier terminates K. Assert exact bytes for all three record types,
@@ -135,12 +145,14 @@ Do not alter the generic layer-file format for this phase.
    boundaries; and assert parent-before-child and signed numeric order by byte comparison.
    Reject truncated/extra keys, wrong tag positions, and wrong terminal identifiers. Verify
    malformed payload bytes are rejected. Assert repeat encoding of the same payload yields
-   identical bytes. Call fold, unfold, and prefix methods through the
-   `CustomerOrdersLineitemIndex` owner in these tests.
+   identical bytes. Call fold, unfold, and prefix methods through
+   `CustomerOrdersLineitemIndex`. Add a tiny second definition in tests to verify the generic
+   base accepts a different domain mapping for a shared source without changing base code.
 3. Add one storage-backed fixture test, following the existing
    [two-column test](../../../crates/dbsp/src/storage/file/test.rs#L956) and
    [`FileIndexedWSetBuilder`](../../../crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L880).
-   Use a temporary backend and the existing `Writer2`/`Reader` factories. Include a Customer,
+   Exercise the base's two-column mapping with a temporary backend and the existing
+   `Writer2`/`Reader` factories. Include a Customer,
    at least two Orders under it, and Lineitems under one Order; include a different Customer to
    prove prefix stopping. Give one K two distinct payload children with opposite signed weights,
    sorted by `PayloadBytes`, to prove that K is written once and weights stay with their payloads.

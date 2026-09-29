@@ -169,8 +169,10 @@ the merged index uses standard KV storage: `index.fold(source, record) → encod
 source roster, ordered key fields, and shared domains in its
 [constitution](folded-key-layer-file-plan.md#merged-index-constitution). Its logical
 customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. Another merged index may fold
-one of these sources differently. The storage
-layer compares opaque byte strings lexicographically. It does not expose those fields as nested groups.
+one of these sources differently. A generic `MergedIndex<D>` base will hold shared folding and
+storage behavior; `CustomerOrdersLineitemIndex` wraps it with this index's definition. The
+storage layer compares opaque byte strings lexicographically. It does not expose those fields
+as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
 
 Each value contains one regular payload and its signed weight. The index
