@@ -233,6 +233,13 @@ newly appended changes. Delta, batch, file, and maintained view are different ob
 | Append the sealed delta batches | Immediately part of the same index, before view maintenance | In-memory batches or layer-file readers |
 | Maintenance reads and background compaction | Already indexed; no need to wait for compaction | Memory and disk; ordinary compaction may combine prior state and delta |
 | Maintenance completion | Delta already indexed; no second append | Release computation-owned handles; ordinary compaction continues |
+| Later compaction of overlapping base and delta-origin batches | Same logical state; the input batches are replaced in the live index by a consolidated base batch | New immutable batch or layer file; matching signed contributions cancel, leaving one payload per K when all its contributions are included |
+
+The final row shows the eventual physical merge, not a required barrier before maintenance completes.
+Compaction may start earlier. If a merge includes only some contributions for K, its output can still have
+several payload rows under K; a later merge with the remaining batches produces the singleton group.
+For the replacement above, a compaction that reads `B: (K,P100,+1)` and
+`D: (K,P100,-1), (K,P120,+1)` writes `M: (K,P120,+1)` and replaces B and D in the live index.
 
 Current Feldera's [accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295) inserts input
 batches into a spine. [Fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445) choose
