@@ -262,3 +262,14 @@ The active plan removes this assertion. Its read cursor consolidates weights for
 contributions and yields every nonzero result, including several payloads at one K after append. Equality
 of payloads is the Z-set matching rule, not an additional search key or base-record identity. The revised
 tests use a `(K, payload)` map solely as a signed-weight oracle and permit multiple post-append results.
+
+### Base uniqueness at transaction incorporation
+
+On 2026-09-28, the user clarified that "base" means the state after pending changes have been
+incorporated into maintained views. Only base records are guaranteed unique by K; a pending delta may
+contain several payloads at that K. The previous correction went too far by treating a nonunique
+post-append state as acceptable for promotion to base. The active plan now returns all intermediate
+weighted rows and requires a transaction-level uniqueness check before incorporation succeeds. It
+explains that Feldera's two-column file indexes payload within each K group, without adding it to the
+paper's folded K, and records the inner-index, comparison, cache, and compaction overhead. Per-file
+outer-key uniqueness does not prove global base uniqueness across LSM batches.

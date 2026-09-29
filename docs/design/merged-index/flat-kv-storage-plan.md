@@ -41,9 +41,10 @@ historical implementation proposals are not additional user instructions.
    before and after appending it. There is no old/new or base/pending bit in stored records.
 10. Snapshot handles own references to immutable batches. They introduce no transaction timestamp,
     historical version catalog, expiration policy, or batch-role override. Normal LSM compaction continues.
-11. K identifies base records, which have unique K. A signed delta may contain several payloads at the
-    same K. The post-append weighted state is not required to be unique by K; storage must return all
-    nonzero `(K, payload, weight)` results without enforcing a key constraint.
+11. K identifies base records, which have unique K. A signed pending delta may contain several payloads
+    at the same K. The read path returns all nonzero `(K, payload, weight)` results without selecting one.
+    Before the delta becomes base, the transaction must establish that the consolidated result is unique
+    by K; a file-local writer cannot establish this across LSM batches.
 12. Maintained view definitions contain no selection predicates. Q3's segment/date filters, aggregation,
     ordering, and limit belong to the query consuming the unfiltered joined view.
 
@@ -147,11 +148,11 @@ before snapshot references B:         (K, P100, +1)
 after snapshot references B and D:   (K, P120, +1)
 ```
 
-The replacement example happens to leave one active payload at K. This is an outcome of those weights,
-not an invariant of the post-append state. Another delta, such as `(K, P120, +1)` without a matching
-retraction, leaves both `(K, P100, +1)` and `(K, P120, +1)` in the after snapshot. The storage reader
-returns both. It neither selects one payload nor rejects the update. Any constraint on the transaction's
-result belongs to the source relation/runtime contract, not this merged-index read path.
+The replacement leaves one active payload at K. An incomplete change such as `(K, P120, +1)` without a
+matching retraction leaves both `(K, P100, +1)` and `(K, P120, +1)` in the after snapshot. The reader
+returns both. The transaction cannot promote that result to base. The commit protocol must reject it or
+rely on an existing source-relation key constraint that already rejects it; the raw cursor itself does not
+choose a winner. This preserves the base uniqueness guarantee without rejecting intermediate delta rows.
 
 K-only record identity does not mean summing every weight for K and discarding the payload: the replacement
 delta's key-only weight is zero, yet its payload changes. Feldera's Z-set consolidation sums weights for
@@ -296,6 +297,41 @@ after handle  -> B + D         # unchanged, still R_plus
 Here B may stand for several batches. The essential requirement is retaining the appropriate handles
 until consumers finish, not forbidding compaction from combining prior state with newly appended changes.
 
+### Cost of using payload as the inner file key
+
+The physical two-column layout keeps K exactly as the paper defines it. `Writer2` stores one outer K row
+per batch and a sorted inner group keyed by payload; payload is **not** appended to K. This reuses
+Feldera's existing indexed Z-set file and generic `BatchReader`/`Spine` merger, so pending replacements
+with different payloads can occupy one batch without changing the layer-file format.
+
+The cost is an inner tree/index, a row-group boundary for each K, and comparisons and sorting of payloads
+within K during batch construction and compaction. Payload bytes may also appear in inner index blocks;
+large or variable-length payloads can increase file size, cache pressure, and I/O. Even a base K with
+one payload pays for an inner row and its group metadata. A lookup by K seeks the outer tree, then reads
+its inner group; for m active contributions at K, a full group scan is O(m). The inner payload index
+permits value seeks within that group, but Q3 does not need them. The backend requires a stable comparison
+for payload equality and merging even though queries order and seek only by K. Measure
+bytes per record, index-block bytes, compaction bytes, seek latency, and cache use against a one-column
+prototype; do not assume the overhead is negligible.
+
+`Writer2` checks uniqueness of outer K **within one batch** and of payload within that K's inner group.
+It does not prove uniqueness of active K across all batches. A one-column file-local K check would not
+prove that either, because another LSM batch may contain the same K. The committed base invariant must be
+checked against the consolidated state (or guaranteed by the source relation's transaction-level key
+constraint). There is no stored base/pending bit: the pre-append snapshot is base, and the post-append
+snapshot includes the pending delta.
+
+For a direct transaction-level check, take the distinct K values appearing in the signed delta before
+projecting or summing their weights. Unchanged keys were already valid by induction. For each changed K,
+seek the post-append snapshot, consolidate weights by equal payload, discard zero totals, and require no
+more than one remaining payload. Perform this before publishing a successful maintenance transaction.
+A failed check aborts that transaction through the existing runtime rollback/recovery protocol; it is not
+a storage-layer cascade or a last-write-wins choice. Step 2 exposes the raw cursor and tests this scan;
+Step 3 binds the check to source/view commit. The scan costs one LSM seek per changed K plus
+traversal of its contributions across batches. Step 3 uses this check unless it proves that
+existing source keyed storage enforces the same uniqueness invariant for all three indexed
+relations; only then can it omit the redundant scan.
+
 ### Append before view maintenance
 
 Index membership and incorporation into a maintained view are separate facts. A delta can already be in
@@ -353,7 +389,8 @@ column 1: P100 -> -1
 
 Every second-level row contains exactly one payload and weight. Its associated parent supplies K.
 The raw cursor flattens this physical grouping into `(K, V)` contributions. No V contains a packed list.
-Base records are unique by K; a delta or post-append read may expose several weighted payloads for K.
+Base records are unique by K. A pending delta or its pre-commit post-append read may expose several
+weighted payloads for K. Transaction validation ensures the state promoted to base is unique by K.
 Multiple physical columns reuse the file format; the logical index has one folded search key.
 
 Both writer levels already require unique keys within each group. Write payload rows with `write1`, then
@@ -413,7 +450,8 @@ The Q3 codec's decoded enum is a utility for validation, not a typed query-acces
 Use Rust tests and an independent `BTreeMap<(Key, Payload), Weight>` Z-set oracle. This map is an
 algebraic test oracle, not the search-key or record-identity definition. Seed base records with unique K,
 then apply the complete signed delta by `(K, payload)` equality. Permit multiple nonzero payloads at K
-in the post-append result. Test supplied related-row changes exactly as given.
+in an intermediate post-append read, but reject promotion to base until the complete transaction yields
+unique active K values. Test supplied related-row changes exactly as given.
 
 1. **Key and payload codecs:** golden key bytes, fold/unfold, malformed keys, serializer round trips,
    prefix scans, no extra END/LOOKUP tags, kind fields, or status bits, and one payload per contribution row.
@@ -421,7 +459,8 @@ in the post-append result. Test supplied related-row changes exactly as given.
    reverse, and exact seeks; flattened cursor agreement; ordinary payload/weight consolidation.
 3. **Weighted state:** unique K in base input; several same-K delta rows; replacements, cancellation,
    signed multiplicity, zero net key weight with changed payload, multiple active post-append payloads at
-   one K, persistence, and reopen. Readers must return all nonzero results.
+   one K before commit, persistence, and reopen. Readers return all nonzero results; the transaction
+   validator checks changed K values before promotion to base.
 4. **References and I/O:** snapshots perform no file-block reads or writes. Seeking a small range reads
    needed blocks. Force compaction of prior batches plus delta while before, after, and delta handles
    remain referenced; all three must retain their distinct intended results. Use files larger than the

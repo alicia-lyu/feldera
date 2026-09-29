@@ -248,7 +248,8 @@ Feldera adapter below remains to be implemented.
 The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
 value contains one regular payload and a signed weight. Base records have unique K. Signed delta
 contributions may share K, and a post-append read may contain multiple nonzero payloads at K. Storage
-returns all such weighted rows; it does not enforce a post-append key constraint. No packed payload
+returns all such weighted rows. The transaction checks K uniqueness before incorporating this result
+into base state. No packed payload
 list or extra key suffix is permitted. Physical columns may split record fields.
 **Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
@@ -295,7 +296,8 @@ replacement appends two flat records at the same folded key: `(old_payload, -1)`
 The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
 alone would lose a payload replacement whose net weight change is zero. The base records are unique by K;
-the post-append weighted state need not be. The generic spine internally orders same-K delta values;
+the intermediate post-append weighted state need not be. The transaction validates K uniqueness before
+that state becomes base. The generic spine internally orders same-K delta values;
 this does not require an order-preserving payload encoding or add V to the merged-index search key.
 The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
@@ -622,8 +624,9 @@ weight(B row)             = weight(O row) * weight(C row)
 weight(J row)             = weight(B row) * weight(L row)
 ```
 
-Base records have unique K. The after-state reader yields every nonzero weighted payload for K; it does
-not assume the transaction leaves only one. During a replacement, the delta can contain both
+Base records have unique K. The after-state reader yields every nonzero weighted payload for K.
+It does not assume an intermediate result has only one. Before the transaction makes this result base,
+its source-key constraint must establish uniqueness. During a replacement, the delta can contain both
 `(K, old_payload, -1)` and `(K, new_payload, +1)`. Its net weight by K is zero, but its two complete
 changes must survive until they are combined with the preexisting record. Distinct line identities remain
 separate in `J`, even if their dates, price, and discount happen to match.
