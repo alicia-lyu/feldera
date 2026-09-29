@@ -15,9 +15,9 @@
 > path. Neither term refers to reconstructing input deltas. Reconstructed state still depends on retained
 > source data and may use bounded temporary buffers; the distinction is how the integrator output is supplied.
 >
-> **spine** — LSM run collection and background merger.
+> **spine** — collection of immutable batches and background merger.
 >
-> **batches** — immutable sorted runs of weighted updates, in memory or files.
+> **batches** — immutable sorted collections of weighted updates, in memory or files.
 >
 > **layer file** — Feldera's immutable file format for nested sorted groups.
 >
@@ -39,12 +39,12 @@ values `V` grouped under each key, with associated weights. One `K` can have man
 composite mapping `(K,V) → weight`, not secondary indexing of every SQL field.
 
 The file-backed batch builder writes keys to level zero and values plus weights to level one, then finishes
-one file-backed batch. Thus these trees belong to each immutable run, not to the entire LSM collection
+one file-backed batch. Thus these trees belong to each immutable batch, not to the entire LSM collection
 ([batch
 construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L982-L1016)).
 The outer level compares `K`. After selecting a fixed `K`, the inner level compares `V`; it does not
 compare `K` again or order records by weight. Inner seeks use a target `V` within that group's sorted values.
-For example, `(K=7,V=order_a)` precedes `(K=7,V=order_b)` according to the order-tuple comparator. When runs
+For example, `(K=7,V=order_a)` precedes `(K=7,V=order_b)` according to the order-tuple comparator. When batches
 are combined, equal `K` groups are matched and equal `V` values within them have their weights added.
 Ordering by `V` does not create a global lookup by `V` across different `K` groups. A scan-only
 consumer need not use that seek capability. The file-format goals explicitly distinguish seeking from
@@ -160,11 +160,11 @@ This is the structure of the existing
 A file batch instead locates the key and its value group through file indexes and block reads. Both expose
 cursor navigation; the consumer does not unpack the entire group into another container.
 
-A snapshot can contain several runs. Its cursor combines their ordered contents: for matching `(K,V)` pairs,
+A snapshot can contain several batches. Its cursor combines their ordered contents: for matching `(K,V)` pairs,
 sum the weights and omit zero totals; omit a key if all its values cancel. For example, appending updates
 `((7,order_a),-1)`, `((7,order_d),+1)`, and `((9,order_c),-1)` to the batch above leaves
 `7 → {order_b → 2, order_d → 1}`. The old snapshot still exposes the original contents. The running merge
-keeps cursor positions in its member runs; it does not need to materialize the entire accumulated relation.
+keeps cursor positions in its member batches; it does not need to materialize the entire accumulated relation.
 See [snapshot cursor construction](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L196-L215)
 and [weight consolidation and zero suppression](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174).
 
@@ -246,11 +246,12 @@ Feldera adapter below remains to be implemented.
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
 The merged index uses folded byte keys and weighted payload rows in Feldera's two-column layer files.
-Each value contains one regular payload and a signed weight. Accumulated base state has unique K. Signed delta
-contributions may share K, and a post-append read may contain multiple nonzero payloads at K. Storage
-returns all such weighted rows. The transaction checks K uniqueness before incorporating this result
-into base state. No packed payload
-list or extra key suffix is permitted. The two file levels store folded K and its payload/weight rows.
+Each value contains one regular payload and a signed weight. At a completed transaction boundary,
+each folded K has at most one active payload. Signed delta contributions may share K, and a
+post-append read may contain multiple nonzero payloads at K. Storage returns all such weighted rows.
+The transaction checks K uniqueness before completion; appending the delta does not by itself complete
+view maintenance. No packed payload list or extra key suffix is permitted. The two file levels store
+folded K and its payload/weight rows.
 **Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
@@ -276,7 +277,7 @@ A consumer that requires individual line or joined tuples receives them incremen
 An operator API that requires an immutable batch object must receive explicitly budgeted storage, including
 spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
 
-Reuse the same LSM machinery: the spine, immutable-run management, compaction scheduling, cache, and
+Reuse the same LSM machinery: the spine, immutable-batch management, compaction scheduling, cache, and
 snapshot ownership. Folded keys and payload codecs change the records and their comparison/merge rules,
 not the need for that machinery. `Spine` is generic over its batch type
 ([generic trace
@@ -294,9 +295,9 @@ replacement appends two weighted payload rows at the same folded key: `(old_payl
 `(new_payload, +1)`. The prior positive contribution remains visible in the snapshot taken before append.
 The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
-alone would lose a payload replacement whose net weight change is zero. The base records are unique by K;
-the intermediate post-append weighted state need not be. The transaction validates K uniqueness before
-that state becomes base. The generic spine internally orders same-K delta values;
+alone would lose a payload replacement whose net weight change is zero. The intermediate
+post-append weighted state may contain several active payloads at K. The transaction validates K
+uniqueness before completion. The generic spine internally orders same-K delta values;
 this does not require an order-preserving payload encoding or add V to the merged-index search key.
 The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
@@ -623,8 +624,8 @@ weight(B row)             = weight(O row) * weight(C row)
 weight(J row)             = weight(B row) * weight(L row)
 ```
 
-Base records have unique K. The after-state reader yields every nonzero weighted payload for K.
-It does not assume an intermediate result has only one. Before the transaction makes this result base,
+The after-state reader yields every nonzero weighted payload for K.
+It does not assume an intermediate result has only one. Before transaction completion,
 its source-key constraint must establish uniqueness. During a replacement, the delta can contain both
 `(K, old_payload, -1)` and `(K, new_payload, +1)`. Its net weight by K is zero, but its two complete
 changes must survive until they are combined with the preexisting record. Distinct line identities remain
@@ -658,8 +659,8 @@ provides related algebra, subject to this transaction-supplied update contract.
 
 `Spine::ro_snapshot()` collects existing `Arc` references into a vector; it does not copy tuples, memory
 batches, or files. It performs no writes, creates no persistent historical version, and sets no expiration
-date. Dropping the handle releases references. Existing backend resource cleanup is separate from the
-snapshot operation does not alter any record. See the
+date. Dropping the handle releases references. Existing backend resource cleanup is separate.
+Snapshot creation does not alter any record. See the
 [exact call-path audit](folded-key-layer-file-plan.md#snapshot-ownership-does-not-copy-the-database).
 `SpineSnapshot` supports
 constructing a view with additional batches
@@ -797,7 +798,7 @@ criteria; this report does not claim they have been met.
 | Does the merged-index adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and before/after snapshot reads. |
 | Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify before/after source reads, reference-only snapshots, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
-| Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
+| Is total maintenance cheaper? | Compare datasets larger than memory under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
 
 For equal-sized blocks, `unique footprint = block_bytes * size(union of all consumers' blocks)`.
 Actual read traffic is the sum of physical read events; eviction can cause repeat reads. Include RF1/RF2,

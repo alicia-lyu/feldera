@@ -119,11 +119,12 @@ Lineitem payload = { ship_day: i32, extended_price_cents: i64, discount_hundredt
 Dates are days since the Unix epoch; price and discount use exact scale-two integers. The index
 identifier selects the payload schema. Feldera's serializer encodes V; only K needs an
 order-preserving byte encoding. The file merger orders payloads for internal equality and merging,
-not to provide a query-visible payload order. There is no stored old/new or base/pending bit,
-format field, kind field, or packed payload list.
+not to provide a query-visible payload order. V has no format field, kind field, or packed
+payload list.
 
-A valid accumulated base relation has at most one active payload per K. A signed delta may have
-several rows for K. Feldera's [upsert input](../../../crates/dbsp/src/operator/dynamic/input_upsert.rs#L628)
+At a completed transaction boundary, accumulated source state has at most one active payload
+per K. A signed delta may have several rows for K. Feldera's
+[upsert input](../../../crates/dbsp/src/operator/dynamic/input_upsert.rs#L628)
 already emits a negative weight for the previous row and a positive weight for its replacement:
 
 ```text
@@ -263,7 +264,7 @@ view_delta = compute_view_delta(delta, before, after)
 incorporate(view_delta, maintained_view)
 wait for all consumers of before, after, and delta
 release(delta, before, after)
-complete maintenance                             # no second append or bit clearing
+complete maintenance                             # no second append
 ```
 
 `clone_handle` shares immutable batch data/file readers with the delta-stream consumer; it does
@@ -271,8 +272,7 @@ not copy tuples. Serialize append-and-snapshot publication for one prototype mai
 so `after` includes exactly its intended changes. The source index can contain a delta that is
 not yet incorporated into the maintained view; the operator graph retains `delta`, `before`,
 and `after` separately, without status bits or batch-role labels. Normal spine insertion,
-backpressure, and compaction continue. Do not pause merging or rewrite files merely to change
-an old/new status.
+backpressure, and compaction continue.
 
 Multiple consumers may finish at different times. Step 3 binds completion, further-input
 admission, and failure rollback to the existing runtime transaction protocol. A snapshot is a
@@ -367,10 +367,12 @@ and shared scan sessions follow in Step 3.
 
 - **Plan:** Locate the consolidation and uniqueness-check boundaries; confirm whether source
   key constraints can establish the accumulated-state invariant.
-- **Build:** Merge signed contributions and provide a changed-K validation helper for Step 3.
+- **Build:** Merge signed contributions by `(K, payload)` and provide a changed-K validation
+  helper for Step 3.
 - **Evidence to advance:** A valid replacement leaves one active payload, an incomplete one is
-  detected, and ordinary compaction preserves the same accumulated state. Use an independent
-  signed-weight oracle when checking these outcomes.
+  detected, and ordinary compaction preserves the same accumulated state. A merge covering all
+  contributions for a valid K leaves one active payload. Use an independent signed-weight
+  oracle when checking these outcomes.
 
 ### Phase 4: Append and snapshots
 

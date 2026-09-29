@@ -28,9 +28,9 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | --- | --- |
 | [Read/write interfaces — trace.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace.rs#L231-L308) | Defines weighted collections, the read interface, and insertion of immutable update batches; anchors the interface pseudocode. |
 | [Key/value navigation — trace/cursor.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L42-L109) | Defines key-then-value iteration, forward seeks, borrowed values, and time/weight access. |
-| [LSM run management — trace/spine_async.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7) | Shows the generic collection of immutable runs and background merging targeted for reuse. |
+| [Spine batch management — trace/spine_async.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7) | Shows the collection of immutable batches and background merging targeted for reuse. |
 | [Read snapshots — trace/spine_async/snapshot.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L23-L43) | Defines snapshot acquisition, batch ownership/composition, and the combined cursor used for a stable read view. |
-| [Weight consolidation — trace/cursor/cursor_list.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174) | Shows addition of weights across runs and suppression of zero totals in unit-time reads. |
+| [Weight consolidation — trace/cursor/cursor_list.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174) | Shows addition of weights across batches and suppression of zero totals in unit-time reads. |
 | [File format — storage/file.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65) | Describes immutable nested groups, per-level tree indexes, associated data, and typed comparisons; constrains the merged-index batch adapter. |
 | [Memory batches — trace/ord/vec/indexed_wset_batch.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199) | Shows sorted keys, value offsets, values, and weights underlying the worked layout example. |
 | [Memory/file selection — trace/ord/fallback/indexed_wset.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58) | Confirms that retained indexed state can use either memory or file-backed batches. |
@@ -114,9 +114,9 @@ storage:
 >
 > **Z-set** — relation with signed tuple multiplicities.
 >
-> **batch** — immutable sorted run of weighted updates, in memory or a file.
+> **batch** — immutable sorted collection of weighted updates, in memory or a file.
 >
-> **spine** — Feldera's LSM run collection and background merger.
+> **spine** — Feldera's collection of immutable batches and background merger.
 
 | Aspect | RocksDB | Feldera |
 | --- | --- | --- |
@@ -135,10 +135,10 @@ storage:
 For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
 batch indexes keys and nested value groups. The format calls these levels **columns**. The outer level is ordered by
 `K`; within each fixed `K`, values are ordered
-by `V`. Inner seeks compare `V`, and consolidation combines weights for identical `(K,V)` tuples across runs.
+by `V`. Inner seeks compare `V`, and consolidation combines weights for identical `(K,V)` tuples across batches.
 This describes existing operator state.
 Feldera exposes retained state through the **trace** interface. `Spine` implements this interface
-by holding immutable sorted runs and merging them in the background. See [Storage differences from
+by holding immutable sorted batches and merging them in the background. See [Storage differences from
 RocksDB](support.md#storage-differences-from-rocksdb).
 An incoming operator delta can be buffered in memory, while an immutable storage batch can be memory backed
 or file backed. Once the adapter appends complete pending changes to the same merged index, its cursor can
@@ -171,9 +171,10 @@ The encoding must preserve the intended cross-type ordering and let the access l
 
 Each value contains one regular payload and its signed weight. The index
 identifier in the folded key determines the record type; `INDEX` is its domain tag, not an extra end marker.
-Base records have unique K. A replacement delta can carry negative and positive contributions with the
-same K; a pre-commit post-append read can return multiple nonzero payloads for that K. Before this
-result becomes base, the transaction validates unique active K values. The raw cursor returns all rows.
+At a completed transaction boundary, each folded K has at most one active payload. A replacement
+delta can carry negative and positive contributions with the same K; a post-append read can return
+multiple nonzero payloads for that K. Before transaction completion, validate unique active K values.
+The raw cursor returns all rows.
 Feldera's layer-file columns store folded K and its weighted payload rows; no payload list or key suffix
 is added.
 A range cursor reads KV entries in byte-key order and
@@ -181,7 +182,7 @@ decodes the fields needed by the requesting operator. For Q3, it streams one ord
 requested joined tuples before and after maintenance. It does not build an in-memory relation containing
 all those lines.
 The transaction supplies complete extended records and any intended related-row changes. Storage does not
-add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, run
+add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, batch
 management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
 merge rules. The planned batch uses Feldera's existing two-column layer-file layout.
 Payload replacement must preserve both payloads and signed changes; ordinary last-write-wins handling alone
@@ -215,7 +216,7 @@ a byte limit, without storing another complete accumulated relation.
 flowchart LR
     D[Weighted source changes] --> E[Type-specific key folding]
     E --> S[Folded-key batch adapter]
-    S --> M[Feldera spine and immutable runs]
+    S --> M[Feldera spine and immutable batches]
     S --> V[Before and after maintenance reads]
     V --> R[Byte-range cursor and joined tuple reconstruction]
     R --> A[Same accumulated-state access contract]
