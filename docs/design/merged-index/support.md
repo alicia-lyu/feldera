@@ -228,7 +228,7 @@ does not promise equal seek costs for both providers. Copies, lookahead, shared 
 consume the budgets described in the shared-session protocol. The proposed signatures illustrate the boundary;
 concrete Rust types and full method compatibility remain implementation work.
 
-## Folded keys require flat KV storage
+## Folded keys in Feldera layer files
 
 The primary general-design source is the
 [interesting-orderings manuscript](../../../../merged_index_interesting_orderings/main.tex#L357):
@@ -245,25 +245,24 @@ Feldera adapter below remains to be implemented.
 >
 > **Folding** — record-type-specific encoding of key fields into bytes.
 
-The chosen merged-index representation is a flat sequence of `(byte_key, encoded_value)` records. Each
-value contains one regular payload and a signed weight. Base records have unique K. Signed delta
+The merged index uses folded byte keys and weighted payload rows in Feldera's two-column layer files.
+Each value contains one regular payload and a signed weight. Accumulated base state has unique K. Signed delta
 contributions may share K, and a post-append read may contain multiple nonzero payloads at K. Storage
 returns all such weighted rows. The transaction checks K uniqueness before incorporating this result
 into base state. No packed payload
-list or extra key suffix is permitted. Physical columns may split record fields.
+list or extra key suffix is permitted. The two file levels store folded K and its payload/weight rows.
 **Folding** produces the key. Customer, Orders, and extended Lineitem use
 different folding rules. Their logical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
 value kind field is needed. Encoding must preserve the required cross-type order. The
-[Step 2 plan](flat-kv-storage-plan.md#flat-record-representation) specifies the concrete prototype bytes and
+[Step 2 plan](flat-kv-storage-plan.md#record-representation) specifies the concrete prototype bytes and
 the mapping to Feldera's existing file columns and cursors. Prefix scans seek and step until the prefix changes;
 they do not need a function computing the next existing key.
 
-The flat KV access contract is a user-specified architectural requirement. Feldera's existing
-`K → {V → weight}` representation remains the baseline for operator state. The storage adapter reuses
-its physical group structure with folded K and payload/weight rows, and exposes flat KV contributions. An
+Feldera's existing `K → {V → weight}` representation remains the baseline for operator state. The
+storage adapter reuses its physical group structure with folded K and payload/weight rows. An
 operator requests a key or range; the adapter computes encoded bounds, seeks the KV cursor, and decodes
 the required fields from the returned entries. The backend compares byte keys without maintaining a
 separate index on each folded field.
@@ -278,20 +277,20 @@ An operator API that requires an immutable batch object must receive explicitly 
 spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
 
 Reuse the same LSM machinery: the spine, immutable-run management, compaction scheduling, cache, and
-snapshot ownership. Flat KV changes the records and their comparison/merge rules, not the need for that
-machinery. `Spine` is generic over its batch type
+snapshot ownership. Folded keys and payload codecs change the records and their comparison/merge rules,
+not the need for that machinery. `Spine` is generic over its batch type
 ([generic trace
 implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L2085-L2090));
 the adapter must satisfy its batch contracts. This does not mean reusing `FileIndexedWSet` unchanged. The file layer
 provides per-level search keys with associated data and documents typed comparisons
 ([file representation and
 ordering](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65)).
-That provides a place to investigate a flat byte-key representation; it does not establish an existing
-flat weighted-KV adapter. Select a byte-key type/comparator with the required lexicographic order and define
+That provides a place to implement folded byte keys; it does not establish an existing
+merged-index batch adapter. Select a byte-key type/comparator with the required lexicographic order and define
 how batches, merging, reads, and snapshots preserve the encoded values.
 
-Flat KV shape does not select update semantics. The index identifier selects the payload schema. A
-replacement appends two flat records at the same folded key: `(old_payload, -1)` and
+The layer-file layout does not select update semantics. The index identifier selects the payload schema. A
+replacement appends two weighted payload rows at the same folded key: `(old_payload, -1)` and
 `(new_payload, +1)`. The prior positive contribution remains visible in the snapshot taken before append.
 The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
@@ -669,11 +668,11 @@ composition](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d6
 Combined cursors add matching
 weights and suppress zero totals
 ([consolidation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174)).
-These establish existing weighted-batch primitives. The flat KV adapter must implement equivalent before/after
+These establish existing weighted-batch primitives. The merged-index adapter must implement equivalent before/after
 visibility for encoded payloads; concatenating batches or overwriting equal byte keys is not by itself proof
 of correct weighted reconstruction. Reads must resolve the pending changes without waiting for compaction.
 
-The integration keeps a read handle to pre-append source batches, appends all supplied flat signed records
+The integration keeps a read handle to pre-append source batches, appends all supplied signed contributions
 once, then **seals** the complete update set for after-maintenance reads. The transaction supplies related
 row changes; the storage layer does not cascade them. Release computation-owned read handles when every
 consumer has finished. Runtime transactions can span multiple steps, so cursor exhaustion or one step is not the barrier
@@ -795,7 +794,7 @@ criteria; this report does not claim they have been met.
 | Acceptance question | Required evidence |
 | --- | --- |
 | Are operator inputs and results identical? | Run the same join operators with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and before/after maintenance reads, then check retraction/insertion outputs against independent evaluation. |
-| Does the flat KV adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and before/after snapshot reads. |
+| Does the merged-index adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and before/after snapshot reads. |
 | Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify before/after source reads, reference-only snapshots, and exactly-once batch advancement. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
 | Is total maintenance cheaper? | Compare beyond-memory runs under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |

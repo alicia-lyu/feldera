@@ -31,7 +31,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [LSM run management — trace/spine_async.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L1-L7) | Shows the generic collection of immutable runs and background merging targeted for reuse. |
 | [Read snapshots — trace/spine_async/snapshot.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async/snapshot.rs#L23-L43) | Defines snapshot acquisition, batch ownership/composition, and the combined cursor used for a stable read view. |
 | [Weight consolidation — trace/cursor/cursor_list.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor/cursor_list.rs#L150-L174) | Shows addition of weights across runs and suppression of zero totals in unit-time reads. |
-| [File format — storage/file.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65) | Describes immutable nested groups, per-level tree indexes, auxiliary payloads, and typed comparisons; constrains the flat byte-key adapter. |
+| [File format — storage/file.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65) | Describes immutable nested groups, per-level tree indexes, associated data, and typed comparisons; constrains the merged-index batch adapter. |
 | [Memory batches — trace/ord/vec/indexed_wset_batch.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/vec/indexed_wset_batch.rs#L158-L199) | Shows sorted keys, value offsets, values, and weights underlying the worked layout example. |
 | [Memory/file selection — trace/ord/fallback/indexed_wset.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58) | Confirms that retained indexed state can use either memory or file-backed batches. |
 | [File batches — trace/ord/file/indexed_wset_batch.rs](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L447-L478) | Shows batched key fetching and, later in the file, key/value batch construction. Both matter when defining the baseline and adapter boundary. |
@@ -64,7 +64,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | --- | --- |
 | [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) | Connects the baseline comparison to concrete storage sources. |
 | [Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values) | Provides interface pseudocode, an array layout, traversal/lookup examples, and interchangeable read providers. |
-| [Folded keys require flat KV storage](support.md#folded-keys-require-flat-kv-storage) | Defines the record representation and weighted-update requirements for reusing the LSM machinery. |
+| [Folded keys in Feldera layer files](support.md#folded-keys-in-feldera-layer-files) | Defines the record representation and weighted-update requirements for reusing the LSM machinery. |
 | [Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory) | Specifies owner/view lifetime, ordering, reader positions, borrowed records, and bounded overflow behavior in pseudocode. |
 | [Merged index reconstructs integrator outputs](support.md#merged-index-reconstructs-integrator-outputs) | Maps predicate-free join state to reconstruction routines and the existing join operator contract. |
 | [Weighted reconstruction preserves group existence](support.md#weighted-reconstruction-preserves-group-existence) | Explains signed multiplicity and defers grouped existence to the consuming Q3 query. |
@@ -94,7 +94,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 >
 > **Residual execution** — Query work performed over the maintained pipeline result to produce the final result.
 
-Reuse Feldera's LSM machinery with a flat byte-key/value representation for the merged index. Reconstruct
+Reuse Feldera's LSM machinery with folded byte keys and weighted payload rows for the merged index. Reconstruct
 accumulated relations from that store while preserving join and aggregation algorithms. The adapter changes
 record representation and accumulated-state access; it does not require a separate LSM implementation.
 The target is maintenance of the result of one **order-sharing pipeline** in a nonrecursive **root circuit**.
@@ -145,7 +145,7 @@ or file backed. Once the adapter appends complete pending changes to the same me
 seek them before view maintenance. File backed batches remain on disk; cursors read indexed blocks as needed.
 Snapshot references do not load every referenced batch into memory.
 [Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values)
-shows interface pseudocode, array layout, cursor traversal, and the flat merged-index adapter.
+shows interface pseudocode, array layout, cursor traversal, and the merged-index adapter.
 
 In this root circuit, logical time has a single value, written `()` in Rust, so records need no varying
 logical timestamp. Feldera's file batches also support fetching multiple requested keys together; retain
@@ -154,7 +154,7 @@ that optimization in the baseline comparison.
 ## What changes in our design
 
 The [Step 2 storage plan](flat-kv-storage-plan.md) records the current implementation contract and the
-user's clarifications: flat tuple records, signed weights, transaction-supplied related-row
+user's clarifications: folded keys, weighted payload rows, transaction-supplied related-row
 changes, and temporary read handles without multi-versioning or expiration policies.
 
 > [!NOTE]
@@ -174,8 +174,8 @@ identifier in the folded key determines the record type; `INDEX` is its domain t
 Base records have unique K. A replacement delta can carry negative and positive contributions with the
 same K; a pre-commit post-append read can return multiple nonzero payloads for that K. Before this
 result becomes base, the transaction validates unique active K values. The raw cursor returns all rows.
-Physical columns may store their fields separately;
-the adapter exposes flat KV contributions with no packed payload list or added key suffix.
+Feldera's layer-file columns store folded K and its weighted payload rows; no payload list or key suffix
+is added.
 A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it streams one order's source rows to supply
 requested joined tuples before and after maintenance. It does not build an in-memory relation containing
@@ -183,11 +183,10 @@ all those lines.
 The transaction supplies complete extended records and any intended related-row changes. Storage does not
 add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, run
 management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
-merge rules. Flat KV records do not require a different LSM, but the grouped indexed batch cannot be reused
-unchanged.
+merge rules. The planned batch uses Feldera's existing two-column layer-file layout.
 Payload replacement must preserve both payloads and signed changes; ordinary last-write-wins handling alone
-cannot implement weighted reconstruction. [Folded keys require flat KV
-storage](support.md#folded-keys-require-flat-kv-storage)
+cannot implement weighted reconstruction. [Folded keys in Feldera layer
+files](support.md#folded-keys-in-feldera-layer-files)
 defines this boundary and the remaining adapter work.
 
 > [!NOTE]
@@ -215,7 +214,7 @@ a byte limit, without storing another complete accumulated relation.
 ```mermaid
 flowchart LR
     D[Weighted source changes] --> E[Type-specific key folding]
-    E --> S[Flat byte-key KV adapter]
+    E --> S[Folded-key batch adapter]
     S --> M[Feldera spine and immutable runs]
     S --> V[Before and after maintenance reads]
     V --> R[Byte-range cursor and joined tuple reconstruction]
@@ -376,9 +375,9 @@ source provenance and implementation acceptance criteria.
    runtime read sites, including before/after maintenance state and cursor operations. Specify the Rust adapter interfaces
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
-2. **Implement flat KV storage on the existing LSM.** Follow the [detailed storage plan](flat-kv-storage-plan.md):
-   paper-defined folded keys and flat values containing one payload and signed weight. Reuse
-   existing file columns; implement flat cursor access and the spine's batch/merge contracts. Append the supplied delta
+2. **Implement folded-key batches on the existing LSM.** Follow the [detailed storage plan](flat-kv-storage-plan.md):
+   paper-defined folded keys and values containing one payload and signed weight. Reuse
+   existing file columns; implement record cursor access and the spine's batch/merge contracts. Append the supplied delta
    once before view maintenance; use reference-only read handles. Verify replacements, signed updates,
    transaction-supplied key changes, and before/after snapshots. No parent lookup, storage-generated
    child moves, multi-versioning, or expiry mechanism is part of this step. Typed scan sessions follow in Step 3.

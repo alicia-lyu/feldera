@@ -1,4 +1,4 @@
-# Step 2: Flat weighted records on Feldera's LSM
+# Step 2: Folded-key weighted records on Feldera's LSM
 
 Date: 2026-09-28. Status: implementation plan; no runtime implementation is claimed.
 
@@ -25,7 +25,7 @@ historical implementation proposals are not additional user instructions.
    Numeric tag values are encoding choices; parent-before-child order constrains their relative values.
 2. There is no `OrderParent` record, lookup namespace, or required reverse-parent lookup in this adapter.
 3. Scans seek a prefix and advance the storage iterator until the prefix changes. No `successor` API is needed.
-4. Each logical record is one flat `(K, V)` pair; physical columns may split its fields. `V` contains one
+4. Each indexed contribution is one `(K, V)` pair; the layer-file columns split its fields. `V` contains one
    regular payload and a signed weight. There are no payload lists, per-record `format`
    fields, or redundant `kind` fields.
 5. An **immutable batch** contains many records and keys; it can reside in memory or in a **layer file**.
@@ -48,7 +48,7 @@ historical implementation proposals are not additional user instructions.
 12. Maintained view definitions contain no selection predicates. Q3's segment/date filters, aggregation,
     ordering, and limit belong to the query consuming the unfiltered joined view.
 
-## Flat record representation
+## Record representation
 
 ### K: the paper's folded key
 
@@ -81,7 +81,7 @@ scan_prefix(snapshot, prefix):
     cursor.seek_ge(prefix)             # first matching row, including repeated equal keys
     while cursor.valid() and cursor.key().starts_with(prefix):
         yield cursor.key(), cursor.value()
-        cursor.next()                 # next flat record, including another record with equal K
+        cursor.next()                 # next contribution, including another with equal K
 ```
 
 Customer prefixes end after `c`; order prefixes end after `o`; a line-only prefix additionally includes the
@@ -91,7 +91,7 @@ does not require manufacturing a next existing key.
 ### V: one payload and one weight
 
 ```text
-FlatValue {
+MergedIndexValue {
     payload: PayloadBytes,
     weight: ZWeight,                   # Feldera's signed i64 weight
 }
@@ -105,7 +105,7 @@ Dates use integer days since the Unix epoch; price and discount use exact scale-
 The payload fields above specify logical types. Use Feldera's existing serializer for V; only K needs an
 order-preserving byte encoding. V has no query-visible comparison order or application-defined endianness
 requirement. The internal ordering required by Feldera's delta-batch merger is specified below.
-The index identifier in K selects the payload schema. `FlatValue` adds no format or kind field.
+The index identifier in K selects the payload schema. `MergedIndexValue` adds no format or kind field.
 
 The index stores the supplied Customer, Orders, and extended Lineitem records. The maintained view is
 an unfiltered join of those relations, retaining the keys, segment, order date/priority, ship date, price,
@@ -117,11 +117,10 @@ The attached manuscript's filtered aggregate-first circuit is a historical refer
 view definition. For example, a Customer outside BUILDING and its joined line rows belong to the maintained
 view; the consuming Q3 query excludes them. Changing that customer's segment updates the joined rows.
 
-Each record associates K with one V containing the data and weight. K alone is the record identity;
-a payload replacement updates that same identity. Source-state traversal orders records by K alone. V does not
-extend K or participate in lookup by K.
-Physical field placement may use multiple columns. The logical flat KV contract does not require packing
-all fields into one physical column.
+In a batch formed by fully consolidating valid accumulated state, each present K has one surviving
+payload-and-weight row. A replacement delta can contain two signed rows for that same K. K alone
+identifies the source record; payload and weight do not extend the folded search key. The layer-file
+layout stores K and its payload/weight rows in separate hierarchy levels.
 
 Feldera uses the word **column** for a level of its layer-file hierarchy: a row in one level can own a
 group of rows in the next. These are not ordinary independent field arrays; see the
@@ -306,21 +305,23 @@ until consumers finish, not forbidding compaction from combining prior state wit
 
 ### Physical mapping to Feldera layer files
 
-FlatKV has one logical search key K and one value V. For every batch, use Feldera's existing two-column
-layer-file layout: [`Writer2`](../../../crates/dbsp/src/storage/file/writer.rs#L1564) stores folded K at
-level 0 and payload with its signed weight at level 1. These levels are physical row groups, not an
-inner or outer key in the merged-index design. Payload is never appended to K.
+For every batch, use Feldera's existing two-column layer-file layout:
+[`Writer2`](../../../crates/dbsp/src/storage/file/writer.rs#L1564) stores folded K at level 0 and payload
+with its signed weight at level 1. K remains exactly the paper's folded search key. The payload is a
+child row in the file hierarchy and is never appended to K.
 
-The **same batch type and file layout** serve consolidated state and incoming deltas:
+The **same batch type and file layout** serve accumulated state and incoming deltas. When a batch is
+formed by fully consolidating valid state, each K group has one surviving payload row. A replacement
+delta can have two child rows under that K:
 
 ```text
-Consolidated batch: K -> { (P100,+1) }
-Incoming delta:     K -> { (P100,-1), (P120,+1) }
-After full merge:   K -> { (P120,+1) }
+Fully consolidated state: K -> [ (P100,+1) ]
+Incoming delta:          K -> [ (P100,-1), (P120,+1) ]
+After full merge:        K -> [ (P120,+1) ]
 ```
 
-Each child row represents one logical `(K, V)` contribution; V contains one payload and weight, not a
-list. A delta can have different payloads under the same folded K. Z-set consolidation matches equal
+Each child row represents one `(K, V)` contribution; V contains one payload and weight, not a list.
+A delta can have different payloads under the same folded K. Z-set consolidation matches equal
 complete `(K, payload)` contributions, so the `P100` weights cancel while `P120` remains. The file
 format's payload ordering serves batch construction and merging; queries seek by folded K.
 
@@ -429,11 +430,11 @@ or ordering by it. Eliminating it entirely would require replacing that contract
 
 ### Batch and raw-cursor contracts
 
-Implement `FlatKvBatch` under `crates/dbsp/src/trace/ord/flat_kv/`. Put prototype Q3 codecs and the storage
+Implement `MergedIndexBatch` under `crates/dbsp/src/trace/ord/merged_index/`. Put prototype Q3 codecs and the storage
 owner under `crates/dbsp/src/trace/merged_index/`. This step exposes crate-internal APIs only.
 
 ```text
-raw batch row:       (FoldedKey, FlatValue { one payload, weight })
+raw batch row:       (FoldedKey, MergedIndexValue { one payload, weight })
 BatchReader::Key:   dynamic FoldedKey
 BatchReader::Val:   dynamic PayloadBytes
 BatchReader::R:     DynZWeight
