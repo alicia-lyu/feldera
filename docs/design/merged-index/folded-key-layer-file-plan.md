@@ -197,8 +197,6 @@ negative weight for the previous row and a positive weight for its replacement. 
 The merged-index batch must preserve both signed rows, and integration must append that batch once before
 taking the after-state snapshot. The internal trace wiring is an implementation reference, not another
 concept required to understand the storage layout.
-[Delayed access](../../../crates/dbsp/src/operator/dynamic/trace.rs#L745) returns a snapshot of delayed
-accumulated state. The adapter supplies identical tuples and weights at those state-access sites.
 
 For example, the [root join](../../../crates/dbsp/src/operator/dynamic/join.rs#L499) computes:
 
@@ -211,11 +209,12 @@ The simultaneous-change term occurs once. A scan of the live index alone cannot 
 compaction has cancelled its contributions against the delta. Retain the before snapshot before append;
 it preserves the needed immutable batches. Do not infer before/after membership from row values or weights.
 
-The [accumulating join](../../../crates/dbsp/src/operator/dynamic/join.rs#L698) uses corresponding current
-and delayed state. Its [delayed-state operator](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L1375)
-caches a handle across runtime steps until a flush-triggered evaluation. Step 1 must bind actual operator
-read sites; Step 3 drives read-handle lifetime and input completion through existing accumulation/flush
-wiring. Chunk arrival, file creation, and a single runtime step do not by themselves complete maintenance.
+Some operators reuse an earlier accumulated-state snapshot across several execution steps. Feldera's
+[delayed snapshot](../../../crates/dbsp/src/operator/dynamic/trace.rs#L745) and
+[snapshot keeper](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L1375) show this behavior.
+The storage requirement is to keep the before-state snapshot readable until the last operator using it
+finishes. Step 3 connects that lifetime to operator completion; Step 2 supplies the stable snapshot.
+Receiving one input chunk or writing one file does not mean all consumers have finished.
 
 ### What trace and batch mean, and where their data lives
 
