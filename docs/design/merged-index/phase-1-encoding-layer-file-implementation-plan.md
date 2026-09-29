@@ -80,6 +80,12 @@ emit, without changing SQL schema generation.
 
 ## Stored representation
 
+```text
+one stored contribution = (folded K, payload, signed weight)
+layer-file column 0: folded K
+layer-file column 1: payload -> signed weight
+```
+
 1. Define a `FoldedKey` whose ordering compares the raw bytes lexicographically.
    Implement checked folding and unfolding on `CustomerOrdersLineitemIndex` for
    `Customer(c)`, `Orders(c, o)`, and `Lineitem(c, o, l)`. Use domain tags `0x00` through `0x03`
@@ -90,19 +96,17 @@ emit, without changing SQL schema generation.
    and line-only scans; a prefix is not necessarily a complete K.
 2. Define separate typed Customer, Orders, and Lineitem payload structures with precisely the
    fields and units in the [payload contract](folded-key-layer-file-plan.md#payload-signed-weight-and-replacement).
-   Encode each with Feldera's existing `rkyv` serialization into `PayloadBytes`; select the
-   decoder from the *validated* K identifier. Do not add a kind, format field, weight, or payload
-   list to those bytes. Document the codec's version assumption before any persisted-format
-   compatibility claim. Use checked decoding, including any required archive alignment, so
-   malformed bytes return an error rather than panic or unchecked archive access. Because V
-   has no discriminator, the codec cannot promise to detect every cross-schema payload mix-up;
-   callers must use the schema selected by K.
+   Encode their fields with Feldera's existing serializer. Before reading a payload, validate
+   K's length, domain tags, and final source identifier. An identifier of `0x01`, `0x02`, or
+   `0x03` then selects the Customer, Orders, or Lineitem payload structure. No second source-kind
+   field or file-format field belongs in each record: K identifies the source, and the layer
+   file handles its format. Report corrupt payload bytes as an error.
 3. Map `Writer2` as column 0 `(FoldedKey, ())` and column 1 `(PayloadBytes, ZWeight)`. The
    [writer contract](../../../crates/dbsp/src/storage/file/writer.rs#L1564) requires at least
    one child per parent, strictly increasing parent keys, and strictly increasing payload keys
-   within each parent. Write every child with `write1` before its parent with `write0`. Keep
-   weight in child auxiliary data. Byte ordering of the payload is only the file's internal
-   equality and merge order; it has no query ordering meaning.
+   within each parent. Write every child with `write1` before its parent with `write0`. Each
+   child row stores one payload and its signed weight; there is no packed payload list. Payload
+   byte order serves only file merging and equality, not query ordering.
 
 The implementation should first verify that `FoldedKey` and `PayloadBytes` wrappers satisfy
 Feldera's `DBData`/factory requirements. If a wrapper adds trait machinery without protecting an
