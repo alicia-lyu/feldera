@@ -456,10 +456,13 @@ and shared scan sessions follow in Step 3.
 
 ### Phase 3: Signed merging and K uniqueness
 
+- **Status:** Planned; see the
+  [Phase 3 implementation plan](phase-3-signed-merging-k-uniqueness-implementation-plan.md).
 - **Plan:** Locate the consolidation and uniqueness-check boundaries; confirm whether source
   key constraints can establish the accumulated-state invariant.
 - **Build:** Merge signed contributions by `(K, payload)` and provide a changed-K validation
-  helper for Step 3.
+  helper for Step 3. Keep the signed merger and state validator independent of physical storage;
+  exercise them through the existing in-memory batches and a small ordered cursor interface.
 - **Evidence to advance:** A valid replacement leaves one active payload, an incomplete one is
   detected, and ordinary compaction preserves the same accumulated state. A merge covering all
   contributions for a valid K leaves one active payload. Use an independent signed-weight
@@ -470,6 +473,8 @@ and shared scan sessions follow in Step 3.
 - **Plan:** Add file-backed batch construction and a bounded staging policy, including explicit
   limits for in-memory batch size and the number of in-memory batches. Specify ownership and
   lifetime of the before, delta, and after handles using the existing append and snapshot APIs.
+  Adapt file and mixed-batch inputs to Phase 3's signed semantics; physical storage and snapshot
+  lifecycle belong to this phase.
 - **Build:** Add on-disk batches, append the delta once, and expose the two accumulated-state
   reads to storage callers.
 - **Evidence to advance:** File-backed batches survive reopen and fetch requested blocks without
