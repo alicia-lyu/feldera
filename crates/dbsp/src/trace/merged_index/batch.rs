@@ -1,22 +1,22 @@
-//! In-memory folded-key batches and consolidated reads across batches.
+//! Folded-key batches and consolidated reads across batches.
 
 use crate::{
-    DynZWeight,
     algebra::ZWeight,
     dynamic::{DynData, Erase},
     trace::{
-        BatchReader, BatchReaderFactories, Builder,
         cursor::CursorList,
-        ord::vec::{VecIndexedWSet, VecIndexedWSetFactories},
+        ord::{OrdIndexedWSet, OrdIndexedWSetFactories},
+        BatchLocation, BatchReader, BatchReaderFactories, Builder,
     },
+    DynZWeight,
 };
 
 use super::{FoldedKey, PayloadBytes};
 
-pub(crate) type MergedIndexBatch = VecIndexedWSet<DynData, DynData, DynZWeight>;
+pub(crate) type MergedIndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
 type BatchCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 
-/// Sorts and consolidates contributions within one immutable in-memory batch.
+/// Sorts and consolidates contributions within one immutable initial batch.
 /// A zero net weight has no stored row.
 pub(crate) fn build_batch(
     rows: impl IntoIterator<Item = (FoldedKey, PayloadBytes, ZWeight)>,
@@ -37,11 +37,12 @@ pub(crate) fn build_batch(
         consolidated.push((key, payload, weight));
     }
 
-    let factories = VecIndexedWSetFactories::new::<Vec<u8>, Vec<u8>, ZWeight>();
-    let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity(
+    let factories = OrdIndexedWSetFactories::new::<Vec<u8>, Vec<u8>, ZWeight>();
+    let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity_in_location(
         &factories,
         consolidated.len(),
         consolidated.len(),
+        Some(BatchLocation::Memory),
     );
     let mut pending_key: Option<FoldedKey> = None;
     for (key, payload, weight) in consolidated {
@@ -68,7 +69,7 @@ pub(crate) fn batch_cursor(
     batches: &[MergedIndexBatch],
 ) -> CursorList<DynData, DynData, (), DynZWeight, BatchCursor<'_>> {
     let factories =
-        VecIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, Vec<u8>, ZWeight>();
+        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, Vec<u8>, ZWeight>();
     CursorList::new(
         factories.weight_factory(),
         batches.iter().map(BatchReader::cursor).collect(),

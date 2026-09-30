@@ -1,11 +1,11 @@
-use rkyv::{Archive, Deserialize, Serialize, bytecheck};
+use rkyv::{bytecheck, Archive, Deserialize, Serialize};
 
 use super::{
     BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
     MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
     SourceIndexSpec,
 };
-use crate::storage::file::{Deserializer, to_bytes};
+use crate::storage::file::{to_bytes, Deserializer};
 
 pub(super) const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
 const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");
@@ -189,7 +189,7 @@ impl CustomerOrdersLineitemIndex {
                 Ok((folded, bytes, weight))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        super::memory_batch::build_batch(encoded)
+        super::batch::build_batch(encoded)
     }
 
     pub fn fold(&self, key: &SourceKey) -> Result<FoldedKey, String> {

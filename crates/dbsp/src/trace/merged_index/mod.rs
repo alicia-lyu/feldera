@@ -8,10 +8,10 @@ use crate::{
     storage::{backend::StorageError, file::writer::Writer2},
 };
 
+pub(crate) mod batch;
 mod customer_orders_lineitem;
-pub(crate) mod memory_batch;
 
-pub(crate) use memory_batch::MergedIndexBatch;
+pub(crate) use batch::MergedIndexBatch;
 
 pub(crate) use customer_orders_lineitem::{
     CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,
