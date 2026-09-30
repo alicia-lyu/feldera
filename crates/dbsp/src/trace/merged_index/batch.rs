@@ -26,13 +26,14 @@ pub(crate) fn build_batch(
 
     let mut consolidated: Vec<(FoldedKey, PayloadBytes, ZWeight)> = Vec::with_capacity(rows.len());
     for (key, payload, weight) in rows {
-        if let Some((last_key, last_payload, last_weight)) = consolidated.last_mut() {
-            if *last_key == key && *last_payload == payload {
-                *last_weight = last_weight
-                    .checked_add(weight)
-                    .ok_or_else(|| "merged-index batch weight overflow".to_string())?;
-                continue;
-            }
+        if let Some((last_key, last_payload, last_weight)) = consolidated.last_mut()
+            && *last_key == key
+            && *last_payload == payload
+        {
+            *last_weight = last_weight
+                .checked_add(weight)
+                .ok_or_else(|| "merged-index batch weight overflow".to_string())?;
+            continue;
         }
         consolidated.push((key, payload, weight));
     }

@@ -11,45 +11,61 @@ or Spine implementations.
 
 ## Native storage boundary
 
-Use existing folding and payload codecs to create signed Customer records. Construct
-standard `OrdIndexedWSet` batches before inserting them into a native Spine. This alias
+Use existing folding and payload codecs to create signed Customer, Order, and Lineitem
+records. Construct standard `OrdIndexedWSet` batches exclusively through
+`index.build_batch` before inserting them into a native Spine. Initial L0 construction must
+always request `Some(BatchLocation::Memory)`, including inside a storage-enabled runtime
+whose normal construction policy selects files. This explicit choice is required because
+Feldera's generic batch builders may choose file storage while constructing a batch. This
+does not alter later Spine persistence or compaction. This alias
 already selects `FallbackIndexedWSet`, which supports memory and file storage. Spine has
 no point-insertion interface. Insert each batch once with awaited `Trace::insert`; use
 `TraceRole::Integral`, the native role for persistent integrator state. Initialize storage
 and background merging with the existing runtime test helper. That helper supplies test
 infrastructure, not transaction semantics.
 
-Use default shared runtime storage and merge configuration under low memory pressure.
-Native policy chooses placement and compaction. **Creating initial L0 sorted runs is run
-generation, not spilling.** It corresponds to the sorted-run generation phase of external
-merge sort. Moving existing in-memory runs to disk is handled through compaction,
-including pressure-triggered single-run compaction. Do not describe these as one
-“buffer-and-spill” operation. **Under normal circumstances, the merged-index adapter
-should never force a storage destination.** Let Feldera's native compaction and
-memory-pressure policy determine when runs move to disk. Ordinary tests inherit shared
+Use default shared runtime storage and merge configuration under low memory pressure for
+the default-policy storage test. **Creating initial L0 sorted runs is run generation, not
+spilling.** Initial construction explicitly requests memory to satisfy the required L0
+contract. Moving existing in-memory runs to disk is handled through native compaction,
+including pressure-triggered single-run compaction. Ordinary storage tests inherit shared
 defaults; targeted policy tests may override shared configuration.
 
-Use 16 batches of 10,000 distinct Customer records with disjoint key ranges. Each record
-has a 256-byte segment payload and weight `+1`. Assert initial batches are memory backed,
-and that eight batches together exceed the effective merge-storage threshold. Batch count
-triggers compaction; combined run size determines disk placement. Poll snapshot batch
-metadata for up to 30 seconds for a file-backed output. On timeout, report locations,
-sizes, and thresholds. Do not force storage destinations or invoke explicit full
-compaction to satisfy this test.
+Use 16 batches, each covering 10,000 distinct customers. For each customer `c`, create a
+Customer with a 256-byte segment, two Orders with IDs `1_000_000 + 2*c + j` for `j = 0`
+or `1`, and two Lineitems per order with line IDs 1 and 2. Set `order_day = c % 365 - 180`,
+`ship_priority = j`, `ship_day = order_day + line_id`,
+`extended_price_cents = 10_000 + order_id + line_id`, and
+`discount_hundredths = c % 101`. Build all 1,120,000 records through `index.build_batch`
+with positive unit weights. Assert initial batches are memory backed, including in a
+storage-enabled runtime. Separately confirm that the generic native builder can select a
+file when its threshold is configured to zero; this documents why merged-index L0
+construction explicitly requests memory.
+
+Preserve default-policy coverage: compare batch sizes across eight insertions, await each
+insertion, and poll snapshot metadata for up to 30 seconds for a file-backed output. On
+timeout, report locations, sizes, and thresholds. Do not force later storage destinations
+or invoke explicit full compaction to satisfy this test.
 
 ## Reads and lifecycle
 
 Retain a snapshot after the first insertion and verify it remains unchanged through
 later insertion and compaction. Verify consolidated reads of the current snapshot contain
-all 160,000 expected records, independent of physical batch boundaries. Reopen a resulting
+all 1,120,000 expected records, independent of physical batch boundaries. Reopen a resulting
 file batch through native path and reader access with matching factories, and compare its
 contents with the batch visible before reopen. Snapshots retain references to immutable
 runs and files; a retained snapshot may keep storage alive after live compaction.
 
-Add signed updates for cancellation, unchanged-key payload replacement, and key moves.
+Retain first-insertion and pre-update snapshots and verify their contents remain unchanged.
+Add signed updates that cancel customer 10's complete group, replace every payload at
+unchanged keys in customer 20's group, and move customer 30's complete group to customer
+160,000 with newly assigned order IDs.
 Compare consolidated reads with an independent `(folded key, payload)` signed-weight
-oracle using representable weights. Verify exact lookup, missing keys, ordered traversal,
-prefix stopping, and rewind across memory and file runs. Keep the test's physical
+oracle using representable weights. Verify Customer, Order, and Lineitem exact/missing
+lookup, ordered traversal, prefix scans, and rewind across memory and file runs. Require a
+resulting file batch to contain all three
+record types; reopen it through native path and reader access with matching factories and
+compare typed keys, payloads, and weights. Keep the test's physical
 placement observations separate from its logical read assertions.
 
 Run unchanged memory-only tests, the new storage tests, relevant native tests, Rust

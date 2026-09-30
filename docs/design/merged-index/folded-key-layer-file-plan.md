@@ -33,8 +33,12 @@ is deferred. This work does not transfer ownership of base rows to the merged in
 
 Reuse Feldera's native signed merging, including `CursorList` over existing batch cursors
 for Phase 2 reads. Matching `(K, payload)` contributions are summed and zero totals omitted;
-reads leave the underlying batches intact. Keep the existing batch builder. No new merger,
-cursor framework, or runtime uniqueness validator is planned.
+reads leave the underlying batches intact. Refactor the existing `index.build_batch` to
+return standard `OrdIndexedWSet` batches and always construct initial L0 runs with
+`Some(BatchLocation::Memory)`. This explicit destination is required because Feldera's
+generic builders can choose files during construction, a “weird” policy relative to this
+L0 contract. Native Spine persistence and compaction retain their existing file-placement
+behavior. No new merger, cursor framework, or runtime uniqueness validator is planned.
 
 Phase 4 verifies native memory-to-file compaction and snapshot reads directly; see the
 [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md) and
@@ -73,10 +77,11 @@ sorted-run generation phase of external merge sort. Moving existing in-memory ru
 is handled through compaction, including pressure-triggered single-run compaction. Do not
 describe these as one “buffer-and-spill” operation.
 
-**Under normal circumstances, the merged-index adapter should never force a storage
-destination.** Let Feldera's native compaction and memory-pressure policy determine when
-runs move to disk. Shared runtime configuration supplies that policy. Ordinary storage
-tests inherit defaults; targeted policy tests may override shared configuration.
+**Initial L0 construction explicitly requests memory.** Feldera's generic builders can
+select a file during construction, which is “weird” relative to this required contract.
+After insertion, native Spine persistence and compaction determine when runs move to disk.
+Shared runtime configuration supplies that later policy. Ordinary storage tests inherit
+defaults; targeted policy tests may override shared configuration.
 
 Compaction is not a maintenance barrier. It may happen earlier or later than the final table row.
 A merge that sees only some contributions for K can still output several payload rows; when it sees
@@ -465,8 +470,9 @@ in Step 3.
 
 - **Status:** Revised to use native consolidated reads on 2026-09-30; see the
   [Phase 2 implementation note](phase-2-implementation-note.md).
-- **Plan:** Use Feldera's in-memory indexed batch for folded keys, payload bytes, and signed
-  weights. Sort small arbitrary-order inputs in memory and return `CursorList` over batch cursors.
+- **Plan:** Refactor `index.build_batch` to return standard `OrdIndexedWSet` batches for
+  folded keys, payload bytes, and signed weights. Sort arbitrary-order inputs and explicitly
+  request memory for initial L0 construction. Return `CursorList` over native batch cursors.
 - **Build:** Add in-memory batches and reads over multiple keys and batches. Combine duplicate
   `(K, payload)` rows within each batch; native reads also consolidate across batches without changing them.
 - **Evidence to advance:** The cursor sums matching pairs across in-memory batches and omits zero totals.
@@ -479,16 +485,19 @@ in Step 3.
 - **Status:** See the [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md)
   and [implementation note](phase-4-implementation-note.md).
   The former Phase 3 plan was withdrawn on 2026-09-30; keep Phase 4 numbering.
-- **Plan:** Construct standard `OrdIndexedWSet` batches, then insert each batch once into a
-  native Spine with `TraceRole::Integral`, Feldera's role for persistent integrator state.
-  Inherit ordinary storage and merge defaults. Let background compaction move runs from
-  memory to file storage under native policy.
+- **Plan:** Construct standard `OrdIndexedWSet` batches through `index.build_batch`, then
+  insert each batch once into a native Spine with `TraceRole::Integral`, Feldera's role for
+  persistent integrator state. Initial L0 runs explicitly request memory; background
+  compaction later moves runs to file storage under native policy.
 - **Build:** Add separate storage tests in the merged-index module while preserving memory-only
-  helpers and tests. Read current and retained snapshots across memory/file runs and reopen a
-  resulting file batch through native path and reader access with matching factories.
+  helpers and tests. Exercise 16 batches of 10,000 customers covering all three record types
+  (1,120,000 total), with deterministic payloads. Read current and retained snapshots across
+  memory/file runs and reopen a resulting all-types file batch through native path and reader
+  access with matching factories.
 - **Evidence to advance:** Verify the file transition and batch metadata, complete consolidated
-  reads, signed cancellation, unchanged-key replacement, key moves, exact/missing seeks,
-  traversal, prefix stopping, and rewind against an independent signed-weight oracle.
+  reads, cancellation of one complete customer group, unchanged-key payload replacement,
+  moving a complete group to customer 160,000, typed exact/missing seeks, traversal, prefix
+  scans, and rewind against an independent signed-weight oracle.
   Snapshots retain references to immutable runs and files, so their lifetime can retain
   storage after live compaction. These tests establish storage behavior, not transaction
   recovery, a hard memory cap, or a performance improvement.

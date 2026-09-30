@@ -4,9 +4,13 @@ Date: 2026-09-30. Status: implemented; see the
 [Phase 2 implementation note](phase-2-implementation-note.md).
 
 The [Step 2 plan](folded-key-layer-file-plan.md#phase-2-batches-and-cursors) governs this phase.
-Keep the existing batch builder and Phase 1 codecs. Store folded keys, encoded payloads, and
-signed weights in Feldera's `VecIndexedWSet<DynData, DynData, DynZWeight>` with `Vec<u8>` keys
-and values, within the crate-internal boundary.
+Refactor the existing `index.build_batch` while retaining the Phase 1 codecs. Return standard
+`OrdIndexedWSet` batches, storing folded keys, encoded payloads, and signed weights in the
+crate-internal representation. Construct each initial L0 run with
+`Some(BatchLocation::Memory)` unconditionally, independent of runtime configuration or
+memory pressure. Generic Feldera builders may choose files during construction; for this
+required L0 contract, explicitly request memory. Keep folding, payload validation, sorting,
+signed consolidation, zero removal, and overflow checks in the existing path.
 
 Replace the custom raw cursor with a small constructor returning Feldera's `CursorList` over
 existing batch cursors. Support zero, one, or multiple batches without copying or separating
