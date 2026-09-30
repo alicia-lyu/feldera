@@ -457,12 +457,15 @@ and shared scan sessions follow in Step 3.
 ### Phase 3: Signed merging and K uniqueness
 
 - **Status:** Planned; see the
-  [Phase 3 implementation plan](phase-3-signed-merging-k-uniqueness-implementation-plan.md).
+  [Phase 3 implementation plan](phase-3-signed-merging-k-uniqueness-implementation-plan.md)
+  for the outline, Feldera component reuse, and required
+  [expert decisions](phase-3-signed-merging-k-uniqueness-implementation-plan.md#human-expert-input).
 - **Plan:** Locate the consolidation and uniqueness-check boundaries; confirm whether source
   key constraints can establish the accumulated-state invariant.
 - **Build:** Merge signed contributions by `(K, payload)` and provide a changed-K validation
   helper for Step 3. Keep the signed merger and state validator independent of physical storage;
-  exercise them through the existing in-memory batches and a small ordered cursor interface.
+  prefer Feldera's existing cursors and batch mergers, and resolve their arithmetic contract
+  with a trace maintainer before adding custom consolidation logic.
 - **Evidence to advance:** A valid replacement leaves one active payload, an incomplete one is
   detected, and ordinary compaction preserves the same accumulated state. A merge covering all
   contributions for a valid K leaves one active payload. Use an independent signed-weight
