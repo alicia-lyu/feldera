@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+## v0.358.0
+
 - Incompatible change (SQL): a `RANGE` window frame with a bound of the
   form `n PRECEDING` or `n FOLLOWING` now requires an `ORDER BY` column
   that cannot be `NULL`.  A program using e.g.,
@@ -18,6 +20,12 @@ Source edition can be found on github.
   by declaring the column `NOT NULL`, or by filtering out the `NULL` values first,
   for example with `WHERE ts IS NOT NULL`.  See [Unsupported
   operations](/sql/unsupported-operations#range-frames-with-offsets-over-nullable-columns).
+
+- Bug fix (Python SDK): `Pipeline.listen()` and `Pipeline.foreach_chunk()`
+  returned a `NULL` value of a `CHAR` or `VARCHAR` column as the string
+  `'None'`.  These columns now have the pandas type `string`, so a `NULL`
+  value is a missing value (`None` in `to_dict()`), and `pandas.isna()`
+  finds it.
 
 ## v0.356.0
 
