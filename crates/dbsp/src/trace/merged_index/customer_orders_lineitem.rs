@@ -1,11 +1,11 @@
-use rkyv::{bytecheck, Archive, Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize, bytecheck};
 
 use super::{
     BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
     MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
     SourceIndexSpec,
 };
-use crate::storage::file::{to_bytes, Deserializer};
+use crate::storage::file::{Deserializer, to_bytes};
 
 pub(super) const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
 const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");

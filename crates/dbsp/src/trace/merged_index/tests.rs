@@ -1,17 +1,17 @@
 use super::batch::batch_cursor;
 use super::customer_orders_lineitem::{
-    CustomerOrdersLineitemDefinition, CUSTOMER, CUSTOMER_DOMAIN, CUSTOMER_KEY_DOMAIN,
-    CUSTOMER_PRIMARY,
+    CUSTOMER, CUSTOMER_DOMAIN, CUSTOMER_KEY_DOMAIN, CUSTOMER_PRIMARY,
+    CustomerOrdersLineitemDefinition,
 };
 use super::*;
 use crate::{
+    DynZWeight,
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
     storage::{
         backend::StorageBackend,
-        file::{format::BatchMetadata, reader::Reader, writer::Parameters, Factories, FilterPlan},
+        file::{Factories, FilterPlan, format::BatchMetadata, reader::Reader, writer::Parameters},
     },
     trace::{BatchLocation, BatchReader, Cursor},
-    DynZWeight,
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
 use tempfile::tempdir;
@@ -112,9 +112,11 @@ fn cursor_consolidates_batches_without_changing_stored_rows() {
             .build_batch([customer_row(1, "A", -1), customer_row(4, "A", -1)])
             .unwrap(),
     ];
-    assert!(batches
-        .iter()
-        .all(|batch| batch.location() == BatchLocation::Memory));
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.location() == BatchLocation::Memory)
+    );
     let stored_before: Vec<_> = batches
         .iter()
         .map(|batch| read_cursor(&index, &mut batch.cursor()))
@@ -257,19 +259,23 @@ fn empty_batches_and_cancelled_rows_are_skipped() {
 #[test]
 fn batch_rejects_weight_overflow_and_mismatched_payload() {
     let index = index();
-    assert!(index
-        .build_batch([customer_row(1, "A", i64::MAX), customer_row(1, "A", 1),])
-        .is_err());
-    assert!(index
-        .build_batch([(
-            SourceKey::Customer(1),
-            SourcePayload::Orders(OrdersPayload {
-                order_day: 1,
-                ship_priority: 0,
-            }),
-            1,
-        )])
-        .is_err());
+    assert!(
+        index
+            .build_batch([customer_row(1, "A", i64::MAX), customer_row(1, "A", 1),])
+            .is_err()
+    );
+    assert!(
+        index
+            .build_batch([(
+                SourceKey::Customer(1),
+                SourcePayload::Orders(OrdersPayload {
+                    order_day: 1,
+                    ship_priority: 0,
+                }),
+                1,
+            )])
+            .is_err()
+    );
 }
 
 #[test]
@@ -285,7 +291,9 @@ fn exact_folded_keys_and_order() {
     );
     assert_eq!(
         line.as_bytes(),
-        &[1, 0x7f, 0xff, 0xff, 0xff, 2, 0x80, 0, 0, 0, 3, 0x80, 0, 0, 1, 0, 3]
+        &[
+            1, 0x7f, 0xff, 0xff, 0xff, 2, 0x80, 0, 0, 0, 3, 0x80, 0, 0, 1, 0, 3
+        ]
     );
     assert!(customer < order && order < line);
     assert_eq!(index.customer_prefix(-1), customer.as_bytes()[..5]);
@@ -441,15 +449,18 @@ fn q3_descriptors_keep_logical_fields_separate_from_tags() {
     );
     for spec in specs {
         for field in spec.key_fields {
-            assert!(CustomerOrdersLineitemDefinition::KEY_DOMAINS
-                .iter()
-                .any(|domain| domain.id == field.domain));
+            assert!(
+                CustomerOrdersLineitemDefinition::KEY_DOMAINS
+                    .iter()
+                    .any(|domain| domain.id == field.domain)
+            );
             assert!(!spec.payload_fields.contains(&field.name));
         }
-        assert!(spec
-            .payload_fields
-            .iter()
-            .all(|field| !spec.key_fields.iter().any(|key| key.name == *field)));
+        assert!(
+            spec.payload_fields
+                .iter()
+                .all(|field| !spec.key_fields.iter().any(|key| key.name == *field))
+        );
     }
     assert_eq!(
         specs[0]

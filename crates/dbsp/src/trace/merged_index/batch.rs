@@ -1,14 +1,14 @@
 //! Folded-key batches and consolidated reads across batches.
 
 use crate::{
+    DynZWeight,
     algebra::ZWeight,
     dynamic::{DynData, Erase},
     trace::{
+        BatchLocation, BatchReader, BatchReaderFactories, Builder,
         cursor::CursorList,
         ord::{OrdIndexedWSet, OrdIndexedWSetFactories},
-        BatchLocation, BatchReader, BatchReaderFactories, Builder,
     },
-    DynZWeight,
 };
 
 use super::{FoldedKey, PayloadBytes};
@@ -38,6 +38,7 @@ pub(crate) fn build_batch(
     }
 
     let factories = OrdIndexedWSetFactories::new::<Vec<u8>, Vec<u8>, ZWeight>();
+    // Generic builders may select file storage during construction. L0 runs start in memory.
     let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity_in_location(
         &factories,
         consolidated.len(),
