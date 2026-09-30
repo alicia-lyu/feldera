@@ -21,8 +21,23 @@ their historical implementation proposals are not additional instructions.
 
 The transaction supplies all intended related-row changes and both keys of a moved row. Storage does not
 move descendants, enforce relational consistency, or add an `OrderParent` lookup record. Step 2 provides
-folding/unfolding, weighted batches, snapshots, and raw cursors. Typed reconstruction, shared scan sessions,
+folding/unfolding, weighted batches, snapshots, and consolidated cursors. Typed reconstruction, shared scan sessions,
 view-operator wiring, and runtime transaction recovery follow in Step 3.
+
+## Settled scope before Phase 4
+
+Scope decision, 2026-09-30: **retain Feldera's existing base-relation storage and implement the
+merged index only as secondary storage**, serving the role of an additional operator trace or
+access path. A merged index could instead provide clustered primary storage, but that design
+is deferred. This work does not transfer ownership of base rows to the merged index.
+
+Reuse Feldera's native signed merging, including `CursorList` over existing batch cursors
+for Phase 2 reads. Matching `(K, payload)` contributions are summed and zero totals omitted;
+reads leave the underlying batches intact. Keep the existing batch builder. No new merger,
+cursor framework, or runtime uniqueness validator is planned.
+
+Phase 4 implementation remains deferred. Its file-backed batches, staging, append, and
+snapshots must follow this secondary-storage scope.
 
 > [!NOTE]
 > **Reading guide:** The main text states the intended behavior. “Implementer suggestion”
@@ -229,35 +244,43 @@ read_source_state(snapshot, K):
         totals[payload] += weight
     for (payload, weight) in totals:
         if weight != 0:
-            yield (K, payload, weight)  # zero, one, or several rows before validation
+            yield (K, payload, weight)  # preserve every nonzero result
 ```
 
-The raw cursor returns stored contributions; the state reader sums them and returns every
-nonzero result. If a transaction inserts `(K, P120, +1)` without retracting an existing
+Native cursors consolidate stored contributions and return every nonzero result. If a transaction
+inserts `(K, P120, +1)` without retracting an existing
 `(K, P100, +1)`, the post-append read returns both; it cannot silently
-choose one. The transaction must reject that result or rely on an existing source key constraint
-that rejects it. The delta is also retained as a separate operator input; reading it alone is
-not a read of accumulated state.
+choose one. Such a result violates the intended source-state invariant; correct source updates
+and secondary-index maintenance must prevent it. This example does not imply a separate
+merged-index runtime scan. The delta is also retained as a separate operator input; reading it
+alone is not a read of accumulated state. The pseudocode describes native consolidation
+semantics, not a request to implement another merger.
 
-### Validate K uniqueness before incorporating state
+### Inherit K uniqueness from source state
 
 [`Writer2`](../../../crates/dbsp/src/storage/file/writer.rs#L1564) checks K uniqueness within one
 batch and payload uniqueness within each K group; it cannot establish the accumulated-state
-invariant across LSM batches. Step 2 exposes the raw cursor and tests this scan; Step 3 binds it
-to source/view commit:
+invariant across LSM batches. General Feldera indexed collections permit several values per
+key; keyed input maps supply the stronger source-table invariant.
 
-```text
-changed_K = distinct folded keys in the signed delta
-for K in changed_K:
-    active = read_source_state(after_snapshot, K)
-    require count(active) <= 1
-```
+For participating sources, the integration must establish that the folded fields retain an
+enforced unique source key, source tags distinguish different sources, and index maintenance
+propagates every insertion and retraction correctly. Retaining a unique key is sufficient;
+the folded key may include additional ordering fields. Moves must retract the old full folded
+key. Any transformation producing extended Lineitem records must preserve the required
+identity and multiplicity as well.
 
-Take distinct K before projecting or summing the delta: its key-only net weight can be zero for
-a replacement. Unchanged K remain valid by induction. A failed check aborts the runtime
-transaction; storage does not repair it or choose a last writer. The scan costs one LSM seek per
-changed K plus traversal of its contributions. Step 3 may omit it only after proving that
-existing source key constraints enforce this invariant for all three indexed relations.
+Under those conditions, source uniqueness implies accumulated folded-K uniqueness. The current
+handwritten source metadata and encoding tests do not establish the actual SQL constraints,
+all update paths, or restore/bootstrap behavior. Step 3 must record that mapping and evidence.
+A source path that cannot establish the invariant needs an explicit integration decision;
+it does not silently add a changed-K scan to Phase 4.
+
+There is no separate mandatory runtime uniqueness validator in this scope. Tests should show
+that native full-pair merging preserves valid source replacements and partial compaction.
+If changed-key tracking is needed by a later consumer, collect keys before key-only summation:
+a replacement can have zero net weight by K. Storage never chooses a winner or repairs invalid
+source state, and checking survivor count alone would not establish unit-weight source validity.
 
 ### Maintained view and consuming query
 
@@ -339,8 +362,7 @@ historical-version catalog or file-retention policy.
 before = merged_index.snapshot()
 delta = prepare_complete_folded_delta()           # bounded staging; may be file-backed
 
-update source storage and its indexes:
-    merged_index.append(delta.clone_handle())     # shares data; one insertion
+merged_index.append(delta.clone_handle())         # secondary index; one insertion
 
 after = merged_index.snapshot()
 view_delta = compute_view_delta(delta, before, after)
@@ -351,7 +373,10 @@ complete maintenance                             # no second append
 ```
 
 `clone_handle` shares immutable batch data/file readers with the delta-stream consumer; it does
-not copy tuples. Serialize append-and-snapshot publication for one prototype maintenance input
+not copy tuples. The existing Feldera source path owns the base-table update and supplies the
+changes from which this folded delta is derived. This example describes only the secondary
+index's append/read sequence; Step 3 wires it into that source path and the runtime protocol.
+Serialize append-and-snapshot publication for one prototype maintenance input
 so `after` includes exactly its intended changes. The source index can contain a delta that is
 not yet incorporated into the maintained view; the operator graph retains `delta`, `before`,
 and `after` separately, without status bits or batch-role labels. Normal spine insertion,
@@ -434,7 +459,7 @@ and shared scan sessions follow in Step 3.
 
 ### Phase 1: Encoding and one readable layer-file batch
 
-- **Status:** Implemented and verified on 2026-09-29; see the
+- **Status:** Revised to use native consolidated reads on 2026-09-30; see the
   [Phase 1 implementation note](phase-1-implementation-note.md) for the encoding,
   file mapping, and test evidence.
 - **Plan:** Confirm the folded-key bytes, payload serialization, and two-column file mapping.
@@ -444,45 +469,35 @@ and shared scan sessions follow in Step 3.
 
 ### Phase 2: Batches and cursors
 
-- **Status:** Implemented and verified on 2026-09-29; see the
+- **Status:** Revised to use native consolidated reads on 2026-09-30; see the
   [Phase 2 implementation note](phase-2-implementation-note.md).
 - **Plan:** Use Feldera's in-memory indexed batch for folded keys, payload bytes, and signed
-  weights. Sort small arbitrary-order inputs in memory and expose a raw cursor over batches.
+  weights. Sort small arbitrary-order inputs in memory and return `CursorList` over batch cursors.
 - **Build:** Add in-memory batches and reads over multiple keys and batches. Combine duplicate
-  `(K, payload)` rows within each batch, but retain contributions from separate batches.
-- **Evidence to advance:** The cursor returns requested signed contributions across in-memory
-  batches, including equal `(K, payload)` pairs from different batches. This phase's test inputs
+  `(K, payload)` rows within each batch; native reads also consolidate across batches without changing them.
+- **Evidence to advance:** The cursor sums matching pairs across in-memory batches and omits zero totals.
+  Tests cover cancellation, replacement, interleaved sources, seeking, rewind, and unchanged stored rows.
+  This phase's test inputs
   are below 100 MiB; that is a workload assumption, not an enforced memory limit.
-
-### Phase 3: Signed merging and K uniqueness
-
-- **Status:** Planned; see the
-  [Phase 3 implementation plan](phase-3-signed-merging-k-uniqueness-implementation-plan.md)
-  for the outline, Feldera component reuse, and required
-  [expert decisions](phase-3-signed-merging-k-uniqueness-implementation-plan.md#human-expert-input).
-- **Plan:** Locate the consolidation and uniqueness-check boundaries; confirm whether source
-  key constraints can establish the accumulated-state invariant.
-- **Build:** Merge signed contributions by `(K, payload)` and provide a changed-K validation
-  helper for Step 3. Keep the signed merger and state validator independent of physical storage;
-  prefer Feldera's existing cursors and batch mergers, and resolve their arithmetic contract
-  with a trace maintainer before adding custom consolidation logic.
-- **Evidence to advance:** A valid replacement leaves one active payload, an incomplete one is
-  detected, and ordinary compaction preserves the same accumulated state. A merge covering all
-  contributions for a valid K leaves one active payload. Use an independent signed-weight
-  oracle when checking these outcomes.
 
 ### Phase 4: File-backed batches, append, and snapshots
 
+- **Status:** Next storage phase; not started. The former Phase 3 plan was withdrawn on
+  2026-09-30. Native signed merging needs no separate implementation phase; the
+  [settled scope](#settled-scope-before-phase-4) governs the remaining work. Keep Phase 4 numbering.
 - **Plan:** Add file-backed batch construction and a bounded staging policy, including explicit
   limits for in-memory batch size and the number of in-memory batches. Specify ownership and
   lifetime of the before, delta, and after handles using the existing append and snapshot APIs.
-  Adapt file and mixed-batch inputs to Phase 3's signed semantics; physical storage and snapshot
-  lifecycle belong to this phase.
+  Use Feldera's existing full-pair signed merge semantics for file and mixed batches; physical
+  storage and snapshot lifecycle belong to this phase. Account for the retained base storage
+  and additional secondary representation.
 - **Build:** Add on-disk batches, append the delta once, and expose the two accumulated-state
   reads to storage callers.
 - **Evidence to advance:** File-backed batches survive reopen and fetch requested blocks without
   materializing the whole index. Each handle returns its intended rows while normal compaction
-  merges earlier and delta batches; snapshot creation does not copy the relation.
+  merges earlier and delta batches; snapshot creation does not copy the relation. An independent
+  signed-weight oracle agrees with native cancellation, replacement, and partial/full compaction
+  for representable test weights.
 
 ### Step 3 handoff
 

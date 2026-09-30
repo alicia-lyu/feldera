@@ -2,14 +2,16 @@ use super::customer_orders_lineitem::{
     CUSTOMER, CUSTOMER_DOMAIN, CUSTOMER_KEY_DOMAIN, CUSTOMER_PRIMARY,
     CustomerOrdersLineitemDefinition,
 };
-use super::memory_batch::RawBatchCursor;
+use super::memory_batch::batch_cursor;
 use super::*;
 use crate::{
+    DynZWeight,
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
     storage::{
         backend::StorageBackend,
         file::{Factories, FilterPlan, format::BatchMetadata, reader::Reader, writer::Parameters},
     },
+    trace::{BatchReader, Cursor},
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
 use tempfile::tempdir;
@@ -28,10 +30,37 @@ fn customer_row(id: i32, segment: &str, weight: i64) -> (SourceKey, SourcePayloa
     )
 }
 
+fn cursor_row(
+    index: &CustomerOrdersLineitemIndex,
+    cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
+) -> (SourceKey, SourcePayload, ZWeight) {
+    let weight = *cursor.weight().downcast_checked::<ZWeight>();
+    let key = cursor.key().downcast_checked::<Vec<u8>>();
+    let payload = cursor.val().downcast_checked::<Vec<u8>>();
+    (
+        index.unfold(key).unwrap(),
+        index.decode_payload(key, payload).unwrap(),
+        weight,
+    )
+}
+
+fn read_cursor(
+    index: &CustomerOrdersLineitemIndex,
+    cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
+) -> Vec<(SourceKey, SourcePayload, ZWeight)> {
+    let mut rows = Vec::new();
+    while cursor.key_valid() {
+        while cursor.val_valid() {
+            rows.push(cursor_row(index, cursor));
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    rows
+}
+
 #[test]
 fn memory_batch_sorts_and_consolidates_within_batch() {
-    use crate::trace::BatchReader;
-
     let index = index();
     let batch = index
         .build_batch([
@@ -46,99 +75,161 @@ fn memory_batch_sorts_and_consolidates_within_batch() {
         .unwrap();
     assert_eq!(batch.key_count(), 2);
     assert_eq!(batch.len(), 3);
-    let batches = [batch];
-    let mut cursor = RawBatchCursor::new(&batches);
-    let mut rows = Vec::new();
-    while let Some((key, payload, weight)) = cursor.row() {
-        rows.push((
-            index.unfold(key).unwrap(),
-            index.decode_payload(key, payload).unwrap(),
-            weight,
-        ));
-        cursor.next();
-    }
     assert_eq!(
-        rows,
+        read_cursor(&index, &mut batch_cursor(&[batch])),
         vec![
             customer_row(1, "A", 2),
             customer_row(2, "A", 4),
-            customer_row(2, "B", -1)
+            customer_row(2, "B", -1),
         ]
     );
 }
 
 #[test]
-fn raw_cursor_seeks_and_keeps_cross_batch_contributions() {
-    let index = index();
-    let batches = [
-        index
-            .build_batch([customer_row(3, "A", -1), customer_row(1, "A", 1)])
-            .unwrap(),
-        index
-            .build_batch([customer_row(3, "A", 2), customer_row(2, "B", 1)])
-            .unwrap(),
-    ];
-    let mut cursor = RawBatchCursor::new(&batches);
-    cursor.seek_ge(index.fold(&SourceKey::Customer(3)).unwrap().as_bytes());
-    assert_eq!(cursor.row().unwrap().2, -1);
-    cursor.next();
-    assert_eq!(cursor.row().unwrap().2, 2);
-    cursor.next();
-    assert!(cursor.row().is_none());
-
-    cursor.seek_ge(index.fold(&SourceKey::Customer(2)).unwrap().as_bytes());
-    assert_eq!(cursor.row().unwrap().2, 1);
-    cursor.seek_ge(index.fold(&SourceKey::Customer(4)).unwrap().as_bytes());
-    assert!(cursor.row().is_none());
-}
-
-#[test]
-fn raw_cursor_stops_at_prefix_boundary() {
+fn cursor_consolidates_batches_without_changing_stored_rows() {
     let index = index();
     let batches = [
         index
             .build_batch([
-                customer_row(6, "other", 1),
-                (
-                    SourceKey::Orders(5, 2),
-                    SourcePayload::Orders(OrdersPayload {
-                        order_day: 1,
-                        ship_priority: 0,
-                    }),
-                    1,
-                ),
+                customer_row(1, "A", 2),
+                customer_row(2, "gone", 1),
+                customer_row(3, "old", 1),
+                customer_row(4, "A", 1),
+                customer_row(5, "negative", -3),
             ])
             .unwrap(),
         index
-            .build_batch([(
-                SourceKey::Orders(5, 1),
-                SourcePayload::Orders(OrdersPayload {
-                    order_day: 2,
-                    ship_priority: 0,
-                }),
-                -1,
-            )])
+            .build_batch([
+                customer_row(1, "A", 3),
+                customer_row(2, "gone", -1),
+                customer_row(3, "old", -1),
+                customer_row(3, "new", 1),
+                customer_row(4, "B", 2),
+            ])
+            .unwrap(),
+        index
+            .build_batch([customer_row(1, "A", -1), customer_row(4, "A", -1)])
+            .unwrap(),
+    ];
+    let stored_before: Vec<_> = batches
+        .iter()
+        .map(|batch| read_cursor(&index, &mut batch.cursor()))
+        .collect();
+    let expected = vec![
+        customer_row(1, "A", 4),
+        customer_row(3, "new", 1),
+        customer_row(4, "B", 2),
+        customer_row(5, "negative", -3),
+    ];
+    let mut cursor = batch_cursor(&batches);
+    assert_eq!(read_cursor(&index, &mut cursor), expected);
+    cursor.rewind_keys();
+    assert_eq!(read_cursor(&index, &mut cursor), expected);
+    let stored_after: Vec<_> = batches
+        .iter()
+        .map(|batch| read_cursor(&index, &mut batch.cursor()))
+        .collect();
+    assert_eq!(stored_before, stored_after);
+}
+
+#[test]
+fn cursor_exact_and_lower_bound_seeks_after_rewind() {
+    let index = index();
+    let batches = [
+        index
+            .build_batch([customer_row(1, "A", 1), customer_row(2, "gone", 1)])
+            .unwrap(),
+        index
+            .build_batch([
+                customer_row(1, "A", 2),
+                customer_row(2, "gone", -1),
+                customer_row(3, "B", 1),
+            ])
+            .unwrap(),
+    ];
+    let mut cursor = batch_cursor(&batches);
+    let first = index.fold(&SourceKey::Customer(1)).unwrap();
+    assert!(cursor.seek_key_exact(first.0.erase(), None));
+    assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
+    let cancelled = index.fold(&SourceKey::Customer(2)).unwrap();
+    assert!(!cursor.seek_key_exact(cancelled.0.erase(), None));
+    let after = index.fold(&SourceKey::Customer(4)).unwrap();
+    assert!(!cursor.seek_key_exact(after.0.erase(), None));
+    cursor.rewind_keys();
+    cursor.seek_key(cancelled.0.erase());
+    assert_eq!(
+        read_cursor(&index, &mut cursor),
+        vec![customer_row(3, "B", 1)]
+    );
+    cursor.rewind_keys();
+    cursor.seek_key(first.0.erase());
+    assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
+    cursor.seek_key(after.0.erase());
+    assert!(!cursor.key_valid());
+}
+
+#[test]
+fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
+    let index = index();
+    let order = (
+        SourceKey::Orders(5, 2),
+        SourcePayload::Orders(OrdersPayload {
+            order_day: 1,
+            ship_priority: 0,
+        }),
+        1,
+    );
+    let line = (
+        SourceKey::Lineitem(5, 2, 1),
+        SourcePayload::Lineitem(LineitemPayload {
+            ship_day: 2,
+            extended_price_cents: 100,
+            discount_hundredths: 5,
+        }),
+        1,
+    );
+    let batches = [
+        index
+            .build_batch([customer_row(6, "other", 1), order.clone()])
+            .unwrap(),
+        index
+            .build_batch([line.clone(), customer_row(5, "A", 1)])
+            .unwrap(),
+        index
+            .build_batch([order.clone(), customer_row(5, "A", -1)])
             .unwrap(),
     ];
     let prefix = index.customer_prefix(5);
-    let mut cursor = RawBatchCursor::new(&batches);
-    cursor.seek_ge(&prefix);
-    let mut keys = Vec::new();
-    while let Some((key, _, _)) = cursor.row() {
-        if !key.starts_with(&prefix) {
-            break;
+    let mut cursor = batch_cursor(&batches);
+    cursor.seek_key(prefix.erase());
+    let mut rows = Vec::new();
+    while cursor.key_valid()
+        && cursor
+            .key()
+            .downcast_checked::<Vec<u8>>()
+            .starts_with(&prefix)
+    {
+        while cursor.val_valid() {
+            rows.push(cursor_row(&index, &mut cursor));
+            cursor.step_val();
         }
-        keys.push(index.unfold(key).unwrap());
-        cursor.next();
+        cursor.step_key();
     }
-    assert_eq!(keys, [SourceKey::Orders(5, 1), SourceKey::Orders(5, 2)]);
+    assert_eq!(rows, vec![(order.0, order.1, 2), line]);
+    assert_eq!(cursor_row(&index, &mut cursor), customer_row(6, "other", 1));
 }
 
 #[test]
 fn empty_batches_and_cancelled_rows_are_skipped() {
-    use crate::trace::BatchReader;
-
     let index = index();
+    assert!(!batch_cursor(&[]).key_valid());
+    let empty = [index.build_batch([]).unwrap()];
+    assert!(!batch_cursor(&empty).key_valid());
+    let cancelled = [
+        index.build_batch([customer_row(1, "A", 1)]).unwrap(),
+        index.build_batch([customer_row(1, "A", -1)]).unwrap(),
+    ];
+    assert!(!batch_cursor(&cancelled).key_valid());
     let batches = [
         index.build_batch([]).unwrap(),
         index
@@ -148,12 +239,15 @@ fn empty_batches_and_cancelled_rows_are_skipped() {
     ];
     assert_eq!(batches[0].len(), 0);
     assert_eq!(batches[1].key_count(), 0);
-    let mut cursor = RawBatchCursor::new(&batches);
-    assert_eq!(cursor.row().unwrap().2, -3);
-    cursor.next();
-    assert!(cursor.row().is_none());
-    cursor.seek_ge(index.fold(&SourceKey::Customer(1)).unwrap().as_bytes());
-    assert_eq!(cursor.row().unwrap().2, -3);
+    let mut cursor = batch_cursor(&batches);
+    assert_eq!(
+        read_cursor(&index, &mut cursor),
+        vec![customer_row(2, "B", -3)]
+    );
+    cursor.rewind_keys();
+    let first = index.fold(&SourceKey::Customer(1)).unwrap();
+    cursor.seek_key(first.0.erase());
+    assert_eq!(cursor_row(&index, &mut cursor), customer_row(2, "B", -3));
 }
 
 #[test]

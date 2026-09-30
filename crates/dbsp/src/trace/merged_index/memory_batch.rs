@@ -1,11 +1,12 @@
-//! In-memory folded-key batches and ordered reads of their raw contributions.
+//! In-memory folded-key batches and consolidated reads across batches.
 
 use crate::{
     DynZWeight,
     algebra::ZWeight,
-    dynamic::{DowncastTrait, DynData, Erase},
+    dynamic::{DynData, Erase},
     trace::{
-        BatchReader, BatchReaderFactories, Builder, Cursor,
+        BatchReader, BatchReaderFactories, Builder,
+        cursor::CursorList,
         ord::vec::{VecIndexedWSet, VecIndexedWSetFactories},
     },
 };
@@ -62,67 +63,14 @@ pub(crate) fn build_batch(
     Ok(builder.done())
 }
 
-/// Reads stored rows across batches without merging equal rows between batches.
-pub(crate) struct RawBatchCursor<'a> {
-    cursors: Vec<BatchCursor<'a>>,
-    current: Option<usize>,
-}
-
-impl<'a> RawBatchCursor<'a> {
-    pub fn new(batches: &'a [MergedIndexBatch]) -> Self {
-        let mut result = Self {
-            cursors: batches.iter().map(BatchReader::cursor).collect(),
-            current: None,
-        };
-        result.select_current();
-        result
-    }
-
-    /// Positions each batch at its first key greater than or equal to `key`.
-    pub fn seek_ge(&mut self, key: &[u8]) {
-        let key = key.to_vec();
-        for cursor in &mut self.cursors {
-            cursor.rewind_keys();
-            cursor.seek_key(key.erase());
-            if cursor.key_valid() {
-                cursor.rewind_vals();
-            }
-        }
-        self.select_current();
-    }
-
-    /// The returned slices and weight are borrowed until this cursor advances.
-    pub fn row(&mut self) -> Option<(&[u8], &[u8], ZWeight)> {
-        let cursor = self.cursors.get_mut(self.current?)?;
-        let weight = *cursor.weight().downcast_checked::<ZWeight>();
-        let key = cursor.key().downcast_checked::<Vec<u8>>();
-        let val = cursor.val().downcast_checked::<Vec<u8>>();
-        Some((key, val, weight))
-    }
-
-    pub fn next(&mut self) {
-        if let Some(index) = self.current {
-            let cursor = &mut self.cursors[index];
-            cursor.step_val();
-            if !cursor.val_valid() {
-                cursor.step_key();
-                if cursor.key_valid() {
-                    cursor.rewind_vals();
-                }
-            }
-            self.select_current();
-        }
-    }
-
-    fn select_current(&mut self) {
-        self.current = self
-            .cursors
-            .iter()
-            .enumerate()
-            .filter(|(_, cursor)| cursor.key_valid() && cursor.val_valid())
-            .min_by(|(left_index, left), (right_index, right)| {
-                (left.key(), left.val(), left_index).cmp(&(right.key(), right.val(), right_index))
-            })
-            .map(|(index, _)| index);
-    }
+/// Consolidates matching pairs without changing or copying the underlying batches.
+pub(crate) fn batch_cursor(
+    batches: &[MergedIndexBatch],
+) -> CursorList<DynData, DynData, (), DynZWeight, BatchCursor<'_>> {
+    let factories =
+        VecIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, Vec<u8>, ZWeight>();
+    CursorList::new(
+        factories.weight_factory(),
+        batches.iter().map(BatchReader::cursor).collect(),
+    )
 }

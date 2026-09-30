@@ -12,3 +12,7 @@ docs/design/merged-index/evidence/source-map.md - moved to TRASH/ - superseded i
 docs/design/merged-index/evidence/validation-plan.md - moved to TRASH/ - superseded investigation.
 docs/design/merged-index/evidence/weighted-examples.md - moved to TRASH/ - superseded investigation.
 docs/design/merged-index/README.md (previous version) - moved to TRASH/ - superseded overview.
+
+Archived on 2026-09-30:
+
+docs/design/merged-index/phase-3-signed-merging-k-uniqueness-implementation-plan.md - moved to TRASH/ - withdrawn plan.

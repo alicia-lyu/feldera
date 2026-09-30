@@ -101,6 +101,26 @@ the user's choice to name intermediate SQL views or materialize queryable result
 [join implementation](../../../crates/dbsp/src/operator/dynamic/join.rs#L663) and the
 [SQL index rules](https://docs.feldera.com/sql/grammar/#creating-indexes).
 
+### Secondary storage scope
+
+The scope settled on 2026-09-30 retains Feldera's existing base-relation storage. A primary-key
+input map maintains current base rows in a trace so updates can retract the old row. The merged
+index is additional secondary storage, serving selected operator reads in the same role as
+other retained operator traces. Using a merged index as clustered primary storage is deferred.
+
+Adding this secondary index does not remove the source trace or automatically replace another
+operator trace. A selected operator trace is replaced only when runtime wiring redirects its
+consumers and stops maintaining that trace. Storage accounting must include base state, the
+merged index, and all remaining operator state. Feldera can already reuse a source trace for
+materialized input reads; that does not imply sharing with our different folded representation.
+See the [settled storage scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4).
+
+Reuse Feldera's native signed merging. K uniqueness should follow from enforced source keys,
+identity-preserving folding, and correct secondary-index maintenance; Step 3 must establish
+those conditions for the actual source and recovery paths. No new merger or mandatory
+changed-key validation scan is planned. The former Phase 3 plan is withdrawn; Phase 4 remains
+the next storage phase and has not started.
+
 ## How Feldera stores indexed state
 
 > [!NOTE]
@@ -212,8 +232,11 @@ Each value contains one regular payload and its signed weight. The index
 identifier in the folded key determines the record type; `INDEX` is its domain tag, not an extra end marker.
 At a completed transaction boundary, each folded K has at most one active payload. A replacement
 delta can carry negative and positive contributions with the same K; a post-append read can return
-multiple nonzero payloads for that K. Before transaction completion, validate unique active K values.
-The raw cursor returns all rows.
+multiple nonzero payloads for that K if the source-state invariant is violated.
+Phase 2 returns Feldera's `CursorList` over existing batch cursors. Reads consolidate complete
+`(K, payload)` pairs and omit zero totals without changing the stored batches. Source uniqueness and
+correct index maintenance must establish the
+[folded-K invariant](folded-key-layer-file-plan.md#inherit-k-uniqueness-from-source-state).
 Feldera's layer-file columns store folded K and its weighted payload rows; no payload list or key suffix
 is added.
 A range cursor reads KV entries in byte-key order and
@@ -222,8 +245,8 @@ requested joined tuples before and after maintenance. It does not build an in-me
 all those lines.
 The transaction supplies complete extended records and any intended related-row changes. Storage does not
 add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, batch
-management, compaction, cache, and snapshots; adapt the record format, byte comparison, and weighted-value
-merge rules. The planned batch uses Feldera's existing two-column layer-file layout.
+management, compaction, cache, snapshots, and signed merge rules; supply the folded key and payload
+representation. The planned batch uses Feldera's existing two-column layer-file layout.
 Payload replacement must preserve both payloads and signed changes; ordinary last-write-wins handling alone
 cannot implement weighted reconstruction. [Folded keys in Feldera layer
 files](support.md#folded-keys-in-feldera-layer-files)

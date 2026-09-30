@@ -1,35 +1,38 @@
-# Phase 2 implementation note: in-memory batches and raw cursors
+# Phase 2 implementation note: in-memory batches and consolidated cursors
 
-Date: 2026-09-29.
+Date: 2026-09-30.
 
 ## Implementation
 
-`CustomerOrdersLineitemIndex::build_batch` folds keys and serializes payloads using the
-Phase 1 codecs. It checks that each payload belongs to its source key, sorts arbitrary-order
-input by `(K, payload)`, and adds signed weights for equal pairs within one batch. Zero-weight
-rows disappear; weight overflow returns an error. The resulting batch is Feldera's existing
-`VecIndexedWSet<DynData, DynData, DynZWeight>` with `Vec<u8>` keys and values. It implements
-Feldera's full `Batch` interface without a new storage format or trait implementation.
+`CustomerOrdersLineitemIndex::build_batch` retains the Phase 1 codecs and existing builder.
+It checks source/payload correspondence, sorts arbitrary-order input by `(K, payload)`, and
+combines identical pairs within each batch. Zero totals disappear; local weight overflow
+returns an error. Storage remains Feldera's `VecIndexedWSet<DynData, DynData, DynZWeight>`
+with `Vec<u8>` keys and values.
 
-`RawBatchCursor` holds one cursor per in-memory batch. `seek_ge` positions each at the first
-eligible folded key; `next` chooses the next stored `(K, payload)` row in key order, breaking
-ties by batch position. `row` lends the folded key and payload bytes until cursor advancement
-and returns the signed weight. Equal pairs in different batches remain separate raw
-contributions. The cursor does not compute accumulated state or validate K uniqueness.
+`batch_cursor` returns Feldera's `CursorList` over the existing batch cursors, including for
+zero batches. Native reads combine matching `(K, payload)` signed weights and omit zero
+totals. They borrow the batches without copying, partitioning by source, or mutating stored
+rows. Callers use Feldera's `Cursor` interface; rewind keys before seeking backwards or
+switching from an exact lookup to an ordered scan. Prefix scans stop at the caller's boundary.
+The custom `RawBatchCursor` traversal has been removed.
 
 ## Verification
 
-Commit `a2fa68aea` passed `cargo check -p dbsp --lib`, focused
-`cargo test -p dbsp --lib trace::merged_index` (11/11 tests), and `cargo fmt --check`.
-Tests cover unordered input, within-batch addition and cancellation, empty batches,
-overflow and source/payload mismatch, multi-batch signed contributions, exact and missing-key
-seeks, and prefix stopping. Existing Phase 1 layer-file tests remain in the focused suite.
+Passed `cargo +1.96.1 test -p dbsp --lib trace::merged_index --offline` (12/12 tests),
+`cargo +1.96.1 fmt --all --check`, Markdown lint, local link/source checks, Mermaid parsing,
+and `git diff --check`.
 
-## Handoff
+The focused merged-index suite covers unordered input, within-batch addition and cancellation,
+empty input, local overflow and source/payload mismatch, cross-batch addition, cancellation,
+replacement, negative totals, and interleaved Customer/Orders/Lineitem records. It checks
+exact and missing-key seeks, prefix stopping, rewind followed by seeking, and preservation
+of the original batch rows. Existing Phase 1 layer-file tests remain in the suite.
 
-This phase assumes small input batches below 100 MiB. It does not enforce a memory cap or
-bound peak sorting memory. Phase 3 adds cross-batch signed consolidation and accumulated-K
-uniqueness. Phase 4 adds file-backed batches, bounded staging, spine append, snapshots, and
-spill/reopen evidence. The raw cursor currently selects among batch positions by scanning
-their current rows; a later spine integration can use its own merge cursor if batch count
-makes this selection cost significant.
+## Storage scope
+
+Retain Feldera's existing base-relation storage and treat the merged index as secondary
+storage. Reuse native signed merging; no separate Phase 3 plan or runtime uniqueness validator
+is introduced. Clustered primary storage and Phase 4 implementation remain deferred under
+the [settled scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4).
+This phase assumes small inputs below 100 MiB without enforcing a memory cap.

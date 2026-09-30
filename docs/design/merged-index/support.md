@@ -249,9 +249,10 @@ Feldera adapter below remains to be implemented.
 The merged index uses folded byte keys and weighted payload rows in Feldera's two-column layer files.
 Each value contains one regular payload and a signed weight. At a completed transaction boundary,
 each folded K has at most one active payload. Signed delta contributions may share K, and a
-post-append read may contain multiple nonzero payloads at K. Storage returns all such weighted rows.
-The transaction checks K uniqueness before completion; appending the delta does not by itself complete
-view maintenance. No packed payload list or extra key suffix is permitted. The two file levels store
+post-append read of invalid source state may contain multiple nonzero payloads at K. Storage returns
+all such weighted rows. Enforced source keys and correct secondary-index maintenance must establish
+uniqueness; no separate changed-key runtime scan is planned. Appending the delta does not by itself
+complete view maintenance. No packed payload list or extra key suffix is permitted. The two file levels store
 folded K and its payload/weight rows.
 **Folding** produces the key. The Customer–Orders–Lineitem index assigns ordered key fields and
 shared domains to Customer, Orders, and extended Lineitem; another index can assign a different
@@ -270,6 +271,13 @@ operator requests a key or range; the adapter computes encoded bounds, seeks the
 the required fields from the returned entries. The backend compares byte keys without maintaining a
 separate index on each folded field.
 
+Feldera retains ownership of base-relation storage, including primary-key input-map traces used
+for updates. The merged index is secondary storage. Replacing selected operator traces requires
+explicit read-site wiring and removal of their independent accumulation; source storage remains.
+A clustered merged index as primary storage is deferred. Count both retained base state and
+secondary representations when evaluating storage costs. The
+[settled scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4) records these decisions.
+
 The proposed Q3 scan keeps the current order identifier and the required parent payloads. It advances
 through the order's encoded range and emits the accumulated line or joined rows requested by the operator.
 It does not retain a vector or hash map of all line tuples. Storage pages, decoding buffers, variable
@@ -280,8 +288,8 @@ An operator API that requires an immutable batch object must receive explicitly 
 spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
 
 Reuse the same LSM machinery: the spine, immutable-batch management, compaction scheduling, cache, and
-snapshot ownership. Folded keys and payload codecs change the records and their comparison/merge rules,
-not the need for that machinery. `Spine` is generic over its batch type
+snapshot ownership. Folded keys and payload codecs supply the records; existing full-key/value
+signed consolidation supplies the merge semantics. `Spine` is generic over its batch type
 ([generic trace
 implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L2085-L2090));
 the adapter must satisfy its batch contracts. This does not mean reusing `FileIndexedWSet` unchanged. The file layer
@@ -298,8 +306,10 @@ replacement appends two weighted payload rows at the same folded key: `(old_payl
 The sign says whether a contribution inserts or retracts a tuple. K is the record identity.
 Signed-change consolidation also compares payloads to cancel the matching retraction; summing weights by K
 alone would lose a payload replacement whose net weight change is zero. The intermediate
-post-append weighted state may contain several active payloads at K. The transaction validates K
-uniqueness before completion. The generic spine internally orders same-K delta values;
+raw or partially merged state may contain several payload contributions at K. Accumulated K
+uniqueness follows when enforced source identity is preserved by folding and index maintenance;
+Step 3 must establish that implication for the actual sources and update/recovery paths. The
+former Phase 3 custom-merger/validator plan is withdrawn. The generic spine internally orders same-K delta values;
 this does not require an order-preserving payload encoding or add V to the merged-index search key.
 The transaction supplies all intended related-row
 changes and complete extended keys. This adapter adds no parent lookup, automatic descendant movement,
@@ -627,8 +637,9 @@ weight(J row)             = weight(B row) * weight(L row)
 ```
 
 The after-state reader yields every nonzero weighted payload for K.
-It does not assume an intermediate result has only one. Before transaction completion,
-its source-key constraint must establish uniqueness. During a replacement, the delta can contain both
+It does not assume a partial merge has only one. Source-key constraints and correct secondary-index
+maintenance must establish accumulated uniqueness; this is an integration obligation, not a planned
+additional runtime scan. During a replacement, the delta can contain both
 `(K, old_payload, -1)` and `(K, new_payload, +1)`. Its net weight by K is zero, but its two complete
 changes must survive until they are combined with the preexisting record. Distinct line identities remain
 separate in `J`, even if their dates, price, and discount happen to match.
