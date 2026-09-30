@@ -78,10 +78,12 @@ The `rkyv` serializer's error needs debug formatting rather than `Display`.
 ## Phase 2 handoff
 
 The subsequent [Phase 2 plan](phase-2-in-memory-batches-implementation-plan.md) narrows the next
-implementation increment to in-memory batches and consolidated reads across batches. File-backed batch
-integration, bounded staging, and spill move to Phase 4. Phase 2 must preserve the crate-internal
+implementation increment to in-memory batches and consolidated reads across batches. Native
+memory-to-file compaction and snapshot reads move to the
+[Phase 4 plan](phase-4-file-backed-storage-implementation-plan.md); custom bounded staging
+and spill are outside that phase. Phase 2 must preserve the crate-internal
 key and payload representation. Under the 2026-09-30
 [scope clarification](folded-key-layer-file-plan.md#settled-scope-before-phase-4), native Feldera
 facilities supply signed consolidation and the separate Phase 3 plan is withdrawn. Phase 4
-adds snapshots for the secondary index; Step 3 handles source-uniqueness inheritance and runtime
+verifies snapshots for the secondary index; Step 3 handles source-uniqueness inheritance and runtime
 wiring while retaining existing base-relation storage.

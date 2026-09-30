@@ -292,13 +292,12 @@ snapshot ownership. Folded keys and payload codecs supply the records; existing 
 signed consolidation supplies the merge semantics. `Spine` is generic over its batch type
 ([generic trace
 implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/spine_async.rs#L2085-L2090));
-the adapter must satisfy its batch contracts. This does not mean reusing `FileIndexedWSet` unchanged. The file layer
-provides per-level search keys with associated data and documents typed comparisons
+the standard `OrdIndexedWSet` alias already supplies a memory/file batch implementation.
+The file layer provides per-level search keys with associated data and documents typed comparisons
 ([file representation and
 ordering](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/storage/file.rs#L3-L65)).
-That provides a place to implement folded byte keys; it does not establish an existing
-merged-index batch adapter. Select a byte-key type/comparator with the required lexicographic order and define
-how batches, merging, reads, and snapshots preserve the encoded values.
+The folded byte keys and payload values use that native implementation; Phase 4 verifies
+its compaction, reads, and snapshots without a custom batch adapter.
 
 The layer-file layout does not select update semantics. The index identifier selects the payload schema. A
 replacement appends two weighted payload rows at the same folded key: `(old_payload, -1)` and

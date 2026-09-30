@@ -118,8 +118,9 @@ See the [settled storage scope](folded-key-layer-file-plan.md#settled-scope-befo
 Reuse Feldera's native signed merging. K uniqueness should follow from enforced source keys,
 identity-preserving folding, and correct secondary-index maintenance; Step 3 must establish
 those conditions for the actual source and recovery paths. No new merger or mandatory
-changed-key validation scan is planned. The former Phase 3 plan is withdrawn; Phase 4 remains
-the next storage phase and has not started.
+changed-key validation scan is planned. The former Phase 3 plan is withdrawn. The
+[Phase 4 plan](phase-4-file-backed-storage-implementation-plan.md) verifies native
+memory-to-file compaction and snapshot reads directly.
 
 ## How Feldera stores indexed state
 
@@ -206,6 +207,10 @@ user's clarifications: folded keys, weighted payload rows, transaction-supplied 
 changes, and temporary read handles without multi-versioning or expiration policies.
 The [Phase 1 implementation note](phase-1-implementation-note.md) records the verified
 encoding and two-column layer-file fixture.
+The [Phase 2 implementation note](phase-2-implementation-note.md) records native
+consolidated memory reads. The [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md)
+specifies native Spine storage and snapshot tests; the
+[Phase 4 implementation note](phase-4-implementation-note.md) records the resulting evidence.
 
 > [!NOTE]
 > **Glossary**
@@ -246,7 +251,8 @@ all those lines.
 The transaction supplies complete extended records and any intended related-row changes. Storage does not
 add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, batch
 management, compaction, cache, snapshots, and signed merge rules; supply the folded key and payload
-representation. The planned batch uses Feldera's existing two-column layer-file layout.
+representation. Standard `OrdIndexedWSet` batches already support memory and file storage;
+native compaction chooses when to write files.
 Payload replacement must preserve both payloads and signed changes; ordinary last-write-wins handling alone
 cannot implement weighted reconstruction. [Folded keys in Feldera layer
 files](support.md#folded-keys-in-feldera-layer-files)
@@ -438,12 +444,11 @@ source provenance and implementation acceptance criteria.
    runtime read sites, including before/after maintenance state and cursor operations. Specify the Rust adapter interfaces
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
-2. **Implement folded-key batches on the existing LSM.** Follow the [detailed storage plan](folded-key-layer-file-plan.md):
-   paper-defined folded keys and values containing one payload and signed weight. Reuse
-   existing file columns; implement record cursor access and the spine's batch/merge contracts. Append the supplied delta
-   once before view maintenance; use reference-only read handles. Verify replacements, signed updates,
-   transaction-supplied key changes, and before/after snapshots. No parent lookup, storage-generated
-   child moves, multi-versioning, or expiry mechanism is part of this step. Typed scan sessions follow in Step 3.
+2. **Verify native merged-index storage.** Follow the [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md):
+   construct `OrdIndexedWSet` batches with folded keys, payloads, and signed weights;
+   insert them into a native Spine and observe normal memory-to-file compaction. Verify
+   reopened file reads, signed updates, and retained snapshots. Production insertion and
+   operator wiring follow separately. Typed scan sessions follow in Step 3.
 3. **Implement reconstruction and bounded scan sharing.** Supply per-integrator routines, then connect them
    through the [session protocol](support.md#shared-scan-sessions-bound-ownership-and-memory). Choose explicit
    buffer limits, overflow handling, and ordering paths. Verify consumer progress, borrowed-value lifetimes,

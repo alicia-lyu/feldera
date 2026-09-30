@@ -261,3 +261,6 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod storage_tests;

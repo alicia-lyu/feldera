@@ -21,5 +21,6 @@ Inputs below 100 MiB remain a workload assumption, not an enforced cap.
 
 Retain Feldera's base-relation storage; the merged index is secondary storage. Reuse native
 signed merging. The separate Phase 3 plan remains withdrawn. Clustered primary storage and
-Phase 4 implementation are deferred. No new merger, cursor framework, or runtime uniqueness
-validator belongs to this revision.
+Phase 4 storage verification follows the
+[native storage plan](phase-4-file-backed-storage-implementation-plan.md). No new merger,
+cursor framework, or runtime uniqueness validator belongs to this revision.

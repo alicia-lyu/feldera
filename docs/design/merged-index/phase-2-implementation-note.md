@@ -33,6 +33,7 @@ of the original batch rows. Existing Phase 1 layer-file tests remain in the suit
 
 Retain Feldera's existing base-relation storage and treat the merged index as secondary
 storage. Reuse native signed merging; no separate Phase 3 plan or runtime uniqueness validator
-is introduced. Clustered primary storage and Phase 4 implementation remain deferred under
-the [settled scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4).
+is introduced. Clustered primary storage remains deferred. Phase 4 follows the
+[native storage plan](phase-4-file-backed-storage-implementation-plan.md) under the
+[settled scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4).
 This phase assumes small inputs below 100 MiB without enforcing a memory cap.

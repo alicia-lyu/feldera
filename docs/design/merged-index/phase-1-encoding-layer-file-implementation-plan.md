@@ -17,9 +17,11 @@ The [architecture guide](README.md#what-changes-in-our-design) and
 [storage evidence](support.md#folded-keys-in-feldera-layer-files) explain why the file has one
 folded key per outer row and weighted payloads in its inner row group.
 
-Phase 1 does not publish a `Batch`/`Trace` implementation. Memory-backed batches, bounded
-staging and spill, multi-batch cursors, signed compaction, accumulated-K validation, snapshots,
-and runtime integration have their own later phases. A fixture's write/read success is evidence
+Phase 1 does not publish a `Batch`/`Trace` implementation. Memory-backed batches,
+multi-batch cursors, native compaction, snapshots, and runtime integration have later
+phases. The [Phase 4 plan](phase-4-file-backed-storage-implementation-plan.md) uses standard
+batches and native storage policy; bounded custom staging and spill are not part of that
+phase. A fixture's write/read success is evidence
 for the file mapping, not for those behaviors.
 
 ## Merged-index constitution

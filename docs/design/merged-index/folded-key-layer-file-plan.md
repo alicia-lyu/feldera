@@ -36,8 +36,10 @@ for Phase 2 reads. Matching `(K, payload)` contributions are summed and zero tot
 reads leave the underlying batches intact. Keep the existing batch builder. No new merger,
 cursor framework, or runtime uniqueness validator is planned.
 
-Phase 4 implementation remains deferred. Its file-backed batches, staging, append, and
-snapshots must follow this secondary-storage scope.
+Phase 4 verifies native memory-to-file compaction and snapshot reads directly; see the
+[Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md) and
+[implementation note](phase-4-implementation-note.md).
+Transaction integration and production source/operator wiring remain deferred.
 
 > [!NOTE]
 > **Reading guide:** The main text states the intended behavior. “Implementer suggestion”
@@ -60,25 +62,28 @@ or a separate field array. A file-backed batch keeps a reader, not all file rows
 
 | Stage | Merged-index membership | Storage and result |
 | --- | --- | --- |
-| Buffer/sort input | Not appended | Bounded memory and, when needed, spill files |
-| Append sealed delta batches | Immediately indexed, before view maintenance | Memory batches or indexed layer files |
+| Generate a sorted run from input | Not appended | Native batch construction produces an immutable run |
+| Insert a constructed batch | Immediately indexed, before view maintenance | Native policy places and compacts memory or file batches |
 | Maintain view | Delta remains indexed; readers use captured handles | Background compaction may already merge batches |
 | Finish maintenance | No second append | Release handles after their last consumer finishes |
 | Compaction covering prior state and delta | Same accumulated relation | New immutable batch/file replaces inputs; matching signed rows cancel |
 
+**Creating initial L0 sorted runs is run generation, not spilling.** It corresponds to the
+sorted-run generation phase of external merge sort. Moving existing in-memory runs to disk
+is handled through compaction, including pressure-triggered single-run compaction. Do not
+describe these as one “buffer-and-spill” operation.
+
+**Under normal circumstances, the merged-index adapter should never force a storage
+destination.** Let Feldera's native compaction and memory-pressure policy determine when
+runs move to disk. Shared runtime configuration supplies that policy. Ordinary storage
+tests inherit defaults; targeted policy tests may override shared configuration.
+
 Compaction is not a maintenance barrier. It may happen earlier or later than the final table row.
 A merge that sees only some contributions for K can still output several payload rows; when it sees
-all contributions for a valid K, its output has one surviving row. A staging file has an on-disk
-index but is not part of the merged index until appended. An appended memory batch is indexed without
-first becoming a file. Staging must have a memory bound and spill when needed.
-
-> [!NOTE]
-> **Implementer suggestion — provisional.** The details in this block have not been
-> comprehensively audited or reviewed by a human expert.
->
-> [Feldera's accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L295)
-> inserts batches into a spine; [fallback builders](../../../crates/dbsp/src/trace/ord/fallback/val_batch.rs#L445)
-> can choose memory or storage. The new adapter must implement the bounded staging choice explicitly.
+all contributions for a valid K, its output has one surviving row. Native batch construction
+precedes Spine insertion; Spine has no point-insertion interface. Standard indexed batches
+already support memory and file storage. Phase 4 needs no custom run format, merger,
+staging spine, chunk limit, or storage owner.
 
 ## Merged-index constitution
 
@@ -360,9 +365,9 @@ historical-version catalog or file-retention policy.
 
 ```text
 before = merged_index.snapshot()
-delta = prepare_complete_folded_delta()           # bounded staging; may be file-backed
+delta = construct_native_batch(complete_folded_delta)
 
-merged_index.append(delta.clone_handle())         # secondary index; one insertion
+merged_index.insert(delta.clone_handle())         # secondary index; one insertion
 
 after = merged_index.snapshot()
 view_delta = compute_view_delta(delta, before, after)
@@ -380,7 +385,8 @@ Serialize append-and-snapshot publication for one prototype maintenance input
 so `after` includes exactly its intended changes. The source index can contain a delta that is
 not yet incorporated into the maintained view; the operator graph retains `delta`, `before`,
 and `after` separately, without status bits or batch-role labels. Normal spine insertion,
-backpressure, and compaction continue.
+backpressure, and compaction continue. This is a later integration sketch, not a Phase 4
+storage test or a point-insertion API.
 
 Multiple consumers may finish at different times. Step 3 binds completion, further-input
 admission, and failure rollback to the existing runtime transaction protocol. A snapshot is a
@@ -390,9 +396,9 @@ read handle, not atomic rollback. Storage-only tests do not claim crash recovery
 
 ### Layer-file columns and weighted rows
 
-Use the existing [two-column writer](../../../crates/dbsp/src/storage/file/writer.rs#L1564)
-for every batch. It stores folded K at level 0 and one payload/weight contribution per child
-row at level 1:
+Native indexed batches use the existing [two-column writer](../../../crates/dbsp/src/storage/file/writer.rs#L1564)
+when placed in a file. It stores folded K at level 0 and one payload/weight contribution
+per child row at level 1:
 
 ```text
 column 0: search key = FoldedKey; data = ()
@@ -423,31 +429,19 @@ their file-size, cache, and read costs before making performance claims.
 > payloads identically; weight is excluded from the comparison. No SQL field order or
 > big-endian payload encoding is required.
 
-### Batch and raw-cursor contracts
+### Batch and cursor contracts
 
-Expose `fold`, `unfold`, `append`, `snapshot`, and a cursor with `seek_ge`/`next`.
+Use existing folding and payload codecs to construct `OrdIndexedWSet` batches, then insert
+them into a native Spine. This alias already selects the memory/file fallback batch type.
+Use native snapshots and cursors for seeks, traversal, and rewind; do not expose fallback
+implementation details through a new merged-index API.
+
 For a requested K or range, the cursor advances through the relevant immutable batches in
-key order and yields their stored `(K, payload, weight)` contributions. The state reader
-then sums contributions with equal `(K, payload)`. This reads the requested rows and file
-blocks as needed; it does not load the entire accumulated relation into memory. For the
-replacement above, a lookup of K reads the relevant rows from B and D, then the state
-reader returns only `(K, P120, +1)`; unrelated keys are not materialized. Typed query access
-and shared scan sessions follow in Step 3.
-
-> [!NOTE]
-> **Implementer suggestion — provisional.** The details in this block have not been
-> comprehensively audited or reviewed by a human expert.
->
-> Implement `MergedIndexBatch` under
-> `crates/dbsp/src/trace/ord/merged_index/`; put Q3 codecs and the storage owner under
-> `crates/dbsp/src/trace/merged_index/`. The [Batch contract](../../../crates/dbsp/src/trace.rs#L846)
-> uses `FoldedKey` as `Key`, `PayloadBytes` as `Val`, `DynZWeight` as `R`, and `()` as
-> `Time`. Implement memory/file variants, ordered builders, chunked `MergeBatcher` staging,
-> cursor navigation, metadata counts/bounds, `persisted`/`from_path`, and storage-destination
-> merges for spills. `key_count()` counts K groups; `len()` counts contribution rows. Reuse
-> `FallbackValBatch` for required `Timed<T>`; follow dynamic-data/factory conventions, order
-> byte wrappers lexicographically, and report no roaring compatibility. The cursor returns
-> borrowed row bytes that become invalid when it advances. Keep these APIs crate-internal.
+key order and consolidates matching `(K, payload)` contributions. This reads the requested
+rows and file blocks as needed; it does not load the entire accumulated relation into
+memory. For the replacement above, a lookup of K returns only `(K, P120, +1)`;
+unrelated keys are not materialized. Typed query access and shared scan sessions follow
+in Step 3.
 
 ## Verification and implementation sequence
 
@@ -480,27 +474,30 @@ and shared scan sessions follow in Step 3.
   This phase's test inputs
   are below 100 MiB; that is a workload assumption, not an enforced memory limit.
 
-### Phase 4: File-backed batches, append, and snapshots
+### Phase 4: Native file storage and snapshots
 
-- **Status:** Next storage phase; not started. The former Phase 3 plan was withdrawn on
-  2026-09-30. Native signed merging needs no separate implementation phase; the
-  [settled scope](#settled-scope-before-phase-4) governs the remaining work. Keep Phase 4 numbering.
-- **Plan:** Add file-backed batch construction and a bounded staging policy, including explicit
-  limits for in-memory batch size and the number of in-memory batches. Specify ownership and
-  lifetime of the before, delta, and after handles using the existing append and snapshot APIs.
-  Use Feldera's existing full-pair signed merge semantics for file and mixed batches; physical
-  storage and snapshot lifecycle belong to this phase. Account for the retained base storage
-  and additional secondary representation.
-- **Build:** Add on-disk batches, append the delta once, and expose the two accumulated-state
-  reads to storage callers.
-- **Evidence to advance:** File-backed batches survive reopen and fetch requested blocks without
-  materializing the whole index. Each handle returns its intended rows while normal compaction
-  merges earlier and delta batches; snapshot creation does not copy the relation. An independent
-  signed-weight oracle agrees with native cancellation, replacement, and partial/full compaction
-  for representable test weights.
+- **Status:** See the [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md)
+  and [implementation note](phase-4-implementation-note.md).
+  The former Phase 3 plan was withdrawn on 2026-09-30; keep Phase 4 numbering.
+- **Plan:** Construct standard `OrdIndexedWSet` batches, then insert each batch once into a
+  native Spine with `TraceRole::Integral`, Feldera's role for persistent integrator state.
+  Inherit ordinary storage and merge defaults. Let background compaction move runs from
+  memory to file storage under native policy.
+- **Build:** Add separate storage tests in the merged-index module while preserving memory-only
+  helpers and tests. Read current and retained snapshots across memory/file runs and reopen a
+  resulting file batch through native path and reader access with matching factories.
+- **Evidence to advance:** Verify the file transition and batch metadata, complete consolidated
+  reads, signed cancellation, unchanged-key replacement, key moves, exact/missing seeks,
+  traversal, prefix stopping, and rewind against an independent signed-weight oracle.
+  Snapshots retain references to immutable runs and files, so their lifetime can retain
+  storage after live compaction. These tests establish storage behavior, not transaction
+  recovery, a hard memory cap, or a performance improvement.
 
 ### Step 3 handoff
 
-Plan operator read-site wiring, typed reconstruction, and runtime completion/rollback separately.
+For later integration, replace only the persistent trace produced by
+`dyn_accumulate_integrate_trace` and its associated `accumulate_delay_trace` reads. Leave
+`dyn_accumulate` and its delta-accumulation/delayed-read path unchanged. Plan operator
+read-site wiring, typed reconstruction, and runtime completion/rollback separately.
 Step 2's storage evidence does not establish those integration properties. Each phase should
 leave a short implementation note, focused tests, and any API findings for the next planner.
