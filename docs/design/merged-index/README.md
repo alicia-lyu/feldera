@@ -1,11 +1,54 @@
-# Reconstructing accumulated state from a merged index
+# Range-aligned incremental view maintenance
+
+**Range-aligned IVM** supplies selected accumulated state to a logical delta program from
+source records in a merged index. Compatible join/group key domains and the chosen physical
+ordering align delta locations with the state ranges needed for maintenance. This is a future
+integration design; the [native Q3 baseline](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+uses ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
+records the scope settled on 2026-10-01 and supersedes earlier assumptions about a fixed Q3 circuit.
+
+## Four architecture stages
+
+1. **Author physical pipelines outside this project.** The user handwrites predicate-free,
+   order-preserving physical pipelines whose operators share compatible orderings. Logical SQL
+   alone does not establish that property. Pipeline composition is outside this project's scope.
+2. **Define a merged index for the chosen pipeline.** Its constitution specifies source
+   representations, compatible key domains, and folded keys. The implemented
+   [COL constitution](folded-key-layer-file-plan.md#merged-index-constitution) makes customer,
+   order, and line ranges available for reconstruction.
+3. **Translate the pipeline result into logical SQL.** Define maintained result `V` (`J` in
+   the earlier Q3 discussion) and obtain a DBSP program. SQL need not preserve the authored
+   physical shape, and the physical plan used to load `V` may differ. Step 1 bootstraps and
+   updates `V` through the same compiler-generated incremental circuit.
+4. **Supply accumulated state to the logical `ΔV` program.** Replace selected independently
+   maintained integrator traces with reconstructed state. Preserve logical delta computation,
+   signed multiplicities, and before/after semantics. The logical IVM shape affects efficiency;
+   it need not reproduce the original full-query physical plan.
+
+An integrator denotes logical accumulation; a keyed retained trace is one physical realization
+of its output. Native trace sharing means “one index per integrator” is an architectural
+comparison, not an exact universal allocation count. Replacing a trace requires redirecting
+its reads **and stopping its independent accumulation**. Base storage, the secondary merged
+index, materialized `V`, and unreplaced operator state remain separately accounted for.
+
+## Range alignment
+
+Compatible join and grouping semantics define relevant key domains; folded-key design embeds
+those domains in shared ranges. Delta records identify affected ranges, and source reads
+reconstruct requested accumulated relations within common or nested prefixes. In COL, a customer
+prefix contains order prefixes, which contain line prefixes. Different consumers may request
+different levels of that hierarchy. Alignment requires neither identical leaf keys, a single
+coordinated scan, nor global sorting of delta execution. A small customer delta can affect a
+large descendant range. Grouping belongs to the broader architecture; Step 1's Q3 join has
+no aggregation. See the [state-read contracts](support.md#range-alignment-and-native-state-read-contracts).
 
 ## References and how each helps
 
 This guide lists all sources used by this note and its supporting report, grouped by source file. Detailed
 line-level citations remain beside the claims they support. Start with the interesting-orderings manuscript
 for general merged-index design, LeanStore for working storage and query execution, and the lecture note
-for historical Q3 maintenance examples. Direct, query-specific reconstruction is the chosen access path.
+for historical Q3 maintenance examples. Direct, query-specific reconstruction is the current implementation
+choice within range-aligned IVM.
 The validated `mi_db` scan-session section informs a deferred, optional sharing design;
 validation does not extend to its other sections.
 Local links assume the sibling checkout layout; public code links pin the inspected revisions. The modified
@@ -89,8 +132,9 @@ Feldera pipelines. See the [Feldera pipeline API](https://docs.feldera.com/api/)
 Feldera permits explicit, named intermediate SQL views. `CREATE LOCAL VIEW` defines an intermediate
 calculation for dependent views without exposing its change stream as a pipeline output. `CREATE VIEW`
 exposes output changes; `CREATE MATERIALIZED VIEW` also retains the complete current result for ad-hoc
-queries and snapshots. Thus the logical `B = O ⋈ C` below could be a named local view consumed by a view
-for `J = B ⋈ L`. Naming `B` does not require materializing its full result. See the
+queries and snapshots. In the intended decomposition, local SQL views belong at order-destroying boundaries.
+`B = O ⋈ C` below is explanatory internal-state notation, not a required SQL declaration or
+a compiler-selected intermediate. Step 1 declares one three-way view and lets the compiler choose its shape. See the
 [SQL view grammar](https://docs.feldera.com/sql/grammar/) and
 [materialized-view behavior](https://docs.feldera.com/sql/materialized/).
 
@@ -251,7 +295,8 @@ A range cursor reads KV entries in byte-key order and
 decodes the fields needed by the requesting operator. For Q3, it streams one order's source rows to supply
 requested joined tuples before and after maintenance. It does not build an in-memory relation containing
 all those lines.
-The transaction supplies complete extended records and any intended related-row changes. Storage does not
+The transaction supplies complete extended records and any intended related-row changes,
+available before the associated join maintenance runs. Storage does not
 add an `OrderParent` record, perform reverse-parent lookup, or move child rows automatically. Reuse the spine, batch
 management, compaction, cache, snapshots, and signed merge rules; supply the folded key and payload
 representation. Standard `OrdIndexedWSet` batches already support memory and file storage;
@@ -264,14 +309,16 @@ defines this boundary and the remaining adapter work.
 > [!NOTE]
 > **Glossary**
 >
-> **integrator state** — retained results of accumulating changes.
+> **integrator state** — logical results of accumulating changes, supplied by retained or reconstructed state.
 
 The integration boundary is **accumulated-state access**: for requested keys and the state before or after
 maintenance, return the
 same tuples, weights, ordering, and absence information that existing **integrator state** would supply.
 For the current experiments, ad-hoc routines for each query and integrator control their own source
-lookups and reconstruct only the requested accumulated state. Operator code consumes the resulting
-tuples through the same access contract, whether they were retained or reconstructed. The
+lookups and reconstruct only the requested accumulated state. Native join execution remains the current
+integration constraint. Trace access is the principal
+substitution point, but partitioning, batched fetches, cursor-driving choices, sorting, and batch
+construction also determine its state-read contracts. Reconstruction must satisfy those contracts. The
 [direct-reconstruction decision](support.md#direct-reconstruction-is-the-chosen-access-path) explains why
 limited maintenance ranges reduce the motivation for shared scan coordination. A scan-operator layer
 remains an architectural option for both full-query execution and IVM.
@@ -315,28 +362,30 @@ snapshot and completion requirements independently of scan sharing.
 optional abstraction if later workloads justify coordinated readers. Their basis is the validated
 `mi_db` scan-session section; the Feldera adaptation and overflow extensions remain proposals.
 
-The reconstruction target is each requested accumulated relation in the predicate-free join pipeline,
-not its input delta stream. For Q3 those relations are `O`, `C`, `B = O ⋈ C`, and `L`; the maintained
-pipeline output is `J = B ⋈ L`. Join equalities define the relationships among records. Segment and date
-predicates are applied when a query consumes `J`. The [lecture note's filtered, aggregate-first Q3
-circuit](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276) is a historical alternative,
-not the selected maintained view. [Merged index reconstructs integrator
-outputs](support.md#merged-index-reconstructs-integrator-outputs) defines the active join-state requests.
+The reconstruction target is a requested accumulated relation, not an input delta stream.
+The compiler determines actual Q3 read sites; `B = O ⋈ C` is an illustrative relation only.
+The [native baseline circuit](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
+records the generated shape rather than prescribing this illustration. The
+[lecture note's filtered, aggregate-first Q3 circuit](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276)
+is a historical alternative with a different maintained-view boundary.
 
 ## How Q3 works with reconstructed state
 
-Maintain the unfiltered, unaggregated Customer–Orders–Lineitem join. Let `O` contain all Orders, `C` all
-Customers, and `L` all extended Lineitems. `B = O ⋈ C` joins on customer ID; `J = B ⋈ L` joins on
-order ID and the supplied extended key. A valid transaction supplies any related row changes needed to
-keep its extended keys consistent. The storage layer does not infer them.
+Maintain the unfiltered, unaggregated logical Customer–Orders–Lineitem join `V = J`.
+Logical `L` has order and line identities, without customer ID; it joins Orders on order ID.
+`B = O ⋈ C` joins on customer ID and merely illustrates a possible intermediate.
+Customer-led extended Lineitem records are physical merged-index representations. Producing them
+is a separate index/view maintenance problem. Corresponding extended records and related key
+changes are assumed supplied and available **before associated join maintenance runs**; they
+locate logical `ΔL` physically without changing its schema. Storage does not infer those changes.
 
-| Accumulated relation | Required fields and multiplicity | Source access |
+| Relation | Required fields and multiplicity | Source access in a future provider |
 | --- | --- | --- |
 | `O` | Order ID, customer ID, order date, ship priority, signed weight | Order records. |
 | `C` | Customer ID, market segment, signed weight | Customer records. |
-| `B = O ⋈ C` | All fields above, with joined weight | Customer and order prefixes. |
-| `L` | Customer ID, order ID, line ID, ship date, extended price, discount, signed weight | Extended line records. |
-| Maintained `J = B ⋈ L` | Customer, order, and line identities; market segment, order date, ship priority, ship date, price, and discount; joined weight | The pipeline output, maintained incrementally. |
+| Illustrative `B = O ⋈ C` | All fields above, with joined weight | Customer and order prefixes, if requested by the circuit. |
+| Logical `L` | Order ID, line ID, ship date, extended price, discount, signed weight | Physical extended records also carry the customer prefix. |
+| Maintained `V = J` | Customer, order, and line identities; market segment, order date, ship priority, ship date, price, and discount; joined weight | Separate materialized pipeline result. |
 
 Line identity stays in `J`: two lines with identical visible Q3 fields still represent two joined rows.
 Neither source scans nor the maintained join apply market-segment or date predicates. Q3's consuming query
@@ -369,11 +418,12 @@ algorithm.
 >
 > **support** — tuples with nonzero weight.
 
-One traversal of an order range can supply line tuples to multiple join-state readers and reuse decoded
-parent payloads. A customer change affects its descendant orders in the before and after states. Discover
+An optional shared traversal of an order range could supply line tuples to multiple readers
+and reuse decoded parent payloads; direct readers can instead open their own ranges. A customer change affects
+its descendant orders in the before and after states. Discover
 affected identities from the **support** of complete signed changes: projecting a replacement to K and
-summing first can cancel its weights and hide a changed row. Consumers share decoded
-records but need independent positions. A slow consumer can pin buffers, so bounded sharing must account for
+summing first can cancel its weights and hide a changed row. Consumers that share decoded
+records need independent positions. A slow consumer can pin buffers, so bounded sharing must account for
 spilling or rereading oversized ranges.
 
 > [!NOTE]
@@ -410,8 +460,9 @@ See [Consumers determine the required payload](support.md#consumers-determine-th
 
 ## Why this could improve I/O
 
-The expected saving comes from avoiding retained intermediate collections and their writes. Source changes
-still incur KV update, consolidation, and persistence work, but reconstructed `B` need not have
+The hypothesis is that avoiding selected retained intermediate collections reduces writes;
+Step 1 only establishes the native baseline, and any saving requires measurement. Source changes
+still incur KV update, consolidation, and persistence work, but a selected reconstructed intermediate need not have
 separate accumulated storage. Co-location also lets several logical consumers use one physical range read.
 Neither benefit implies that every update becomes cheaper.
 
@@ -441,33 +492,29 @@ large descendant ranges.
 
 The design sources specify weighted reconstruction semantics; implementation correctness, recovery, and
 the I/O improvement remain to be established. First verify reconstructed integrator outputs and IVM deltas
-against independent evaluation, then verify snapshot and scheduling behavior, and finally measure total maintenance cost.
+against independent evaluation, then verify snapshot and scheduling behavior, and finally measure total
+maintenance cost.
 [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) gives the
 source provenance and implementation acceptance criteria.
 
 ## Next Steps
 
-1. **Bind the Q3 state requests.** Map the predicate-free join circuit's `O`, `C`, `B`, and `L` accesses to concrete
-   runtime read sites, including before/after maintenance state and cursor operations. Specify the Rust adapter interfaces
-   from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
-   streams and IVM computation shared between retained and reconstructed state providers.
-2. **Use the verified native storage substrate.** The [Phase 4 implementation note](phase-4-implementation-note.md)
-   records native weighted batches, memory-to-file compaction, mixed snapshot reads, signed updates,
-   and reopened file reads. Build integration on those capabilities; production source/operator wiring
-   and transaction recovery remain deferred. Shared scan sessions are not a prerequisite.
-3. **Implement direct reconstruction.** Write ad-hoc routines for each experimental query and integrator
-   that look up required source tuples and reconstruct only the requested accumulated state. Choose
-   explicit temporary-storage limits and ordering paths. Verify cursor and snapshot lifetimes,
-   batch publication, and commit/recovery behavior with ranges larger than the memory budget.
-   Defer [shared scan sessions](support.md#shared-scan-sessions-bound-ownership-and-memory) unless
-   workload evidence justifies coordinating readers.
-4. **Verify the complete Q3 path.** Run identical updates through retained and reconstructed providers.
-   Compare each requested state and maintained `J` against independent evaluation. Include simultaneous
-   source changes, replacements, duplicate visible Q3 fields on distinct lines, and supplied key moves.
-   Confirm that replaced integrator state is not still being accumulated elsewhere. Verify the consuming
-   query's predicates, aggregation, ordering, and limit over `J` separately.
-5. **Measure total maintenance cost.** Benchmark against unmodified Feldera beyond RAM with equal total
-   memory and comparable durability. Include RF1/RF2, scattered line updates, customer fan-out, and rekeys.
-   Account for all reads, writes, sorting, spill, repeated scans, and background work using the
-   [measurement criteria](support.md#evidence-and-measurements-bound-the-claim). Report correctness and
-   performance separately; extend to the stated Q5/Q10 boundaries after the Q3 path is validated.
+1. **Establish the native baseline.** The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+   uses one predicate-free materialized SQL view, default optimization, Catalog mode, and native
+   incremental bootstrap/update execution. Inspect its actual state reads, compare signed deltas
+   and snapshots with independent full joins, and measure load and RF1/RF2 separately. Defaults
+   are one worker, 10,000-row load batches, three independent runs, and memory-backed state.
+2. **Bind the generated state requests.** Identify concrete accumulated read sites, their
+   before/after semantics, partitioning, fetches, and cursor operations. Use the verified
+   [native storage substrate](phase-4-implementation-note.md); extension production, runtime
+   integration, and recovery remain later work.
+3. **Implement direct reconstruction.** Supply requested state with explicit temporary-storage
+   limits and ordering paths. Redirect reads and stop replaced accumulation. Verify cursor,
+   snapshot, publication, and recovery behavior. Shared scan sessions remain optional.
+4. **Verify range-aligned IVM.** Compare native and reconstructed reads, deltas, and `V` with
+   independent evaluation for simultaneous changes, replacements, distinct lines with identical
+   payloads, fan-out, and supplied key moves. Verify residual Q3 separately.
+5. **Measure total maintenance cost.** Compare beyond-memory state under equal total memory and
+   comparable durability, including discovery, reads, writes, sorting, spill, and background work.
+   Step 1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3
+   integration passes its [acceptance criteria](support.md#evidence-and-measurements-bound-the-claim).

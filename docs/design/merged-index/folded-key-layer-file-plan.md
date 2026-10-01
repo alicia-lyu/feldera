@@ -2,6 +2,11 @@
 
 Date: 2026-09-28. Status: implementation plan; no runtime implementation is claimed.
 
+Architecture clarification, 2026-10-01: the [range-aligned IVM architecture](README.md#four-architecture-stages)
+and [new native-baseline plan](range-aligned-ivm-native-q3-baseline-plan.md) supersede assumptions
+that logical SQL must preserve the authored physical pipeline or select `B = O ⋈ C`.
+This plan and its completed storage evidence remain Step 2; Step 1 uses only native Feldera state.
+
 ## Contract and references
 
 Implement the storage substrate for one Customer–Orders–Lineitem merged index. The user's clarifications
@@ -295,8 +300,12 @@ source state, and checking survivor count alone would not establish unit-weight 
 
 ### Maintained view and consuming query
 
-The index stores supplied Customer, Orders, and extended Lineitem records. The maintained Q3 view
-is their unfiltered join, retaining keys, segment, order date/priority, ship date, price, and
+The index stores supplied Customer, Orders, and extended Lineitem records. Logical Lineitem contains order and
+line identities, without customer ID; it joins Orders on
+order ID. Extended Lineitem is a physical representation produced by separate index/view
+maintenance. Its records and related key changes must be supplied before associated join
+maintenance runs. The maintained Q3 view `V` (`J` in earlier notes)
+is the unfiltered logical join, retaining keys, segment, order date/priority, ship date, price, and
 discount. The consuming Q3 query applies segment/date filters, revenue aggregation, ordering,
 and limit; see the [view definition](README.md#how-q3-works-with-reconstructed-state). Join equality
 still connects the relations. Thus a Customer outside BUILDING and its joined line rows remain in
@@ -337,6 +346,10 @@ compaction has cancelled contributions against the delta; capture its snapshot b
 Some operators use an earlier snapshot across several execution steps. Feldera's
 [delayed snapshot](../../../crates/dbsp/src/operator/dynamic/trace.rs#L745) and
 [snapshot keeper](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L1375) are examples.
+Native join partitioning, batched fetches, cursor-driving choices, sorting, and batch
+construction constrain any replacement read provider. The generated baseline determines actual
+read sites; replacing a trace requires redirecting reads and stopping independent accumulation.
+Native trace sharing precludes a universal one-index-per-integrator allocation count.
 Step 3 connects handle lifetime to the last operator use; an input chunk or file creation does
 not establish maintenance completion.
 
@@ -385,7 +398,9 @@ complete maintenance                             # no second append
 
 `clone_handle` shares immutable batch data/file readers with the delta-stream consumer; it does
 not copy tuples. The existing Feldera source path owns the base-table update and supplies the
-changes from which this folded delta is derived. This example describes only the secondary
+changes from which this folded delta is derived. Corresponding extended records and related
+key changes are available before the associated logical join maintenance runs; producing
+those records is a separate integration problem. This example describes only the secondary
 index's append/read sequence; Step 3 wires it into that source path and the runtime protocol.
 Serialize append-and-snapshot publication for one prototype maintenance input
 so `after` includes exactly its intended changes. The source index can contain a delta that is

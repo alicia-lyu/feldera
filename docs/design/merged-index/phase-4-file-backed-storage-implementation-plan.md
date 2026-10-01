@@ -75,9 +75,18 @@ not establish transaction recovery, a hard memory cap, or a performance improvem
 
 ## Later integration
 
+Clarification, 2026-10-01: [range-aligned IVM](README.md#four-architecture-stages) preserves
+logical delta execution while substituting selected accumulated-state reads. The
+[native baseline plan](range-aligned-ivm-native-q3-baseline-plan.md) establishes actual generated
+read sites first; it implements no reconstruction. Logical Lineitem has no customer ID;
+extended records are physical representations supplied before join maintenance. Phase 4's
+verified storage tests do not establish their producer or runtime integration.
+
 For subsequent production wiring, substitute only storage of the persistent trace
 produced by `dyn_accumulate_integrate_trace` and its associated
-`accumulate_delay_trace` reads. Leave `dyn_accumulate` and its delta-accumulation and
+`accumulate_delay_trace` reads. Redirect every replaced read and stop its independent accumulation. Satisfy native join
+partitioning, batched fetch, cursor, sorting, and batch-construction contracts; keep base
+storage, materialized `V`, and unreplaced state accounted for. Leave `dyn_accumulate` and its delta-accumulation and
 delayed-read path unchanged. Transaction integration and production source/operator
 wiring are deferred. Phase 4 needs no custom run format, merger, staging spine, chunk
 limits, storage owner, transaction operators, or point-insertion facade.

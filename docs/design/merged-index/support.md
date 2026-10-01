@@ -1,5 +1,37 @@
 # Evidence for reconstructed accumulated state
 
+## Range alignment and native state-read contracts
+
+The [four architecture stages](README.md#four-architecture-stages) separate externally authored
+physical pipelines, merged-index design, logical SQL, and logical IVM. **Range-aligned IVM**
+aligns delta locations with accumulated-state reads through compatible join/group key domains
+embedded in common or nested folded-key ranges. COL customer prefixes contain order prefixes,
+which contain line prefixes; consumers can request different levels. This does not require
+identical leaf keys, coordinated scans, or globally order-preserving delta execution. A small
+delta can affect a large descendant range. Grouping is part of the broader architecture;
+the native Q3 baseline maintains a join without aggregation.
+
+An integrator is logical accumulation; a retained keyed trace supplies its accumulated output.
+Native join execution remains the integration constraint. Trace reads are the principal
+substitution point, alongside partitioning, batched fetches, cursor-driving choices, sorting,
+and batch construction. Reconstructed state must satisfy all contracts of the reused join,
+including keys, weighted values, absence, ordering, snapshot visibility, and lifetime. Native
+sharing means one index per integrator is an architectural comparison, not a universal physical
+allocation count. Redirect selected reads and stop their independent accumulation; account
+separately for retained base storage, secondary merged index, materialized `V`, and remaining state.
+
+Logical Lineitem has order and line identities and joins Orders on order ID, without a customer
+ID column. Customer-led extended Lineitem is a physical index representation; its producer is
+separate work. Extended records and related key changes are assumed supplied and available
+**before associated join maintenance runs**. They locate logical `ΔL` without changing its schema.
+Local SQL views belong at order-destroying decomposition boundaries; illustrative `B = O ⋈ C`
+is neither a required SQL declaration nor the native compiler's prescribed intermediate.
+
+The [native baseline circuit](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
+explains the generated Step 1 program. The earlier two-join formulas below remain illustrations,
+superseded as a circuit prescription on 2026-10-01 by the
+[new plan](range-aligned-ivm-native-q3-baseline-plan.md). Verified storage evidence remains unchanged.
+
 ## Storage differences from RocksDB
 
 > [!NOTE]
@@ -257,7 +289,7 @@ complete view maintenance. No packed payload list or extra key suffix is permitt
 folded K and its payload/weight rows.
 **Folding** produces the key. The Customer–Orders–Lineitem index assigns ordered key fields and
 shared domains to Customer, Orders, and extended Lineitem; another index can assign a different
-rule to the same source. Their logical positions `(c)`,
+rule to the same source. Their physical positions `(c)`,
 `(c,o)`, and `(c,o,l)` describe the intended order, not storage-visible columns. The storage layer compares
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
@@ -346,7 +378,7 @@ required source tuples using native cursors, then reconstructs only the requeste
 The routine controls which exact keys or ranges it opens and when to release them; it does not receive
 source rows through an intermediate scan-operator layer. The
 [integrator-output description](#merged-index-reconstructs-integrator-outputs) below maps these reads
-for the selected Q3 join circuit.
+for an illustrative Q3 decomposition; the compiler-selected baseline is documented separately.
 
 This lookup-first approach differs from the maintained-trace path. In that path,
 [integrated trace construction](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L372)
@@ -629,8 +661,9 @@ retained-state baseline; report high-water bytes and every spill, reread, sort, 
 
 ## Merged index reconstructs integrator outputs
 
-The selected Q3 maintenance target is the unfiltered, unaggregated join `J = (O ⋈ C) ⋈ L`.
-Here `O`, `C`, and `L` are accumulated Orders, Customers, and extended Lineitems; `B = O ⋈ C`
+The logical Q3 maintenance boundary is the unfiltered, unaggregated three-way join `V`
+(`J` in earlier notes). The following decomposition illustrates its semantics, not a prescribed circuit.
+Here `O`, `C`, and `L` are logical accumulated Orders, Customers, and standard Lineitems; `B = O ⋈ C`
 is the intermediate join. The join equalities match customer and order identities. They are part
 of the relation definition. Market-segment and date predicates belong to a query consuming `J`.
 The maintained `J` includes customer, order, and line identities, segment, order and ship dates,
@@ -643,7 +676,7 @@ flowchart LR
     DC[Customer changes] --> C[Accumulated C]
     O --> B[Join B = O join C]
     C --> B
-    DL[Extended line changes] --> L[Accumulated L]
+    DL[Logical line changes] --> L[Accumulated L]
     B --> J[Maintained J = B join L]
     L --> J
     J --> Q[Q3 query: filter, group, order, limit]
@@ -651,7 +684,7 @@ flowchart LR
 
 The merged-index provider supplies requested accumulated state to the **existing** incremental join
 operators. Its reads of before-maintenance state exclude pending contributions. Reads of after-maintenance
-state include them. With `ΔO`, `ΔC`, and `ΔL` as signed input changes, the selected join orientation gives:
+state include them. With `ΔO`, `ΔC`, and `ΔL` as signed input changes, this illustrative join orientation gives:
 
 ```text
 B_before = O_before ⋈ C_before
@@ -665,12 +698,14 @@ J_after  = B_after  ⋈ L_after
 
 These are the same old/current-trace choices made by Feldera's
 [incremental join](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749).
-The provider supplies state tuples; the operator computes `ΔB` and `ΔJ`. The circuit binding must identify
+For this illustration, the provider supplies state tuples; the operator computes `ΔB` and `ΔJ`. The circuit
+binding must identify
 its actual accumulated read sites and preserve their key/value ordering and weighted cursor behavior.
 The provider reads the appropriate snapshot and returns weighted tuples to join operators. The input
 delta is retained separately and supplied to their existing delta ports.
 
 ```text
+# Illustrative relation set; bind actual read sites from the generated circuit.
 provider.open(relation, requested_keys, state):
     assert relation in {O, C, L, B}
     assert state in {BEFORE_MAINTENANCE, AFTER_MAINTENANCE}
@@ -680,10 +715,11 @@ provider.open(relation, requested_keys, state):
 
 # Existing IVM path receives ΔO, ΔC, and ΔL unchanged.
 # It requests accumulated O, C, L, or B from provider.open as needed.
-# It computes and applies ΔJ to the maintained J exactly once.
+# It computes and applies ΔV to the maintained V exactly once.
 ```
 
-`O`, `C`, and `L` reconstruct by decoding and consolidating their source records. `B` reconstructs
+`O`, `C`, and logical `L` reconstruct by decoding and consolidating their physical source records.
+For `L`, decoding removes the customer-led placement fields from the logical schema. `B` reconstructs
 matching order/customer rows, multiplying their weights. A range cursor can stream the rows needed for a
 requested order without materializing all of `J`. Each query/integrator routine controls these lookups
 and returns the same tuples, weights, and ordering to its operator. Shared sessions could later reuse
@@ -694,7 +730,8 @@ into a delta input.
 The [lecture note's Q3 figure](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59)
 and [five-state account](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)
 illustrate a filtered, aggregate-first circuit with `H` and `A` states. They document another maintenance
-boundary and are not the active `O`/`C`/`B`/`L`/`J` circuit. Feldera's generic
+boundary and are not the maintained join boundary. Neither that figure nor the illustrative `B` wiring
+prescribes the compiler-selected native circuit. Feldera's generic
 [aggregation implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)
 remains relevant when Q3's consuming query groups the maintained joined rows.
 
@@ -880,7 +917,14 @@ storage/query evidence. The `mi_db` scan-session section is validated input for 
 sharing design, without implying validation of its other sections or implementation of this report's
 Feldera-specific extensions.
 
-The design sources specify the intended semantics. The following checks are implementation acceptance
+Step 1 checks native deltas and materialized `V` against independent joins and validates exact
+parsing and paired RF1/RF2 updates. It measures native load/refresh transaction latency and
+throughput including `V` maintenance, with preparation, driver memory, and end-to-end time
+reported separately. It implements no merged-index access, extension producer, reconstruction,
+or residual Q3 execution. The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+records native evidence; it makes no performance-gain claim.
+
+The design sources specify the intended semantics. The following later-integration checks are implementation acceptance
 criteria; this report does not claim they have been met.
 
 | Acceptance question | Required evidence |

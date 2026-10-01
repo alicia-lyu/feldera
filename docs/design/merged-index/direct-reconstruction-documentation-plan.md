@@ -2,6 +2,12 @@
 
 Date: 2026-10-01.
 
+Follow-up, 2026-10-01: the
+[range-aligned IVM and native Q3 baseline plan](range-aligned-ivm-native-q3-baseline-plan.md)
+clarifies the architecture and establishes the actual compiler-generated circuit. This completed
+documentation plan records the direct-access decision; its illustrative `B` decomposition does
+not prescribe the native circuit. Historical evidence and the optional scan-sharing decision remain.
+
 ## Decision
 
 For the current Feldera experiments, use direct, query-specific reconstruction without an
