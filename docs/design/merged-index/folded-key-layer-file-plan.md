@@ -16,13 +16,14 @@ their historical implementation proposals are not additional instructions.
 | [DBSP signed changes](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L205) | Retractions use negative weights and match complete tuples. |
 | [DBSP before/after algebra](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L508) | State before changes and state after applying the delta. |
 | [Operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39) | Numeric summaries, output tuples, and affected-key support have distinct roles. |
-| [mi_db scan sessions](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | Later typed-accessor/session layer, outside Step 2. |
+| [mi_db scan sessions](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | Deferred optional scan-sharing abstraction, outside Step 2. |
 | [Multi-pipeline manuscript](../../../../query_execution_using_MI/main.tex#L88) | Future pipeline composition; this step covers one merged index. |
 
 The transaction supplies all intended related-row changes and both keys of a moved row. Storage does not
 move descendants, enforce relational consistency, or add an `OrderParent` lookup record. Step 2 provides
-folding/unfolding, weighted batches, snapshots, and consolidated cursors. Typed reconstruction, shared scan sessions,
-view-operator wiring, and runtime transaction recovery follow in Step 3.
+folding/unfolding, weighted batches, snapshots, and consolidated cursors. Direct query/integrator reconstruction,
+view-operator wiring, and runtime transaction recovery follow in Step 3. Shared scan sessions are deferred
+and optional; the [access decision](support.md#direct-reconstruction-is-the-chosen-access-path) records why.
 
 ## Settled scope before Phase 4
 
@@ -445,8 +446,8 @@ For a requested K or range, the cursor advances through the relevant immutable b
 key order and consolidates matching `(K, payload)` contributions. This reads the requested
 rows and file blocks as needed; it does not load the entire accumulated relation into
 memory. For the replacement above, a lookup of K returns only `(K, P120, +1)`;
-unrelated keys are not materialized. Typed query access and shared scan sessions follow
-in Step 3.
+unrelated keys are not materialized. Direct, query-specific reconstruction follows in Step 3;
+shared scan sessions remain a deferred optional abstraction.
 
 ## Verification and implementation sequence
 

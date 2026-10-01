@@ -5,7 +5,8 @@
 This guide lists all sources used by this note and its supporting report, grouped by source file. Detailed
 line-level citations remain beside the claims they support. Start with the interesting-orderings manuscript
 for general merged-index design, LeanStore for working storage and query execution, and the lecture note
-for historical Q3 maintenance examples. The validated `mi_db` scan-session section supplies the sharing design;
+for historical Q3 maintenance examples. Direct, query-specific reconstruction is the chosen access path.
+The validated `mi_db` scan-session section informs a deferred, optional sharing design;
 validation does not extend to its other sections.
 Local links assume the sibling checkout layout; public code links pin the inspected revisions. The modified
 `mi_db` design is identified by revision and content hash in the supporting report.
@@ -19,7 +20,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [Maintaining a Query, One Change at a Time](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L276) | Historical filtered, aggregate-first Q3 circuit and signed-delta algebra. Its five-state circuit is not the maintained view selected here. |
 | [Equivalent Q3 circuits — figure source](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59) | Documents the historical grouping, delay, and join wiring for comparison. |
 | [Operator-state guide](../../../../DBSP_w_merged_index/operator-state.tex#L39) | Historical aggregate-first example of group existence; grouping now belongs to the consuming query. |
-| [mi_db validated scan-session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | The scan-session section is validated. Other sections, including the separate buffer guard, require independent assessment. Spill/reread and Feldera batch-lifetime pseudocode are extensions proposed here. |
+| [mi_db validated scan-session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions) | The scan-session section is validated. Other sections, including the separate buffer guard, require independent assessment. Sharing is deferred and optional; spill/reread are proposed extensions. |
 | [Interesting-orderings manuscript — experiments](../../../../merged_index_interesting_orderings/sections/experiments_revised.tex#L173) | Defines the refresh workload and reports backend-dependent results, including the LSM comparison. It motivates measuring total maintenance cost rather than assuming a Feldera speedup. |
 
 ### Existing Feldera storage and operator behavior
@@ -65,7 +66,9 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) | Connects the baseline comparison to concrete storage sources. |
 | [Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values) | Provides interface pseudocode, an array layout, traversal/lookup examples, and interchangeable read providers. |
 | [Folded keys in Feldera layer files](support.md#folded-keys-in-feldera-layer-files) | Defines the record representation and weighted-update requirements for reusing the LSM machinery. |
-| [Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory) | Specifies owner/view lifetime, ordering, reader positions, borrowed records, and bounded overflow behavior in pseudocode. |
+| [Direct reconstruction is the chosen access path](support.md#direct-reconstruction-is-the-chosen-access-path) | Explains selective maintenance reads, query/integrator-controlled lookup, and the demonstrated native storage substrate. |
+| [Batch ownership and operator access](support.md#batch-ownership-and-operator-access) | Preserves snapshot lifetime, weighted visibility, cursor ordering, and transaction-completion requirements for direct reconstruction. |
+| [Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory) | Records a deferred, optional coordination abstraction for full-query execution or IVM, including reader positions and bounded overflow behavior. |
 | [Merged index reconstructs integrator outputs](support.md#merged-index-reconstructs-integrator-outputs) | Maps predicate-free join state to reconstruction routines and the existing join operator contract. |
 | [Weighted reconstruction preserves group existence](support.md#weighted-reconstruction-preserves-group-existence) | Explains signed multiplicity and defers grouped existence to the consuming Q3 query. |
 | [Immutable batches preserve old reads](support.md#immutable-batches-preserve-old-reads) | Separates existing snapshot primitives from the publication/recovery behavior the adapter must implement. |
@@ -265,9 +268,13 @@ defines this boundary and the remaining adapter work.
 
 The integration boundary is **accumulated-state access**: for requested keys and the state before or after
 maintenance, return the
-same tuples, weights, ordering, and absence information that existing **integrator state** would supply. The provider
-scans encoded ranges to derive those tuples. Operator
-code consumes them through the same access contract, whether they were retained or reconstructed.
+same tuples, weights, ordering, and absence information that existing **integrator state** would supply.
+For the current experiments, ad-hoc routines for each query and integrator control their own source
+lookups and reconstruct only the requested accumulated state. Operator code consumes the resulting
+tuples through the same access contract, whether they were retained or reconstructed. The
+[direct-reconstruction decision](support.md#direct-reconstruction-is-the-chosen-access-path) explains why
+limited maintenance ranges reduce the motivation for shared scan coordination. A scan-operator layer
+remains an architectural option for both full-query execution and IVM.
 
 The existing incremental view maintenance (IVM) algorithm determines the output: an additive summary can
 emit a tuple carrying a value difference; a replacement emits `-[[old_tuple]] + [[new_tuple]]`, where `[[t]]`
@@ -301,12 +308,12 @@ One storage owner appends each complete input delta to the same index before vie
 consistent views, and keeps them alive for every
 consumer. Provider cursors seek encoded ranges and return the requested state through the shared contract. When
 byte-key order differs from the required operator order, use budgeted external sorting or a maintained access
-path and count its I/O. Each shared scan has a byte-limited buffer and per-consumer positions; a lagging
-consumer must cause backpressure, spilling, or rereading, rather than unbounded retention.
-[Shared scan sessions bound ownership and memory](support.md#shared-scan-sessions-bound-ownership-and-memory)
-gives pseudocode for batch lifetime, provider requests, reader positions, ordering, and overflow handling.
-Its scan-sharing basis is the validated `mi_db` scan-session section; the Feldera lifecycle and overflow
-extensions remain proposals.
+path and count its I/O. Direct routines must budget temporary records and respect borrowed-value lifetimes.
+[Batch ownership and operator access](support.md#batch-ownership-and-operator-access) describes the
+snapshot and completion requirements independently of scan sharing.
+[Shared scan sessions](support.md#shared-scan-sessions-bound-ownership-and-memory) remain a deferred,
+optional abstraction if later workloads justify coordinated readers. Their basis is the validated
+`mi_db` scan-session section; the Feldera adaptation and overflow extensions remain proposals.
 
 The reconstruction target is each requested accumulated relation in the predicate-free join pipeline,
 not its input delta stream. For Q3 those relations are `O`, `C`, `B = O ⋈ C`, and `L`; the maintained
@@ -419,9 +426,9 @@ existing refresh behavior from the proposed sharing.
 
 Reconstruction trades writes and persistent intermediate bytes for reads, decoding, and computation. A single
 line change may rescan all `f` lines of its order; a customer change may visit every descendant. Transaction-supplied
-key changes write the supplied before and after placements. Temporary read handles, incoming batches, shared buffers,
-and any additional ordering increase memory or peak storage. Existing Feldera traces may answer selective
-probes more cheaply, especially with cached or batched fetches.
+key changes write the supplied before and after placements. Temporary read handles, incoming batches,
+reconstruction buffers, and any additional ordering increase memory or peak storage. Existing Feldera
+traces may answer selective probes more cheaply, especially with cached or batched fetches.
 
 Judge the design against unmodified Feldera with identical results, updates, memory budgets, and comparable
 durability. Measure actual read/write bytes, repeated reads, seeks, decoded records, CPU, peak memory and
@@ -444,15 +451,16 @@ source provenance and implementation acceptance criteria.
    runtime read sites, including before/after maintenance state and cursor operations. Specify the Rust adapter interfaces
    from the [trace-access pseudocode](support.md#trace-access-traverses-keys-then-weighted-values). Keep delta
    streams and IVM computation shared between retained and reconstructed state providers.
-2. **Verify native merged-index storage.** Follow the [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md):
-   construct `OrdIndexedWSet` batches with folded keys, payloads, and signed weights;
-   insert them into a native Spine and observe normal memory-to-file compaction. Verify
-   reopened file reads, signed updates, and retained snapshots. Production insertion and
-   operator wiring follow separately. Typed scan sessions follow in Step 3.
-3. **Implement reconstruction and bounded scan sharing.** Supply per-integrator routines, then connect them
-   through the [session protocol](support.md#shared-scan-sessions-bound-ownership-and-memory). Choose explicit
-   buffer limits, overflow handling, and ordering paths. Verify consumer progress, borrowed-value lifetimes,
+2. **Use the verified native storage substrate.** The [Phase 4 implementation note](phase-4-implementation-note.md)
+   records native weighted batches, memory-to-file compaction, mixed snapshot reads, signed updates,
+   and reopened file reads. Build integration on those capabilities; production source/operator wiring
+   and transaction recovery remain deferred. Shared scan sessions are not a prerequisite.
+3. **Implement direct reconstruction.** Write ad-hoc routines for each experimental query and integrator
+   that look up required source tuples and reconstruct only the requested accumulated state. Choose
+   explicit temporary-storage limits and ordering paths. Verify cursor and snapshot lifetimes,
    batch publication, and commit/recovery behavior with ranges larger than the memory budget.
+   Defer [shared scan sessions](support.md#shared-scan-sessions-bound-ownership-and-memory) unless
+   workload evidence justifies coordinating readers.
 4. **Verify the complete Q3 path.** Run identical updates through retained and reconstructed providers.
    Compare each requested state and maintained `J` against independent evaluation. Include simultaneous
    source changes, replacements, duplicate visible Q3 fields on distinct lines, and supplied key moves.

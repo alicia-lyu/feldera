@@ -215,8 +215,8 @@ RetainedStateAccess.open(id, keys, view):
     return scoped_cursor(pin_integrator_trace(id, view), keys)
 
 MergedStateAccess.open(id, keys, view):
-    source = owner.open_source_byte_ranges(encode_ranges(id, keys), view)
-    tuples = reconstructors[id].stream(source) # derive (K,V,weight) tuples for this state
+    tuples = reconstructors[id].lookup_and_reconstruct(keys, view)
+    # Each query/integrator routine opens its own source lookups and ranges.
     ordered = ensure_requested_order_and_consolidation(tuples)
     return grouped_navigation_cursor(ordered)  # same key/value operations as the retained path
 ```
@@ -224,9 +224,10 @@ MergedStateAccess.open(id, keys, view):
 `grouped_navigation_cursor` identifies key boundaries in an ordered tuple stream and exposes the current
 value group without collecting the group in a map. A `step_key` can drain/skip the remainder of the current
 group. Seeks use an available physical access path, a budgeted sorted run, or a charged scan; the interface
-does not promise equal seek costs for both providers. Copies, lookahead, shared buffers, and external ordering
-consume the budgets described in the shared-session protocol. The proposed signatures illustrate the boundary;
-concrete Rust types and full method compatibility remain implementation work.
+does not promise equal seek costs for both providers. Copies, lookahead, and external ordering must fit
+explicit memory budgets; shared buffers would also count if introduced later. The proposed signatures
+illustrate the access boundary, not a requirement for a common scan layer. Concrete Rust types and full
+method compatibility remain implementation work.
 
 ## Folded keys in Feldera layer files
 
@@ -281,11 +282,12 @@ secondary representations when evaluating storage costs. The
 The proposed Q3 scan keeps the current order identifier and the required parent payloads. It advances
 through the order's encoded range and emits the accumulated line or joined rows requested by the operator.
 It does not retain a vector or hash map of all line tuples. Storage pages, decoding buffers, variable
-payload sizes, and shared-consumer buffers still count toward the memory budget.
+payload sizes, and any temporary reconstructed rows still count toward the memory budget.
 
 A consumer that requires individual line or joined tuples receives them incrementally through a cursor.
 An operator API that requires an immutable batch object must receive explicitly budgeted storage, including
-spills if needed. The shared-session pseudocode below specifies ownership, ordering, and buffer pressure.
+spills if needed. The ownership and operator-access requirements below apply to direct reconstruction;
+shared scan sessions are a separate, deferred option.
 
 Reuse the same LSM machinery: the spine, immutable-batch management, compaction scheduling, cache, and
 snapshot ownership. Folded keys and payload codecs supply the records; existing full-key/value
@@ -315,26 +317,60 @@ changes and complete extended keys. This adapter adds no parent lookup, automati
 or relational-consistency enforcement. Snapshot membership selects before or after state; no stored status
 bit or clearing pass is needed.
 
-## Shared scan sessions bound ownership and memory
+## Direct reconstruction is the chosen access path
 
-> [!NOTE]
-> **Glossary**
->
-> **Scan session** — An owner of one physical range cursor and the buffers used by its registered readers.
+The scan-operator layer is an architectural choice, not an inherent distinction between evaluating
+`Q` and maintaining `ΔV`. A regular join can read a merged index through one sequential cursor;
+IVM can also use multiple coordinated scan operators. For the current Feldera experiments, we choose
+direct, query-specific reconstruction without that intermediate layer.
 
-Each **scan session** has its own cursor position and reader buffers. A durable
-index handle may be shared; mutable cursor position belongs to a session. This follows the validated
-[`mi_db` session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions): register readers
-before scanning, share one buffer per record type, and give same-type readers independent positions.
-Validation applies to the scan-session section, not the entire architecture document. The separate
-[buffer guard](../../../../mi_db/docs/architecture.md#pending-buffer-guard) warns at 80% and fails before
-an insertion reaches its limit; that section describes no spill or reread and is not assumed validated.
-The pseudocode below is a proposed Feldera adaptation with explicit overflow choices, not an implemented
-API or a claim about `mi_db` code.
+### Most maintenance accesses request limited key ranges
 
-The cited document is modified working-tree content inspected on 2026-09-28, based on `mi_db` revision
-`d50d29dfe559258351c1071e59ca5365eacf09d0`. Its SHA-256 is
-`d043b9b28121fe044980fde032d95e4b00c331e1d7a137ce709bd70eb6914e79`.
+Our maintenance accesses usually look up accumulated partners for keys present in a delta, rather than
+scan an entire accumulated relation. Feldera's [delta-key fetch
+path](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661-L1672) illustrates this: when join fetch is
+enabled, `trace.fetch(&delta)` narrows the accumulated side to the delta's keys. The fetch is conditional;
+this is evidence of selective access, not a claim that every existing join uses it.
+
+The corresponding source reads are expected to be short-lived: look up the required partners, supply
+weighted tuples for the requested state, and release the cursor when that request finishes. A customer
+change can still visit many descendants, and scattered delta keys can touch many ranges. Limited requests
+reduce the motivation for shared scan coordination in our chosen implementation; they do not make
+coordination inherently unnecessary for IVM. Before/after snapshot handles can outlive individual reads
+and must remain valid until all consumers finish.
+
+### Our reconstruction functions control their own reads
+
+We will write ad-hoc routines for each experimental query and integrator. Each routine first looks up the
+required source tuples using native cursors, then reconstructs only the requested accumulated state.
+The routine controls which exact keys or ranges it opens and when to release them; it does not receive
+source rows through an intermediate scan-operator layer. The
+[integrator-output description](#merged-index-reconstructs-integrator-outputs) below maps these reads
+for the selected Q3 join circuit.
+
+This lookup-first approach differs from the maintained-trace path. In that path,
+[integrated trace construction](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L372)
+maintains accumulated state before the join fetches its partners: its
+[append path](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L429-L463) combines accumulated
+changes with the delayed trace. In the chosen path, source tuples
+already exist in the merged index, but the requested integrator output is reconstructed after its source
+lookups rather than retained as a separate accumulated collection. The routines still supply the same
+weighted tuples, absence information, and cursor order, with input deltas kept separate.
+
+### Native storage does not require a shared scan prerequisite
+
+The [Phase 4 note](phase-4-implementation-note.md) demonstrates native weighted batch construction and
+Spine insertion, memory-to-file compaction, consolidated reads over mixed memory/file snapshots,
+exact/missing lookups, prefix scans, ordered traversal, and rewind. Old snapshots remain readable through
+compaction and signed updates, and a resulting file batch can be reopened and compared by typed records
+and weights. These capabilities provide the storage operations needed for direct source lookup.
+
+Choose query-specific reconstruction on that substrate without adding common scan infrastructure as a
+prerequisite. Phase 4 does not demonstrate reconstructed-state runtime integration, transaction recovery,
+a hard memory cap, or a performance improvement. Source/operator wiring and transaction completion remain
+implementation work; the requirements below apply regardless of whether shared sessions are added later.
+
+## Batch ownership and operator access
 
 ### Batch owner and view lifetime
 
@@ -370,7 +406,7 @@ process_batch(input, consumer_plan):
         provider = ReconstructedStateProvider(owner)
         run_existing_ivm_paths(input.deltas, provider, consumer_plan)
         await consumer_plan.all_tasks_and_output_updates_finished()
-        provider.close_all_sessions_and_sorted_cursors()
+        provider.close_all_source_and_sorted_cursors()
         assert owner.outstanding_view_leases == 0
 
         complete_source_and_output_transaction(owner)         # no second weighted insertion
@@ -392,10 +428,54 @@ existing batches; they create no tuple copies, historical-version catalog, or ex
 
 ### Requests retain the existing operator contract
 
-A request identifies the accumulated relation, requested keys, before/after maintenance state, and required key/value order.
-The provider derives bounds with the record-type codecs. Sharing is chosen when the consumer plan is prepared,
-so every reader is registered before scanning. A session may scan a coalesced range and readers may filter
-within it, but two arbitrary overlapping requests do not automatically share a mutable cursor.
+A request identifies the accumulated relation, requested keys, before/after maintenance state, and
+required key/value order. Its query/integrator routine derives source lookup bounds with the record-type
+codecs and reads the appropriate immutable snapshot. Each cursor has its own mutable position and holds
+its read handle until it closes. Borrowed records must be consumed before cursor movement or copied into
+budgeted storage. A later request may open a fresh cursor without registering readers in advance.
+
+The routine must prove that its output has the requested key/value order and complete-tuple consolidation.
+If physical order is insufficient, use an equivalent maintained access path or budgeted external sorting
+and count its I/O. The maintained path must expose the same before/after view. This ordering requirement
+applies to direct reconstruction independently of any scan-sharing abstraction.
+
+External sorting writes bounded sorted runs and performs a bounded-fan-in merge. It orders by the requested
+operator comparator and consolidates identical output tuples, preserving weights and dropping zero totals.
+A maintained access path must expose the same batch view and include its maintenance cost. Merely decoding
+byte keys proves neither operator order nor consolidation. These choices happen inside state access;
+value-difference and retraction/insertion logic stays in the existing IVM operators.
+
+## Shared scan sessions bound ownership and memory
+
+Shared scan sessions are a **deferred, optional abstraction** for either full-query execution or IVM.
+The current experiments use direct reconstruction. The design below applies only if later workloads
+justify coordinating multiple readers over the same ranges; it is not a prerequisite for reconstruction
+or runtime integration.
+
+> [!NOTE]
+> **Glossary**
+>
+> **Scan session** — An owner of one physical range cursor and the buffers used by its registered readers.
+
+Each **scan session** has its own cursor position and reader buffers. A durable
+index handle may be shared; mutable cursor position belongs to a session. This follows the validated
+[`mi_db` session design](../../../../mi_db/docs/architecture.md#merged-index-scan-sessions): register readers
+before scanning, share one buffer per record type, and give same-type readers independent positions.
+Validation applies to the scan-session section, not the entire architecture document. The separate
+[buffer guard](../../../../mi_db/docs/architecture.md#pending-buffer-guard) warns at 80% and fails before
+an insertion reaches its limit; that section describes no spill or reread and is not assumed validated.
+The pseudocode below is a proposed Feldera adaptation with explicit overflow choices, not an implemented
+API or a claim about `mi_db` code.
+
+The cited document is modified working-tree content inspected on 2026-09-28, based on `mi_db` revision
+`d50d29dfe559258351c1071e59ca5365eacf09d0`. Its SHA-256 is
+`d043b9b28121fe044980fde032d95e4b00c331e1d7a137ce709bd70eb6914e79`.
+
+### Optional grouping of compatible requests
+
+If shared sessions are implemented, choose sharing before scanning and register every reader first.
+A session may scan a coalesced range and readers may filter within it; arbitrary overlapping requests do
+not automatically share a mutable cursor. The following pseudocode is only for that deferred design.
 
 ```text
 prepare_access(requests, owner):
@@ -422,17 +502,12 @@ prepare_access(requests, owner):
 ```
 
 Compatibility includes read-state identity, encoded range, decoder requirements, and forward traversal.
-Independent states or ranges use independent sessions in this minimal design. Sharing one traversal across
-before/after states requires access to both immutable snapshot inventories and their weighted payloads; the lifecycle
-above permits it but does not imply it is already implemented. Readers needing an independent seek close
-and reopen their own access instead of repositioning a cursor under other consumers. Replayed reads are
+If sessions are introduced, independent states or ranges use independent sessions in this design. Sharing
+one traversal across before/after states requires access to both immutable snapshot inventories and their
+weighted payloads; the batch lifecycle permits it but does not imply it is already implemented.
+Readers needing an independent seek close and reopen their own access instead of repositioning a cursor
+under other consumers. Replayed reads are
 charged. Existing operator seek/order behavior must still be honored.
-
-External sorting writes bounded sorted runs and performs a bounded-fan-in merge. It orders by the requested
-operator comparator and consolidates identical output tuples, preserving weights and dropping zero totals.
-A maintained access path must expose the same batch view and include its maintenance cost. Merely decoding
-byte keys proves neither operator order nor consolidation. These choices happen inside state access;
-value-difference and retraction/insertion logic stays in the existing IVM operators.
 
 ### Shared typed buffers and reader positions
 
@@ -599,8 +674,9 @@ delta is retained separately and supplied to their existing delta ports.
 provider.open(relation, requested_keys, state):
     assert relation in {O, C, L, B}
     assert state in {BEFORE_MAINTENANCE, AFTER_MAINTENANCE}
-    source = scan_owner.access(requested_keys, state)
-    return reconstruct_requested_relation(relation, source)
+    view = owner.acquire(state)
+    return query_reconstructors[relation].lookup_and_reconstruct(requested_keys, view)
+    # The routine opens its own source cursors and retains view until its result closes.
 
 # Existing IVM path receives ΔO, ΔC, and ΔL unchanged.
 # It requests accumulated O, C, L, or B from provider.open as needed.
@@ -609,9 +685,11 @@ provider.open(relation, requested_keys, state):
 
 `O`, `C`, and `L` reconstruct by decoding and consolidating their source records. `B` reconstructs
 matching order/customer rows, multiplying their weights. A range cursor can stream the rows needed for a
-requested order without materializing all of `J`. Shared sessions may reuse decoded rows across compatible
-requests; they still return the same tuples, weights, and ordering to each operator. The maintained `J`
-remains a separate output relation; reconstruction does not feed a full snapshot back into a delta input.
+requested order without materializing all of `J`. Each query/integrator routine controls these lookups
+and returns the same tuples, weights, and ordering to its operator. Shared sessions could later reuse
+rows across compatible requests, but the current experiments do not require that abstraction. The
+maintained `J` remains a separate output relation; reconstruction does not feed a full snapshot back
+into a delta input.
 
 The [lecture note's Q3 figure](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59)
 and [five-state account](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)
@@ -798,8 +876,9 @@ the modified `main.tex` inspected on 2026-09-28, SHA-256
 `44bf60963e6b94f6aaad04cdacea3ecc31e248a95cb10dd1118ff2e6fa17a9c2`.
 The future multi-pipeline manuscript is clean at `e485dd5b5775cabf9cfbf0aa44a0e5bd64a8f925`.
 The interesting-orderings manuscript is the primary architectural reference; LeanStore supplies working
-storage/query evidence. The `mi_db` scan-session section is validated design input, without implying
-validation of its other sections or implementation of this report's Feldera-specific extensions.
+storage/query evidence. The `mi_db` scan-session section is validated input for the deferred optional
+sharing design, without implying validation of its other sections or implementation of this report's
+Feldera-specific extensions.
 
 The design sources specify the intended semantics. The following checks are implementation acceptance
 criteria; this report does not claim they have been met.
@@ -808,7 +887,8 @@ criteria; this report does not claim they have been met.
 | --- | --- |
 | Are operator inputs and results identical? | Run the same join operators with retained and reconstructed state providers; compare requested tuples, weights, ordering, absence, and before/after maintenance reads, then check retraction/insertion outputs against independent evaluation. |
 | Does the merged-index adapter preserve encoding and weighted updates? | Verify cross-type byte ordering, exact range bounds, type decoding, payload replacements at unchanged keys, signed multiplicities, and before/after snapshot reads. |
-| Does shared access preserve lifecycle and memory bounds? | Interleave consumers, exceed the buffer budget, and exercise abort/restart; verify before/after source reads, reference-only snapshots, and exactly-once batch advancement. |
+| Does direct access preserve lifecycle and memory bounds? | Exercise overlapping request lifetimes, ranges larger than the budget, and abort/restart; verify before/after source reads, borrowed-value validity, reference-only snapshots, and exactly-once batch advancement. |
+| If shared sessions are added, do readers progress within their budgets? | Interleave consumers, hold borrowed values under pressure, and exercise overflow and cancellation without dropping or duplicating rows. |
 | Does storage replacement actually occur? | Inventory retained state, including aggregate output and delays; confirm intermediate snapshots are not accumulated again. |
 | Is total maintenance cheaper? | Compare datasets larger than memory under equal total memory and comparable durability, with matched predicates/results and baseline fetch enabled where configured. |
 
