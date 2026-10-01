@@ -1,0 +1,32 @@
+[package]
+name = "q3-ivm-baseline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arcstr = "1"
+compare = "0.1"
+dbsp = { path = "../../../crates/dbsp", features = ["backend-mode"] }
+dbsp_adapters = { path = "../../../crates/adapters", default-features = false }
+derive_more = { version = "1", features = ["add", "not", "from"] }
+erased-serde = "0.3"
+libc = "0.2"
+feldera-sqllib = { path = "../../../crates/sqllib" }
+feldera-adapterlib = { path = "../../../crates/adapterlib" }
+feldera-types = { path = "../../../crates/feldera-types" }
+feldera-macros = { path = "../../../crates/feldera-macros" }
+paste = "1"
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+size-of = { version = "0.1", package = "feldera-size-of" }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+
+[profile.dev]
+debug = "line-tables-only"
