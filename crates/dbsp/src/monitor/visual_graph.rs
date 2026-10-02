@@ -2,9 +2,23 @@
 //! conversion to a visual format like dot.
 
 use serde::{Serialize, ser::SerializeStruct};
-use std::fmt::{self, Debug, Display, Write};
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Debug, Display, Write},
+};
 
 type Id = String;
+
+/// Presentation category for an existing circuit operator node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CircuitNodeStyle {
+    /// Operator that explicitly accumulates updates.
+    Accumulation,
+    /// Operator that retains state for another purpose.
+    OtherState,
+    /// Operator whose state behavior has not been classified.
+    Unclassified,
+}
 
 /// Visual representation of a circuit graph.
 ///
@@ -28,11 +42,23 @@ impl Graph {
 
     /// Convert graph to dot format.
     pub fn to_dot(&self) -> String {
+        self.render_dot(None)
+    }
+
+    /// Convert graph to dot format with presentation styles keyed by existing node ID.
+    ///
+    /// Missing IDs are rendered as unclassified. Entries for IDs absent from the
+    /// graph have no effect on the output.
+    pub fn to_dot_with_styles(&self, styles: &BTreeMap<String, CircuitNodeStyle>) -> String {
+        self.render_dot(Some(styles))
+    }
+
+    fn render_dot(&self, styles: Option<&BTreeMap<String, CircuitNodeStyle>>) -> String {
         let mut output = String::with_capacity((self.nodes.nodes.len() + self.edges.len()) * 50);
         output.push_str("digraph {\nnode [shape=box]\n");
 
         self.nodes
-            .to_dot(&mut output)
+            .to_dot(&mut output, styles)
             .expect("writing to a string should never fail");
 
         for edge in self.edges.iter() {
@@ -80,7 +106,43 @@ impl SimpleNode {
         Self { id, label, color }
     }
 
-    fn to_dot(&self, output: &mut dyn Write) -> fmt::Result {
+    fn to_dot(
+        &self,
+        output: &mut dyn Write,
+        styles: Option<&BTreeMap<String, CircuitNodeStyle>>,
+    ) -> fmt::Result {
+        if let Some(styles) = styles {
+            let (marker, fillcolor, bordercolor, tooltip) = match styles
+                .get(&self.id)
+                .copied()
+                .unwrap_or(CircuitNodeStyle::Unclassified)
+            {
+                CircuitNodeStyle::Accumulation => (
+                    "A",
+                    "#dbeafe",
+                    "#2563eb",
+                    "Accumulation: retains accumulated updates",
+                ),
+                CircuitNodeStyle::OtherState => (
+                    "S",
+                    "#ede9fe",
+                    "#7c3aed",
+                    "Other state: retains state for another purpose",
+                ),
+                CircuitNodeStyle::Unclassified => (
+                    "U",
+                    "#eeeeee",
+                    "#777777",
+                    "Unclassified: state behavior has not been classified",
+                ),
+            };
+            return writeln!(
+                output,
+                "{}[label=\"{}\\l[{marker}]\" fillcolor=\"{fillcolor}\" color=\"{bordercolor}\" tooltip=\"{tooltip}\" style=filled]",
+                self.id, self.label,
+            );
+        }
+
         let r = 1.0 - self.color;
         let gb = (r * r * r * 255.0) as u8;
 
@@ -119,13 +181,17 @@ impl ClusterNode {
     // these nodes.  This does not look great.  We should instead connect each
     // edge to a specific simple node, which requires extending the circuit
     // builder API.
-    fn to_dot(&self, output: &mut dyn Write) -> fmt::Result {
+    fn to_dot(
+        &self,
+        output: &mut dyn Write,
+        styles: Option<&BTreeMap<String, CircuitNodeStyle>>,
+    ) -> fmt::Result {
         writeln!(output, "subgraph cluster_{} {{", self.id)?;
         writeln!(output, "label=\"{}\"", self.label)?;
         writeln!(output, "enter_{}[style=invis]", self.id)?;
         writeln!(output, "exit_{}[style=invis]", self.id)?;
         for node in self.nodes.iter() {
-            node.to_dot(output)?;
+            node.to_dot(output, styles)?;
         }
         writeln!(output, "}}")?;
 
@@ -160,10 +226,14 @@ impl Node {
         }
     }
 
-    fn to_dot(&self, output: &mut dyn Write) -> fmt::Result {
+    fn to_dot(
+        &self,
+        output: &mut dyn Write,
+        styles: Option<&BTreeMap<String, CircuitNodeStyle>>,
+    ) -> fmt::Result {
         match self {
-            Self::Simple(simple_node) => simple_node.to_dot(output),
-            Self::Cluster(cluster_node) => cluster_node.to_dot(output),
+            Self::Simple(simple_node) => simple_node.to_dot(output, styles),
+            Self::Cluster(cluster_node) => cluster_node.to_dot(output, styles),
         }
     }
 
@@ -215,5 +285,73 @@ impl Display for Indentation {
             f.write_char(' ')?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CircuitNodeStyle, ClusterNode, Edge, Graph, Node, SimpleNode};
+    use std::collections::BTreeMap;
+
+    fn nested_graph() -> Graph {
+        Graph::new(
+            ClusterNode::new(
+                "root".into(),
+                "Root".into(),
+                vec![
+                    Node::Simple(SimpleNode::new("source".into(), "Source".into(), 0.5)),
+                    Node::Cluster(ClusterNode::new(
+                        "inner".into(),
+                        "Inner".into(),
+                        vec![
+                            Node::Simple(SimpleNode::new(
+                                "accumulate".into(),
+                                "Accumulate".into(),
+                                0.25,
+                            )),
+                            Node::Simple(SimpleNode::new("state".into(), "Trace".into(), 0.75)),
+                        ],
+                    )),
+                ],
+            ),
+            vec![
+                Edge::new("source".into(), false, "inner".into(), true),
+                Edge::new("accumulate".into(), false, "state".into(), false),
+                Edge::new("inner".into(), true, "source".into(), false),
+            ],
+        )
+    }
+
+    #[test]
+    fn styled_dot_preserves_topology_and_marks_all_nodes() {
+        let graph = nested_graph();
+        let original = graph.to_dot();
+        let styles = BTreeMap::from([
+            ("accumulate".into(), CircuitNodeStyle::Accumulation),
+            ("state".into(), CircuitNodeStyle::OtherState),
+            ("absent".into(), CircuitNodeStyle::Accumulation),
+        ]);
+        let styled = graph.to_dot_with_styles(&styles);
+
+        for structural_line in original
+            .lines()
+            .filter(|line| line.starts_with("subgraph ") || line.contains(" -> "))
+        {
+            assert!(styled.lines().any(|line| line == structural_line));
+        }
+        assert_eq!(
+            original.matches("subgraph cluster_").count(),
+            styled.matches("subgraph cluster_").count()
+        );
+        assert!(styled.contains("source[label=\"Source\\l[U]\""));
+        assert!(styled.contains(
+            "accumulate[label=\"Accumulate\\l[A]\" fillcolor=\"#dbeafe\" color=\"#2563eb\""
+        ));
+        assert!(
+            styled.contains("state[label=\"Trace\\l[S]\" fillcolor=\"#ede9fe\" color=\"#7c3aed\"")
+        );
+        assert!(!styled.contains("absent["));
+        assert_eq!(original, graph.to_dot());
+        assert!(original.contains("source[label=\"Source\" fillcolor=\"#ff1f1f\" style=filled]"));
     }
 }
