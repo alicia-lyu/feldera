@@ -109,6 +109,32 @@ public class ToDotTests {
     }
 
     @Test
+    public void expandedJoinProductsDoNotClaimAdditionalState() throws IOException {
+        CompilerOptions options = new CompilerOptions();
+        options.languageOptions.incrementalize = true;
+        Path directory = this.temporary.newFolder().toPath();
+        options.ioOptions.dumpExpandedCircuit = directory.toString();
+        DBSPCompiler compiler = new DBSPCompiler(options);
+        compiler.submitStatementsForCompilation("""
+                CREATE TABLE a(k INT NOT NULL, x INT);
+                CREATE TABLE b(k INT NOT NULL, y INT);
+                CREATE VIEW v AS SELECT a.k, x, y FROM a JOIN b ON a.k = b.k;
+                """);
+        Assert.assertNotNull(compiler.getFinalCircuit(false));
+        compiler.throwIfErrorsOccurred();
+        String dot = Files.readString(directory.resolve("expanded.dot"));
+        var joins = Pattern.compile("(stream[0-9]+).*stream_join(?:_index)?").matcher(dot);
+        int count = 0;
+        while (joins.find()) {
+            count++;
+            Assert.assertFalse(dot.contains(joins.group(1) + " [style=filled"));
+        }
+        Assert.assertTrue(count > 0);
+        Assert.assertTrue(dot.contains("accumulate_delay_trace"));
+        Assert.assertTrue(dot.contains("[I]"));
+    }
+
+    @Test
     public void exportFailuresPreserveDot() throws IOException {
         Path directory = this.temporary.newFolder().toPath();
         Files.createDirectory(directory.resolve("fail.svg"));

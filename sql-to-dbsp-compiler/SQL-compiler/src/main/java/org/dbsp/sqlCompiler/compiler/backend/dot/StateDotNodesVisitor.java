@@ -4,6 +4,8 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPDelayedIntegralOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinIndexOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.IStateful;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.ir.IDBSPOuterNode;
@@ -35,7 +37,11 @@ public class StateDotNodesVisitor extends ToDotNodesVisitor {
                         .append(" [style=filled fillcolor=\"#dbeafe\" color=\"#2563eb\" ")
                         .append("xlabel=\"[I]\" tooltip=\"Integrator state: historical collection or its delayed snapshot\"]")
                         .newline();
-            } else if (operator instanceof IStateful) {
+            } else if (operator instanceof IStateful &&
+                    !(operator instanceof DBSPStreamJoinOperator) &&
+                    !(operator instanceof DBSPStreamJoinIndexOperator)) {
+                // Stream joins inherit IStateful via IJoin. In the analysis expansion they are
+                // bilinear products of supplied operands, not additional retained histories.
                 this.stream.append(operator.getNodeName(false))
                         .append(" [style=filled fillcolor=\"#ede9fe\" color=\"#7c3aed\" ")
                         .append("xlabel=\"[S]\" tooltip=\"Compiler-declared IStateful operator; not highlighted integrator state\"]")

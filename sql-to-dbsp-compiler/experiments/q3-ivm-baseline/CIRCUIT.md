@@ -42,6 +42,13 @@ rekey/project the incoming delta batches; they do not integrate history.
 The expansion comes directly from
 [`DeltaExpandOperators`](../../SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/visitors/outer/expansion/DeltaExpandOperators.java).
 
+The expanded `stream_join` and `stream_join_index` products are neutral.
+Their compiler classes inherit `IStateful` through `IJoin`, but here they
+multiply the supplied operands rather than introduce another retained
+historical relation. Runtime `JoinTrace` remains other state: it keeps a delta
+snapshot, time-indexed pending outputs, and bookkeeping while reading an
+input trace. Those are separate from historical integration.
+
 Node IDs and original operator names remain intact.
 
 ![Compiler-expanded logical graph](../../../target/q3-circuit-exports/compiler/expanded.svg)

@@ -42,3 +42,8 @@ artifacts. The driver's one-worker default already implements this policy.
 
 Partitioning and distributed execution are outside the current IVM maintenance
 scope. No multiworker maintenance extension is planned.
+
+Expanded `DBSPStreamJoinOperator` and `DBSPStreamJoinIndexOperator` products
+are neutral: inherited `IStateful` does not mean they add another retained
+history in this analysis graph. Actual runtime `JoinTrace` keeps working and
+scheduling state and retains the other-state style.

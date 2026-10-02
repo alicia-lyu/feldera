@@ -265,7 +265,9 @@ exports its existing analysis circuit; it does not rebuild maintenance topology.
 [`StateDotNodesVisitor`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/dot/StateDotNodesVisitor.java)
 uses `DBSPIntegrateOperator` and `DBSPDelayedIntegralOperator` for the blue
 integrator-state marker, and `IStateful` for other compiler-declared state; the Q3 analysis export contains these prior-integral placeholders
-rather than explicit runtime integration regions.
+rather than explicit runtime integration regions. Expanded stream-join
+products are neutral despite inherited `IStateful`: their supplied integrator
+operands already represent the retained histories.
 
 The experiment's [`dump_runtime_circuit` and `runtime_node_styles`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs)
 capture `GraphProfile` and map source-referenced operator names to existing IDs.
