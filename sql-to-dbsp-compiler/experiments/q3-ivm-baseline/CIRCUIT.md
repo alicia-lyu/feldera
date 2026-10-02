@@ -21,15 +21,16 @@ incremental logical graph produced by the compiler; it excludes runtime
 operator internals. In particular, compiler analysis omits Catalog's
 materialization of `V`, which appears in the runtime graph.
 
-The compiler graph visitor reserves blue `[I]` for an explicit
-`DBSPIntegrateOperator`. Other compiler-declared `IStateful` operators,
-including `accumulate_delay_trace`, receive purple `[S]`. Tooltips and this
+The compiler graph visitor uses blue `[I]` for integrator state:
+`DBSPIntegrateOperator` and `DBSPDelayedIntegralOperator`
+(`accumulate_delay_trace`). Other compiler-declared `IStateful` operators
+receive purple `[S]`. Tooltips and this
 legend explain the categories:
 
 | Marker | Meaning |
 | --- | --- |
-| `[I]` | Explicit integrator of the historical collection. |
-| `[S]` | Other compiler-declared state, including delayed-trace placeholders. |
+| `[I]` | Historical collection or its delayed prior-state representation. |
+| `[S]` | Other compiler-declared state. |
 
 This Q3 analysis graph has no explicit `integrate` node. Its
 `DBSPDelayedIntegralOperator` nodes stand for prior accumulated collections
@@ -57,8 +58,8 @@ presentation only.
 
 | Marker | Meaning |
 | --- | --- |
-| `[I]` | Existing `accumulate_integrate_trace` or `shard_accumulate_integrate_trace` region: historical integrator. |
-| `[S]` | Other state, including delta-batch accumulators, trace append components, and snapshot/delay nodes. |
+| `[I]` | Existing `accumulate_integrate_trace` or `shard_accumulate_integrate_trace` region, or `AccumulateDelayTrace`: historical integrator state. |
+| `[S]` | Other state, including delta-batch accumulators, trace append components, and other stateful components. |
 | `[U]` | Runtime operator name is not classified by the table. |
 
 Runtime `Accumulator` coalesces deltas within a clock cycle and resets at
@@ -66,8 +67,9 @@ flush. `AccumulateDelayTrace` snapshots an already-maintained trace; it does
 not create or update the historical integral. The join's historical keyed
 traces are built in `shard_accumulate_trace` regions, while Catalog's retained
 `V` uses `shard_accumulate_integrate_trace`. The blue integrator highlight is
-reserved for the explicitly named integration regions, not every stateful
-component inside them. See the
+applies to the named integration regions and `AccumulateDelayTrace`
+snapshots. The snapshot represents historical integrator state, although it
+does not itself append new deltas to that state. See the
 [trace builders](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs)
 and [delta accumulator](../../../crates/dbsp/src/operator/accumulator.rs).
 

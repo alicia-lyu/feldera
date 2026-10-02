@@ -18,16 +18,14 @@ Load, RF1, and RF2 use the same incremental circuit. No execution semantics chan
 
 ## Integrator styling refinement
 
-Reserve blue `[I]` for explicit historical integration. Compiler
-`DBSPIntegrateOperator` qualifies; `DBSPDelayedIntegralOperator` uses the other
-state style. The Q3 analysis expansion uses delayed prior-integral placeholders
+Use blue `[I]` for historical integrator state, including compiler
+`DBSPIntegrateOperator` and `DBSPDelayedIntegralOperator`. The Q3 analysis expansion uses delayed prior-integral placeholders
 and contains no explicit runtime integration region. Its `map_index` operators
 rekey/project delta batches without integrating history.
 
 At runtime, mark existing `accumulate_integrate_trace` and
-`shard_accumulate_integrate_trace` regions as integrators. Delta accumulators,
-trace append components, and `AccumulateDelayTrace` snapshot/delay operators
-use other-state styling. The renderer must style existing cluster IDs as well
+`shard_accumulate_integrate_trace` regions as integrators. `AccumulateDelayTrace` snapshot/delay operators also use integrator-state
+styling. Delta accumulators and trace append components use other-state styling. The renderer must style existing cluster IDs as well
 as existing simple node IDs, preserving all topology and profiling output.
 
 ## Artifact destination

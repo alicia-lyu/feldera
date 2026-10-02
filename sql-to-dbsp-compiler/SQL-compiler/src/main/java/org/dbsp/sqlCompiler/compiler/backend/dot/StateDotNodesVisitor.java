@@ -1,5 +1,6 @@
 package org.dbsp.sqlCompiler.compiler.backend.dot;
 
+import org.dbsp.sqlCompiler.circuit.operator.DBSPDelayedIntegralOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
@@ -29,15 +30,15 @@ public class StateDotNodesVisitor extends ToDotNodesVisitor {
     @Override
     public void pop(IDBSPOuterNode node) {
         if (node instanceof DBSPOperator operator) {
-            if (operator instanceof DBSPIntegrateOperator) {
+            if (operator instanceof DBSPIntegrateOperator || operator instanceof DBSPDelayedIntegralOperator) {
                 this.stream.append(operator.getNodeName(false))
                         .append(" [style=filled fillcolor=\"#dbeafe\" color=\"#2563eb\" ")
-                        .append("xlabel=\"[I]\" tooltip=\"Integrator: retains the historical collection\"]")
+                        .append("xlabel=\"[I]\" tooltip=\"Integrator state: historical collection or its delayed snapshot\"]")
                         .newline();
             } else if (operator instanceof IStateful) {
                 this.stream.append(operator.getNodeName(false))
                         .append(" [style=filled fillcolor=\"#ede9fe\" color=\"#7c3aed\" ")
-                        .append("xlabel=\"[S]\" tooltip=\"Compiler-declared IStateful operator; not a highlighted integrator\"]")
+                        .append("xlabel=\"[S]\" tooltip=\"Compiler-declared IStateful operator; not highlighted integrator state\"]")
                         .newline();
             }
         }

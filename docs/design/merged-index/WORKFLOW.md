@@ -255,9 +255,8 @@ shares DOT writing with diagnostic dumps and renders SVG through Graphviz.
 [`MonotoneAnalyzer`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/visitors/outer/monotonicity/MonotoneAnalyzer.java)
 exports its existing analysis circuit; it does not rebuild maintenance topology.
 [`StateDotNodesVisitor`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/dot/StateDotNodesVisitor.java)
-uses `DBSPIntegrateOperator` for the blue integrator marker, and `IStateful`
-for other compiler-declared state. `DBSPDelayedIntegralOperator` is styled as
-other state; the Q3 analysis export contains these prior-integral placeholders
+uses `DBSPIntegrateOperator` and `DBSPDelayedIntegralOperator` for the blue
+integrator-state marker, and `IStateful` for other compiler-declared state; the Q3 analysis export contains these prior-integral placeholders
 rather than explicit runtime integration regions.
 
 The experiment's [`dump_runtime_circuit` and `runtime_node_styles`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs)
@@ -265,8 +264,8 @@ capture `GraphProfile` and map source-referenced operator names to existing IDs.
 The monitor's [`Graph::to_dot_with_styles`](../../../crates/dbsp/src/monitor/visual_graph.rs)
 shares topology traversal with `to_dot()`, whose profiling colours remain
 unchanged. Existing integration-region IDs receive blue `[I]`; the renderer
-adds no integrator nodes. Delta-batch accumulators and snapshot/delay nodes
-receive other-state styling. Unknown names receive `[U]`; this does not assert they are stateless.
+adds no integrator nodes. `AccumulateDelayTrace` snapshots also receive integrator-state styling;
+delta-batch accumulators receive other-state styling. Unknown names receive `[U]`; this does not assert they are stateless.
 Raw files survive Graphviz failures, including every worker's DOT and JSON.
 
 ### Metric formulas and precision

@@ -86,8 +86,8 @@ public class ToDotTests {
         var delayedDeclaration = Pattern.compile("(stream[0-9]+).*accumulate_delay_trace").matcher(dot);
         Assert.assertTrue(delayedDeclaration.find());
         String delayedId = delayedDeclaration.group(1);
-        Assert.assertTrue(dot.contains(delayedId + " [style=filled fillcolor=\"#ede9fe\""));
-        Assert.assertFalse(dot.contains(delayedId + " [style=filled fillcolor=\"#dbeafe\""));
+        Assert.assertTrue(dot.contains(delayedId + " [style=filled fillcolor=\"#dbeafe\""));
+        Assert.assertFalse(dot.contains(delayedId + " [style=filled fillcolor=\"#ede9fe\""));
         Assert.assertTrue(dot.contains("subgraph cluster_"));
     }
 
