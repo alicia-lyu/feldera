@@ -8,6 +8,10 @@ predicate-free materialized view and no intermediate view or join hint.
 
 ## Generate and run
 
+The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
+walks through compiler builds, ordinary and incremental inspection artifacts,
+baseline comparisons, native execution, and the agent-added report formatting.
+
 Use the repository's pinned Calcite build and Java 21 as described in the
 [compiler README](../../README.md). From this directory, regenerate the Rust
 circuit with:

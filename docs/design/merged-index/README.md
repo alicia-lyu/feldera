@@ -6,6 +6,8 @@ ordering align delta locations with the state ranges needed for maintenance. Thi
 integration design; the [native Q3 baseline](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
 uses ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
 records the scope settled on 2026-10-01 and supersedes earlier assumptions about a fixed Q3 circuit.
+The [compilation and run workflow](WORKFLOW.md) explains the native baseline's commands,
+raw artifacts, and agent-added presentation steps.
 
 ## Four architecture stages
 
