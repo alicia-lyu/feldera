@@ -9,15 +9,40 @@ use std::{
 
 type Id = String;
 
-/// Presentation category for an existing circuit operator node.
+/// Presentation category for an existing circuit operator or cluster.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CircuitNodeStyle {
-    /// Operator that explicitly accumulates updates.
+    /// Persistent integral or its prior-state snapshot.
     Accumulation,
     /// Operator that retains state for another purpose.
     OtherState,
     /// Operator whose state behavior has not been classified.
     Unclassified,
+}
+
+impl CircuitNodeStyle {
+    fn appearance(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Accumulation => (
+                "I",
+                "#dbeafe",
+                "#2563eb",
+                "Integrator state: historical collection or its delayed snapshot",
+            ),
+            Self::OtherState => (
+                "S",
+                "#ede9fe",
+                "#7c3aed",
+                "Other state: retains state for another purpose",
+            ),
+            Self::Unclassified => (
+                "U",
+                "#eeeeee",
+                "#777777",
+                "Unclassified: state behavior has not been classified",
+            ),
+        }
+    }
 }
 
 /// Visual representation of a circuit graph.
@@ -45,7 +70,8 @@ impl Graph {
         self.render_dot(None)
     }
 
-    /// Convert graph to dot format with presentation styles keyed by existing node ID.
+    /// Convert graph to dot format with presentation styles keyed by existing
+    /// operator or cluster ID.
     ///
     /// Missing IDs are rendered as unclassified. Entries for IDs absent from the
     /// graph have no effect on the output.
@@ -112,30 +138,11 @@ impl SimpleNode {
         styles: Option<&BTreeMap<String, CircuitNodeStyle>>,
     ) -> fmt::Result {
         if let Some(styles) = styles {
-            let (marker, fillcolor, bordercolor, tooltip) = match styles
+            let (marker, fillcolor, bordercolor, tooltip) = styles
                 .get(&self.id)
                 .copied()
                 .unwrap_or(CircuitNodeStyle::Unclassified)
-            {
-                CircuitNodeStyle::Accumulation => (
-                    "A",
-                    "#dbeafe",
-                    "#2563eb",
-                    "Accumulation: retains accumulated updates",
-                ),
-                CircuitNodeStyle::OtherState => (
-                    "S",
-                    "#ede9fe",
-                    "#7c3aed",
-                    "Other state: retains state for another purpose",
-                ),
-                CircuitNodeStyle::Unclassified => (
-                    "U",
-                    "#eeeeee",
-                    "#777777",
-                    "Unclassified: state behavior has not been classified",
-                ),
-            };
+                .appearance();
             return writeln!(
                 output,
                 "{}[label=\"{}\\l[{marker}]\" fillcolor=\"{fillcolor}\" color=\"{bordercolor}\" tooltip=\"{tooltip}\" style=filled]",
@@ -187,7 +194,16 @@ impl ClusterNode {
         styles: Option<&BTreeMap<String, CircuitNodeStyle>>,
     ) -> fmt::Result {
         writeln!(output, "subgraph cluster_{} {{", self.id)?;
-        writeln!(output, "label=\"{}\"", self.label)?;
+        if let Some(style) = styles.and_then(|styles| styles.get(&self.id)) {
+            let (marker, fillcolor, bordercolor, tooltip) = style.appearance();
+            writeln!(output, "label=\"{}\\l[{marker}]\"", self.label)?;
+            writeln!(
+                output,
+                "style=filled bgcolor=\"{fillcolor}\" color=\"{bordercolor}\" tooltip=\"{tooltip}\""
+            )?;
+        } else {
+            writeln!(output, "label=\"{}\"", self.label)?;
+        }
         writeln!(output, "enter_{}[style=invis]", self.id)?;
         writeln!(output, "exit_{}[style=invis]", self.id)?;
         for node in self.nodes.iter() {
@@ -327,7 +343,7 @@ mod tests {
         let graph = nested_graph();
         let original = graph.to_dot();
         let styles = BTreeMap::from([
-            ("accumulate".into(), CircuitNodeStyle::Accumulation),
+            ("inner".into(), CircuitNodeStyle::Accumulation),
             ("state".into(), CircuitNodeStyle::OtherState),
             ("absent".into(), CircuitNodeStyle::Accumulation),
         ]);
@@ -344,14 +360,19 @@ mod tests {
             styled.matches("subgraph cluster_").count()
         );
         assert!(styled.contains("source[label=\"Source\\l[U]\""));
+        assert!(styled.contains("subgraph cluster_inner {\nlabel=\"Inner\\l[I]\""));
         assert!(styled.contains(
-            "accumulate[label=\"Accumulate\\l[A]\" fillcolor=\"#dbeafe\" color=\"#2563eb\""
+            "style=filled bgcolor=\"#dbeafe\" color=\"#2563eb\" tooltip=\"Integrator state: historical collection or its delayed snapshot\""
         ));
+        assert!(styled.contains("accumulate[label=\"Accumulate\\l[U]\""));
         assert!(
             styled.contains("state[label=\"Trace\\l[S]\" fillcolor=\"#ede9fe\" color=\"#7c3aed\"")
         );
+        assert!(styled.contains("source -> enter_inner"));
+        assert!(styled.contains("exit_inner -> source"));
         assert!(!styled.contains("absent["));
         assert_eq!(original, graph.to_dot());
+        assert!(original.contains("subgraph cluster_inner {\nlabel=\"Inner\""));
         assert!(original.contains("source[label=\"Source\" fillcolor=\"#ff1f1f\" style=filled]"));
     }
 }
