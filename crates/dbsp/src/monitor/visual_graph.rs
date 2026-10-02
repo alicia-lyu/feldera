@@ -199,7 +199,7 @@ impl ClusterNode {
             writeln!(output, "label=\"{}\\l[{marker}]\"", self.label)?;
             writeln!(
                 output,
-                "style=filled bgcolor=\"{fillcolor}\" color=\"{bordercolor}\" tooltip=\"{tooltip}\""
+                "style=filled fillcolor=\"{fillcolor}\" color=\"{bordercolor}\" tooltip=\"{tooltip}\""
             )?;
         } else {
             writeln!(output, "label=\"{}\"", self.label)?;
@@ -362,7 +362,7 @@ mod tests {
         assert!(styled.contains("source[label=\"Source\\l[U]\""));
         assert!(styled.contains("subgraph cluster_inner {\nlabel=\"Inner\\l[I]\""));
         assert!(styled.contains(
-            "style=filled bgcolor=\"#dbeafe\" color=\"#2563eb\" tooltip=\"Integrator state: historical collection or its delayed snapshot\""
+            "style=filled fillcolor=\"#dbeafe\" color=\"#2563eb\" tooltip=\"Integrator state: historical collection or its delayed snapshot\""
         ));
         assert!(styled.contains("accumulate[label=\"Accumulate\\l[U]\""));
         assert!(
