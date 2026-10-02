@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +12,7 @@ use data::{Customer, Line, Order};
 use dbsp::circuit::{
     CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
 };
+use dbsp::monitor::visual_graph::CircuitNodeStyle;
 use dbsp_adapters::{CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 use serde_json::{json, Value};
@@ -426,6 +428,7 @@ struct Config {
     rf1_lines: Option<PathBuf>,
     rf2: Option<PathBuf>,
     storage_path: Option<PathBuf>,
+    dump_runtime_circuit: Option<PathBuf>,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -468,6 +471,13 @@ impl Config {
                     config.storage_path =
                         Some(args.next().context("--storage-path needs path")?.into())
                 }
+                "--dump-runtime-circuit" => {
+                    config.dump_runtime_circuit = Some(
+                        args.next()
+                            .context("--dump-runtime-circuit needs path")?
+                            .into(),
+                    )
+                }
                 "--workers" => {
                     config.workers = args.next().context("--workers needs number")?.parse()?
                 }
@@ -485,6 +495,143 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+/// Classify only operator names whose state behavior is established by the
+/// corresponding DBSP implementation. The label's location and profile lines
+/// are annotations and are not part of the operator name.
+fn runtime_operator_style(name: &str) -> CircuitNodeStyle {
+    match name {
+        // crates/dbsp/src/operator/dynamic/accumulate_trace.rs.
+        "AccumulateTraceAppend" | "AccumulateUntimedTraceAppend" => CircuitNodeStyle::OtherState,
+        // The delayed accumulated trace remains available across clock cycles.
+        "AccumulateDelayTrace" => CircuitNodeStyle::Accumulation,
+        // crates/dbsp/src/operator/dynamic/trace.rs.
+        "TraceAppend" | "UntimedTraceAppend" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/dynamic/accumulator.rs.
+        "Accumulator" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/accumulator.rs.
+        "AccumulateApply2" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/dynamic/concat.rs.
+        "AccumulateConcat" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/non_incremental.rs.
+        "ImportAccumulator" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/dynamic/join.rs.
+        "JoinTrace" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/dynamic/{trace,accumulate_trace}.rs.
+        "Z1 (trace)" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/z1.rs.
+        "Z^-1" | "Z^-1 (nested)" => CircuitNodeStyle::OtherState,
+        // crates/dbsp/src/operator/transaction_z1.rs.
+        "Transaction Z^-1" => CircuitNodeStyle::OtherState,
+        _ => CircuitNodeStyle::Unclassified,
+    }
+}
+
+fn runtime_cluster_style(name: &str) -> Option<CircuitNodeStyle> {
+    match name {
+        // crates/dbsp/src/operator/dynamic/accumulate_trace.rs: both paths
+        // integrate updates into a retained trace.
+        "accumulate_integrate_trace" | "shard_accumulate_integrate_trace" => {
+            Some(CircuitNodeStyle::Accumulation)
+        }
+        // Timed retained-trace regions remain other state under the explicit
+        // integrate-region highlight convention.
+        "accumulate_trace" | "shard_accumulate_trace" => Some(CircuitNodeStyle::OtherState),
+        _ => None,
+    }
+}
+
+fn runtime_node_styles(graph_json: &str) -> Result<BTreeMap<String, CircuitNodeStyle>> {
+    fn visit_cluster(
+        cluster: &Value,
+        styles: &mut BTreeMap<String, CircuitNodeStyle>,
+    ) -> Result<()> {
+        let id = cluster
+            .get("id")
+            .and_then(Value::as_str)
+            .context("cluster has no id")?;
+        let label = cluster
+            .get("label")
+            .and_then(Value::as_str)
+            .context("cluster has no label")?;
+        let name = label.split("\\l").next().unwrap_or(label);
+        let name = name.split(" @ ").next().unwrap_or(name);
+        if let Some(style) = runtime_cluster_style(name) {
+            styles.insert(id.to_owned(), style);
+        }
+        let nodes = cluster
+            .get("nodes")
+            .and_then(Value::as_array)
+            .context("runtime graph cluster has no nodes array")?;
+        for node in nodes {
+            if let Some(simple) = node.get("Simple") {
+                let id = simple
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("node has no id")?;
+                let label = simple
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .context("node has no label")?;
+                let name = label.split("\\l").next().unwrap_or(label);
+                let name = name.split(" @ ").next().unwrap_or(name);
+                styles.insert(id.to_owned(), runtime_operator_style(name));
+            } else if let Some(child) = node.get("Cluster") {
+                visit_cluster(child, styles)?;
+            } else {
+                bail!("unexpected runtime graph node: {node}");
+            }
+        }
+        Ok(())
+    }
+
+    let graph: Value = serde_json::from_str(graph_json).context("invalid runtime graph JSON")?;
+    let root = graph
+        .get("nodes")
+        .context("runtime graph has no root cluster")?;
+    let mut styles = BTreeMap::new();
+    visit_cluster(root, &mut styles)?;
+    Ok(styles)
+}
+
+fn render_svg(dot_path: &Path) -> Result<()> {
+    let svg_path = dot_path.with_extension("svg");
+    let status = Command::new("dot")
+        .arg("-Tsvg")
+        .arg(dot_path)
+        .arg("-o")
+        .arg(&svg_path)
+        .status()
+        .with_context(|| format!("running Graphviz for {}", dot_path.display()))?;
+    if !status.success() {
+        bail!("Graphviz failed for {} with {status}", dot_path.display());
+    }
+    Ok(())
+}
+
+fn dump_runtime_circuit(circuit: &mut dbsp::DBSPHandle, directory: &Path) -> Result<()> {
+    std::fs::create_dir(directory)
+        .with_context(|| format!("creating new capture directory {}", directory.display()))?;
+    let profile = circuit
+        .graph_profile()
+        .context("capturing runtime graph profile")?;
+    for (graph, worker) in profile.worker_graphs.iter().zip(profile.worker_offset..) {
+        let raw_dot = directory.join(format!("worker-{worker}.dot"));
+        let graph_json = graph.to_json();
+        let styles = runtime_node_styles(&graph_json)?;
+        std::fs::write(&raw_dot, graph.to_dot())?;
+        std::fs::write(directory.join(format!("worker-{worker}.json")), graph_json)?;
+        let styled_dot = directory.join(format!("worker-{worker}-styled.dot"));
+        std::fs::write(&styled_dot, graph.to_dot_with_styles(&styles))?;
+    }
+    for worker in profile.worker_offset..profile.worker_offset + profile.worker_graphs.len() {
+        let raw_dot = directory.join(format!("worker-{worker}.dot"));
+        let styled_dot = directory.join(format!("worker-{worker}-styled.dot"));
+        render_svg(&raw_dot)?;
+        render_svg(&styled_dot)?;
+    }
+    Ok(())
 }
 
 fn run(config: &Config, run_number: usize) -> Result<()> {
@@ -612,11 +759,66 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             milliseconds(measurement.native), throughput(count, measurement.native),
             milliseconds(measurement.preparation), milliseconds(phase.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&measurement.latencies));
     }
+    if let Some(root) = &config.dump_runtime_circuit {
+        let directory = root.join(format!("run-{run_number}"));
+        let revision = Command::new("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+            .output()
+            .context("reading source revision")?;
+        if !revision.status.success() {
+            bail!("git rev-parse HEAD failed with {}", revision.status);
+        }
+        let source_status = Command::new("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "status", "--short"])
+            .output()
+            .context("reading source worktree status")?;
+        if !source_status.status.success() {
+            bail!("git status --short failed with {}", source_status.status);
+        }
+        let manifest = json!({
+            "revision": String::from_utf8(revision.stdout)?.trim().to_owned(),
+            "worktree_status": String::from_utf8(source_status.stdout)?,
+            "command": std::env::args().collect::<Vec<_>>(),
+            "configuration": {
+                "workers": config.workers,
+                "batch": config.batch,
+                "runs": config.runs,
+                "verify": config.verify,
+                "storage_mode": if config.storage_path.is_some() { "file" } else { "memory" },
+                "storage_path": config.storage_path,
+                "customer": config.customer,
+                "orders": config.orders,
+                "lineitem": config.lineitem,
+                "rf1_orders": config.rf1_orders,
+                "rf1_lines": config.rf1_lines,
+                "rf2": config.rf2,
+            },
+            "capture_stage": "after final refresh report and outside phase timers",
+            "run": run_number,
+        });
+        let capture_result = dump_runtime_circuit(&mut circuit, &directory);
+        if directory.is_dir() {
+            std::fs::write(
+                directory.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+        }
+        capture_result?;
+    }
     Ok(())
 }
 
 fn main() -> Result<()> {
     let config = Config::parse()?;
+    if let Some(root) = &config.dump_runtime_circuit {
+        std::fs::create_dir_all(root)?;
+        for run_number in 1..=config.runs {
+            let directory = root.join(format!("run-{run_number}"));
+            if directory.exists() {
+                bail!("capture directory already exists: {}", directory.display());
+            }
+        }
+    }
     for run_number in 1..=config.runs {
         run(&config, run_number)?;
     }
@@ -764,6 +966,7 @@ mod tests {
         assert!(parse(&["--rf1-orders", "orders.tbl.u1"]).is_err());
         assert!(parse(&["--rf1-lines", "lineitem.tbl.u1"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+        assert!(parse(&["--dump-runtime-circuit"]).is_err());
         let config = parse(&[
             "--workers",
             "2",
@@ -775,9 +978,112 @@ mod tests {
             "orders.tbl.u1",
             "--rf1-lines",
             "lineitem.tbl.u1",
+            "--dump-runtime-circuit",
+            "graphs",
         ])
         .unwrap();
         assert_eq!((config.workers, config.batch, config.runs), (2, 13, 1));
+        assert_eq!(
+            config.dump_runtime_circuit.as_deref(),
+            Some(Path::new("graphs"))
+        );
+    }
+
+    #[test]
+    fn runtime_classification_is_explicit_and_preserves_node_ids() -> Result<()> {
+        let graph = json!({
+            "nodes": {"id":"root", "label":"", "nodes": [
+                {"Simple":{"id":"n1", "label":"AccumulateTraceAppend @ file.rs:1:1\\lrecords: 4"}},
+                {"Cluster":{"id":"integral", "label":"shard_accumulate_integrate_trace @ trace.rs:1:1", "nodes": [
+                    {"Simple":{"id":"n2", "label":"JoinTrace @ join.rs:2:1"}},
+                    {"Simple":{"id":"n3", "label":"FutureOperator"}},
+                    {"Simple":{"id":"n4", "label":"TraceAppend"}},
+                    {"Simple":{"id":"n5", "label":"InputUpsert"}},
+                    {"Simple":{"id":"n6", "label":"AccumulateDelayTrace"}}
+                ]}},
+                {"Cluster":{"id":"trace", "label":"shard_accumulate_trace", "nodes": []}},
+                {"Cluster":{"id":"other", "label":"join", "nodes": []}}
+            ]},
+            "edges": []
+        });
+        let styles = runtime_node_styles(&graph.to_string())?;
+        assert_eq!(styles.get("n1"), Some(&CircuitNodeStyle::OtherState));
+        assert_eq!(styles.get("n2"), Some(&CircuitNodeStyle::OtherState));
+        assert_eq!(styles.get("n3"), Some(&CircuitNodeStyle::Unclassified));
+        assert_eq!(styles.get("n4"), Some(&CircuitNodeStyle::OtherState));
+        assert_eq!(styles.get("n5"), Some(&CircuitNodeStyle::Unclassified));
+        assert_eq!(styles.get("n6"), Some(&CircuitNodeStyle::Accumulation));
+        assert_eq!(
+            styles.get("integral"),
+            Some(&CircuitNodeStyle::Accumulation)
+        );
+        assert_eq!(styles.get("trace"), Some(&CircuitNodeStyle::OtherState));
+        assert!(!styles.contains_key("root"));
+        assert!(!styles.contains_key("other"));
+        assert!(runtime_node_styles("not JSON").is_err());
+        assert!(runtime_node_styles("{}").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_capture_writes_each_worker_without_overwriting() -> Result<()> {
+        for workers in [1, 2] {
+            let (mut circuit, catalog) =
+                q3_ivm_baseline::circuit(CircuitConfig::with_workers(workers))?;
+            let mut input = Inputs::new(&catalog)?;
+            let mut state = Reference::default();
+            let mut stats = Measurements::default();
+            transact(
+                &mut circuit,
+                &catalog,
+                &mut input,
+                &mut state,
+                Change {
+                    customers: vec![(customer(2, "BUILDING"), true)],
+                    orders: vec![(order(20, 2), true)],
+                    lines: vec![(line(20, 1), true)],
+                },
+                true,
+                &mut stats,
+            )?;
+            let directory = std::env::temp_dir().join(format!(
+                "q3-runtime-capture-{}-{workers}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+            dump_runtime_circuit(&mut circuit, &directory)?;
+            for worker in 0..workers {
+                for extension in ["dot", "json", "svg"] {
+                    assert!(directory
+                        .join(format!("worker-{worker}.{extension}"))
+                        .exists());
+                }
+                assert!(directory
+                    .join(format!("worker-{worker}-styled.dot"))
+                    .exists());
+                assert!(directory
+                    .join(format!("worker-{worker}-styled.svg"))
+                    .exists());
+            }
+            assert!(dump_runtime_circuit(&mut circuit, &directory).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graphviz_failure_is_reported() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "q3-invalid-dot-{}-{}.dot",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::write(&path, "digraph { invalid ->")?;
+        assert!(render_svg(&path).is_err());
+        Ok(())
     }
 
     #[test]
