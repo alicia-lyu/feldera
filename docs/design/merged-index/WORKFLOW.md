@@ -9,9 +9,8 @@ owns the generated operator and state-read explanation; the
 [results note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
 owns the original dataset, correctness tests, and measurements.
 
-The checked-in graph captures and raw logs are in the experiment's
-[`graphs/`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/graphs/)
-directory. The local native benchmark reports in
+The local graph captures and raw logs are in the repository’s
+[`target/q3-circuit-exports/`](../../../target/q3-circuit-exports/) directory. The local native benchmark reports in
 `target/q3-ivm-runs/20261002T183104Z/benchmark.log` remain separate from the
 original measurements in the results note. Commands below use configurable
 paths and fresh output directories.
@@ -63,8 +62,8 @@ executes `SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar` with Java.
 
 The default Calcite checkout is `sql-to-dbsp-compiler/calcite-build`, controlled
 by `CALCITE_BUILD_DIR`. The sibling `../calcite` checkout is not automatically
-selected. The checked-in graph capture uses the rebuilt compiler JAR, with its hash
-recorded in `graphs/provenance.txt`.
+selected. The local graph capture uses the rebuilt compiler JAR, with its hash
+recorded in `target/q3-circuit-exports/provenance.txt`.
 
 ## 2. Translate SQL into a relational plan
 
@@ -183,7 +182,7 @@ and refresh use the same incremental program. The
 [parser](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/data.rs#L30)
 validates exact dates and represents decimals as integer hundredths before
 serializing them for Catalog inputs. The driver submits inputs and calls
-[`circuit.transaction()`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs#L295).
+[`circuit.transaction()`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs#L298).
 Load batches contain at most 10,000 total input records, taking Customer,
 Orders, then Lineitem records. Loading bootstraps through the same incremental
 circuit used for updates. RF1 submits related order/line inserts together;
@@ -219,12 +218,13 @@ per-worker runtime graphs after each run's final refresh report with
 uses a new directory; capture fails if a run directory already exists. Capture
 is outside phase timers.
 
-For the checked-in example exports, the graph directories are
-`graphs/compiler/`, `graphs/runtime-1/run-1/`, and
-`graphs/runtime-2/run-1/`. Compiler output is captured after
+For the local example exports, the graph directories are
+`target/q3-circuit-exports/compiler/`,
+`target/q3-circuit-exports/runtime-1/run-1/`, and
+`target/q3-circuit-exports/runtime-2/run-1/`. Compiler output is captured after
 `DeltaExpandOperators` and monotonicity analysis, before `InsertLimiters`.
 Runtime output comes from `graph_profile()` and preserves each worker's raw
-DOT and JSON, plus raw and styled SVG. Both manifests record revision,
+DOT and JSON, plus raw and styled SVG. Both captures record revision,
 command, configuration, and capture stage. See the experiment's
 [CIRCUIT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
 for generated graph links, styling labels, and interpretation.
@@ -239,7 +239,7 @@ for generated graph links, styling labels, and interpretation.
 | `relational-optimization.txt`, `operators.tsv` | Agent-extracted plan text from compile logs and operator listings from circuit JSON. |
 | `graphs/compiler/expanded.dot`, `expanded.svg`, `expanded.metadata.txt` | Compiler-expanded logical graph and provenance, captured by `--dump-expanded-circuit`; the SVG is rendered from the preserved DOT. |
 | `graphs/runtime-1/run-1/`, `graphs/runtime-2/run-1/` | Per-worker runtime graph captures: raw DOT/JSON, raw SVG, styled DOT/SVG, and a manifest with provenance. |
-| `graphs/compiler.log`, `graphs/runtime-1.log`, `graphs/runtime-2.log`, `graphs/verification.log`, `graphs/provenance.txt` | Capture commands, their outputs, correctness verification with capture enabled, and provenance for the checked-in graph artifacts. |
+| `graphs/compiler.log`, `graphs/runtime-1.log`, `graphs/runtime-2.log`, `graphs/verification.log`, `graphs/provenance.txt` | Capture commands, their outputs, correctness verification with capture enabled, and provenance for the local graph artifacts. |
 | `CIRCUIT.md` | Generated graph links and source-grounded explanation of the compiler and runtime captures. |
 | `metrics.csv`, `validation.log` | Parsed benchmark fields, calculated rates, and validation/median output. |
 
@@ -247,6 +247,27 @@ Each capture preserves compiler or driver stdout/stderr in its raw log.
 Compiler and runtime exports supply topology; state colours, textual markers,
 Graphviz layout, and the accompanying legend are presentation steps. They do
 not add nodes or edges.
+
+### Export and styling hooks
+
+The compiler's [`ToDot.exportArtifacts`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/dot/ToDot.java)
+shares DOT writing with diagnostic dumps and renders SVG through Graphviz.
+[`MonotoneAnalyzer`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/visitors/outer/monotonicity/MonotoneAnalyzer.java)
+exports its existing analysis circuit; it does not rebuild maintenance topology.
+[`StateDotNodesVisitor`](../../../sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/dot/StateDotNodesVisitor.java)
+uses `DBSPIntegrateOperator` for the blue integrator marker, and `IStateful`
+for other compiler-declared state. `DBSPDelayedIntegralOperator` is styled as
+other state; the Q3 analysis export contains these prior-integral placeholders
+rather than explicit runtime integration regions.
+
+The experiment's [`dump_runtime_circuit` and `runtime_node_styles`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs)
+capture `GraphProfile` and map source-referenced operator names to existing IDs.
+The monitor's [`Graph::to_dot_with_styles`](../../../crates/dbsp/src/monitor/visual_graph.rs)
+shares topology traversal with `to_dot()`, whose profiling colours remain
+unchanged. Existing integration-region IDs receive blue `[I]`; the renderer
+adds no integrator nodes. Delta-batch accumulators and snapshot/delay nodes
+receive other-state styling. Unknown names receive `[U]`; this does not assert they are stateless.
+Raw files survive Graphviz failures, including every worker's DOT and JSON.
 
 ### Metric formulas and precision
 
@@ -277,5 +298,5 @@ The captured verification log records correctness checks with graph capture
 enabled. The compiler and runtime SVGs are rendered from their corresponding
 DOT files. Provenance records revisions, commands, configurations, and capture
 stages. Markdown and local artifact links should be checked when updating the
-checked-in capture set.
+local capture set.
 

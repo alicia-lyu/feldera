@@ -1,7 +1,8 @@
 # Generated native circuit for `V`
 
 This note describes the compiler-expanded logical graph and the actual runtime
-graphs captured for the native Q3 baseline. The graph files preserve the node
+graphs captured for the native Q3 baseline. Artifacts and capture logs are stored under the repository’s
+`target/q3-circuit-exports/` directory. The graph files preserve the node
 IDs, edges, ports, and clusters emitted by their source graph. The source code
 and runtime operator behavior referenced below explain how to read those
 graphs; they do not reconstruct the topology.
@@ -11,48 +12,70 @@ graphs; they do not reconstruct the topology.
 The compiler graph is the existing `DBSPCircuit` after
 `DeltaExpandOperators` and monotonicity analysis, before `InsertLimiters`.
 `MonotoneAnalyzer` exports it when the compiler receives
-`--dump-expanded-circuit DIR`. The checked-in capture is
-[`expanded.svg`](graphs/compiler/expanded.svg); its raw source is
-[`expanded.dot`](graphs/compiler/expanded.dot), with revision, command,
+`--dump-expanded-circuit DIR`. The local capture is
+[`expanded.svg`](../../../target/q3-circuit-exports/compiler/expanded.svg); its raw source is
+[`expanded.dot`](../../../target/q3-circuit-exports/compiler/expanded.dot), with revision, command,
 configuration, and capture stage in
-[`expanded.metadata.txt`](graphs/compiler/expanded.metadata.txt). This is the
+[`expanded.metadata.txt`](../../../target/q3-circuit-exports/compiler/expanded.metadata.txt). This is the
 incremental logical graph produced by the compiler; it excludes runtime
 operator internals. In particular, compiler analysis omits Catalog's
 materialization of `V`, which appears in the runtime graph.
 
-The compiler graph visitor marks explicit accumulation operators, including
-integrate and delayed integral, with `[A]` in blue. Other compiler-declared
-`IStateful` operators receive `[S]` in purple. Tooltips explain these
-categories; the accompanying legend is:
+The compiler graph visitor reserves blue `[I]` for an explicit
+`DBSPIntegrateOperator`. Other compiler-declared `IStateful` operators,
+including `accumulate_delay_trace`, receive purple `[S]`. Tooltips and this
+legend explain the categories:
 
 | Marker | Meaning |
 | --- | --- |
-| `[A]` | Explicit accumulated collection or delayed trace. |
-| `[S]` | Compiler-declared `IStateful` operator other than explicit accumulation. |
+| `[I]` | Explicit integrator of the historical collection. |
+| `[S]` | Other compiler-declared state, including delayed-trace placeholders. |
+
+This Q3 analysis graph has no explicit `integrate` node. Its
+`DBSPDelayedIntegralOperator` nodes stand for prior accumulated collections
+in the analysis, despite their `accumulate_delay_trace` operation name. They
+are not a decomposition of the runtime integrator. In this capture, node 105
+sums the Orders–Customer delta branches and feeds node 108, the second join's
+prior-state placeholder for that intermediate result. `map_index` nodes only
+rekey/project the incoming delta batches; they do not integrate history.
+The expansion comes directly from
+[`DeltaExpandOperators`](../../SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/visitors/outer/expansion/DeltaExpandOperators.java).
 
 Node IDs and original operator names remain intact.
+
+![Compiler-expanded logical graph](../../../target/q3-circuit-exports/compiler/expanded.svg)
 
 ## Per-worker runtime graphs
 
 The runtime SVGs come from DBSP's `graph_profile()` after the final refresh
 report, outside phase timers. Each run directory contains each worker's raw
 profile DOT and JSON, unstyled SVG, styled DOT, and styled SVG. The styled
-graph keeps the same topology and adds `[A]` in blue, `[S]` in purple, or
+graph keeps the same topology and adds `[I]` in blue, `[S]` in purple, or
 `[U]` in gray. Runtime names are classified by the explicit, source-referenced table in
 [`src/main.rs`](src/main.rs); unknown names remain unclassified. The style is
 presentation only.
 
 | Marker | Meaning |
 | --- | --- |
-| `[A]` | Runtime operator name is in the accumulation table. |
-| `[S]` | Runtime operator name is in the other-state table. |
+| `[I]` | Existing `accumulate_integrate_trace` or `shard_accumulate_integrate_trace` region: historical integrator. |
+| `[S]` | Other state, including delta-batch accumulators, trace append components, and snapshot/delay nodes. |
 | `[U]` | Runtime operator name is not classified by the table. |
 
-The checked-in one-worker capture is
-[`worker-0-styled.svg`](graphs/runtime-1/run-1/worker-0-styled.svg). The
+Runtime `Accumulator` coalesces deltas within a clock cycle and resets at
+flush. `AccumulateDelayTrace` snapshots an already-maintained trace; it does
+not create or update the historical integral. The join's historical keyed
+traces are built in `shard_accumulate_trace` regions, while Catalog's retained
+`V` uses `shard_accumulate_integrate_trace`. The blue integrator highlight is
+reserved for the explicitly named integration regions, not every stateful
+component inside them. See the
+[trace builders](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs)
+and [delta accumulator](../../../crates/dbsp/src/operator/accumulator.rs).
+
+The local one-worker capture is
+[`worker-0-styled.svg`](../../../target/q3-circuit-exports/runtime-1/run-1/worker-0-styled.svg). The
 two-worker capture is
-[`worker-0-styled.svg`](graphs/runtime-2/run-1/worker-0-styled.svg) and
-[`worker-1-styled.svg`](graphs/runtime-2/run-1/worker-1-styled.svg). Raw
+[`worker-0-styled.svg`](../../../target/q3-circuit-exports/runtime-2/run-1/worker-0-styled.svg) and
+[`worker-1-styled.svg`](../../../target/q3-circuit-exports/runtime-2/run-1/worker-1-styled.svg). Raw
 graphs and the capture manifest are alongside each SVG. The manifest records
 the source revision, command, configuration, run, and capture stage.
 

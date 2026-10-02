@@ -80,9 +80,14 @@ public class ToDotTests {
         Path directory = this.temporary.newFolder().toPath();
         this.compareTopology(this.stateCircuit(), directory);
         String dot = Files.readString(directory.resolve("styled.dot"));
-        Assert.assertTrue(dot.contains("[A]"));
+        Assert.assertTrue(dot.contains("[I]"));
         Assert.assertTrue(dot.contains("[S]"));
         Assert.assertTrue(dot.contains("accumulate_delay_trace"));
+        var delayedDeclaration = Pattern.compile("(stream[0-9]+).*accumulate_delay_trace").matcher(dot);
+        Assert.assertTrue(delayedDeclaration.find());
+        String delayedId = delayedDeclaration.group(1);
+        Assert.assertTrue(dot.contains(delayedId + " [style=filled fillcolor=\"#ede9fe\""));
+        Assert.assertFalse(dot.contains(delayedId + " [style=filled fillcolor=\"#dbeafe\""));
         Assert.assertTrue(dot.contains("subgraph cluster_"));
     }
 

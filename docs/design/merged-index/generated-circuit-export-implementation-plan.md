@@ -15,3 +15,23 @@ Implement the supplied plan using existing compiler and runtime graphs.
    correctness with capture enabled; render and inspect SVG; check docs and commit.
 
 Load, RF1, and RF2 use the same incremental circuit. No execution semantics change.
+
+## Integrator styling refinement
+
+Reserve blue `[I]` for explicit historical integration. Compiler
+`DBSPIntegrateOperator` qualifies; `DBSPDelayedIntegralOperator` uses the other
+state style. The Q3 analysis expansion uses delayed prior-integral placeholders
+and contains no explicit runtime integration region. Its `map_index` operators
+rekey/project delta batches without integrating history.
+
+At runtime, mark existing `accumulate_integrate_trace` and
+`shard_accumulate_integrate_trace` regions as integrators. Delta accumulators,
+trace append components, and `AccumulateDelayTrace` snapshot/delay operators
+use other-state styling. The renderer must style existing cluster IDs as well
+as existing simple node IDs, preserving all topology and profiling output.
+
+## Artifact destination
+
+Keep generated diagrams, raw graphs, and logs in the repository’s
+`target/q3-circuit-exports/`. Documentation links point to these local ignored
+artifacts; graph outputs are not committed.
