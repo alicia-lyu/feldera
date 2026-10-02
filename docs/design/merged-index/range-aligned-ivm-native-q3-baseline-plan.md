@@ -48,4 +48,18 @@ as a universal physical allocation count.
 
 ## Progress
 
-- Planning and repository review started; implementation and verification are pending.
+- Architecture review and documentation are complete, committed in `8897e3293` and `a9789d911`.
+- The native experiment is implemented and committed in `830ec4f43`. The pinned compiler
+  generates Orders–Customer followed by Lineitem–joined-orders, using two balanced binary joins. Its generated Rust, relational
+  plan, and circuit explanation are retained with the experiment.
+- All six native/parser/refresh tests pass, including simultaneous changes to all three
+  sources with one and two workers. Rust formatting and strict Clippy checks pass.
+- Generated Rust and relational-plan bytes reproduce exactly. Markdown formatting, links,
+  source line ranges, and all five Mermaid diagrams pass checks.
+- Three optimized local SF 0.01 dbgen runs pass independent delta and materialized-view
+  checks for loading, RF1, and RF2. [Verified results and reproduction commands][native-results]
+  record native transaction measurements, preparation time, driver memory, and end-to-end time.
+- Step 1 is complete. Merged-index reconstruction and the extended-record producer remain
+  future work outside this baseline.
+
+[native-results]: ../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md

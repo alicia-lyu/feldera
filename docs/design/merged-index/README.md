@@ -106,6 +106,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 
 | Reference | How it helps |
 | --- | --- |
+| [Native Q3 baseline experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md) | Implements native incremental bootstrap and refreshes; the circuit note maps generated joins and state reads, and the results note records verification and measurements. |
 | [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) | Connects the baseline comparison to concrete storage sources. |
 | [Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values) | Provides interface pseudocode, an array layout, traversal/lookup examples, and interchangeable read providers. |
 | [Folded keys in Feldera layer files](support.md#folded-keys-in-feldera-layer-files) | Defines the record representation and weighted-update requirements for reusing the LSM machinery. |
@@ -499,11 +500,16 @@ source provenance and implementation acceptance criteria.
 
 ## Next Steps
 
-1. **Establish the native baseline.** The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+1. **Use the native baseline.** The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
    uses one predicate-free materialized SQL view, default optimization, Catalog mode, and native
    incremental bootstrap/update execution. Inspect its actual state reads, compare signed deltas
    and snapshots with independent full joins, and measure load and RF1/RF2 separately. Defaults
    are one worker, 10,000-row load batches, three independent runs, and memory-backed state.
+   The generated grouping is Orders–Customer first, then Lineitem–joined-orders; both joins
+   have the opposite left/right orientation from the written SQL. This preserves its grouping,
+   while the [circuit note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
+   records actual before/after read choices. See [verified results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
+   for executed checks and measurements.
 2. **Bind the generated state requests.** Identify concrete accumulated read sites, their
    before/after semantics, partitioning, fetches, and cursor operations. Use the verified
    [native storage substrate](phase-4-implementation-note.md); extension production, runtime
