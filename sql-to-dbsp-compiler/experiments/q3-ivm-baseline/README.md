@@ -9,7 +9,7 @@ predicate-free materialized view and no intermediate view or join hint.
 ## Generate and run
 
 The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
-walks through compiler builds, ordinary and incremental inspection artifacts,
+walks through compiler builds, incremental inspection artifacts,
 baseline comparisons, native execution, and the agent-added report formatting.
 
 Use the repository's pinned Calcite build and Java 21 as described in the
@@ -73,7 +73,9 @@ as unavailable.
 
 ## Generated circuit
 
-The circuit evidence and its mapping to the generated Rust and runtime join
-implementation are in [CIRCUIT.md](CIRCUIT.md).
+The compiler-expanded logical graph and per-worker runtime graph exports,
+including raw DOT/JSON and provenance, are documented in [CIRCUIT.md](CIRCUIT.md).
+The shared [workflow](../../../docs/design/merged-index/WORKFLOW.md) gives the
+capture commands and artifact layout.
 The pinned dataset, verification, and measured runs are in
 [RESULTS.md](RESULTS.md).

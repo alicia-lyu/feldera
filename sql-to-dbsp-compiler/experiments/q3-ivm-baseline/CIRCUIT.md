@@ -1,84 +1,88 @@
 # Generated native circuit for `V`
 
-This document describes the circuit generated from [query.sql](query.sql) by
-the repository compiler against its pinned Calcite commit
-`f840e7ab3f8121e71035a7a1ed3fc1372f0139d5` (Calcite
-`1.43.0-SNAPSHOT`). The exact invocation is [generate.sh](generate.sh): `-i`
-enables incremental compilation, Catalog mode is the default, and omission of
-`-O` selects optimization level 2. The checked-in [relational plan](plan.json)
-and [generated Rust](src/lib.rs) are the evidence for this particular SQL
-program and compiler revision.
+This note describes the compiler-expanded logical graph and the actual runtime
+graphs captured for the native Q3 baseline. The graph files preserve the node
+IDs, edges, ports, and clusters emitted by their source graph. The source code
+and runtime operator behavior referenced below explain how to read those
+graphs; they do not reconstruct the topology.
 
-## Optimized relational shape
+## Compiler-expanded logical graph
 
-The relational plan scans Orders and Customer, joins them on customer key,
-projects their needed fields, and joins the result with Lineitem on order key.
-The logical Lineitem input has `(l_orderkey, l_linenumber)` identity and no
-customer key; the second join uses `l_orderkey = o_orderkey`.
-It then projects the nine fields of `V`. These are plan nodes 2, 3, 4, 5, 1,
-6, 7, and 8 respectively in [plan.json](plan.json). The SQL statement itself
-starts with `Customer JOIN Orders`; the actual optimized plan's first join has
-Orders on the left. The compiler's [hypergraph
-step](../../SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/frontend/calciteCompiler/optimizer/CalciteOptimizer.java#L383)
-is eligible for an unhinted query with more than one join, but eligibility
-alone does not establish what it changed. The plan file records the result.
+The compiler graph is the existing `DBSPCircuit` after
+`DeltaExpandOperators` and monotonicity analysis, before `InsertLimiters`.
+`MonotoneAnalyzer` exports it when the compiler receives
+`--dump-expanded-circuit DIR`. The checked-in capture is
+[`expanded.svg`](graphs/compiler/expanded.svg); its raw source is
+[`expanded.dot`](graphs/compiler/expanded.dot), with revision, command,
+configuration, and capture stage in
+[`expanded.metadata.txt`](graphs/compiler/expanded.metadata.txt). This is the
+incremental logical graph produced by the compiler; it excludes runtime
+operator internals. In particular, compiler analysis omits Catalog's
+materialization of `V`, which appears in the runtime graph.
 
-```mermaid
-flowchart LR
-    O[Orders] --> OC[Join on customer key]
-    C[Customer] --> OC
-    OC --> B[Project and key by order ID]
-    B --> VL[Join on order ID]
-    L[Lineitem] --> VL
-    VL --> V[Project materialized V]
-```
+The compiler graph visitor marks explicit accumulation operators, including
+integrate and delayed integral, with `[A]` in blue. Other compiler-declared
+`IStateful` operators receive `[S]` in purple. Tooltips explain these
+categories; the accompanying legend is:
 
-`B` labels the generated join output [s6](src/lib.rs#L487) for discussion; it
-is not a SQL view. The compiler rekeys Orders by customer key in
-[s3](src/lib.rs#L442), Customer by customer key in [s4](src/lib.rs#L456), and
-Lineitem by order key in [s5](src/lib.rs#L465). It computes `s6` with
-`s3.join_index_balanced(&s4)` and `s7` with `s5.join_balanced(&s6)` in
-[generated Rust](src/lib.rs#L487). The latter produces the nine-column delta
-of `V`. The generated file imports star-join helpers but calls neither one;
-the experiment uses the compiler's default settings without an opt-out. A
-[materialized output registration](src/lib.rs#L641) retains `V` and
-exposes both a signed delta handle and an integrated snapshot.
+| Marker | Meaning |
+| --- | --- |
+| `[A]` | Explicit accumulated collection or delayed trace. |
+| `[S]` | Compiler-declared `IStateful` operator other than explicit accumulation. |
 
-## Expanded incremental shape
+Node IDs and original operator names remain intact.
 
-`ΔO`, `ΔC`, and `ΔL` are the changes emitted by the three primary-key input
-maps. The map inputs and their retained base state are created by
-[`add_input_map_persistent`](src/lib.rs#L79), with Catalog registrations for
-Customer, Orders, and Lineitem. The join's indexed projections are logical
-delta streams; the runtime maintains keyed traces of their accumulated
-relations. For the default one-worker configuration,
-[`join_balanced`](../../../crates/dbsp/src/operator/dynamic/join.rs#L866)
-delegates to [`dyn_join_generic`](../../../crates/dbsp/src/operator/dynamic/join.rs#L651).
-For multiple workers, it uses balanced trace accumulation and registers a
-balancer. Both paths retain the same two algebraic branches per join.
+## Per-worker runtime graphs
 
-```mermaid
-flowchart LR
-    dO[ΔOrders] --> J1[Join by customer key]
-    dO --> IO[I_O: accumulated Orders trace]
-    IO --> DO[Delay to Orders before]
-    DO --> J2[Join by customer key]
-    dC[ΔCustomer] --> J2
-    dC --> IC[I_C: accumulated Customer trace]
-    IC --> J1
-    J1 --> dB[ΔB, rekeyed by order ID]
-    J2 --> dB
-    dL[ΔLineitem] --> J3[Join by order ID]
-    dL --> IL[I_L: accumulated Lineitem trace]
-    IL --> DL[Delay to Lineitem before]
-    DL --> J4[Join by order ID]
-    dB --> IB[I_B: accumulated B trace]
-    IB --> J3
-    dB --> J4
-    J3 --> dV[ΔV]
-    J4 --> dV
-    dV --> IV[I_V: integrated materialized V]
-```
+The runtime SVGs come from DBSP's `graph_profile()` after the final refresh
+report, outside phase timers. Each run directory contains each worker's raw
+profile DOT and JSON, unstyled SVG, styled DOT, and styled SVG. The styled
+graph keeps the same topology and adds `[A]` in blue, `[S]` in purple, or
+`[U]` in gray. Runtime names are classified by the explicit, source-referenced table in
+[`src/main.rs`](src/main.rs); unknown names remain unclassified. The style is
+presentation only.
+
+| Marker | Meaning |
+| --- | --- |
+| `[A]` | Runtime operator name is in the accumulation table. |
+| `[S]` | Runtime operator name is in the other-state table. |
+| `[U]` | Runtime operator name is not classified by the table. |
+
+The checked-in one-worker capture is
+[`worker-0-styled.svg`](graphs/runtime-1/run-1/worker-0-styled.svg). The
+two-worker capture is
+[`worker-0-styled.svg`](graphs/runtime-2/run-1/worker-0-styled.svg) and
+[`worker-1-styled.svg`](graphs/runtime-2/run-1/worker-1-styled.svg). Raw
+graphs and the capture manifest are alongside each SVG. The manifest records
+the source revision, command, configuration, run, and capture stage.
+
+`JoinTrace` is a runtime join operator that consumes a supplied retained trace.
+It performs keyed cursor and range access inside the operator; the graph does
+not contain separate index-access nodes. The other-state category can include
+buffered join work and does not mean the operator accumulates a trace. Read the
+[join implementation](../../../crates/dbsp/src/operator/dynamic/join.rs#L651)
+and its [range fetch path](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661),
+and see [generated Rust](src/lib.rs#L487) for the calls that instantiate the
+joins.
+
+## Reading the generated program
+
+The optimized relational plan scans Orders and Customer, joins them on
+customer key, projects their needed fields, and joins the result with Lineitem
+on order key. The logical Lineitem input has `(l_orderkey, l_linenumber)`
+identity and no customer key. It then projects the nine fields of `V`. These
+are plan nodes 2, 3, 4, 5, 1, 6, 7, and 8 in [plan.json](plan.json). The SQL
+starts with `Customer JOIN Orders`; the optimized plan's first join has Orders
+on the left. The plan records the selected shape.
+
+`B` below names the generated join output [s6](src/lib.rs#L487) for discussion;
+it is not a SQL view. The compiler rekeys Orders by customer key in
+[s3](src/lib.rs#L442), Customer by customer key in [s4](src/lib.rs#L456),
+and Lineitem by order key in [s5](src/lib.rs#L465). It computes `s6` with
+`s3.join_index_balanced(&s4)` and `s7` with `s5.join_balanced(&s6)`. The latter
+produces the nine-column delta of `V`. A [materialized output
+registration](src/lib.rs#L641) exposes both a signed delta handle and an
+integrated snapshot.
 
 With `O₀`, `C₀`, `L₀`, and `B₀` denoting state before the transaction, the
 generated branch orientation is:
@@ -89,34 +93,21 @@ generated branch orientation is:
 V_after = V_before + ΔV
 ```
 
-This is the orientation of the actual generated calls: Orders is left of
-Customer, and Lineitem is left of `B`. In
-[`dyn_join_generic`](../../../crates/dbsp/src/operator/dynamic/join.rs#L700),
-each input's retained trace supplies the opposite branch. The left delta
-joins the right trace after its current change; the right delta joins a
-delayed left trace, giving the before state. Signed weights multiply in the
-joins and add at the branch unions, so insertions, deletions, replacements,
-and concurrent changes are represented in the same circuit. The
-materialized-output registration requests a gathered integral. In the default
-solo layout, [the Catalog
-path](../../../crates/adapters/src/static_compile/catalog.rs#L130) uses
-`shard_accumulate_integrate_trace_legacy`, and
-[the snapshot handle](../../../crates/adapters/src/static_compile/catalog.rs#L643)
-reads that integral. The primary-key input maps retain base storage too.
-Here `I_O`, `I_C`, `I_L`, and `I_B` denote logical accumulation. Their keyed
-traces are physical realizations supplying the join consumers; native sharing
-and extra indexes mean there is no universal one-index-per-integrator
-allocation count.
+In [`dyn_join_generic`](../../../crates/dbsp/src/operator/dynamic/join.rs#L700),
+each input's retained trace supplies the opposite branch. The left delta joins
+the right trace after its current change; the right delta joins a delayed left
+trace, giving the before state. Signed weights multiply in the joins and add
+at the branch unions, so inserts, deletes, replacements, and concurrent
+changes use the same circuit. In the default solo layout, Catalog's
+[integration path](../../../crates/adapters/src/static_compile/catalog.rs#L130)
+uses `shard_accumulate_integrate_trace_legacy`; the
+[snapshot handle](../../../crates/adapters/src/static_compile/catalog.rs#L643)
+reads that integral. Primary-key input maps retain base storage too. Native
+trace sharing and extra indexes mean there is no universal one-index-per-
+integrator allocation count.
 
-The join runtime also [partitions and fetches trace
-ranges](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661), chooses a
-cursor-driving side from key estimates, and builds sorted output batches.
-These physical details are part of the native baseline's state-read contract.
-The source program does not route trace reads through a merged index.
-
-The driver submits base records as transactions to this incremental circuit.
-The initial load is therefore bootstrap through `ΔO`, `ΔC`, and `ΔL`, with
-empty before state. It does not run a separate full-query evaluator. Later RF1
-and RF2 transactions use the same circuit and materialized output. The
-independent full join in [main.rs](src/main.rs) is a checker outside the
-measured native transaction call.
+The source program does not route trace reads through a merged index. The
+initial load bootstraps the incremental circuit from empty before state; RF1
+and RF2 use that same circuit and materialized output. The independent full
+join in [main.rs](src/main.rs) is a checker outside the measured transaction
+call.

@@ -7,7 +7,7 @@ integration design; the [native Q3 baseline](../../../sql-to-dbsp-compiler/exper
 uses ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
 records the scope settled on 2026-10-01 and supersedes earlier assumptions about a fixed Q3 circuit.
 The [compilation and run workflow](WORKFLOW.md) explains the native baseline's commands,
-raw artifacts, and agent-added presentation steps.
+generated compiler/runtime graphs, raw artifacts, and provenance.
 
 ## Four architecture stages
 

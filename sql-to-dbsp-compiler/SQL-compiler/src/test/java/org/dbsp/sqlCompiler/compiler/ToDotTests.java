@@ -80,8 +80,8 @@ public class ToDotTests {
         Path directory = this.temporary.newFolder().toPath();
         this.compareTopology(this.stateCircuit(), directory);
         String dot = Files.readString(directory.resolve("styled.dot"));
-        Assert.assertTrue(dot.contains("[A] accumulation"));
-        Assert.assertTrue(dot.contains("[S] other state"));
+        Assert.assertTrue(dot.contains("[A]"));
+        Assert.assertTrue(dot.contains("[S]"));
         Assert.assertTrue(dot.contains("accumulate_delay_trace"));
         Assert.assertTrue(dot.contains("subgraph cluster_"));
     }

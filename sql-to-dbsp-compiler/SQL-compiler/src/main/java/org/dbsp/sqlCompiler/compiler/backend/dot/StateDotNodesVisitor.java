@@ -33,12 +33,12 @@ public class StateDotNodesVisitor extends ToDotNodesVisitor {
             if (operator instanceof DBSPIntegrateOperator || operator instanceof DBSPDelayedIntegralOperator) {
                 this.stream.append(operator.getNodeName(false))
                         .append(" [style=filled fillcolor=\"#dbeafe\" color=\"#2563eb\" ")
-                        .append("xlabel=\"[A] accumulation\" tooltip=\"Explicit accumulated collection or delayed trace\"]")
+                        .append("xlabel=\"[A]\" tooltip=\"Explicit accumulated collection or delayed trace\"]")
                         .newline();
             } else if (operator instanceof IStateful) {
                 this.stream.append(operator.getNodeName(false))
                         .append(" [style=filled fillcolor=\"#ede9fe\" color=\"#7c3aed\" ")
-                        .append("xlabel=\"[S] other state\" tooltip=\"Compiler-declared IStateful operator; not an explicit accumulation node\"]")
+                        .append("xlabel=\"[S]\" tooltip=\"Compiler-declared IStateful operator; not an explicit accumulation node\"]")
                         .newline();
             }
         }

@@ -9,12 +9,12 @@ owns the generated operator and state-read explanation; the
 [results note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
 owns the original dataset, correctness tests, and measurements.
 
-The saved rerun `target/q3-ivm-runs/20261002T183104Z` is a local example from
-2026-10-02, separate from the measurements in the results note. Its `rerun.py`
-and `summarize.py` are local, gitignored helpers with host-specific paths, rather
-than checked-in entry points. The directory preserves the compiler outputs,
-logs, checks, and formatted report. The examples below express its commands
-with configurable paths; they do not require those helpers.
+The checked-in graph captures and raw logs are in the experiment's
+[`graphs/`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/graphs/)
+directory. The local native benchmark reports in
+`target/q3-ivm-runs/20261002T183104Z/benchmark.log` remain separate from the
+original measurements in the results note. Commands below use configurable
+paths and fresh output directories.
 
 ## Configure paths
 
@@ -34,7 +34,7 @@ export CARGO_TARGET_DIR="$REPO/target"
 RUN_DIR="$REPO/target/q3-ivm-runs/$(date -u +%Y%m%dT%H%M%SZ)"
 EXPERIMENT="$REPO/sql-to-dbsp-compiler/experiments/q3-ivm-baseline"
 COMPILER="$REPO/sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp"
-mkdir -p "$RUN_DIR"
+mkdir -p "$RUN_DIR/graphs"
 cp "$EXPERIMENT/query.sql" "$RUN_DIR/query.sql"
 ```
 
@@ -63,10 +63,8 @@ executes `SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar` with Java.
 
 The default Calcite checkout is `sql-to-dbsp-compiler/calcite-build`, controlled
 by `CALCITE_BUILD_DIR`. The sibling `../calcite` checkout is not automatically
-selected. The saved rerun reused the existing compiler JAR: its manifest contains
-compiler version/help queries and SQL compilations, but no Calcite or Maven
-build command. Thus `compiler-build.log` above belongs to a new build, not to
-that rerun's artifact set.
+selected. The checked-in graph capture uses the rebuilt compiler JAR, with its hash
+recorded in `graphs/provenance.txt`.
 
 ## 2. Translate SQL into a relational plan
 
@@ -86,86 +84,61 @@ Orders becomes left of Customer, and Lineitem becomes left of their joined
 result. Orders–Customer grouping remains intact. This observation comes from
 the logged before/after plans, beyond the rule's eligibility alone.
 
-## 3. Generate ordinary and incremental circuits
+## 3. Generate the incremental circuit
 
-Compile once without `-i` and once with it. Omit `-O` to retain default
-optimization level 2 and leave Catalog mode at its default. Each mode uses
-three separate compiler invocations:
+Compile with `-i`. Omit `-O` to retain default optimization level 2 and leave
+Catalog mode at its default. The inspection uses three separate compiler
+invocations:
 
 ```bash
-for mode in ordinary incremental; do
-  set --
-  if [[ "$mode" == incremental ]]; then
-    set -- -i
-  fi
-  destination="$RUN_DIR/$mode"
-  mkdir "$destination"
-  cd "$destination"
-  "$COMPILER" "$RUN_DIR/query.sql" "$@" \
-    -TCalciteOptimizer=2 -TCircuitOptimizer=2 \
-    --plan "$destination/relational-plan.json" \
-    --dataflow "$destination/dataflow.json" \
-    --js "$destination/schema.json" \
-    -o "$destination/circuit.rs" \
-    > "$RUN_DIR/$mode-compile.log" 2>&1
-  "$COMPILER" "$RUN_DIR/query.sql" "$@" \
-    --svg -v 2 -o "$destination/circuit.svg" \
-    > "$RUN_DIR/$mode-diagram.log" 2>&1
-  "$COMPILER" "$RUN_DIR/query.sql" "$@" \
-    --jit -o "$destination/circuit.json" \
-    > "$RUN_DIR/$mode-circuit-ir.log" 2>&1
-done
+DESTINATION="$RUN_DIR/incremental"
+mkdir "$DESTINATION"
+cd "$DESTINATION"
+"$COMPILER" "$RUN_DIR/query.sql" -i \
+  -TCalciteOptimizer=2 -TCircuitOptimizer=2 \
+  --plan "$DESTINATION/relational-plan.json" \
+  --dataflow "$DESTINATION/dataflow.json" \
+  --js "$DESTINATION/schema.json" \
+  -o "$DESTINATION/circuit.rs" \
+  > "$RUN_DIR/incremental-compile.log" 2>&1
+"$COMPILER" "$RUN_DIR/query.sql" -i \
+  --svg -v 2 -o "$DESTINATION/circuit.svg" \
+  > "$RUN_DIR/incremental-diagram.log" 2>&1
+"$COMPILER" "$RUN_DIR/query.sql" -i \
+  --jit -o "$DESTINATION/circuit.json" \
+  > "$RUN_DIR/incremental-circuit-ir.log" 2>&1
+```
+
+To export the expanded logical graph for the incremental compilation, run an
+additional compiler invocation with `-i` and
+`--dump-expanded-circuit "$RUN_DIR/graphs/compiler"`. The capture occurs in
+`MonotoneAnalyzer` after `DeltaExpandOperators` and monotonicity analysis,
+before `InsertLimiters`:
+
+```bash
+cd "$RUN_DIR/incremental"
+"$COMPILER" "$RUN_DIR/query.sql" -i \
+  --dump-expanded-circuit "$RUN_DIR/graphs/compiler" \
+  -o "$RUN_DIR/incremental/circuit-expanded.rs" \
+  > "$RUN_DIR/graphs/compiler.log" 2>&1
 ```
 
 `--plan` writes the optimized relational plan, `--dataflow` the dataflow
 description, and `--js` the input/output schema. `--svg -v 2` produces a circuit
 diagram with layout through Graphviz. `--jit` serializes circuit IR as JSON.
 These are compiler artifacts; none of these commands executes a benchmark.
-Working in each mode's directory also keeps auxiliary generated Rust files
+Working in the incremental directory also keeps auxiliary generated Rust files
 (`stubs.rs` and `udf.rs`) separate. Option definitions are in the
 [compiler usage guide](../../../sql-to-dbsp-compiler/using.md#command-line-options).
 
-The optimized ordinary circuit differentiates Orders and Customer, joins their
-deltas with `join_index`, integrates that result, and then uses `stream_join`
-with Lineitem. Ordinary compilation can therefore retain incremental operators
-internally after optimization. The incremental Rust instead calls
-`join_index_balanced` and `join_balanced`. Their retained traces and before/after
-reads are implemented inside the native runtime, so the top-level compiler
-graph does not expand them into separate trace operators. The circuit note
-maps those calls to
+The incremental Rust calls `join_index_balanced` and `join_balanced`. Their
+retained traces and before/after reads are implemented inside the native
+runtime, so the top-level compiler graph does not expand them into separate
+trace operators. The circuit note maps those calls to
 [`dyn_join_generic`](../../../crates/dbsp/src/operator/dynamic/join.rs#L700)
 and explains their signed-delta semantics.
 
-## 4. Check the generated baseline
-
-Keep raw inspection output unchanged. Normalize a separate copy of incremental
-Rust using the same adjustments as the checked-in
-[`generate.sh`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/generate.sh):
-
-```bash
-cp "$RUN_DIR/incremental/circuit.rs" \
-  "$RUN_DIR/incremental/circuit.normalized.rs"
-perl -pi -e 's/[ \t]+$//' "$RUN_DIR/incremental/circuit.normalized.rs"
-perl -0pi -e 's{\A// Automatically-generated file\n}{// Automatically-generated file\n#![allow(clippy::useless_conversion, clippy::explicit_auto_deref, clippy::clone_on_copy, clippy::type_complexity)]\n}' \
-  "$RUN_DIR/incremental/circuit.normalized.rs"
-rustfmt +1.96.1 --edition 2021 "$RUN_DIR/incremental/circuit.normalized.rs"
-{
-  cmp "$RUN_DIR/incremental/circuit.normalized.rs" "$EXPERIMENT/src/lib.rs"
-  cmp "$RUN_DIR/ordinary/relational-plan.json" \
-    "$RUN_DIR/incremental/relational-plan.json"
-  cmp "$RUN_DIR/incremental/relational-plan.json" "$EXPERIMENT/plan.json"
-  echo 'Normalized Rust and all three relational plans match byte for byte.'
-} > "$RUN_DIR/generation-check.log" 2>&1
-```
-
-Whitespace trimming, the four file-scoped Clippy allowances, and rustfmt do not
-change query semantics. The saved rerun passed all three byte comparisons. Its
-raw `circuit.rs`, normalized copy, JSON plans, and diagrams remain available.
-The comparison establishes that the inspected incremental program reproduces
-the checked-in baseline; it does not replace that library with the inspection
-copy.
-
-## 5. Build the Rust executable
+## 4. Build the Rust executable
 
 ```bash
 cd "$EXPERIMENT"
@@ -177,9 +150,9 @@ Cargo builds the checked-in generated `src/lib.rs`, handwritten `src/main.rs`
 driver and `src/data.rs` parser, and native runtime dependencies declared in
 [`Cargo.toml`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/Cargo.toml).
 `CARGO_TARGET_DIR` selects the repository target directory. Cargo does not
-build the ordinary inspection circuit or either run-directory Rust copy.
+build run-directory Rust copies.
 
-## 6. Load and refresh through the incremental circuit
+## 5. Load and refresh through the incremental circuit
 
 ```bash
 cd "$RUN_DIR"
@@ -191,11 +164,22 @@ cd "$RUN_DIR"
   --rf1-lines "$TPCH_DATA/lineitem.tbl.u1" \
   --rf2 "$TPCH_DATA/delete.1" \
   --workers 1 --batch 10000 --runs 3 \
+  --dump-runtime-circuit "$RUN_DIR/graphs/runtime-1" \
   > "$RUN_DIR/benchmark.log" 2>&1
 ```
 
-The process constructs three fresh circuits with one worker and memory-backed
-state; omission of `--storage-path` selects that configuration. The
+Use `--workers 2 --dump-runtime-circuit "$RUN_DIR/graphs/runtime-2"` for a
+two-worker capture. The driver writes `run-N/worker-ID.dot`, `.json`, `.svg`,
+`worker-ID-styled.dot`, and `worker-ID-styled.svg`, plus `manifest.json`.
+Runtime capture happens after the final refresh report and outside phase
+timers. Supply a fresh output root: existing per-run directories are rejected
+so captures are not overwritten. Preserve the output in `graphs/runtime-1.log`
+or `graphs/runtime-2.log`, respectively.
+
+The process constructs three fresh incremental circuits with one worker and
+memory-backed state; omission of `--storage-path` selects that configuration.
+Each circuit handles its initial load and then RF1/RF2 refreshes, so bootstrap
+and refresh use the same incremental program. The
 [parser](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/data.rs#L30)
 validates exact dates and represents decimals as integer hundredths before
 serializing them for Catalog inputs. The driver submits inputs and calls
@@ -226,29 +210,43 @@ counters unavailable and still retains source maps for RF2 discovery.
 
 ## Raw artifacts and presentation additions
 
-Names below are relative to the saved run directory. Both `ordinary/` and
-`incremental/` contain direct compiler artifacts and derived inspection files.
+Names below are relative to a run directory. `incremental/` contains direct
+compiler artifacts. The incremental compile also
+captures the compiler-expanded logical graph. The executable can capture
+per-worker runtime graphs after each run's final refresh report with
+`--dump-runtime-circuit "$RUN_DIR/graphs/runtime-1"` for one worker or
+`--dump-runtime-circuit "$RUN_DIR/graphs/runtime-2"` for two workers. Each run
+uses a new directory; capture fails if a run directory already exists. Capture
+is outside phase timers.
+
+For the checked-in example exports, the graph directories are
+`graphs/compiler/`, `graphs/runtime-1/run-1/`, and
+`graphs/runtime-2/run-1/`. Compiler output is captured after
+`DeltaExpandOperators` and monotonicity analysis, before `InsertLimiters`.
+Runtime output comes from `graph_profile()` and preserves each worker's raw
+DOT and JSON, plus raw and styled SVG. Both manifests record revision,
+command, configuration, and capture stage. See the experiment's
+[CIRCUIT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
+for generated graph links, styling labels, and interpretation.
 
 | Artifact | Origin and contents |
 | --- | --- |
-| `ordinary-compile.log`, `incremental-compile.log` | Captured compiler stdout/stderr: relational optimization output and circuit-pass timings. |
-| `*-diagram.log`, `*-circuit-ir.log` | Captured output from the separate SVG and `--jit` invocations; a successful log may be empty. |
+| `incremental-compile.log`, `incremental-diagram.log`, `incremental-circuit-ir.log` | Captured output from incremental compiler invocations; a successful log may be empty. |
 | `release-build.log` | Captured Cargo build output. |
 | `benchmark.log` | Nine driver reports with timings, throughput, signed multiplicities, cardinalities, reference bytes, and peak RSS. |
 | `git-provenance.log`, `git-status-before.log`, `java-version.log`, `rust-version.log`, `compiler-version.log`, `compiler-help.log`, `host.log` | Captured revision/status, Java/Rust/compiler versions, compiler help, and host information. |
-| `relational-plan.json`, `dataflow.json`, `schema.json`, `circuit.json`, `circuit.rs`, `stubs.rs`, `udf.rs`, `circuit.svg` | Direct compiler artifacts in each mode directory; Graphviz supplies SVG layout. |
-| `run.log` | Aggregated stage output with agent-added command, directory, UTC timestamp, exit-status, and elapsed-time headers, plus a validation footer. |
-| `manifest.json` | Agent-produced configuration, source/input/JAR/binary hashes, command outcomes, artifact hashes, and checks. |
-| `circuit.normalized.rs`, `generation-check.log` | Agent-normalized comparison copy and byte-comparison results. |
+| `relational-plan.json`, `dataflow.json`, `schema.json`, `circuit.json`, `circuit.rs`, `stubs.rs`, `udf.rs`, `circuit.svg` | Direct compiler artifacts in the incremental directory; Graphviz supplies SVG layout. |
 | `relational-optimization.txt`, `operators.tsv` | Agent-extracted plan text from compile logs and operator listings from circuit JSON. |
-| `CIRCUIT.md`, `incremental/expanded-native.mmd` | Copied circuit explanation and extracted explanatory Mermaid expansion of native trace reads and before/after semantics, with source references in the note. |
-| `metrics.csv`, `README.md`, `validation.log` | Agent-parsed benchmark fields, calculated rates, formatted report, and validation/median output. |
+| `graphs/compiler/expanded.dot`, `expanded.svg`, `expanded.metadata.txt` | Compiler-expanded logical graph and provenance, captured by `--dump-expanded-circuit`; the SVG is rendered from the preserved DOT. |
+| `graphs/runtime-1/run-1/`, `graphs/runtime-2/run-1/` | Per-worker runtime graph captures: raw DOT/JSON, raw SVG, styled DOT/SVG, and a manifest with provenance. |
+| `graphs/compiler.log`, `graphs/runtime-1.log`, `graphs/runtime-2.log`, `graphs/verification.log`, `graphs/provenance.txt` | Capture commands, their outputs, correctness verification with capture enabled, and provenance for the checked-in graph artifacts. |
+| `CIRCUIT.md` | Generated graph links and source-grounded explanation of the compiler and runtime captures. |
+| `metrics.csv`, `validation.log` | Parsed benchmark fields, calculated rates, and validation/median output. |
 
-The runner merges stdout and stderr into each stage log, copies those lines
-into `run.log`, and records command outcomes in `manifest.json`. The summary
-helper parses reports into CSV and Markdown tables. The expanded native
-diagram and formatted report are agent-authored explanations, while the
-compiler artifacts and underlying measurements remain identifiable.
+Each capture preserves compiler or driver stdout/stderr in its raw log.
+Compiler and runtime exports supply topology; state colours, textual markers,
+Graphviz layout, and the accompanying legend are presentation steps. They do
+not add nodes or edges.
 
 ### Metric formulas and precision
 
@@ -275,15 +273,9 @@ one small batch per fresh circuit, not sustained repeated refresh execution.
 
 ### Final checks
 
-The agent repaired local documentation links and checked Markdown formatting,
-JSON parsing and circuit-mode flags, SVG XML, generated-file equality, and all
-nine reported verification results. It also preserved provenance and artifact
-hashes in the manifest. The explanatory Mermaid diagram belongs to the circuit
-note; the SVG is a separate compiler-generated diagram. Checks of links and
-formatting establish readability, while the independent full-join comparisons
-establish the executed transactions' correctness.
+The captured verification log records correctness checks with graph capture
+enabled. The compiler and runtime SVGs are rendered from their corresponding
+DOT files. Provenance records revisions, commands, configurations, and capture
+stages. Markdown and local artifact links should be checked when updating the
+checked-in capture set.
 
-When documenting an existing run, inspect its manifest commands, raw reports,
-comparison results, and source references without rewriting historical logs
-or rerunning its helpers. This workflow documentation requires no new benchmark
-run, compiler/driver changes, or production tests.
