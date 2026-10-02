@@ -185,6 +185,9 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         public boolean emitPng = false;
         @Parameter(names = {"--svg", "-svg"}, description = "Emit an svg image of the circuit instead of Rust")
         public boolean emitSvg = false;
+        @Nullable @Parameter(names = "--dump-expanded-circuit",
+                description = "Export the monotonicity analysis expanded circuit as DOT and SVG to this directory")
+        public String dumpExpandedCircuit = null;
         @Parameter(names="--jit", description = "Emit a JSON representation suitable for an interpreter")
         public boolean interpreterJson = false;
         @Parameter(names="--gen2", description = "Compile for the Gen-2 engine: emit the circuit IR (as --jit does) and drop the primary-key columns from the value of an indexed source")
@@ -289,6 +292,7 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                     ",\n\temitHandles=" + this.emitHandles +
                     ",\n\temitJpeg=" + this.emitJpeg +
                     ",\n\temitSvg=" + this.emitSvg +
+                    ",\n\tdumpExpandedCircuit=" + this.dumpExpandedCircuit +
                     ",\n\tinterpreterJson=" + this.interpreterJson +
                     ",\n\tgen2=" + this.gen2 +
                     ",\n\temitJsonErrors=" + this.emitJsonErrors +

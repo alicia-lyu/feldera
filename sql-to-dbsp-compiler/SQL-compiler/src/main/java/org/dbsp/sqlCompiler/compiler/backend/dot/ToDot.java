@@ -11,6 +11,9 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 /** Dump a graph in the graphviz dot format. */
 public class ToDot {
@@ -24,19 +27,7 @@ public class ToDot {
         try {
             tmp = File.createTempFile("tmp", ".dot");
             tmp.deleteOnExit();
-            PrintWriter writer = new PrintWriter(tmp.getAbsolutePath());
-            IndentStream stream = new IndentStream(writer);
-            stream.append("digraph ")
-                    .append(circuit.id)
-                    .append(" {")
-                    .increase()
-                    .append("ordering=\"in\"").newline();
-            CircuitVisitor nVisitor = nodesVisitor.create(stream);
-            CircuitVisitor eVisitor = edgesVisitor.create(stream);
-            nVisitor.apply(circuit);
-            eVisitor.apply(circuit);
-            stream.decrease().append("}").newline();
-            writer.close();
+            writeDot(circuit, tmp.toPath(), nodesVisitor, edgesVisitor);
             if (outputFormat != null) {
                 System.out.println("Writing " + fileName + " " + circuit.id);
                 Utilities.runProcess(".", "dot", "-T", outputFormat,
@@ -51,6 +42,47 @@ public class ToDot {
                 }
             }
             throw new RuntimeException(ex);
+        }
+    }
+
+    /** Write the topology with the supplied visitors, retaining a DOT file even if rendering fails. */
+    private static void writeDot(DBSPCircuit circuit, Path file,
+                                 ToDotEdgesVisitor.VisitorConstructor nodesVisitor,
+                                 ToDotEdgesVisitor.VisitorConstructor edgesVisitor) throws IOException {
+        try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(file, StandardCharsets.UTF_8))) {
+            IndentStream stream = new IndentStream(writer);
+            stream.append("digraph ")
+                    .append(circuit.id)
+                    .append(" {")
+                    .increase()
+                    .append("ordering=\"in\"").newline();
+            nodesVisitor.create(stream).apply(circuit);
+            edgesVisitor.create(stream).apply(circuit);
+            stream.decrease().append("}").newline();
+            if (writer.checkError())
+                throw new IOException("Could not write DOT file " + file);
+        }
+    }
+
+    /** Export persistent DOT and SVG using the existing topology visitors.
+     * The stem must be a file name, not a path.  Empty circuits produce an empty graph. */
+    public static void exportArtifacts(DBSPCircuit circuit, Path directory, String stem,
+                                       ToDotEdgesVisitor.VisitorConstructor nodesVisitor,
+                                       ToDotEdgesVisitor.VisitorConstructor edgesVisitor) throws IOException {
+        if (stem.isEmpty() || stem.equals(".") || stem.equals("..") ||
+                stem.contains("/") || stem.contains("\\"))
+            throw new IllegalArgumentException("Artifact stem must be a file name: " + stem);
+        Files.createDirectories(directory);
+        Path dot = directory.resolve(stem + ".dot");
+        Path svg = directory.resolve(stem + ".svg");
+        writeDot(circuit, dot, nodesVisitor, edgesVisitor);
+        try {
+            Utilities.runProcess(".", "dot", "-Tsvg", "-o", svg.toString(), dot.toString());
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted rendering " + dot, ex);
+        } catch (RuntimeException ex) {
+            throw new IOException("Could not render " + dot + "; raw DOT is preserved", ex);
         }
     }
 

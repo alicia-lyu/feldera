@@ -5,6 +5,7 @@ import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.backend.dot.StateDotNodesVisitor;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDotEdgesVisitor;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDot;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDotNodesVisitor;
@@ -21,6 +22,10 @@ import org.dbsp.util.IWritesLogs;
 import org.dbsp.util.IndentStream;
 import org.dbsp.util.graph.Port;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -145,6 +150,32 @@ public class MonotoneAnalyzer implements CircuitTransform, IWritesLogs {
             ToDot.customDump("expanded.png", "png", expanded,
                     stream -> new ToDotNodesVisitor(compiler, stream, details),
                     stream -> new MonotoneDot(compiler, stream, details, monotonicity.info));
+
+        String exportDirectory = this.compiler.options.ioOptions.dumpExpandedCircuit;
+        if (exportDirectory != null) {
+            try {
+                Path directory = Path.of(exportDirectory);
+                Files.createDirectories(directory);
+                Process revision = new ProcessBuilder("git", "rev-parse", "HEAD")
+                        .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                String commit = new String(revision.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                if (revision.waitFor() != 0)
+                    commit = "unknown (not a Git checkout)";
+                Files.writeString(directory.resolve("expanded.metadata.txt"),
+                        "revision=" + commit + "\ncommand=" +
+                        ProcessHandle.current().info().commandLine().orElse("unknown") +
+                        "\ncapture_stage=MonotoneAnalyzer after DeltaExpandOperators and Monotonicity, before InsertLimiters\n" +
+                        "configuration=" + this.compiler.options + "\n");
+                ToDot.exportArtifacts(expanded, Path.of(exportDirectory), "expanded",
+                        stream -> new StateDotNodesVisitor(compiler, stream, 1),
+                        stream -> new ToDotEdgesVisitor(compiler, stream, 1));
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted recording expanded circuit provenance", ex);
+            } catch (IOException ex) {
+                throw new RuntimeException("Could not export expanded circuit to " + exportDirectory, ex);
+            }
+        }
 
         InsertLimiters limiters = new InsertLimiters(
                 this.compiler, expanded, monotonicity.info, expander.expansion, reachableFromError);

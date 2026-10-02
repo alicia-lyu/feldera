@@ -58,6 +58,9 @@ Usage: sql-to-dbsp [options] Input file to compile
       Default: <empty string>
     --dataflow
       Emit the Dataflow graph of the program in the specified JSON file
+    --dump-expanded-circuit
+      Followed by a directory. Export the monotonicity-expanded incremental
+      circuit as DOT and SVG, with provenance metadata
     --enterprise
       Generate code supporting enterprise features
       Default: false
@@ -194,6 +197,12 @@ Here is a description of the non-obvious command-line options:
 
 --plan: Generates a JSON structure for each view compiled, representing the Calcite
      optimized plan for computing the view
+
+--dump-expanded-circuit: Exports the existing expanded logical circuit from
+     monotonicity analysis as `expanded.dot`, `expanded.svg`, and
+     `expanded.metadata.txt` in the specified directory. Capture happens after
+     delta expansion and monotonicity analysis, before limiters are inserted.
+     Graphviz is required to render the SVG.
 
 --outputsAreSets: SQL queries can produce outputs that contain duplicates, but
      such outputs are rarely useful in practice.  Using this flag will ensure that
