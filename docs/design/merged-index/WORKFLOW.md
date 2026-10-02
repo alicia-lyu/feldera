@@ -15,6 +15,17 @@ The local graph captures and raw logs are in the repository’s
 original measurements in the results note. Commands below use configurable
 paths and fresh output directories.
 
+## Worker policy
+
+All future IVM maintenance runs use one DBSP worker (`--workers 1`), including
+RF1 and RF2. Initial loading may use multiple workers.
+Record the worker count in each run's configuration. The existing two-worker
+graphs are retained as prior runtime inspection artifacts.
+
+The IVM maintenance implementation targets single-worker execution. Partitioning,
+cross-worker exchange, distributed state placement, and migration are outside
+its current scope. No multiworker maintenance extension is planned.
+
 ## Configure paths
 
 Use absolute paths and a fresh run directory. Set `REPO`, `TPCH_DATA`, and
@@ -167,13 +178,11 @@ cd "$RUN_DIR"
   > "$RUN_DIR/benchmark.log" 2>&1
 ```
 
-Use `--workers 2 --dump-runtime-circuit "$RUN_DIR/graphs/runtime-2"` for a
-two-worker capture. The driver writes `run-N/worker-ID.dot`, `.json`, `.svg`,
+The driver writes `run-N/worker-ID.dot`, `.json`, `.svg`,
 `worker-ID-styled.dot`, and `worker-ID-styled.svg`, plus `manifest.json`.
 Runtime capture happens after the final refresh report and outside phase
 timers. Supply a fresh output root: existing per-run directories are rejected
-so captures are not overwritten. Preserve the output in `graphs/runtime-1.log`
-or `graphs/runtime-2.log`, respectively.
+so captures are not overwritten. Preserve the output in the run directory.
 
 The process constructs three fresh incremental circuits with one worker and
 memory-backed state; omission of `--storage-path` selects that configuration.
@@ -213,8 +222,7 @@ Names below are relative to a run directory. `incremental/` contains direct
 compiler artifacts. The incremental compile also
 captures the compiler-expanded logical graph. The executable can capture
 per-worker runtime graphs after each run's final refresh report with
-`--dump-runtime-circuit "$RUN_DIR/graphs/runtime-1"` for one worker or
-`--dump-runtime-circuit "$RUN_DIR/graphs/runtime-2"` for two workers. Each run
+`--dump-runtime-circuit "$RUN_DIR/graphs/runtime-1"` with `--workers 1`. Each run
 uses a new directory; capture fails if a run directory already exists. Capture
 is outside phase timers.
 

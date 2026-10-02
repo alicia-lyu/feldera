@@ -7,7 +7,11 @@ integration design; the [native Q3 baseline](../../../sql-to-dbsp-compiler/exper
 uses ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
 records the scope settled on 2026-10-01 and supersedes earlier assumptions about a fixed Q3 circuit.
 The [compilation and run workflow](WORKFLOW.md) explains the native baseline's commands,
-generated compiler/runtime graphs, raw artifacts, and provenance.
+generated compiler/runtime graphs, raw artifacts, and provenance. All future
+IVM maintenance runs use one DBSP worker. Initial loading may use multiple
+workers. The IVM maintenance implementation targets single-worker execution; partitioning, cross-worker
+exchange, distributed state placement, and migration are outside its current
+scope. No multiworker maintenance extension is planned.
 
 ## Four architecture stages
 

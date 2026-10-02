@@ -46,6 +46,18 @@ Node IDs and original operator names remain intact.
 
 ![Compiler-expanded logical graph](../../../target/q3-circuit-exports/compiler/expanded.svg)
 
+## Worker policy
+
+All future IVM maintenance runs use one worker. Initial loading may use
+multiple workers. The two-worker captures below are prior runtime inspection
+artifacts. `CircuitConfig::with_workers(N)` creates local worker threads with
+replicas of the circuit; input maps and join traces are partitioned by key.
+The generated `join_*_balanced` wrappers select adaptive balancing only when
+`adaptive_joins` is enabled, which is off in the default configuration used
+for these captures. See the
+[wrappers](../../../crates/dbsp/src/mono.rs) and
+[default settings](../../../crates/feldera-types/src/config/dev_tweaks.rs).
+
 ## Per-worker runtime graphs
 
 The runtime SVGs come from DBSP's `graph_profile()` after the final refresh

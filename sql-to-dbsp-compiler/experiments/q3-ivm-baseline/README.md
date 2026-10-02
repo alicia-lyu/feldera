@@ -6,6 +6,16 @@ payloads needed by Q3 before its residual filters, revenue aggregation,
 ranking, limit, and projection. The SQL in [query.sql](query.sql) has one
 predicate-free materialized view and no intermediate view or join hint.
 
+## Worker policy
+
+All future IVM maintenance runs use one DBSP worker (`--workers 1`), including
+RF1 and RF2. Initial loading may use multiple workers. The driver defaults to one worker. Keep this
+setting explicit in recorded run commands and configurations.
+
+The IVM maintenance implementation targets single-worker execution. Partitioning,
+cross-worker exchange, distributed state placement, and migration are outside
+its current scope. No multiworker maintenance extension is planned.
+
 ## Generate and run
 
 The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
@@ -39,13 +49,14 @@ cargo run -- \
   --lineitem "$TPCH_DATA/lineitem.tbl" \
   --rf1-orders "$TPCH_DATA/orders.tbl.u1" \
   --rf1-lines "$TPCH_DATA/lineitem.tbl.u1" \
-  --rf2 "$TPCH_DATA/delete.1"
+  --rf2 "$TPCH_DATA/delete.1" \
+  --workers 1
 ```
 
 The defaults are one worker, 10,000 input records per load transaction, three
 independent runs, full delta and materialized snapshot verification, and
-memory-backed DBSP state. `--workers`, `--batch`, and `--runs` override these
-counts. `--storage-path DIR` enables native file-backed state in a distinct
+memory-backed DBSP state. `--batch` and `--runs` override these counts;
+retain `--workers 1` for IVM maintenance runs. `--storage-path DIR` enables native file-backed state in a distinct
 `run-N` subdirectory for each run. `--no-verify` excludes the independent
 full-join oracle from measurement runs. RF1 submits related Orders and Lineitem inserts in one
 transaction. RF2 removes each present order and its lines in one transaction.

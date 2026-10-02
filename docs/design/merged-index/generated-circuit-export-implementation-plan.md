@@ -33,3 +33,12 @@ as existing simple node IDs, preserving all topology and profiling output.
 Keep generated diagrams, raw graphs, and logs in the repository’s
 `target/q3-circuit-exports/`. Documentation links point to these local ignored
 artifacts; graph outputs are not committed.
+
+## Execution policy
+
+All future IVM maintenance runs use one DBSP worker. Initial loading may use
+multiple workers. Previously captured two-worker graphs remain runtime inspection
+artifacts. The driver's one-worker default already implements this policy.
+
+Partitioning and distributed execution are outside the current IVM maintenance
+scope. No multiworker maintenance extension is planned.
