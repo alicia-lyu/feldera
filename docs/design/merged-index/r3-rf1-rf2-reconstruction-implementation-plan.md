@@ -1,6 +1,6 @@
 # R3: generated Q3 reconstruction for RF1/RF2
 
-Date: 2026-10-06. Status: implementation in progress.
+Date: 2026-10-06. Status: implemented for the RF1/RF2 prototype.
 
 ## Contract
 
@@ -48,3 +48,34 @@ temporary rows; it is not required for this implementation.
 Preserve the native baseline's broader tests and the other agent's COL changes.
 Maintenance uses one worker. Broader R4 verification and R5 beyond-memory
 comparisons remain separate.
+
+## Implementation outcome
+
+The compiler's `--q3-merged-index` option validates the supported Q3 circuit and
+emits the four COL state readers through two supplied-snapshot joins. The default
+generator retains native joins. The manual index owner uses the native `Spine`
+on a DBSP auxiliary thread; Q3 keeps its transaction delta collectors and
+materialized output while omitting the four replaced historical traces.
+
+Native checkpoint restoration is verified at a completed transaction boundary.
+The harness saves the manual trace using the prepared checkpoint UUID before
+committing Q3, so native checkpoint dependency collection includes its batch
+files. This does not implement independently stacked circuits or their
+checkpoint protocol.
+
+Completed checks:
+
+- The supplied-snapshot join regression matches native signed updates across
+  simultaneous and multi-step transactions.
+- The COL library passes all 19 tests, including weighted reconstruction,
+  consolidation, mixed memory/file snapshots, and compaction.
+- Compiler binding tests pass all four cases; opt-in generation emits both
+  reconstructed joins and rejects unsupported circuits.
+- The reconstructed harness passes all six tests, including independent full
+  join verification, empty and multi-step transactions, workload rejection,
+  grouped loading, and checkpoint restoration followed by RF2.
+- Default regeneration passes all nine native harness tests.
+- Both harness modes and the COL library pass Clippy with warnings denied;
+  Rust formatting and shell syntax checks pass.
+- A small file-driven RF1/RF2 smoke run verifies deltas and materialized output.
+  It supplies no performance comparison.

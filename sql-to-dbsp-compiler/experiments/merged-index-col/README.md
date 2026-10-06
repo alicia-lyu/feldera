@@ -38,6 +38,11 @@ Subsequent RF1/RF2 insert or delete complete groups under referential integrity.
 General replacements, key moves, orphan lines, and Customer updates are deferred.
 The [Q3 experiment](../q3-ivm-baseline/README.md) documents generation and execution.
 
+`joined_orders_after` reconstructs `B⁺` on the fly for distinct order keys in
+`ΔL`: it seeks the Customer and Order in the after snapshot, combines their
+payloads, and multiplies their signed weights. Customer placement comes from
+the current Orders delta. No accumulated `B` relation is stored.
+
 Readers copy only requested accumulated rows into transient native indexed batches.
 `SpineSnapshot` shares references to the original source batches, and native
 sorting/consolidated cursors preserve the generated key/value order and signed

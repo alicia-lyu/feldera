@@ -519,10 +519,10 @@ device read events measure realized traffic. Test beyond-memory state with both 
 and scattered updates, including
 large descendant ranges.
 
-The design sources specify weighted reconstruction semantics; implementation correctness, recovery, and
-the I/O improvement remain to be established. First verify reconstructed integrator outputs and IVM deltas
-against independent evaluation, then verify snapshot and scheduling behavior, and finally measure total
-maintenance cost.
+The RF1/RF2 prototype verifies reconstructed reads, IVM deltas, and materialized output against
+independent evaluation, including native checkpoint restoration at a completed transaction boundary.
+Broader update correctness, coordinated recovery across circuits, and the I/O improvement remain to be
+established. Extend those checks before measuring beyond-memory total maintenance cost.
 [Evidence and measurements bound the claim](support.md#evidence-and-measurements-bound-the-claim) gives the
 source provenance and implementation acceptance criteria.
 
@@ -546,7 +546,7 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    semantics, and existing snapshot, fetch, and cursor behavior at the inspected revision.
    They record compatibility gaps with the [native storage substrate](phase-4-implementation-note.md).
 3. **R3 — Direct reconstruction.** The [implementation contract](r3-rf1-rf2-reconstruction-implementation-plan.md)
-   selects an opt-in compiler path for the four generated reads. The RF1/RF2 prototype
+   implements an opt-in compiler path for the four generated reads. The RF1/RF2 prototype
    manually maintains the COL index before Q3 consumes logical deltas. Orders records in
    the same delta batch supply customer placement; initial loading keeps complete order/line
    groups together under referential integrity. Replaced historical join traces are omitted;

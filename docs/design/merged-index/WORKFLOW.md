@@ -15,6 +15,51 @@ The local graph captures and raw logs are in the repository’s
 original measurements in the results note. Commands below use configurable
 paths and fresh output directories.
 
+## Reconstructed RF1/RF2 prototype
+
+The experiment also has an opt-in reconstruction path. It is limited to
+subsequent RF1/RF2 refreshes after initial state setup. The native path remains
+the default and is generated and run with `./generate.sh` and default Cargo
+features. The reconstructed path requires both the compiler option and Cargo
+feature:
+
+```bash
+# From sql-to-dbsp-compiler/experiments/q3-ivm-baseline
+./generate.sh --q3-merged-index
+cargo +1.96.1 build --release --offline -j2 --features merged-index
+```
+
+Run the resulting executable with the same base and refresh file arguments
+shown below. Initial loading builds the reference relations and merged index;
+it is not part of the native-versus-reconstructed RF1/RF2 comparison. In this
+mode Customers are loaded initially, then complete Order and Lineitem groups
+are loaded together. The supported measured changes are RF1 insertion and RF2
+deletion under referential integrity. Replacements, key moves, orphan rows,
+and independent Lineitem changes are outside the prototype workload.
+
+The manual merged-index owner runs on a DBSP auxiliary thread outside the Q3
+circuit graph. For each refresh, it captures the previous snapshot, applies
+physical signed index rows, waits for insertion, then publishes previous and
+current snapshots to Q3 before logical deltas are submitted. Customer placement
+for changed orders comes from complete Orders records in that same delta batch;
+no persistent order-to-customer lookup is maintained. Snapshot views stay
+published through the Q3 transaction and are released after its consumers
+finish.
+
+Reconstruction decodes and copies only requested matching key ranges into
+temporary native batches, which the existing joins consume. This materializing
+copy path is suboptimal: it adds decoding, copying, and possible sorting to Q3
+maintenance. Those costs are included in `q3_ms`. A direct reconstructed cursor
+could avoid the temporary batches and is a future optimization. The current
+prototype makes no performance-gain or hard-memory-cap claim.
+
+For each measured RF1/RF2 refresh, report `index_ms`, `q3_ms`, and
+`combined_maintenance_ms` from the reconstructed run. Keep input preparation,
+including RF2 discovery, separate. Initial load is setup, not comparison data.
+The checkpoint test saves and restores Q3 and the manual index at a completed
+transaction boundary; circuit stacking and cross-circuit checkpoint
+coordination remain future work.
+
 ## Worker policy
 
 All future IVM maintenance runs use one DBSP worker (`--workers 1`), including

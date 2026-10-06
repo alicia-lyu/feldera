@@ -2762,6 +2762,15 @@ pub struct CheckpointCommitter {
 }
 
 impl CheckpointCommitter {
+    /// Returns the UUID of the prepared checkpoint.
+    ///
+    /// An external state owner can save its native trace in this checkpoint's
+    /// directory before [`Self::commit`] collects the checkpoint's batch-file
+    /// dependencies. The owner must commit its own files before this commit.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
     /// Executes the first phase of checkpoint commit.
     ///
     /// Committing a checkpoint ensures that its data is on stable storage.  It

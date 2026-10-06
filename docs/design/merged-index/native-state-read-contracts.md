@@ -382,6 +382,14 @@ only during initial loading, before any Orders are loaded. RF1/RF2 change only
 complete order/line groups. Referential integrity is assumed; orphan lines,
 customer updates, replacements, and key moves are outside this prototype.
 
+`B⁺` is reconstructed by joining Orders and Customer on the fly. For each
+distinct order key requested by `ΔL`, the reader obtains customer placement from
+the current Orders delta, seeks that Customer and Order in the after snapshot,
+combines their payloads, and multiplies their signed weights. It emits the exact
+`B` projection keyed by order ID; no accumulated `B` relation is maintained.
+The current reader repeats Customer seeks for different requested orders sharing
+a customer. Reusing those reads is another future optimization.
+
 The supplied-state join retains transaction delta collection and `JoinTrace`,
 including its flush barrier and signed-delta equations. It omits the four
 independent historical join traces. At that barrier, readers decode and copy only

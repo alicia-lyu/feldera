@@ -40,6 +40,21 @@ explains the generated R1 program. The [native-baseline plan](range-aligned-ivm-
 superseded earlier circuit prescriptions on 2026-10-01; R2 now records the verified bindings.
 Verified storage evidence remains unchanged.
 
+The R3 executable prototype implements those bindings for subsequent RF1/RF2
+maintenance. Its harness owns and manually updates the merged index on a DBSP
+auxiliary thread, outside the Q3 graph. It publishes immutable previous/current
+index snapshots and the current batch's complete Orders placement records
+before Q3 consumes logical deltas. The supported workload assumes referential
+integrity, initial Customer loading, and complete Order-plus-Lineitem groups;
+replacements, key moves, orphan rows, and independent Lineitem changes are not
+covered. The prototype copies and decodes only requested ranges into temporary
+native batches. This is suboptimal; decoding, copying, and possible sorting are
+charged to Q3 maintenance. A direct reconstructed cursor is a future
+optimization. Circuit stacking and coordinated checkpoints across circuits
+are deferred; the prototype checkpoint test covers restore at a completed
+transaction boundary only. See the
+[experiment workflow](WORKFLOW.md#reconstructed-rf1rf2-prototype).
+
 ## Storage differences from RocksDB
 
 > [!NOTE]
@@ -933,8 +948,9 @@ reported separately. It implements no merged-index access, extension producer, r
 or residual Q3 execution. The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
 records native evidence; it makes no performance-gain claim.
 
-The design sources specify the intended semantics. The following later-integration checks are implementation acceptance
-criteria; this report does not claim they have been met.
+The design sources specify the intended semantics. R3 implements a restricted
+single-worker RF1/RF2 prototype; the following broader integration checks remain
+acceptance criteria beyond that prototype.
 
 | Acceptance question | Required evidence |
 | --- | --- |

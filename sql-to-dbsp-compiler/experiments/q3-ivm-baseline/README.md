@@ -24,7 +24,8 @@ baseline comparisons, native execution, and the agent-added report formatting.
 The concrete Customer–Orders–Lineitem codecs and storage fixture are also
 available as a reusable standalone library in
 [`merged-index-col`](../merged-index-col/src/lib.rs). This baseline does not
-instantiate that library; Q3 runtime integration remains deferred.
+instantiate that library on its default path. The opt-in `merged-index`
+feature runs the RF1/RF2 reconstruction prototype described below.
 
 Use the repository's pinned Calcite build and Java 21 as described in the
 [compiler README](../../README.md). From this directory, regenerate the Rust
@@ -45,6 +46,41 @@ Run the deterministic native transactions with:
 ```sh
 cargo test --offline
 ```
+
+The native path is the default: use `./generate.sh` and Cargo without the
+`merged-index` feature. To generate and build the reconstructed path, use:
+
+```sh
+./generate.sh --q3-merged-index
+cargo build --offline --features merged-index
+cargo +1.96.1 test --offline --features merged-index
+```
+
+The generated compiler option and Cargo feature must be enabled together. Run
+the executable with the same input arguments as the native command. Initial
+loading prepares the base relations and merged index; it is setup, not part of
+the RF1/RF2 comparison. The reconstructed mode loads Customers initially,
+then keeps complete Order and Lineitem groups together. Its measured workload
+is limited to RF1 insertion and RF2 deletion under referential integrity.
+Replacements, key moves, orphan rows, and independent Lineitem changes are
+unsupported.
+
+The harness maintains the merged index manually on a DBSP auxiliary thread
+outside the Q3 graph. Before each logical refresh, it captures the previous
+index snapshot, appends physical signed changes, waits for insertion, and
+publishes previous and current snapshots to Q3. The temporary order-to-customer
+map is built from complete Orders records in that refresh's delta. No persistent
+lookup is kept. Views remain published until Q3 finishes the transaction.
+
+Reconstruction reads only requested matching key ranges, decodes their rows,
+and copies them into temporary native batches for the existing joins. This
+copying path is suboptimal: decoding, copying, and possible sorting are charged
+to `q3_ms`. A direct reconstructed cursor is a future optimization. Report
+`index_ms`, `q3_ms`, and `combined_maintenance_ms` for each RF1/RF2 refresh;
+input preparation and RF2 discovery remain separate. The prototype makes no
+performance-gain or hard-memory-cap claim. Its checkpoint test covers save and
+restore at a completed transaction boundary; circuit stacking and coordinated
+cross-circuit checkpoints are deferred.
 
 For a local dbgen run, supply exact paths to complete base files and one
 refresh batch. For example, after setting `TPCH_DATA` to a dbgen output
