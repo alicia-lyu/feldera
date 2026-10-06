@@ -862,6 +862,86 @@ impl<I1> Stream<RootCircuit, I1>
 where
     I1: IndexedZSet,
 {
+    /// Incrementally joins two delta streams using caller-supplied snapshots of
+    /// their opposite accumulated states. The readers run once the corresponding
+    /// complete delta has been collected. The left reader must return right state
+    /// after the current update; the right reader must return left state before it.
+    ///
+    /// Unlike [`Self::dyn_join_generic`], this operator retains no historical
+    /// traces of either input. The caller is responsible for keeping the state
+    /// behind each returned snapshot valid through the join's flush.
+    #[track_caller]
+    pub fn dyn_join_generic_with_snapshot_readers<I2, Z>(
+        &self,
+        factories: &JoinFactories<I1, I2, (), Z>,
+        other: &Stream<RootCircuit, I2>,
+        read_right_current: Box<dyn Fn(&SpineSnapshot<I1>) -> SpineSnapshot<I2>>,
+        read_left_before: Box<dyn Fn(&SpineSnapshot<I2>) -> SpineSnapshot<I1>>,
+        join_funcs: TraceJoinFuncs<I1::Key, I1::Val, I2::Val, Z::Key, Z::Val>,
+    ) -> Stream<RootCircuit, Z>
+    where
+        I2: IndexedZSet<Key = I1::Key>,
+        Z: IndexedZSet,
+    {
+        self.circuit().region("join_with_snapshot_readers", || {
+            let left_delta = self
+                .dyn_shard_accumulate(&factories.left_factories)
+                .into_enabled_stream();
+            let right_delta = other
+                .dyn_shard_accumulate(&factories.right_factories)
+                .into_enabled_stream();
+
+            // JoinTrace invokes each reader at flush. These empty inputs keep
+            // its binary scheduling while avoiding any retained state stream.
+            let right_factories = factories.right_factories.clone();
+            let right_state = left_delta.apply_named("Empty right state", move |_| {
+                SpineSnapshot::new(right_factories.clone())
+            });
+            let left_factories = factories.left_factories.clone();
+            let left_state = right_delta.apply_named("Empty left state", move |_| {
+                SpineSnapshot::new(left_factories.clone())
+            });
+
+            let left = self.circuit().add_binary_operator(
+                StreamingBinaryWrapper::new(
+                    JoinTrace::new(
+                        &factories.right_trace_factories,
+                        &factories.output_factories,
+                        factories.timed_item_factory,
+                        factories.timed_items_factory,
+                        false,
+                        join_funcs.left,
+                        Location::caller(),
+                        self.circuit().clone(),
+                    )
+                    .with_snapshot_reader(read_right_current),
+                ),
+                &left_delta,
+                &right_state,
+            );
+
+            let right = self.circuit().add_binary_operator(
+                StreamingBinaryWrapper::new(
+                    JoinTrace::new(
+                        &factories.left_trace_factories,
+                        &factories.output_factories,
+                        factories.timed_item_factory,
+                        factories.timed_items_factory,
+                        false,
+                        join_funcs.right,
+                        Location::caller(),
+                        self.circuit().clone(),
+                    )
+                    .with_snapshot_reader(read_left_before),
+                ),
+                &right_delta,
+                &left_state,
+            );
+
+            left.plus(&right)
+        })
+    }
+
     #[track_caller]
     pub fn dyn_join_generic_balanced<I2, Z>(
         &self,
@@ -1293,6 +1373,7 @@ where
             Z::Val,
         >,
     >,
+    snapshot_reader: Option<Box<dyn Fn(&SpineSnapshot<I::Batch>) -> SpineSnapshot<B>>>,
     location: &'static Location<'static>,
     delta: RefCell<Option<SpineSnapshot<I::Batch>>>,
     flush: Cell<bool>,
@@ -1344,6 +1425,7 @@ where
             saturate,
             clock,
             join_func: RefCell::new(join_func),
+            snapshot_reader: None,
             location,
             delta: RefCell::new(None),
             flush: Cell::new(false),
@@ -1353,6 +1435,14 @@ where
             stats: RefCell::new(JoinStats::new()),
             _types: PhantomData,
         }
+    }
+
+    fn with_snapshot_reader(
+        mut self,
+        reader: Box<dyn Fn(&SpineSnapshot<I::Batch>) -> SpineSnapshot<B>>,
+    ) -> Self {
+        self.snapshot_reader = Some(reader);
+        self
     }
 }
 
@@ -1651,7 +1741,10 @@ where
             }
 
             let delta = self.delta.borrow_mut().take().expect("no input delta provided before flush");
-            let trace = trace.unwrap();
+            let trace = match &self.snapshot_reader {
+                Some(reader) => reader(&delta),
+                None => trace.unwrap(),
+            };
 
             self.empty_input.set(delta.is_empty());
             self.empty_output.set(true);
@@ -2049,6 +2142,74 @@ pub(crate) mod test {
         zset,
     };
     use std::vec;
+
+    #[cfg(feature = "backend-mode")]
+    #[test]
+    fn supplied_snapshot_join_matches_native_signed_updates() {
+        use crate::{
+            trace::BatchReaderFactories, typed_batch::SpineSnapshot as TypedSpineSnapshot,
+        };
+        use std::sync::{Arc, Mutex};
+
+        fn snapshot(
+            batch: OrdIndexedZSet<u64, u64>,
+        ) -> TypedSpineSnapshot<OrdIndexedZSet<u64, u64>> {
+            let factories = BatchReaderFactories::new::<u64, u64, ZWeight>();
+            TypedBatch::new(crate::trace::SpineSnapshot::with_batches(
+                &factories,
+                vec![Arc::new(batch.into_inner())],
+            ))
+        }
+
+        let empty = snapshot(indexed_zset! {});
+        let right_current = Arc::new(Mutex::new(empty.clone()));
+        let left_before = Arc::new(Mutex::new(empty));
+        let right_reader = right_current.clone();
+        let left_reader = left_before.clone();
+
+        let (mut circuit, (left_input, right_input, supplied, native)) =
+            Runtime::init_circuit(CircuitConfig::from(1), move |circuit| {
+                let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                let supplied = left
+                    .join_with_snapshot_readers(
+                        &right,
+                        move |_| right_reader.lock().unwrap().clone(),
+                        move |_| left_reader.lock().unwrap().clone(),
+                        |key, left, right| Tup2(*key, Tup2(*left, *right)),
+                    )
+                    .accumulate_output();
+                let native = left
+                    .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                    .accumulate_output();
+                Ok((left_input, right_input, supplied, native))
+            })
+            .unwrap();
+
+        *right_current.lock().unwrap() = snapshot(indexed_zset! {1 => {3 => 1}});
+        left_input.append(&mut vec![Tup2(1, Tup2(2, 1))]);
+        right_input.append(&mut vec![Tup2(1, Tup2(3, 1))]);
+        circuit.transaction().unwrap();
+        assert_eq!(
+            supplied.concat().consolidate(),
+            native.concat().consolidate()
+        );
+
+        *left_before.lock().unwrap() = snapshot(indexed_zset! {1 => {2 => 1}});
+        *right_current.lock().unwrap() = snapshot(indexed_zset! {1 => {3 => 2}});
+        circuit.start_transaction().unwrap();
+        left_input.append(&mut vec![Tup2(1, Tup2(2, -1))]);
+        circuit.step().unwrap();
+        right_input.append(&mut vec![Tup2(1, Tup2(3, 1))]);
+        circuit.step().unwrap();
+        circuit.commit_transaction().unwrap();
+        assert_eq!(
+            supplied.concat().consolidate(),
+            native.concat().consolidate()
+        );
+
+        circuit.kill().unwrap();
+    }
 
     fn do_join_test(workers: usize, transaction: bool, balanced: bool) {
         let mut input1 = vec![

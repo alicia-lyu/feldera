@@ -43,6 +43,7 @@ use crate::{
         time_series::OrdPartitionedOverStream,
     },
     trace::BatchReaderFactories,
+    typed_batch::{SpineSnapshot, TypedBatch},
     utils::Tup2,
 };
 
@@ -151,6 +152,47 @@ where
 
         self.inner()
             .dyn_join_mono(&join_factories, &other.inner(), join_funcs)
+            .typed()
+    }
+
+    /// Joins deltas using reconstructed accumulated state supplied by readers.
+    /// `read_right_current` sees the complete left delta and returns right state
+    /// after this update. `read_left_before` sees the complete right delta and
+    /// returns left state before this update.
+    #[track_caller]
+    pub fn join_with_snapshot_readers<F, V2, OV, RR, RL>(
+        &self,
+        other: &Stream<RootCircuit, OrdIndexedZSet<K, V2>>,
+        read_right_current: RR,
+        read_left_before: RL,
+        join: F,
+    ) -> Stream<RootCircuit, OrdZSet<OV>>
+    where
+        V2: DBData,
+        OV: DBData,
+        RR: Fn(&SpineSnapshot<OrdIndexedZSet<K, V>>) -> SpineSnapshot<OrdIndexedZSet<K, V2>>
+            + 'static,
+        RL: Fn(&SpineSnapshot<OrdIndexedZSet<K, V2>>) -> SpineSnapshot<OrdIndexedZSet<K, V>>
+            + 'static,
+        F: Fn(&K, &V, &V2) -> OV + Clone + 'static,
+    {
+        let join_funcs =
+            mk_trace_join_funcs::<OrdIndexedZSet<K, V>, OrdIndexedZSet<K, V2>, OrdZSet<OV>, _>(
+                join,
+            );
+        let join_factories = JoinFactories::new::<K, V, V2, OV, ()>();
+        self.inner()
+            .dyn_join_generic_with_snapshot_readers(
+                &join_factories,
+                &other.inner(),
+                Box::new(move |delta| {
+                    read_right_current(&TypedBatch::new(delta.clone())).into_inner()
+                }),
+                Box::new(move |delta| {
+                    read_left_before(&TypedBatch::new(delta.clone())).into_inner()
+                }),
+                join_funcs,
+            )
             .typed()
     }
 
@@ -450,6 +492,49 @@ where
 
         self.inner()
             .dyn_join_index_mono(&join_factories, &other.inner(), join_funcs)
+            .typed()
+    }
+
+    /// Indexed-output variant of [`Self::join_with_snapshot_readers`].
+    #[track_caller]
+    pub fn join_index_with_snapshot_readers<F, V2, OK, OV, It, RR, RL>(
+        &self,
+        other: &Stream<RootCircuit, OrdIndexedZSet<K, V2>>,
+        read_right_current: RR,
+        read_left_before: RL,
+        join: F,
+    ) -> Stream<RootCircuit, OrdIndexedZSet<OK, OV>>
+    where
+        V2: DBData,
+        OK: DBData,
+        OV: DBData,
+        RR: Fn(&SpineSnapshot<OrdIndexedZSet<K, V>>) -> SpineSnapshot<OrdIndexedZSet<K, V2>>
+            + 'static,
+        RL: Fn(&SpineSnapshot<OrdIndexedZSet<K, V2>>) -> SpineSnapshot<OrdIndexedZSet<K, V>>
+            + 'static,
+        F: Fn(&K, &V, &V2) -> It + Clone + 'static,
+        It: IntoIterator<Item = (OK, OV)> + 'static,
+    {
+        let join_funcs = mk_trace_join_generic_funcs::<
+            OrdIndexedZSet<K, V>,
+            OrdIndexedZSet<K, V2>,
+            OrdIndexedZSet<OK, OV>,
+            _,
+            _,
+        >(join);
+        let join_factories = JoinFactories::new::<K, V, V2, OK, OV>();
+        self.inner()
+            .dyn_join_generic_with_snapshot_readers(
+                &join_factories,
+                &other.inner(),
+                Box::new(move |delta| {
+                    read_right_current(&TypedBatch::new(delta.clone())).into_inner()
+                }),
+                Box::new(move |delta| {
+                    read_left_before(&TypedBatch::new(delta.clone())).into_inner()
+                }),
+                join_funcs,
+            )
             .typed()
     }
 
