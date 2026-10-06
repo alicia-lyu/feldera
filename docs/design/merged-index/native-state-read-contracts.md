@@ -113,6 +113,16 @@ the four accumulated join-read bindings above.
 All four bindings use the same `JoinTrace` implementation with their respective
 types and current or delayed trace.
 
+### Weird Feldera naming: flush
+
+> [!NOTE]
+> **Glossary — weird Feldera naming**
+>
+> **`Operator::flush`** — The scheduler's notification to finish processing a
+> transaction's inputs and emit remaining outputs. For `JoinTrace`, this
+> coordinates delta processing with snapshots of the required before/after
+> accumulated states. The name does not mean a memory-to-storage flush.
+
 `Operator::flush` means **finish processing the current transaction's inputs
 and emit the remaining outputs**. The
 [scheduler](../../../crates/dbsp/src/circuit/schedule.rs#L219)
@@ -128,6 +138,39 @@ notification, the next evaluation returns that Spine and replaces it with an
 empty one. The returned delta is one logical collection, which may still
 contain multiple memory-backed or file-backed batches. The retained historical
 trace is a separate collection and can likewise span multiple batches and files.
+
+### Why this join waits for complete inputs
+
+The [scheduler](../../../crates/dbsp/src/circuit/schedule.rs#L216) permits
+operators to process inputs before transaction completion; some operators
+accumulate them for later processing. The wait described here belongs to the
+existing accumulated-trace join, not a requirement that every downstream
+operator defer every tuple.
+
+The generated first join computes `ΔB = ΔO ⋈ C⁺ + O⁻ ⋈ ΔC`. The `ΔO` branch
+requires the complete current `C⁺`, including all Customer changes in the
+transaction. Tuple delivery alone does not establish that this state is ready.
+For example, start with empty Orders and Customer and insert a matching order
+and customer in the same transaction. If the order delta were processed against
+the Customer trace before the customer insertion, it would produce no pair.
+The other branch uses empty `O⁻`, so it would not recover that missing pair.
+The existing branch wiring therefore waits for input completion before reading
+its required accumulated state.
+
+In this implementation, **transaction completion notifications and snapshot
+reads are coupled**: after predecessor outputs are complete, `JoinTrace`
+snapshots the trace supplied to its branch and uses it with the transaction
+delta. The
+[current branch](../../../crates/dbsp/src/operator/dynamic/join.rs#L714)
+receives the accumulated trace including current updates; the
+[before-state branch](../../../crates/dbsp/src/operator/dynamic/join.rs#L731)
+receives the delayed prior trace. `flush()` does not itself take a sequential
+pair of snapshots before and after appending the delta. The
+[delayed-trace wiring](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L773)
+provides the before state. This coordination controls logical visibility,
+not batch placement, storage writes, or compaction.
+
+### Snapshot, fetch, and cursor operations
 
 The following operations are confirmed in the inspected source:
 

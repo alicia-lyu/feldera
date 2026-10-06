@@ -237,6 +237,11 @@ storage:
 >
 > **Trace** — Feldera's name for its interface to retained, weighted state. The name appears in its code;
 > this design does not require provenance from a particular research system.
+>
+> **`Operator::flush`** — A weird Feldera naming choice: finish processing the transaction's
+> inputs and emit remaining outputs. In the native join, it coordinates complete delta inputs
+> with before/after trace snapshots; it does not mean a memory-to-storage flush. See the
+> [naming note and join example](native-state-read-contracts.md#weird-feldera-naming-flush).
 
 For a join keyed by customer ID, `K` is that ID and each `V` can be a complete order tuple. Each file-backed
 batch indexes keys and nested value groups. The format calls these levels **columns**. The outer level is ordered by

@@ -95,6 +95,10 @@ memory batches or files; `flush` does not consolidate it into a single batch
 or request a storage write. Snapshots can retain memory-backed and file-backed
 batches without requiring a spill; see the
 [R2 snapshot contract](../../../docs/design/merged-index/native-state-read-contracts.md#existing-snapshot-fetch-and-cursor-behavior).
+The [naming note and join example](../../../docs/design/merged-index/native-state-read-contracts.md#weird-feldera-naming-flush)
+explain why `JoinTrace` couples this notification with its accumulated-state
+snapshot reads: the current trace must include the transaction's complete
+updates, while the other branch receives the delayed prior trace.
 `AccumulateDelayTrace` snapshots an already-maintained trace; it does
 not create or update the historical integral. The join's historical keyed
 traces are built in `shard_accumulate_trace` regions, while Catalog's retained
