@@ -70,8 +70,9 @@ wires the two branches as cited above, and [adds their outputs](../../../crates/
 The [delayed-trace accessor](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L773)
 uses the cached prior-cycle trace; its
 [snapshot operator](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L1416)
-captures that trace on initialization or flush. A delayed snapshot is a read
-of existing accumulation, not a second accumulation of the input.
+captures that trace on initialization or on evaluation after the runtime's
+notification that transaction inputs are complete (`Operator::flush`). A delayed snapshot is a
+read of existing accumulation, not a second accumulation of the input.
 
 The generated `*_balanced` wrappers use ordinary joins when adaptive joins are
 disabled, as in the native baseline: see
@@ -114,9 +115,16 @@ types and current or delayed trace. The following operations are confirmed in
 the inspected source:
 
 1. [JoinTrace::eval](../../../crates/dbsp/src/operator/dynamic/join.rs#L1633)
-   takes a read-only snapshot of an arriving delta, buffers it until flush,
-   and takes the supplied accumulated trace's snapshot at flush. That trace's
-   wiring determines whether it represents the before or after state.
+   takes a read-only snapshot of an arriving delta and retains it until
+   [Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)
+   notifies the operator that all predecessors have produced their outputs
+   for the current transaction. The
+   [join's notification handler](../../../crates/dbsp/src/operator/dynamic/join.rs#L1454)
+   sets a flag; the following evaluation snapshots the supplied accumulated
+   trace and processes the retained delta. That trace's wiring determines
+   whether it represents the before or after state. Here `flush` denotes
+   transaction readiness, not a memory-limit flush to storage or a prerequisite
+   for taking a snapshot.
 2. [WithSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L23)
    defines read-only, non-merging snapshots. A
    [SpineSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L55)
@@ -124,8 +132,14 @@ the inspected source:
    [Spine](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L170)
    obtains batch references. Its
    [cursor](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L213)
-   retains cloned batch references. Reading that view does not append updates
-   or merge its batches.
+   retains cloned batch references. Both memory-backed and file-backed batches
+   can be retained; snapshot acquisition does not require spilling in-memory
+   batches. The existing
+   [storage test](../../../crates/dbsp/src/trace/merged_index/storage_tests.rs#L216)
+   preserves a memory-backed snapshot across compaction and later checks a
+   [snapshot containing both batch locations](../../../crates/dbsp/src/trace/merged_index/storage_tests.rs#L321).
+   Reading that view does not append updates or merge its batches. These
+   snapshot and notification operations do not define a memory-limit policy.
 3. When `fetch_join == Some(true)`, the join invokes
    [trace.fetch(&delta)](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661).
    [SpineSnapshot::fetch](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L252)

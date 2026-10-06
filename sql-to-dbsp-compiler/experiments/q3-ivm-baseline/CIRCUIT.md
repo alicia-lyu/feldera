@@ -86,8 +86,14 @@ presentation only.
 | `[S]` | Other state, including delta-batch accumulators, trace append components, and other stateful components. |
 | `[U]` | Runtime operator name is not classified by the table. |
 
-Runtime `Accumulator` coalesces deltas within a clock cycle and resets at
-flush. `AccumulateDelayTrace` snapshots an already-maintained trace; it does
+Runtime `Accumulator` coalesces deltas within a clock cycle and resets when
+processing inputs after the runtime's notification that transaction inputs are complete
+([Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)).
+Here `flush` is a transaction-scheduling notification, not a memory-limit
+flush to storage. Snapshots can retain memory-backed and file-backed batches
+without requiring a spill; see the
+[R2 snapshot contract](../../../docs/design/merged-index/native-state-read-contracts.md#existing-snapshot-fetch-and-cursor-behavior).
+`AccumulateDelayTrace` snapshots an already-maintained trace; it does
 not create or update the historical integral. The join's historical keyed
 traces are built in `shard_accumulate_trace` regions, while Catalog's retained
 `V` uses `shard_accumulate_integrate_trace`. The blue integrator highlight is
