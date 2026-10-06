@@ -1,6 +1,8 @@
 mod data;
 #[cfg(feature = "merged-index")]
 mod reconstruction;
+#[cfg(test)]
+mod verification;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -24,7 +26,7 @@ use reconstruction::ManualIndex;
 use serde_json::{json, Value};
 use size_of::SizeOf;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
 struct Joined {
     customer_key: i64,
     segment: String,
@@ -120,7 +122,7 @@ impl Reference {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Change {
     customers: Vec<(Customer, bool)>,
     orders: Vec<(Order, bool)>,
