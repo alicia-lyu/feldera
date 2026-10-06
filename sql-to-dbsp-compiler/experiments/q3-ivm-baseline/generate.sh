@@ -7,9 +7,18 @@ if [[ -n "${JAVA_HOME:-}" ]]; then
   export PATH="${JAVA_HOME}/bin:${PATH}"
 fi
 
-"${compiler}" "${experiment_dir}/query.sql" -i \
-  --plan "${experiment_dir}/plan.json" \
+compiler_args=(
+  --plan "${experiment_dir}/plan.json"
   -o "${experiment_dir}/src/lib.rs"
+)
+if [[ "${1:-}" == "--q3-merged-index" && "$#" -eq 1 ]]; then
+  compiler_args+=("--q3-merged-index")
+elif [[ "$#" -ne 0 ]]; then
+  echo "usage: $0 [--q3-merged-index]" >&2
+  exit 2
+fi
+
+"${compiler}" "${experiment_dir}/query.sql" -i "${compiler_args[@]}"
 
 perl -pi -e 's/[ \t]+$//' "${experiment_dir}/src/lib.rs"
 # The compiler emits redundant conversions and dereferences in generated Rust.

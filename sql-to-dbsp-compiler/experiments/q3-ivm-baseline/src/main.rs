@@ -1,4 +1,6 @@
 mod data;
+#[cfg(feature = "merged-index")]
+mod reconstruction;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -15,6 +17,10 @@ use dbsp::circuit::{
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
 use dbsp_adapters::{CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
+#[cfg(feature = "merged-index")]
+use merged_index_col::q3::Q3State;
+#[cfg(feature = "merged-index")]
+use reconstruction::ManualIndex;
 use serde_json::{json, Value};
 use size_of::SizeOf;
 
@@ -91,7 +97,7 @@ impl Joined {
     }
 }
 
-#[derive(Default, SizeOf)]
+#[derive(Clone, Default, SizeOf)]
 struct Reference {
     customers: HashMap<i64, Customer>,
     orders: HashMap<i64, Order>,
@@ -268,6 +274,8 @@ fn difference(
 struct Measurements {
     preparation: Duration,
     native: Duration,
+    #[cfg(feature = "merged-index")]
+    index: Duration,
     transactions: usize,
     rows: usize,
     latencies: Vec<Duration>,
@@ -276,6 +284,13 @@ struct Measurements {
     view_rows: Option<i64>,
 }
 
+#[cfg_attr(
+    feature = "merged-index",
+    expect(
+        clippy::too_many_arguments,
+        reason = "the experiment transaction coordinates circuit and external index owners"
+    )
+)]
 fn transact(
     circuit: &mut dbsp::DBSPHandle,
     catalog: &impl CircuitCatalog,
@@ -284,7 +299,10 @@ fn transact(
     change: Change,
     verify: bool,
     stats: &mut Measurements,
+    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
 ) -> Result<()> {
+    #[cfg(feature = "merged-index")]
+    let (index, q3_state) = reconstruction;
     let before = if verify {
         state.evaluate()
     } else {
@@ -292,11 +310,35 @@ fn transact(
     };
     stats.rows += change.len();
     let preparation_started = Instant::now();
+    #[cfg(feature = "merged-index")]
+    let (placements, index_rows) = reconstruction::prepare(&change, state)?;
+    #[cfg(feature = "merged-index")]
+    {
+        stats.preparation += preparation_started.elapsed();
+    }
+    #[cfg(feature = "merged-index")]
+    {
+        let index_started = Instant::now();
+        let (before_index, after_index) = index.append(index_rows)?;
+        stats.index += index_started.elapsed();
+        let publish_started = Instant::now();
+        q3_state
+            .publish(before_index, after_index, placements)
+            .map_err(anyhow::Error::msg)?;
+        stats.preparation += publish_started.elapsed();
+    }
+    #[cfg(feature = "merged-index")]
+    let preparation_started = Instant::now();
     change.apply(state, input)?;
     stats.preparation += preparation_started.elapsed();
     let native_started = Instant::now();
-    circuit.transaction()?;
+    let transaction_result = circuit.transaction();
     let latency = native_started.elapsed();
+    #[cfg(feature = "merged-index")]
+    let finish_result = q3_state.finish().map_err(anyhow::Error::msg);
+    transaction_result?;
+    #[cfg(feature = "merged-index")]
+    finish_result?;
     stats.native += latency;
     stats.latencies.push(latency);
     stats.transactions += 1;
@@ -490,6 +532,10 @@ impl Config {
         if config.workers == 0 || config.batch == 0 || config.runs == 0 {
             bail!("workers, batch, and runs must be positive");
         }
+        #[cfg(feature = "merged-index")]
+        if config.workers != 1 {
+            bail!("merged-index reconstruction supports exactly one worker");
+        }
         if config.rf1_orders.is_some() != config.rf1_lines.is_some() {
             bail!("RF1 orders and lines must be provided together");
         }
@@ -635,6 +681,7 @@ fn dump_runtime_circuit(circuit: &mut dbsp::DBSPHandle, directory: &Path) -> Res
 }
 
 fn run(config: &Config, run_number: usize) -> Result<()> {
+    #[cfg(not(feature = "merged-index"))]
     let started = Instant::now();
     let mut circuit_config = CircuitConfig::with_workers(config.workers);
     if let Some(root) = &config.storage_path {
@@ -653,7 +700,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
         )?));
     }
+    #[cfg(feature = "merged-index")]
+    let q3_state = Q3State::default();
+    #[cfg(feature = "merged-index")]
+    let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config, q3_state.clone())?;
+    #[cfg(not(feature = "merged-index"))]
     let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config)?;
+    #[cfg(feature = "merged-index")]
+    let index = ManualIndex::new(circuit.runtime());
     let mut inputs = Inputs::new(&catalog)?;
     let mut state = Reference::default();
     let mut stats = Measurements::default();
@@ -677,24 +731,41 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         lines: lines.into_iter().map(|row| (row, true)).collect(),
     };
     let load_rows = load.len();
-    // Submit all related records in each transaction; the final partial batch is still stepped.
-    let mut customers = load.customers.into_iter();
-    let mut orders = load.orders.into_iter();
-    let mut lines = load.lines.into_iter();
     stats.preparation += parse_started.elapsed();
-    while customers.len() + orders.len() + lines.len() > 0 {
-        let batch_started = Instant::now();
-        let mut batch = Change::default();
-        for _ in 0..config.batch {
-            if let Some(row) = customers.next() {
-                batch.customers.push(row);
-            } else if let Some(row) = orders.next() {
-                batch.orders.push(row);
-            } else if let Some(row) = lines.next() {
-                batch.lines.push(row);
+    #[cfg(feature = "merged-index")]
+    let batches = reconstruction::grouped_load(load, config.batch)?;
+    #[cfg(not(feature = "merged-index"))]
+    {
+        // Submit all related records in each transaction; the final partial batch is still stepped.
+        let mut customers = load.customers.into_iter();
+        let mut orders = load.orders.into_iter();
+        let mut lines = load.lines.into_iter();
+        while customers.len() + orders.len() + lines.len() > 0 {
+            let batch_started = Instant::now();
+            let mut batch = Change::default();
+            for _ in 0..config.batch {
+                if let Some(row) = customers.next() {
+                    batch.customers.push(row);
+                } else if let Some(row) = orders.next() {
+                    batch.orders.push(row);
+                } else if let Some(row) = lines.next() {
+                    batch.lines.push(row);
+                }
             }
+            stats.preparation += batch_started.elapsed();
+            transact(
+                &mut circuit,
+                &catalog,
+                &mut inputs,
+                &mut state,
+                batch,
+                config.verify,
+                &mut stats,
+            )?;
         }
-        stats.preparation += batch_started.elapsed();
+    }
+    #[cfg(feature = "merged-index")]
+    for batch in batches {
         transact(
             &mut circuit,
             &catalog,
@@ -703,12 +774,19 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             batch,
             config.verify,
             &mut stats,
+            (&index, &q3_state),
         )?;
     }
+    #[cfg(not(feature = "merged-index"))]
     println!("run={run_number} phase=load rows={load_rows} transactions={} delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
         stats.transactions, stats.delta_positive, stats.delta_negative, stats.view_rows, config.verify,
         milliseconds(stats.native), throughput(load_rows, stats.native),
         milliseconds(stats.preparation), milliseconds(started.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&stats.latencies));
+    #[cfg(feature = "merged-index")]
+    println!(
+        "run={run_number} phase=setup rows={load_rows} transactions={} view_rows={:?} verified={}",
+        stats.transactions, stats.view_rows, config.verify
+    );
 
     if let (Some(order_path), Some(line_path)) = (&config.rf1_orders, &config.rf1_lines) {
         let phase = Instant::now();
@@ -732,11 +810,20 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             change,
             config.verify,
             &mut measurement,
+            #[cfg(feature = "merged-index")]
+            (&index, &q3_state),
         )?;
         println!("run={run_number} phase=rf1 rows={count} transactions=1 delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
             measurement.delta_positive, measurement.delta_negative, measurement.view_rows, config.verify,
             milliseconds(measurement.native), throughput(count, measurement.native),
             milliseconds(measurement.preparation), milliseconds(phase.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&measurement.latencies));
+        #[cfg(feature = "merged-index")]
+        println!(
+            "run={run_number} phase=rf1 index_ms={:.3} q3_ms={:.3} combined_maintenance_ms={:.3}",
+            milliseconds(measurement.index),
+            milliseconds(measurement.native),
+            milliseconds(measurement.index + measurement.native)
+        );
     }
     if let Some(path) = &config.rf2 {
         let phase = Instant::now();
@@ -753,11 +840,20 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             change,
             config.verify,
             &mut measurement,
+            #[cfg(feature = "merged-index")]
+            (&index, &q3_state),
         )?;
         println!("run={run_number} phase=rf2 rows={count} transactions=1 delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
             measurement.delta_positive, measurement.delta_negative, measurement.view_rows, config.verify,
             milliseconds(measurement.native), throughput(count, measurement.native),
             milliseconds(measurement.preparation), milliseconds(phase.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&measurement.latencies));
+        #[cfg(feature = "merged-index")]
+        println!(
+            "run={run_number} phase=rf2 index_ms={:.3} q3_ms={:.3} combined_maintenance_ms={:.3}",
+            milliseconds(measurement.index),
+            milliseconds(measurement.native),
+            milliseconds(measurement.index + measurement.native)
+        );
     }
     if let Some(root) = &config.dump_runtime_circuit {
         let directory = root.join(format!("run-{run_number}"));
@@ -825,7 +921,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "merged-index")))]
 mod tests {
     use super::*;
 
@@ -1154,6 +1250,321 @@ mod tests {
             )?;
             assert_eq!(stats.view_rows, Some(1));
         }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "merged-index"))]
+mod reconstructed_tests {
+    use super::*;
+
+    fn customer(key: i64) -> Customer {
+        Customer {
+            key,
+            segment: "BUILDING".to_owned(),
+        }
+    }
+
+    fn order(key: i64, customer_key: i64) -> Order {
+        Order {
+            key,
+            customer_key,
+            date: "1996-01-02".to_owned(),
+            ship_priority: 0,
+        }
+    }
+
+    fn line(order_key: i64, number: i32) -> Line {
+        Line {
+            order_key,
+            number,
+            price_cents: 100,
+            discount_hundredths: 4,
+            ship_date: "1996-03-13".to_owned(),
+        }
+    }
+
+    #[test]
+    fn rf1_rf2_match_full_join() -> Result<()> {
+        let q3_state = Q3State::default();
+        let (mut circuit, catalog) =
+            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
+        let index = ManualIndex::new(circuit.runtime());
+        let mut input = Inputs::new(&catalog)?;
+        let mut state = Reference::default();
+        let mut stats = Measurements::default();
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut state,
+            Change {
+                customers: vec![(customer(2), true), (customer(3), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut state,
+            Change {
+                orders: vec![(order(20, 2), true)],
+                lines: vec![(line(20, 1), true), (line(20, 2), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut state,
+            Change {
+                orders: vec![(order(30, 3), true)],
+                lines: vec![(line(30, 1), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        let keys = HashSet::from([20]);
+        let deletion = rf2_changes(&state, &keys);
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut state,
+            deletion,
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut state,
+            Change::default(),
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        assert_eq!(stats.view_rows, Some(1));
+        assert_eq!(stats.transactions, 5);
+        let profile = circuit.graph_profile()?;
+        let graph = profile.worker_graphs[0].to_json();
+        assert!(!graph.contains("shard_accumulate_trace"));
+        assert!(graph.contains("JoinTrace"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_missing_placement_and_incomplete_rf2() -> Result<()> {
+        let state = Reference::default();
+        let no_order = Change {
+            lines: vec![(line(20, 1), true)],
+            ..Change::default()
+        };
+        assert!(reconstruction::prepare(&no_order, &state).is_err());
+
+        let mut state = Reference::default();
+        state.customers.insert(2, customer(2));
+        state.orders.insert(20, order(20, 2));
+        state.lines.insert((20, 1), line(20, 1));
+        let missing_line = Change {
+            orders: vec![(order(20, 2), false)],
+            ..Change::default()
+        };
+        assert!(reconstruction::prepare(&missing_line, &state).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_load_keeps_oversized_order_and_lines_together() -> Result<()> {
+        let batches = reconstruction::grouped_load(
+            Change {
+                customers: vec![(customer(2), true)],
+                orders: vec![(order(20, 2), true), (order(30, 2), true)],
+                lines: vec![
+                    (line(20, 1), true),
+                    (line(20, 2), true),
+                    (line(30, 1), true),
+                ],
+            },
+            2,
+        )?;
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[1].orders[0].0.key, 20);
+        assert_eq!(batches[1].lines.len(), 2);
+        assert_eq!(batches[2].orders[0].0.key, 30);
+        Ok(())
+    }
+
+    #[test]
+    fn published_views_cover_multiple_transaction_steps() -> Result<()> {
+        let q3_state = Q3State::default();
+        let (mut circuit, catalog) =
+            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
+        let index = ManualIndex::new(circuit.runtime());
+        let mut input = Inputs::new(&catalog)?;
+        let mut reference = Reference::default();
+        let mut stats = Measurements::default();
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut reference,
+            Change {
+                customers: vec![(customer(2), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+
+        let complete = Change {
+            orders: vec![(order(20, 2), true)],
+            lines: vec![(line(20, 1), true), (line(20, 2), true)],
+            ..Change::default()
+        };
+        let before = reference.evaluate();
+        let (placements, rows) = reconstruction::prepare(&complete, &reference)?;
+        let (before_index, after_index) = index.append(rows)?;
+        q3_state
+            .publish(before_index, after_index, placements)
+            .map_err(anyhow::Error::msg)?;
+        circuit.start_transaction()?;
+        Change {
+            orders: complete.orders,
+            ..Change::default()
+        }
+        .apply(&mut reference, &mut input)?;
+        assert!(!circuit.step()?);
+        Change {
+            lines: complete.lines,
+            ..Change::default()
+        }
+        .apply(&mut reference, &mut input)?;
+        assert!(!circuit.step()?);
+        circuit.commit_transaction()?;
+        q3_state.finish().map_err(anyhow::Error::msg)?;
+
+        let output = catalog
+            .output_handles(&SqlIdentifier::from("V"))
+            .context("missing V output")?;
+        let expected = reference.evaluate();
+        assert_eq!(
+            read_output(&*output.delta_handle)?,
+            difference(&before, &expected)
+        );
+        assert_eq!(
+            read_output(
+                &**output
+                    .integrate_handle
+                    .as_ref()
+                    .context("V has no materialized snapshot")?
+            )?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_restores_q3_and_manual_index_at_completed_boundary() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "q3-reconstructed-checkpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path)?;
+        let storage = || StorageConfig {
+            path: path.to_string_lossy().into_owned(),
+            cache: StorageCacheConfig::default(),
+        };
+        let options = || StorageOptions {
+            min_storage_bytes: Some(0),
+            ..StorageOptions::default()
+        };
+        let initial = CircuitConfig::with_workers(1).with_storage(Some(
+            CircuitStorageConfig::for_config(storage(), options())?,
+        ));
+        let q3_state = Q3State::default();
+        let (mut circuit, catalog) = q3_ivm_baseline::circuit(initial, q3_state.clone())?;
+        let index = ManualIndex::new(circuit.runtime());
+        let mut inputs = Inputs::new(&catalog)?;
+        let mut reference = Reference::default();
+        let mut stats = Measurements::default();
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut inputs,
+            &mut reference,
+            Change {
+                customers: vec![(customer(2), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut inputs,
+            &mut reference,
+            Change {
+                orders: vec![(order(20, 2), true), (order(30, 2), true)],
+                lines: vec![(line(20, 1), true), (line(30, 1), true)],
+                ..Change::default()
+            },
+            true,
+            &mut stats,
+            (&index, &q3_state),
+        )?;
+        let restored_reference = reference.clone();
+        let committer = circuit.checkpoint().prepare()?;
+        let checkpoint_id = committer.uuid();
+        index.save(checkpoint_id.to_string().into())?;
+        let publisher = committer.commit()?;
+        publisher.publish()?;
+        drop(inputs);
+        drop(catalog);
+        drop(index);
+        drop(circuit);
+
+        let restored = CircuitConfig::with_workers(1).with_storage(Some(
+            CircuitStorageConfig::for_config(storage(), options())?
+                .with_init_checkpoint(Some(checkpoint_id)),
+        ));
+        let restored_q3 = Q3State::default();
+        let (mut circuit, catalog) = q3_ivm_baseline::circuit(restored, restored_q3.clone())?;
+        let restored_index = ManualIndex::new(circuit.runtime());
+        restored_index.restore(checkpoint_id.to_string().into())?;
+        let mut inputs = Inputs::new(&catalog)?;
+        let mut reference = restored_reference;
+        let mut stats = Measurements::default();
+        let deletion = rf2_changes(&reference, &HashSet::from([20]));
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut inputs,
+            &mut reference,
+            deletion,
+            true,
+            &mut stats,
+            (&restored_index, &restored_q3),
+        )?;
+        assert_eq!(stats.view_rows, Some(1));
         Ok(())
     }
 }

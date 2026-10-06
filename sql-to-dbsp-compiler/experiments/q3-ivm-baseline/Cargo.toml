@@ -6,16 +6,22 @@ publish = false
 
 [workspace]
 
+[features]
+merged-index = ["dep:merged-index-col", "dep:crossbeam", "dep:feldera-storage"]
+
 [dependencies]
 anyhow = "1"
 arcstr = "1"
 compare = "0.1"
+crossbeam = { version = "0.8", optional = true }
 dbsp = { path = "../../../crates/dbsp", features = ["backend-mode"] }
 dbsp_adapters = { path = "../../../crates/adapters", default-features = false }
 derive_more = { version = "1", features = ["add", "not", "from"] }
 erased-serde = "0.3"
 libc = "0.2"
 feldera-sqllib = { path = "../../../crates/sqllib" }
+feldera-storage = { path = "../../../crates/storage", optional = true }
+merged-index-col = { path = "../merged-index-col", optional = true }
 feldera-adapterlib = { path = "../../../crates/adapterlib" }
 feldera-types = { path = "../../../crates/feldera-types" }
 feldera-macros = { path = "../../../crates/feldera-macros" }

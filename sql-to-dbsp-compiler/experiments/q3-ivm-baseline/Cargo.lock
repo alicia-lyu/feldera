@@ -3676,6 +3676,7 @@ dependencies = [
  "base58",
  "base64",
  "blake3",
+ "bytecheck",
  "chrono",
  "chrono-tz",
  "dbsp",
@@ -5134,6 +5135,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "merged-index-col"
+version = "0.1.0"
+dependencies = [
+ "dbsp",
+ "feldera-sqllib",
+ "rkyv",
+]
+
+[[package]]
 name = "metrics"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6148,6 +6158,7 @@ dependencies = [
  "anyhow",
  "arcstr",
  "compare",
+ "crossbeam",
  "dbsp",
  "dbsp_adapters",
  "derive_more 1.0.0",
@@ -6156,8 +6167,10 @@ dependencies = [
  "feldera-macros",
  "feldera-size-of",
  "feldera-sqllib",
+ "feldera-storage",
  "feldera-types",
  "libc",
+ "merged-index-col",
  "paste",
  "rkyv",
  "serde",
