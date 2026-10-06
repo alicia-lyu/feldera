@@ -50,9 +50,11 @@ The expansion comes directly from
 The expanded `stream_join` and `stream_join_index` products are neutral.
 Their compiler classes inherit `IStateful` through `IJoin`, but here they
 multiply the supplied operands rather than introduce another retained
-historical relation. Runtime `JoinTrace` remains other state: it keeps a delta
-snapshot, time-indexed pending outputs, and bookkeeping while reading an
-input trace. Those are separate from historical integration.
+historical relation. In this generated root circuit, runtime `JoinTrace`
+keeps a delta snapshot and bookkeeping while reading an input trace. Records
+have no per-record logical timestamps; old/new snapshots own references to
+immutable batches that supply the before/after relation state. This join work
+is separate from historical integration.
 
 Node IDs and original operator names remain intact.
 

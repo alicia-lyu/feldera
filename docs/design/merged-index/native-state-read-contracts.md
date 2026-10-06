@@ -234,7 +234,7 @@ The following operations are confirmed in the inspected source:
    Reading that view does not append updates or merge its batches. These
    snapshot and notification operations do not define a memory-limit policy.
    For a consolidated read, the
-   [unit-time CursorList](../../../crates/dbsp/src/trace/cursor/cursor_list.rs#L150)
+   [CursorList](../../../crates/dbsp/src/trace/cursor/cursor_list.rs#L150)
    sums contributions for identical key/value pairs across batches and skips
    zero totals.
 3. When `fetch_join == Some(true)`, the join invokes
@@ -247,24 +247,36 @@ The following operations are confirmed in the inspected source:
    [Cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42): ordered
    key/value navigation and borrowed key/value references.
    [JointKeyCursor](../../../crates/dbsp/src/operator/dynamic/join.rs#L1572)
-   coordinates the two input cursors at the key level, enumerating one side's
-   keys and calling `seek_key_exact` on the other. For
+   finds keys shared by the delta and accumulated-state snapshot: it visits
+   keys on one side and seeks the same key on the other. For
    these inner joins, fetched state makes the delta drive; otherwise
    [estimated key counts](../../../crates/dbsp/src/operator/dynamic/join.rs#L1667)
    choose which side drives. Missing keys produce no joined rows. At each
-   matching key, the root-time
-   [JoinTrace loop](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
-   reads `key_valid`/`val_valid`, `key`/`val`, delta `weight` and trace
-   `weight_checked`, enumerates matching value pairs with `step_val`, rewinds
-   trace values with `rewind_vals`, and advances with `step_key`.
-   It multiplies the signed weights and sends resulting tuples to the native
-   batcher for consolidation. Value pairing, weight multiplication, and output
-   construction belong to this loop, not to `JointKeyCursor` or the cursor
-   interface itself.
+   matching key, the
+   [JoinTrace loop for this circuit](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
+   takes each delta value in turn and pairs it with every accumulated-state
+   value under that key. After each delta value, it resets the accumulated-state
+   cursor to the first value under the same key, so the next delta value sees
+   all of them again. After all value pairs, it advances to the next shared key.
+   Each pair supplies the shared key, delta payload, and accumulated-state
+   payload to the generated join function. Each resulting output tuple receives
+   the delta record's signed weight multiplied by the accumulated-state record's
+   consolidated signed weight. The native batcher consolidates identical output
+   tuples. Value pairing, weight multiplication, and output construction belong
+   to this loop; `JointKeyCursor` only coordinates matching keys.
 
-Root-circuit [time is `()`](../../../crates/dbsp/src/time.rs#L214).
-Before/after states describe logical update visibility, not additional runtime
-timestamps or merged-index record versions. Fetch is conditional; a binding
+**The generated Q3 circuit has no per-record logical timestamps.** Old/new
+snapshots own references to immutable batches. Reading and consolidating the
+weighted records in those referenced batches yields the before/after relation
+state; records are not selected by a timestamp or a time-travel request. A
+snapshot can reference memory-backed or file-backed batches.
+
+In the source, the generic time parameter is Rust's unit type `()`, and its
+[batch specialization](../../../crates/dbsp/src/time.rs#L214) uses the ordinary
+batch directly. This is a type-level representation of the absence of
+per-record logical time, not a timestamp stored with each record.
+
+Fetch is conditional; a binding
 does not imply that its delta always drives a selective lookup.
 
 ## Worked signed examples

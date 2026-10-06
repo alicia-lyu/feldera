@@ -125,9 +125,11 @@ layout](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6
 `FallbackIndexedWSet` selects memory or file
 representation
 ([variants](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/fallback/indexed_wset.rs#L34-L58)).
-The **root circuit** has only one timestamp value, `()` in Rust, selecting a batch
-without varying logical time ([timestamp
-mapping](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
+The generated **root circuit** uses ordinary weighted batches without per-record
+logical timestamps ([batch
+specialization](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/time.rs#L214-L219)).
+Old/new snapshots own references to immutable batches; those references determine
+the before/after state read by an operator.
 File indexed batches implement asynchronous key fetching
 ([fetch](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/ord/file/indexed_wset_batch.rs#L447-L478)),
 which joins can use
@@ -238,11 +240,11 @@ into explicitly budgeted storage. The snapshot remains alive until its readers f
 the [cursor navigation contract](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L42-L109)
 and [seek methods](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L197-L245).
 
-With non-unit runtime timestamps the underlying shape is `K → V → (time, weight)` entries; one scalar weight
-requires choosing which times to combine. Feldera provides `map_times` and `map_times_through` for that case
-([time and weight access](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L158-L177)).
-Do not assume time entries are sorted or unique. The merged-index provider separately resolves its source
-contributions to the requested before/after maintenance state before exposing weighted tuples to root operators.
+For this circuit, a read exposes each complete `(K, V)` pair with its consolidated
+signed weight. Before/after visibility comes from the immutable batches referenced
+by the selected snapshot, not from filtering timestamped records. The future
+merged-index provider must reconstruct the requested state before exposing its
+weighted tuples to the join.
 
 The proposed integration substitutes the read side of this contract. Only the storage owner writes source
 updates; reconstructed integrator outputs are not inserted into a fresh trace.
