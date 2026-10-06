@@ -132,12 +132,39 @@ flushing downstream operators. It flushes pending computation downstream;
 it does not request a storage write or consolidation into one batch or file.
 
 For example, the
-[delta accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303)
+[transaction delta collector](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303)
 inserts incoming batches into its transaction Spine. After its `flush`
 notification, the next evaluation returns that Spine and replaces it with an
 empty one. The returned delta is one logical collection, which may still
 contain multiple memory-backed or file-backed batches. The retained historical
 trace is a separate collection and can likewise span multiple batches and files.
+
+### Weird Feldera naming: accumulation
+
+> [!NOTE]
+> **Glossary — weird Feldera naming**
+>
+> **`Accumulator`** — Feldera's name for a **transaction delta collector**.
+> It collects only the current transaction's changes and resets after handing
+> them downstream. It does not maintain the relation's historical integral.
+>
+> **Historical trace accumulation** — Applying successive transaction deltas
+> to retained relation state across transactions, yielding `X⁺ = X⁻ + ΔX`.
+
+**Documentation convention:** avoid “delta accumulator” in explanatory prose;
+use **transaction delta collector** for the native `Accumulator`. Use
+**historical trace accumulation** for the distinct operation that maintains
+accumulated relation state. Keep actual source identifiers unchanged in code
+references.
+
+| Role | Native source | Logical output | Lifetime and reset |
+| --- | --- | --- | --- |
+| Transaction delta collector | [Accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303), used by `dyn_accumulate` and `dyn_shard_accumulate` | The current transaction's `ΔX`, collected from its input batches | Hands off its transaction Spine after `Operator::flush`, then starts with an empty Spine. |
+| Historical trace accumulation | [Trace construction and feedback](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L95) with [AccumulateTraceAppend](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L939) | Accumulated `X⁺`, including `X⁻` and the current `ΔX` | Retains relation state across transactions; transaction completion does not reset it. |
+
+The trace construction uses a transaction delta collector internally before
+appending its output to historical state. Both roles can use a Spine, so the
+collection's representation does not distinguish their temporal scope.
 
 ### Why this join waits for complete inputs
 

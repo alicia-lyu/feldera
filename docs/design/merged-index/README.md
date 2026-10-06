@@ -238,6 +238,11 @@ storage:
 > **Trace** — Feldera's name for its interface to retained, weighted state. The name appears in its code;
 > this design does not require provenance from a particular research system.
 >
+> **`Accumulator`** — Feldera's name for a **transaction delta collector**: collects the
+> current transaction's `ΔX`, hands it downstream, then resets. **Historical trace accumulation**
+> retains relation state across transactions. Avoid “delta accumulator” in explanatory prose;
+> see the [naming distinction](native-state-read-contracts.md#weird-feldera-naming-accumulation).
+>
 > **`Operator::flush`** — A weird Feldera naming choice: finish processing the transaction's
 > inputs and emit remaining outputs. In the native join, it coordinates complete delta inputs
 > with before/after trace snapshots; it does not mean a memory-to-storage flush. See the

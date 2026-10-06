@@ -86,7 +86,7 @@ For subsequent production wiring, substitute only storage of the persistent trac
 produced by `dyn_accumulate_integrate_trace` and its associated
 `accumulate_delay_trace` reads. Redirect every replaced read and stop its independent accumulation. Satisfy native join
 partitioning, batched fetch, cursor, sorting, and batch-construction contracts; keep base
-storage, materialized `V`, and unreplaced state accounted for. Leave `dyn_accumulate` and its delta-accumulation and
+storage, materialized `V`, and unreplaced state accounted for. Leave `dyn_accumulate` and its transaction delta collection and
 delayed-read path unchanged. Transaction integration and production source/operator
 wiring are deferred. Phase 4 needs no custom run format, merger, staging spine, chunk
 limits, storage owner, transaction operators, or point-insertion facade.

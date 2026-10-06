@@ -25,7 +25,7 @@ rekey/project delta batches without integrating history.
 
 At runtime, mark existing `accumulate_integrate_trace` and
 `shard_accumulate_integrate_trace` regions as integrators. `AccumulateDelayTrace` snapshot/delay operators also use integrator-state
-styling. Delta accumulators and trace append components use other-state styling. The renderer must style existing cluster IDs as well
+styling. Transaction delta collectors and trace append components use other-state styling. The renderer must style existing cluster IDs as well
 as existing simple node IDs, preserving all topology and profiling output.
 
 ## Artifact destination

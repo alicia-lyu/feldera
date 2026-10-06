@@ -522,7 +522,7 @@ shared scan sessions remain a deferred optional abstraction.
 
 For later integration, replace only the persistent trace produced by
 `dyn_accumulate_integrate_trace` and its associated `accumulate_delay_trace` reads. Leave
-`dyn_accumulate` and its delta-accumulation/delayed-read path unchanged. Plan operator
+`dyn_accumulate` and its transaction delta collection/delayed-read path unchanged. Plan operator
 read-site wiring, typed reconstruction, and runtime completion/rollback separately.
 Step 2's storage evidence does not establish those integration properties. Each phase should
 leave a short implementation note, focused tests, and any API findings for the next planner.

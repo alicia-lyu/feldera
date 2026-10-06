@@ -87,5 +87,5 @@ These tests demonstrate storage behavior. They do not establish transaction reco
 a hard memory cap, or a performance improvement. Transaction integration and production
 source/operator wiring remain deferred. The eventual substitution target is storage of
 the persistent trace from `dyn_accumulate_integrate_trace` and its associated
-`accumulate_delay_trace` reads. Leave `dyn_accumulate` and its delta-accumulation and
+`accumulate_delay_trace` reads. Leave `dyn_accumulate` and its transaction delta collection and
 delayed-read path unchanged.

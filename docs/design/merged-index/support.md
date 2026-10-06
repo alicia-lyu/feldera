@@ -31,6 +31,9 @@ read bindings, concrete types, runtime snapshot/cursor behavior, and observed pr
 The [weird Feldera naming note](native-state-read-contracts.md#weird-feldera-naming-flush)
 defines `Operator::flush` and explains why the native join waits for complete
 transaction inputs before reading the required state snapshots.
+The [accumulation naming note](native-state-read-contracts.md#weird-feldera-naming-accumulation)
+distinguishes the transaction delta collector (`Accumulator`) from historical
+trace accumulation; explanatory prose uses those distinct terms.
 
 The [native baseline circuit](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
 explains the generated R1 program. The [native-baseline plan](range-aligned-ivm-native-q3-baseline-plan.md)

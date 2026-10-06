@@ -278,7 +278,7 @@ The monitor's [`Graph::to_dot_with_styles`](../../../crates/dbsp/src/monitor/vis
 shares topology traversal with `to_dot()`, whose profiling colours remain
 unchanged. Existing integration-region IDs receive blue `[I]`; the renderer
 adds no integrator nodes. `AccumulateDelayTrace` snapshots also receive integrator-state styling;
-delta-batch accumulators receive other-state styling. Unknown names receive `[U]`; this does not assert they are stateless.
+transaction delta collectors receive other-state styling. Unknown names receive `[U]`; this does not assert they are stateless.
 Raw files survive Graphviz failures, including every worker's DOT and JSON.
 
 ### Metric formulas and precision

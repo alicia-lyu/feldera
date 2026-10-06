@@ -83,13 +83,17 @@ presentation only.
 | Marker | Meaning |
 | --- | --- |
 | `[I]` | Existing `accumulate_integrate_trace` or `shard_accumulate_integrate_trace` region, or `AccumulateDelayTrace`: historical integrator state. |
-| `[S]` | Other state, including delta-batch accumulators, trace append components, and other stateful components. |
+| `[S]` | Other state, including transaction delta collectors, trace append components, and other stateful components. |
 | `[U]` | Runtime operator name is not classified by the table. |
 
-Runtime `Accumulator` collects transaction deltas in a Spine.
+Runtime `Accumulator` is a **transaction delta collector**: it collects the
+current transaction's changes in a Spine. Historical trace accumulation retains
+relation state across transactions. The
+[naming distinction](../../../docs/design/merged-index/native-state-read-contracts.md#weird-feldera-naming-accumulation)
+records these separate roles.
 [Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)
 asks an operator to finish processing that transaction and emit its remaining
-outputs. The accumulator's next evaluation returns its transaction Spine and
+outputs. The collector's next evaluation returns its transaction Spine and
 replaces it with an empty one. The returned Spine can still contain multiple
 memory batches or files; `flush` does not consolidate it into a single batch
 or request a storage write. Snapshots can retain memory-backed and file-backed
@@ -102,12 +106,12 @@ updates, while the other branch receives the delayed prior trace.
 `AccumulateDelayTrace` snapshots an already-maintained trace; it does
 not create or update the historical integral. The join's historical keyed
 traces are built in `shard_accumulate_trace` regions, while Catalog's retained
-`V` uses `shard_accumulate_integrate_trace`. The blue integrator highlight is
+`V` uses `shard_accumulate_integrate_trace`. The blue integrator highlight
 applies to the named integration regions and `AccumulateDelayTrace`
 snapshots. The snapshot represents historical integrator state, although it
 does not itself append new deltas to that state. See the
 [trace builders](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs)
-and [delta accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303).
+and [transaction delta collector](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303).
 
 The local one-worker capture is
 [`worker-0-styled.svg`](../../../target/q3-circuit-exports/runtime-1/run-1/worker-0-styled.svg). The
