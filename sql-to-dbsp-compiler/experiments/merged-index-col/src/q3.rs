@@ -9,7 +9,7 @@
 //! cursor could avoid this materialization and its possible sorting costs.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -39,7 +39,7 @@ pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 struct ReadViews {
     before: SourceSnapshot,
     after: SourceSnapshot,
-    order_customers: BTreeMap<i64, i64>,
+    order_customers: BTreeMap<i64, BTreeSet<i64>>,
 }
 
 /// One externally prepared transaction's read views, shared by the generated joins.
@@ -48,6 +48,9 @@ struct ReadViews {
 /// publication unchanged until `DBSPHandle::transaction` or the equivalent
 /// multi-step commit has completed, then call [`Self::finish`]. The caller must
 /// restore the index, base state, and Q3 at the same completed transaction.
+/// Customer sets contain candidate physical locations for each requested order;
+/// both temporal readers probe the same locations in their respective snapshots.
+/// They deduplicate addresses without storing payloads or signed weights.
 #[derive(Clone, Default)]
 pub struct Q3State {
     views: Arc<Mutex<Option<Arc<ReadViews>>>>,
@@ -58,7 +61,7 @@ impl Q3State {
         &self,
         before: SourceSnapshot,
         after: SourceSnapshot,
-        order_customers: BTreeMap<i64, i64>,
+        order_customers: BTreeMap<i64, BTreeSet<i64>>,
     ) -> Result<(), String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
         if views.is_some() {
@@ -158,54 +161,55 @@ impl Q3State {
         let index = CustomerOrdersLineitemIndex::default();
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
-            let customer = placement(&views, order)?;
-            let mut customers = Vec::new();
-            let customer_key = index.fold(&SourceKey::Customer(customer))?;
-            scan(
-                &index,
-                &views.after,
-                customer_key.as_bytes(),
-                |key, bytes, weight| {
-                    if matches!(key, SourceKey::Customer(_)) {
-                        if let SourcePayload::Customer(payload) =
-                            index.decode_payload(customer_key.as_bytes(), bytes)?
-                        {
-                            customers.push((payload.segment, weight));
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            let order_key = index.fold(&SourceKey::Orders(customer, order))?;
-            scan(
-                &index,
-                &views.after,
-                order_key.as_bytes(),
-                |key, bytes, order_weight| {
-                    if matches!(key, SourceKey::Orders(_, _)) {
-                        if let SourcePayload::Orders(payload) =
-                            index.decode_payload(order_key.as_bytes(), bytes)?
-                        {
-                            for (segment, customer_weight) in &customers {
-                                let weight = order_weight
-                                    .checked_mul(*customer_weight)
-                                    .ok_or("Q3 reconstructed join weight overflow")?;
-                                output.push(
-                                    Tup1(order),
-                                    Tup4(
-                                        customer,
-                                        segment.clone(),
-                                        payload.order_date,
-                                        payload.ship_priority,
-                                    ),
-                                    weight,
-                                );
+            for &customer in placements(&views, order)? {
+                let mut customers = Vec::new();
+                let customer_key = index.fold(&SourceKey::Customer(customer))?;
+                scan(
+                    &index,
+                    &views.after,
+                    customer_key.as_bytes(),
+                    |key, bytes, weight| {
+                        if matches!(key, SourceKey::Customer(_)) {
+                            if let SourcePayload::Customer(payload) =
+                                index.decode_payload(customer_key.as_bytes(), bytes)?
+                            {
+                                customers.push((payload.segment, weight));
                             }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
+                let order_key = index.fold(&SourceKey::Orders(customer, order))?;
+                scan(
+                    &index,
+                    &views.after,
+                    order_key.as_bytes(),
+                    |key, bytes, order_weight| {
+                        if matches!(key, SourceKey::Orders(_, _)) {
+                            if let SourcePayload::Orders(payload) =
+                                index.decode_payload(order_key.as_bytes(), bytes)?
+                            {
+                                for (segment, customer_weight) in &customers {
+                                    let weight = order_weight
+                                        .checked_mul(*customer_weight)
+                                        .ok_or("Q3 reconstructed join weight overflow")?;
+                                    output.push(
+                                        Tup1(order),
+                                        Tup4(
+                                            customer,
+                                            segment.clone(),
+                                            payload.order_date,
+                                            payload.ship_priority,
+                                        ),
+                                        weight,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
         }
         Ok(output.finish())
     }
@@ -218,42 +222,43 @@ impl Q3State {
         let index = CustomerOrdersLineitemIndex::default();
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
-            let customer = placement(&views, order)?;
-            scan(
-                &index,
-                &views.before,
-                &index.line_prefix(customer, order),
-                |key, bytes, weight| {
-                    if let SourceKey::Lineitem(c, o, line) = key {
-                        if let SourcePayload::Lineitem(payload) = index.decode_payload(
-                            index.fold(&SourceKey::Lineitem(c, o, line))?.as_bytes(),
-                            bytes,
-                        )? {
-                            output.push(
-                                Tup1(o),
-                                Tup4(
-                                    line,
-                                    payload.extended_price,
-                                    payload.discount,
-                                    payload.ship_date,
-                                ),
-                                weight,
-                            );
+            for &customer in placements(&views, order)? {
+                scan(
+                    &index,
+                    &views.before,
+                    &index.line_prefix(customer, order),
+                    |key, bytes, weight| {
+                        if let SourceKey::Lineitem(c, o, line) = key {
+                            if let SourcePayload::Lineitem(payload) = index.decode_payload(
+                                index.fold(&SourceKey::Lineitem(c, o, line))?.as_bytes(),
+                                bytes,
+                            )? {
+                                output.push(
+                                    Tup1(o),
+                                    Tup4(
+                                        line,
+                                        payload.extended_price,
+                                        payload.discount,
+                                        payload.ship_date,
+                                    ),
+                                    weight,
+                                );
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
+            }
         }
         Ok(output.finish())
     }
 }
 
-fn placement(views: &ReadViews, order: i64) -> Result<i64, String> {
+fn placements(views: &ReadViews, order: i64) -> Result<&BTreeSet<i64>, String> {
     views
         .order_customers
         .get(&order)
-        .copied()
+        .filter(|customers| !customers.is_empty())
         .ok_or_else(|| format!("order {order} is missing from the current Orders delta"))
 }
 

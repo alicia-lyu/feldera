@@ -107,7 +107,7 @@ fn four_readers_preserve_weighted_before_after_relations() {
         .publish(
             source(vec![initial.clone()]),
             source(vec![initial, changes]),
-            BTreeMap::from([(20, 2)]),
+            BTreeMap::from([(20, BTreeSet::from([2]))]),
         )
         .unwrap();
     let orders_delta = delta(vec![(Tup1(2), Tup3(20, Date::from_days(11), 7), 1)]);
@@ -173,6 +173,107 @@ fn four_readers_preserve_weighted_before_after_relations() {
 }
 
 #[test]
+fn candidate_locations_follow_each_snapshot_without_duplicating_rows() {
+    let initial = vec![
+        customer(2, "old", 2),
+        customer(3, "new", 3),
+        order(2, 20, 10, 4),
+        line(2, 20, 1, 100, 5),
+        line(2, 20, 2, 100, 5),
+    ];
+    let changes = vec![
+        order(2, 20, 10, -4),
+        order(3, 20, 11, 7),
+        line(2, 20, 1, 100, -5),
+        line(2, 20, 2, 100, -5),
+        line(3, 20, 1, 100, 5),
+        line(3, 20, 2, 100, 5),
+    ];
+    let state = Q3State::default();
+    state
+        .publish(
+            source(vec![initial.clone()]),
+            source(vec![initial, changes]),
+            BTreeMap::from([
+                (20, BTreeSet::from([2, 3, 2, 9, 3])),
+                (99, BTreeSet::from([2, 3])),
+            ]),
+        )
+        .unwrap();
+    let line_value = Tup4(
+        1,
+        SqlDecimal::new(100, 2).unwrap(),
+        SqlDecimal::new(4, 2).unwrap(),
+        Date::from_days(30),
+    );
+    let line_request = delta(vec![(Tup1(20), line_value, -1), (Tup1(99), line_value, 1)]);
+    assert_eq!(
+        tuples(&state.joined_orders_after(&line_request).unwrap()),
+        vec![(
+            Tup1(20),
+            Tup4(3, SqlString::from("new"), Date::from_days(11), 7),
+            21,
+        )]
+    );
+    let joined_request = delta(vec![
+        (
+            Tup1(20),
+            Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
+            -1,
+        ),
+        (
+            Tup1(20),
+            Tup4(3, SqlString::from("new"), Date::from_days(11), 7),
+            1,
+        ),
+        (
+            Tup1(99),
+            Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
+            1,
+        ),
+    ]);
+    let mut second_line = line_value;
+    second_line.0 = 2;
+    assert_eq!(
+        tuples(&state.lineitems_before(&joined_request).unwrap()),
+        vec![(Tup1(20), line_value, 5), (Tup1(20), second_line, 5)]
+    );
+}
+
+#[test]
+fn requested_orders_require_nonempty_candidate_locations() {
+    let line_request = delta(vec![(
+        Tup1(20),
+        Tup4(
+            1,
+            SqlDecimal::new(100, 2).unwrap(),
+            SqlDecimal::new(4, 2).unwrap(),
+            Date::from_days(30),
+        ),
+        1,
+    )]);
+    let joined_request = delta(vec![(
+        Tup1(20),
+        Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
+        -1,
+    )]);
+    for locations in [BTreeMap::new(), BTreeMap::from([(20, BTreeSet::new())])] {
+        let state = Q3State::default();
+        state
+            .publish(source(vec![]), source(vec![]), locations)
+            .unwrap();
+        assert!(state
+            .joined_orders_after(&line_request)
+            .unwrap_err()
+            .contains("current Orders delta"));
+        assert!(state
+            .lineitems_before(&joined_request)
+            .unwrap_err()
+            .contains("current Orders delta"));
+    }
+}
+
+#[test]
 fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() {
     let state = Q3State::default();
     state
@@ -185,7 +286,7 @@ fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() 
                 customer(9, "unused", 100),
                 order(9, 90, 10, 100),
             ]]),
-            BTreeMap::from([(20, 2)]),
+            BTreeMap::from([(20, BTreeSet::from([2]))]),
         )
         .unwrap();
     let request = delta(vec![(

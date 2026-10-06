@@ -24,6 +24,7 @@ use crate::{Change, Reference};
 type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
 type SourceRow = (SourceKey, SourcePayload, ZWeight);
+type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
     Snapshot(mpsc::SyncSender<Snapshot>),
@@ -173,8 +174,8 @@ fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
 pub(crate) fn prepare(
     change: &Change,
     state: &Reference,
-) -> Result<(BTreeMap<i64, i64>, Vec<SourceRow>)> {
-    let mut placements = BTreeMap::new();
+) -> Result<(OrderLocations, Vec<SourceRow>)> {
+    let mut placements = OrderLocations::new();
     let mut seen_customers = BTreeSet::new();
     let mut seen_orders = BTreeSet::new();
     let mut seen_lines = BTreeSet::new();
@@ -209,7 +210,10 @@ pub(crate) fn prepare(
         } else if state.orders.get(&order.key) != Some(order) {
             bail!("RF2 Order {} is missing or has changed payload", order.key);
         }
-        placements.insert(order.key, order.customer_key);
+        placements
+            .entry(order.key)
+            .or_default()
+            .insert(order.customer_key);
         rows.push(order_row(order, *insert)?);
     }
     for (line, insert) in &change.lines {
