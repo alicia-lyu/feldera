@@ -2,13 +2,22 @@
 
 Date: 2026-09-30.
 
+## Current ownership
+
+The generic batch builder and storage primitives remain in DBSP. Concrete COL codecs and
+storage tests now live in the standalone
+[`merged-index-col` library](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs).
+The test counts, fixture sizes, and observed run measurements below are historical results from
+the pre-extraction prototype; they are not claims about the current test run. Current commands
+and results are recorded in the [COL implementation plan](native-col-library-implementation-plan.md).
+
 The [Phase 4 plan](phase-4-file-backed-storage-implementation-plan.md) governs this work.
-Storage tests use native batches and Spine insertion while preserving the existing
+The pre-extraction storage tests used native batches and Spine insertion while preserving the
 memory-test behavior. Base-relation storage remains in place; the merged index is secondary storage.
 
 ## Implementation
 
-The separate `storage_tests` module constructs standard `OrdIndexedWSet` batches
+COL's `storage_tests` module constructs standard `OrdIndexedWSet` batches
 exclusively through `index.build_batch` and inserts them once, with awaited
 `Trace::insert`, into a native Spine using `TraceRole::Integral`. Initial L0 runs request
 `Some(BatchLocation::Memory)` unconditionally, even in a storage-enabled runtime whose
@@ -16,8 +25,9 @@ generic construction policy otherwise selects files. Feldera's generic construct
 policy is “weird” relative to this required L0 contract because it may select files while
 building. Later Spine persistence and compaction retain native placement behavior.
 
-The configuration-aware runtime test helper initializes storage and background merging.
-It receives default `StorageOptions` and default merge settings. The simpler storage
+The local runtime test helper uses public `Runtime::init_circuit` with one worker to
+initialize storage and background merging. It receives default `StorageOptions` and
+default merge settings. The simpler storage
 helper uses `min_storage_bytes: Some(0)` and would bypass the intended size-based
 transition, so this test supplies actual defaults instead. Runtime pressure is asserted
 to be low; later persistence and compaction receive no destination or pressure override.
@@ -46,9 +56,10 @@ after live compaction. Reopening a referenced temporary file is not restart reco
 
 ## Verification
 
-All 14 merged-index tests passed, including the 12 encoding, memory-batch, cursor, and
-layer-file tests and both storage tests. Every initial COL run was memory backed, including
-under zero storage thresholds where a generic nonempty builder selected a file.
+The pre-extraction DBSP suite passed all 14 merged-index tests, including the 12 encoding,
+memory-batch, cursor, and layer-file tests and both storage tests. Every initial COL run was
+memory backed, including under zero storage thresholds where a generic nonempty builder
+selected a file.
 
 In one verified default-policy run, the effective merge-storage threshold was 10,485,760
 bytes and the first eight memory runs occupied 74,239,964 approximate bytes. The observed
@@ -57,9 +68,9 @@ snapshot contained eight memory runs of 70,000 rows and one file run of 560,000 
 not fixed assertions. The test awaits insertion and polls for background file compaction
 for at most 30 seconds, reporting locations, sizes, and thresholds on timeout.
 
-Native baseline checks passed: nine Spine merge-threshold tests, eight two-column file
-tests, the runtime memory-pressure threshold/storage-policy test, and the empty-builder
-zero-threshold test. Verification commands:
+The original native baseline checks passed: nine Spine merge-threshold tests, eight two-column
+file tests, the runtime memory-pressure threshold/storage-policy test, and the empty-builder
+zero-threshold test. Original verification commands:
 
 ```sh
 cargo +1.96.1 test -p dbsp --lib trace::merged_index --offline

@@ -5660,6 +5660,7 @@ dependencies = [
  "base58",
  "base64 0.22.1",
  "blake3",
+ "bytecheck",
  "chrono",
  "chrono-tz",
  "dbsp",

@@ -2244,7 +2244,7 @@ some_nullable_function2!(parse_timestamp, SqlString, SqlString, Timestamp);
     IsNone,
     OrdRepr,
 )]
-#[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
+#[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd, rkyv::CheckBytes))]
 #[archive(compare(PartialEq, PartialOrd))]
 #[serde(transparent)]
 pub struct Date {
@@ -3970,6 +3970,26 @@ mod test {
         DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
     };
     use feldera_types::{deserialize_table_record, serialize_table_record};
+    use rkyv::Deserialize as _;
+
+    #[test]
+    fn archived_date_supports_checked_deserialization() {
+        assert_eq!(std::mem::size_of::<rkyv::Archived<Date>>(), 4);
+        for date in [
+            Date::from_days(-1),
+            Date::from_days(0),
+            Date::from_days(19_628),
+        ] {
+            let bytes = dbsp::storage::file::to_bytes(&date).unwrap();
+            assert_eq!(bytes.len(), 4);
+            let archived = rkyv::check_archived_root::<Date>(&bytes).unwrap();
+            let decoded: Date = archived
+                .deserialize(&mut dbsp::storage::file::Deserializer::default())
+                .unwrap();
+            assert_eq!(decoded, date);
+            assert!(rkyv::check_archived_root::<Date>(&bytes[..3]).is_err());
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq, serde::Serialize)]
     #[allow(non_snake_case)]

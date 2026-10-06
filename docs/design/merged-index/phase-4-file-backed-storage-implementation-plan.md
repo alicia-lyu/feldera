@@ -5,9 +5,9 @@ Date: 2026-09-30. Status: implementation plan. Completed test evidence belongs i
 
 The [Step 2 storage plan](folded-key-layer-file-plan.md#phase-4-native-file-storage-and-snapshots)
 governs this phase. Retain Feldera's base-relation storage; the merged index is secondary
-storage. Preserve the existing memory-only helpers and tests. Add separate storage tests
-within the merged-index module. Do not change native batching, Accumulator, integration,
-or Spine implementations.
+storage. The generic batch and cursor machinery belongs in DBSP; the concrete COL definition
+and storage tests belong in the standalone `experiments/merged-index-col` library. Do not
+change native batching, Accumulator, integration, or Spine implementations.
 
 ## Native storage boundary
 
@@ -33,10 +33,10 @@ defaults; targeted policy tests may override shared configuration.
 
 Use 16 batches, each covering 10,000 distinct customers. For each customer `c`, create a
 Customer with a 256-byte segment, two Orders with IDs `1_000_000 + 2*c + j` for `j = 0`
-or `1`, and two Lineitems per order with line IDs 1 and 2. Set `order_day = c % 365 - 180`,
-`ship_priority = j`, `ship_day = order_day + line_id`,
-`extended_price_cents = 10_000 + order_id + line_id`, and
-`discount_hundredths = c % 101`. Build all 1,120,000 records through `index.build_batch`
+or `1`, and two Lineitems per order with line IDs 1 and 2. Derive native `order_date` and
+`ship_date` values deterministically from customer and line IDs; set `ship_priority = j`,
+`extended_price` deterministically from order and line IDs, and `discount` from customer ID.
+Build all 1,120,000 records through `index.build_batch`
 with positive unit weights. Assert initial batches are memory backed, including in a
 storage-enabled runtime. Separately confirm that the generic native builder can select a
 file when its threshold is configured to zero; this documents why merged-index L0

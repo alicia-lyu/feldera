@@ -296,10 +296,12 @@ assigns shared domain and source tags in its
 [future SQL compiler generator](folded-key-layer-file-plan.md#future-static-code-generation)
 is planned to emit these definitions. The index's logical
 customer-leading positions are `(c)`, `(c,o)`, and `(c,o,l)`. Another merged index may fold
-one of these sources differently. A generic `MergedIndex<D>` base holds shared folding and
-storage behavior; `CustomerOrdersLineitemIndex` wraps it with this index's definition. The
-storage layer compares opaque byte strings lexicographically. It does not expose those fields
-as nested groups.
+one of these sources differently. DBSP exposes the generic `MergedIndex<D>` definition,
+folding, batch, and cursor machinery. The concrete Customer–Orders–Lineitem definition,
+native payload codecs, and COL storage tests live in the standalone
+[merged-index-col library](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs).
+The storage layer compares opaque byte strings lexicographically. It does not expose those
+fields as nested groups.
 The encoding must preserve the intended cross-type ordering and let the access layer construct range bounds.
 
 Each value contains one regular payload and its signed weight. The index

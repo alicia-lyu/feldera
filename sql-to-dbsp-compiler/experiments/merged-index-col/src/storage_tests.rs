@@ -12,18 +12,17 @@ use feldera_types::{
 };
 
 use super::{
-    CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,
-    SourcePayload,
+    CustomerOrdersLineitemIndex, CustomerPayload, Date, LineitemPayload, OrdersPayload, SourceKey,
+    SourcePayload, SqlDecimal, SqlString,
 };
-use crate::{
-    DynZWeight, Runtime, ZWeight,
+use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DowncastTrait, DynData, Erase},
     trace::{
         Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, OrdIndexedWSet,
         OrdIndexedWSetFactories, Spine, Trace, TraceRole, WithSnapshot,
-        test::run_in_circuit_with_storage_config,
     },
+    DynZWeight, Runtime, ZWeight,
 };
 
 type IndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
@@ -33,13 +32,24 @@ const BATCHES: usize = 16;
 const CUSTOMERS_PER_BATCH: usize = 10_000;
 type SourceRow = (SourceKey, SourcePayload, ZWeight);
 
-fn customer_segment(id: i32) -> String {
-    let segment = format!("{id:08}-{:0<247}", "segment");
-    assert_eq!(segment.len(), 256);
-    segment
+fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
+where
+    F: FnOnce() + Clone + Send + 'static,
+{
+    let _handle = Runtime::init_circuit(config, move |_| {
+        f();
+        Ok(())
+    })
+    .unwrap();
 }
 
-fn customer_group(c: i32) -> Vec<SourceRow> {
+fn customer_segment(id: i64) -> SqlString {
+    let segment = format!("{id:08}-{:0<247}", "segment");
+    assert_eq!(segment.len(), 256);
+    segment.into()
+}
+
+fn customer_group(c: i64) -> Vec<SourceRow> {
     let mut rows = vec![(
         SourceKey::Customer(c),
         SourcePayload::Customer(CustomerPayload {
@@ -47,14 +57,14 @@ fn customer_group(c: i32) -> Vec<SourceRow> {
         }),
         1,
     )];
-    let order_day = c % 365 - 180;
+    let order_date = c % 365 - 180;
     for j in 0..2 {
         let order_id = 1_000_000 + 2 * c + j;
         rows.push((
             SourceKey::Orders(c, order_id),
             SourcePayload::Orders(OrdersPayload {
-                order_day,
-                ship_priority: j,
+                order_date: Date::from_days(order_date as i32),
+                ship_priority: j as i32,
             }),
             1,
         ));
@@ -62,9 +72,13 @@ fn customer_group(c: i32) -> Vec<SourceRow> {
             rows.push((
                 SourceKey::Lineitem(c, order_id, line_id),
                 SourcePayload::Lineitem(LineitemPayload {
-                    ship_day: order_day + line_id,
-                    extended_price_cents: 10_000 + i64::from(order_id + line_id),
-                    discount_hundredths: i64::from(c % 101),
+                    ship_date: Date::from_days(order_date as i32 + line_id),
+                    extended_price: SqlDecimal::<15, 2>::new(
+                        i128::from(10_000 + order_id + i64::from(line_id)),
+                        2,
+                    )
+                    .unwrap(),
+                    discount: SqlDecimal::<4, 2>::new(i128::from(c % 101), 2).unwrap(),
                 }),
                 1,
             ));
@@ -155,8 +169,8 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let mut first_rows = Vec::new();
         let mut first_eight_bytes = 0;
         for batch_number in 0..BATCHES {
-            let first_id = (batch_number * CUSTOMERS_PER_BATCH) as i32;
-            let source_rows: Vec<_> = (first_id..first_id + CUSTOMERS_PER_BATCH as i32)
+            let first_id = (batch_number * CUSTOMERS_PER_BATCH) as i64;
+            let source_rows: Vec<_> = (first_id..first_id + CUSTOMERS_PER_BATCH as i64)
                 .flat_map(customer_group)
                 .collect();
             let rows: Vec<_> = source_rows
@@ -228,7 +242,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
 
         let before_updates = trace.ro_snapshot();
         let mut oracle = BTreeMap::new();
-        for id in 0..(BATCHES * CUSTOMERS_PER_BATCH) as i32 {
+        for id in 0..(BATCHES * CUSTOMERS_PER_BATCH) as i64 {
             for row in customer_group(id) {
                 apply(&mut oracle, &encoded_row(&index, &row));
             }
@@ -243,21 +257,15 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let reopened_rows = read_rows(&reopened);
         assert_eq!(reopened_rows, file_rows);
         let typed_file: Vec<_> = file_rows.iter().map(|row| typed_row(&index, row)).collect();
-        assert!(
-            typed_file
-                .iter()
-                .any(|row| matches!(row.0, SourceKey::Customer(_)))
-        );
-        assert!(
-            typed_file
-                .iter()
-                .any(|row| matches!(row.0, SourceKey::Orders(_, _)))
-        );
-        assert!(
-            typed_file
-                .iter()
-                .any(|row| matches!(row.0, SourceKey::Lineitem(_, _, _)))
-        );
+        assert!(typed_file
+            .iter()
+            .any(|row| matches!(row.0, SourceKey::Customer(_))));
+        assert!(typed_file
+            .iter()
+            .any(|row| matches!(row.0, SourceKey::Orders(_, _))));
+        assert!(typed_file
+            .iter()
+            .any(|row| matches!(row.0, SourceKey::Lineitem(_, _, _))));
         assert_eq!(
             reopened_rows
                 .iter()
@@ -288,13 +296,17 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
                     match &mut payload {
                         SourcePayload::Customer(value) => value.segment = "replacement".into(),
                         SourcePayload::Orders(value) => {
-                            value.order_day += 1;
+                            value.order_date = Date::from_days(value.order_date.days() + 1);
                             value.ship_priority += 2;
                         }
                         SourcePayload::Lineitem(value) => {
-                            value.ship_day += 1;
-                            value.extended_price_cents += 100;
-                            value.discount_hundredths = (value.discount_hundredths + 1) % 101;
+                            value.ship_date = Date::from_days(value.ship_date.days() + 1);
+                            value.extended_price += SqlDecimal::<15, 2>::new(100, 2).unwrap();
+                            value.discount = SqlDecimal::<4, 2>::new(
+                                (value.discount.internal_representation() + 1) % 101,
+                                2,
+                            )
+                            .unwrap();
                         }
                     }
                     (key, payload, weight)
@@ -319,18 +331,14 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         );
         TOKIO.block_on(trace.insert(index.build_batch(updates.clone()).unwrap()));
         let mixed = trace.ro_snapshot();
-        assert!(
-            mixed
-                .batches()
-                .iter()
-                .any(|batch| batch.location() == BatchLocation::Memory)
-        );
-        assert!(
-            mixed
-                .batches()
-                .iter()
-                .any(|batch| batch.location() == BatchLocation::Storage)
-        );
+        assert!(mixed
+            .batches()
+            .iter()
+            .any(|batch| batch.location() == BatchLocation::Memory));
+        assert!(mixed
+            .batches()
+            .iter()
+            .any(|batch| batch.location() == BatchLocation::Storage));
         for row in &updates {
             apply(&mut oracle, &encoded_row(&index, row));
         }

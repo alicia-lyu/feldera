@@ -1,4 +1,5 @@
-//! Index-owned folded keys and weighted layer-file rows.
+//! Schema-independent folded keys, byte-backed batches, and weighted layer-file rows.
+//! Concrete source definitions and payload codecs belong to client crates.
 
 use std::marker::PhantomData;
 
@@ -8,49 +9,54 @@ use crate::{
     storage::{backend::StorageError, file::writer::Writer2},
 };
 
-pub(crate) mod batch;
-mod customer_orders_lineitem;
+pub mod batch;
 
-pub(crate) use batch::MergedIndexBatch;
-
-pub(crate) use customer_orders_lineitem::{
-    CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,
-    SourcePayload,
-};
+pub use batch::MergedIndexBatch;
 
 const INDEX_TAG: u8 = 0;
 
 /// A logical base relation, independent of how this index stores its rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BaseRelationId(pub &'static str);
+pub struct BaseRelationId(pub &'static str);
 
 /// A selected access path for a base relation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SourceIndexId(pub &'static str);
+pub struct SourceIndexId(pub &'static str);
 
 /// A shared logical domain for an ordered key field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KeyDomainId(pub &'static str);
+pub struct KeyDomainId(pub &'static str);
 
+/// The signed integer width used by a key domain in folded bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KeyPrimitive {
+pub enum KeyPrimitive {
     I32,
+    I64,
+}
+
+impl KeyPrimitive {
+    fn width(self) -> usize {
+        match self {
+            Self::I32 => 4,
+            Self::I64 => 8,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KeyDomain {
+pub struct KeyDomain {
     pub id: KeyDomainId,
     pub primitive: KeyPrimitive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KeyField {
+pub struct KeyField {
     pub name: &'static str,
     pub domain: KeyDomainId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SourceIndexSpec {
+pub struct SourceIndexSpec {
     pub id: SourceIndexId,
     pub base_relation: BaseRelationId,
     pub key_fields: &'static [KeyField],
@@ -58,18 +64,22 @@ pub(crate) struct SourceIndexSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DomainByteTag {
+pub struct DomainByteTag {
     pub domain: KeyDomainId,
     pub tag: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SourceByteTag {
+pub struct SourceByteTag {
     pub source_index: SourceIndexId,
     pub tag: u8,
 }
 
-pub(crate) trait MergedIndexDefinition {
+/// Static source metadata and typed projection for one merged index.
+/// Domain and source tags must be unique within their respective namespaces; zero
+/// is reserved for the terminal index tag. Field values use `i64` at this API
+/// boundary, and folding checks that values in `I32` domains fit without truncation.
+pub trait MergedIndexDefinition {
     type Key: Clone + Eq + std::fmt::Debug;
 
     const KEY_DOMAINS: &'static [KeyDomain];
@@ -77,13 +87,13 @@ pub(crate) trait MergedIndexDefinition {
     const DOMAIN_BYTE_TAGS: &'static [DomainByteTag];
     const SOURCE_BYTE_TAGS: &'static [SourceByteTag];
 
-    fn project(key: &Self::Key) -> (SourceIndexId, Vec<i32>);
-    fn construct(source_index: SourceIndexId, fields: &[i32]) -> Option<Self::Key>;
+    fn project(key: &Self::Key) -> (SourceIndexId, Vec<i64>);
+    fn construct(source_index: SourceIndexId, fields: &[i64]) -> Option<Self::Key>;
 }
 
 /// A complete folded key. Its byte ordering is its query ordering.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FoldedKey(Vec<u8>);
+pub struct FoldedKey(Vec<u8>);
 
 impl FoldedKey {
     pub fn as_bytes(&self) -> &[u8] {
@@ -93,7 +103,15 @@ impl FoldedKey {
 
 /// Encoded payload bytes are ordered only for file equality and merging.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct PayloadBytes(Vec<u8>);
+pub struct PayloadBytes(Vec<u8>);
+
+/// Wraps bytes produced by a client-owned payload codec.
+/// Validation and source-schema selection remain the codec's responsibility.
+impl From<Vec<u8>> for PayloadBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
 
 impl PayloadBytes {
     pub fn as_bytes(&self) -> &[u8] {
@@ -101,7 +119,8 @@ impl PayloadBytes {
     }
 }
 
-pub(crate) struct MergedIndex<D>(PhantomData<D>);
+/// Folding and prefix operations governed by a static index definition.
+pub struct MergedIndex<D>(PhantomData<D>);
 
 impl<D> Default for MergedIndex<D> {
     fn default() -> Self {
@@ -128,32 +147,64 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
             .ok_or_else(|| "empty folded key".to_string())?;
         let source_index = Self::source_index_for_tag(source_tag)?;
         let source = Self::source(source_index)?;
-        if body.len() != source.key_fields.len() * 5 + 1 || body.last() != Some(&INDEX_TAG) {
+        let primitives = source
+            .key_fields
+            .iter()
+            .map(|field| Self::primitive(field.domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_length = primitives
+            .iter()
+            .map(|primitive| 1 + primitive.width())
+            .sum::<usize>()
+            + 1;
+        if body.len() != expected_length || body.last() != Some(&INDEX_TAG) {
             return Err("folded key has an invalid length or index tag".into());
         }
         let mut values = Vec::with_capacity(source.key_fields.len());
-        for (position, field) in source.key_fields.iter().enumerate() {
-            let offset = position * 5;
+        let mut offset = 0;
+        for (field, primitive) in source.key_fields.iter().zip(primitives) {
             if body[offset] != Self::domain_tag(field.domain)? {
                 return Err("folded key has an invalid domain tag".into());
             }
-            let encoded = u32::from_be_bytes(body[offset + 1..offset + 5].try_into().unwrap());
-            values.push((encoded ^ 0x8000_0000) as i32);
+            offset += 1;
+            let value = match primitive {
+                KeyPrimitive::I32 => {
+                    let encoded = u32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
+                    i64::from((encoded ^ 0x8000_0000) as i32)
+                }
+                KeyPrimitive::I64 => {
+                    let encoded = u64::from_be_bytes(body[offset..offset + 8].try_into().unwrap());
+                    (encoded ^ 0x8000_0000_0000_0000) as i64
+                }
+            };
+            values.push(value);
+            offset += primitive.width();
         }
         D::construct(source_index, &values)
             .ok_or_else(|| "source definition could not construct folded key".into())
     }
 
     /// Returns a leading field prefix without the index tag or source id.
-    pub fn prefix(&self, source_index: SourceIndexId, values: &[i32]) -> Result<Vec<u8>, String> {
+    pub fn prefix(&self, source_index: SourceIndexId, values: &[i64]) -> Result<Vec<u8>, String> {
         let source = Self::source(source_index)?;
         if values.len() > source.key_fields.len() {
             return Err("prefix has too many fields".into());
         }
-        let mut bytes = Vec::with_capacity(values.len() * 5);
+        let mut bytes = Vec::new();
         for (field, value) in source.key_fields.iter().zip(values) {
             bytes.push(Self::domain_tag(field.domain)?);
-            bytes.extend_from_slice(&((*value as u32) ^ 0x8000_0000).to_be_bytes());
+            match Self::primitive(field.domain)? {
+                KeyPrimitive::I32 => {
+                    let value = i32::try_from(*value)
+                        .map_err(|_| "key field is outside its I32 domain".to_string())?;
+                    bytes.extend_from_slice(&((value as u32) ^ 0x8000_0000).to_be_bytes());
+                }
+                KeyPrimitive::I64 => {
+                    bytes.extend_from_slice(
+                        &((*value as u64) ^ 0x8000_0000_0000_0000).to_be_bytes(),
+                    );
+                }
+            }
         }
         Ok(bytes)
     }
@@ -162,7 +213,7 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
     pub fn prefix_with_next_tag(
         &self,
         source_index: SourceIndexId,
-        values: &[i32],
+        values: &[i64],
     ) -> Result<Vec<u8>, String> {
         let source = Self::source(source_index)?;
         let next_field = source
@@ -232,14 +283,16 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
         Ok(source_index)
     }
 
-    fn domain_tag(id: KeyDomainId) -> Result<u8, String> {
-        let domain = D::KEY_DOMAINS
+    fn primitive(id: KeyDomainId) -> Result<KeyPrimitive, String> {
+        D::KEY_DOMAINS
             .iter()
             .find(|domain| domain.id == id)
-            .ok_or_else(|| "source references an unknown key domain".to_string())?;
-        if domain.primitive != KeyPrimitive::I32 {
-            return Err("unsupported key-domain primitive".into());
-        }
+            .map(|domain| domain.primitive)
+            .ok_or_else(|| "source references an unknown key domain".to_string())
+    }
+
+    fn domain_tag(id: KeyDomainId) -> Result<u8, String> {
+        Self::primitive(id)?;
         let mut bindings = D::DOMAIN_BYTE_TAGS
             .iter()
             .filter(|binding| binding.domain == id);
@@ -261,6 +314,3 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod storage_tests;

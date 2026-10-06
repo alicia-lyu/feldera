@@ -103,12 +103,14 @@ merged index's byte-tag assignments. A key domain names the same logical identit
 fields, not merely a shared primitive type. Each source index selects ordered key fields and
 payload fields from one base relation. The merged index chooses its participating source
 indexes and assigns their domain and source tags. Another merged index can assign different
-tags to the same source index. These declarations are static Rust metadata in Phase 1; the
-notation does not imply a parser or macro:
+tags to the same source index. The generic definition and storage machinery is public in DBSP;
+the concrete Customer–Orders–Lineitem definition and codecs live in the standalone
+`sql-to-dbsp-compiler/experiments/merged-index-col` library. These declarations describe its
+metadata; the notation does not imply a parser or macro:
 
 ```text
-key_domain customer : i32;
-key_domain order    : i32;
+key_domain customer : i64;
+key_domain order    : i64;
 key_domain line     : i32;
 
 source_index CustomerPrimary on Customer {
@@ -118,12 +120,12 @@ source_index CustomerPrimary on Customer {
 
 source_index OrdersByCustomer on Orders {
     keys { customer_id as customer, order_id as order }
-    payload { order_day, ship_priority }
+    payload { order_date, ship_priority }
 }
 
 source_index LineitemByCustomer on ExtendedLineitem {
     keys { customer_id as customer, order_id as order, line_id as line }
-    payload { ship_day, extended_price_cents, discount_hundredths }
+    payload { ship_date, extended_price, discount }
 }
 
 merged_index CustomerOrdersLineitem {
@@ -141,10 +143,9 @@ relation ID and field selection; the merged definition owns the byte tags. Share
 rather than field-name similarity, establish shared ordering. The source discriminator follows
 the terminal `INDEX` tag and is distinct from a field-domain tag. The base-relation link is a
 symbolic ID until generated row types exist, so field provenance is checked by future codegen.
-In Rust, the generic `MergedIndex<D>` base folds and unfolds keys and constructs prefixes from
-these definitions. `CustomerOrdersLineitemIndex` wraps
-`MergedIndex<CustomerOrdersLineitemDefinition>`. Source row types have no global folding
-operation; the merged index retains that behavior and the common file mapping.
+In Rust, the generic `MergedIndex<D>` base in DBSP folds and unfolds keys and constructs prefixes
+from these definitions. The standalone COL library defines `CustomerOrdersLineitemDefinition`
+and wraps it with its concrete index API. Source row types have no global folding operation.
 
 ### Future static code generation
 
@@ -190,19 +191,21 @@ of LeanStore binary compatibility:
 domain tags: INDEX = 0x00, CUSTOMER = 0x01, ORDERS = 0x02, LINEITEM = 0x03
 index identifiers: customer = 0x01, orders = 0x02, lineitem = 0x03
 
-fold_i32(x) = big_endian_u32((x as u32) XOR 0x80000000)
+fold_iN(x) = big_endian_N_bits((x as unsigned_N_bits) XOR sign_bit_N)
 
-C(c):     CUSTOMER | fold_i32(c) | INDEX | customer
-O(c,o):   CUSTOMER | fold_i32(c) | ORDERS | fold_i32(o) | INDEX | orders
-L(c,o,l): CUSTOMER | fold_i32(c) | ORDERS | fold_i32(o)
+C(c):     CUSTOMER | fold_i64(c) | INDEX | customer
+O(c,o):   CUSTOMER | fold_i64(c) | ORDERS | fold_i64(o) | INDEX | orders
+L(c,o,l): CUSTOMER | fold_i64(c) | ORDERS | fold_i64(o)
           | LINEITEM | fold_i32(l) | INDEX | lineitem
 ```
 
-K occupies 7, 12, or 17 bytes. `INDEX` introduces the identifier; it is not an additional `END`
-marker. Its value sorts below child-domain tags, placing a Customer before its Orders and an Order
-before its Lineitems. Payload, weight, and occurrence counters never extend K. Reject malformed
-lengths, domain sequences, and identifiers in checked `fold`/`unfold` functions. The storage index
-compares K as opaque lexicographic bytes.
+K occupies 11, 20, or 25 bytes. Each field uses its declared width and a sign-bit flip, preserving
+signed numeric order within that domain. `INDEX` introduces the identifier; it is not an additional
+`END` marker. Its value sorts below child-domain tags, placing a Customer before its Orders and an
+Order before its Lineitems. Payload, weight, and occurrence counters never extend K. Reject
+malformed lengths, domain sequences, and identifiers in checked `fold`/`unfold` functions. The
+storage index compares K as opaque lexicographic bytes. Generic field projections and prefix inputs
+use `i64`; values for `I32` domains require checked conversion.
 
 ```text
 scan_prefix(snapshot, prefix):
@@ -225,16 +228,16 @@ MergedIndexValue {
     weight: ZWeight,  # Feldera's signed i64 weight
 }
 
-Customer payload = { segment: String }
-Orders payload   = { order_day: i32, ship_priority: i32 }
-Lineitem payload = { ship_day: i32, extended_price_cents: i64, discount_hundredths: i64 }
+Customer payload = { segment: SqlString }
+Orders payload   = { order_date: Date, ship_priority: i32 }
+Lineitem payload = { ship_date: Date, extended_price: SqlDecimal<15, 2>, discount: SqlDecimal<4, 2> }
 ```
 
-Dates are days since the Unix epoch; price and discount use exact scale-two integers. The index
-identifier selects the payload schema. Feldera's serializer encodes V; only K needs an
-order-preserving byte encoding. The file merger orders payloads for internal equality and merging,
-not to provide a query-visible payload order. V has no format field, kind field, or packed
-payload list.
+The standalone COL library uses native SQL types and Feldera's checked `rkyv` codec to encode V;
+only K needs an order-preserving byte encoding. The file merger orders payloads for internal
+equality and merging, not to provide a query-visible payload order. V has no format field, kind
+field, or packed payload list. Prototype fixtures are regenerated for these codecs; persisted-file
+migration is outside this work.
 
 At a completed transaction boundary, accumulated source state has at most one active payload
 per K. A signed delta may have several rows for K. Feldera's

@@ -20,6 +20,7 @@ arcstr = { workspace = true, features = ["serde"] }
 base58 = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
+bytecheck = "0.6"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dbsp = { workspace = true }

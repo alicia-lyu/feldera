@@ -21,6 +21,10 @@ its current scope. No multiworker maintenance extension is planned.
 The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
 walks through compiler builds, incremental inspection artifacts,
 baseline comparisons, native execution, and the agent-added report formatting.
+The concrete Customer–Orders–Lineitem codecs and storage fixture are also
+available as a reusable standalone library in
+[`merged-index-col`](../merged-index-col/src/lib.rs). This baseline does not
+instantiate that library; Q3 runtime integration remains deferred.
 
 Use the repository's pinned Calcite build and Java 21 as described in the
 [compiler README](../../README.md). From this directory, regenerate the Rust

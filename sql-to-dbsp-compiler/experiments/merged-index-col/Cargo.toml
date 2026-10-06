@@ -1,0 +1,20 @@
+[package]
+name = "merged-index-col"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+dbsp = { path = "../../../crates/dbsp", features = ["backend-mode"] }
+feldera-sqllib = { path = "../../../crates/sqllib" }
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
+
+[dev-dependencies]
+feldera-storage = { path = "../../../crates/storage" }
+feldera-types = { path = "../../../crates/feldera-types" }
+tempfile = "3"
+
+[profile.dev]
+debug = "line-tables-only"

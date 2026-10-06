@@ -2,9 +2,24 @@
 
 Date: 2026-09-29.
 
+## Current ownership
+
+DBSP now provides the public, schema-independent definition and folded-key machinery in
+[`trace::merged_index`](../../../crates/dbsp/src/trace/merged_index/mod.rs), including batch
+construction and consolidated cursors. The concrete COL definition, codecs, and COL-specific
+tests are in the standalone
+[`merged-index-col` library](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs).
+Its identity is `Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`; complete
+folded keys are 11, 20, and 25 bytes. Payloads use native Feldera SQL types as specified in the
+[current storage contract](folded-key-layer-file-plan.md#payload-signed-weight-and-replacement).
+
+The implementation counts and commands below record the 2026-09-29 in-DBSP prototype before
+the concrete COL library was extracted. Current post-extraction verification is tracked in the
+[COL implementation plan](native-col-library-implementation-plan.md).
+
 ## Encoding and ownership
 
-`crates/dbsp/src/trace/merged_index/` contains the crate-internal
+`crates/dbsp/src/trace/merged_index/` contains the public
 `MergedIndex<D>` base. Static source-index descriptors supply logical base-relation
 IDs, ordered key fields and key-domain IDs, and payload field IDs. A
 `MergedIndexDefinition` selects those source indexes, assigns domain and source
@@ -19,20 +34,18 @@ The [future static code-generation plan](folded-key-layer-file-plan.md#future-st
 describes how SQL compiler output would eventually replace these handwritten Q3 definitions.
 This note records the implementation and tests that generated output must match.
 
-Each signed `i32` key field is encoded as big-endian bytes after flipping its sign
-bit. The ordered domain tags are `0x01` for customer, `0x02` for order, and `0x03`
-for line; `0x00` marks the terminal index identifier. Complete keys have lengths
-7, 12, or 17 bytes. Unfolding validates the length, each domain tag, and the
-terminal source identifier before reconstructing a typed key. Prefixes omit the
-terminal index identifier and can end before a complete key.
-The code-generation example's `i64` keys and index tag `255` are illustrative.
-This implementation retains its `i32` keys and terminal index tag `0x00`.
+Fields use their declared widths with a signed-order-preserving sign-bit flip. Customer and
+order IDs are `i64`; line numbers are `i32`. Ordered domain tags are `0x01` for customer,
+`0x02` for order, and `0x03` for line; `0x00` marks the terminal index identifier. Complete
+keys have lengths 11, 20, and 25 bytes. Unfolding validates the length, each domain tag, and
+the terminal source identifier before reconstructing a typed key. Prefixes omit the terminal
+index identifier and can end before a complete key.
 
 The three payload types match the [Step 2 payload contract](folded-key-layer-file-plan.md#payload-signed-weight-and-replacement).
-They use Feldera's `rkyv` serializer. Decoding validates the folded key before
-selecting its payload type and checks the archived payload bytes before
-deserialization. Serialized payload bytes are compared for file equality and
-merging; their byte order is not a query-visible value order.
+They use Feldera's checked `rkyv` codec. Decoding validates the folded key before selecting
+its payload type and checks the archived payload bytes before deserialization. Serialized
+payload bytes are compared for file equality and merging; their byte order is not a
+query-visible value order.
 
 ## File mapping
 

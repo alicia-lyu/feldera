@@ -1,18 +1,21 @@
-use rkyv::{Archive, Deserialize, Serialize, bytecheck};
+//! Concrete native Customer, Orders, and Lineitem merged-index definition.
 
-use super::{
+use feldera_sqllib::{Date, SqlDecimal, SqlString};
+use rkyv::{bytecheck, Archive, Deserialize, Serialize};
+
+use dbsp::storage::file::{to_bytes, Deserializer};
+use dbsp::trace::merged_index::{
     BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
     MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
     SourceIndexSpec,
 };
-use crate::storage::file::{Deserializer, to_bytes};
 
-pub(super) const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
-const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");
-const LINEITEM: SourceIndexId = SourceIndexId("LineitemByCustomer");
-pub(super) const CUSTOMER_DOMAIN: KeyDomainId = KeyDomainId("customer");
-const ORDER_DOMAIN: KeyDomainId = KeyDomainId("order");
-const LINE_DOMAIN: KeyDomainId = KeyDomainId("line");
+pub const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
+pub const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");
+pub const LINEITEM: SourceIndexId = SourceIndexId("LineitemByCustomer");
+pub const CUSTOMER_DOMAIN: KeyDomainId = KeyDomainId("customer");
+pub const ORDER_DOMAIN: KeyDomainId = KeyDomainId("order");
+pub const LINE_DOMAIN: KeyDomainId = KeyDomainId("line");
 
 const CUSTOMER_FIELDS: &[KeyField] = &[KeyField {
     name: "customer_id",
@@ -43,46 +46,46 @@ const LINEITEM_FIELDS: &[KeyField] = &[
     },
 ];
 
-pub(super) const CUSTOMER_KEY_DOMAIN: KeyDomain = KeyDomain {
+pub const CUSTOMER_KEY_DOMAIN: KeyDomain = KeyDomain {
     id: CUSTOMER_DOMAIN,
-    primitive: KeyPrimitive::I32,
+    primitive: KeyPrimitive::I64,
 };
-const ORDER_KEY_DOMAIN: KeyDomain = KeyDomain {
+pub const ORDER_KEY_DOMAIN: KeyDomain = KeyDomain {
     id: ORDER_DOMAIN,
-    primitive: KeyPrimitive::I32,
+    primitive: KeyPrimitive::I64,
 };
-const LINE_KEY_DOMAIN: KeyDomain = KeyDomain {
+pub const LINE_KEY_DOMAIN: KeyDomain = KeyDomain {
     id: LINE_DOMAIN,
     primitive: KeyPrimitive::I32,
 };
 
-pub(super) const CUSTOMER_PRIMARY: SourceIndexSpec = SourceIndexSpec {
+pub const CUSTOMER_PRIMARY: SourceIndexSpec = SourceIndexSpec {
     id: CUSTOMER,
     base_relation: BaseRelationId("Customer"),
     key_fields: CUSTOMER_FIELDS,
     payload_fields: &["segment"],
 };
-const ORDERS_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
+pub const ORDERS_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
     id: ORDERS,
     base_relation: BaseRelationId("Orders"),
     key_fields: ORDERS_FIELDS,
-    payload_fields: &["order_day", "ship_priority"],
+    payload_fields: &["order_date", "ship_priority"],
 };
-const LINEITEM_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
+pub const LINEITEM_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
     id: LINEITEM,
     base_relation: BaseRelationId("ExtendedLineitem"),
     key_fields: LINEITEM_FIELDS,
-    payload_fields: &["ship_day", "extended_price_cents", "discount_hundredths"],
+    payload_fields: &["ship_date", "extended_price", "discount"],
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SourceKey {
-    Customer(i32),
-    Orders(i32, i32),
-    Lineitem(i32, i32, i32),
+pub enum SourceKey {
+    Customer(i64),
+    Orders(i64, i64),
+    Lineitem(i64, i64, i32),
 }
 
-pub(crate) struct CustomerOrdersLineitemDefinition;
+pub struct CustomerOrdersLineitemDefinition;
 
 impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
     type Key = SourceKey;
@@ -122,19 +125,19 @@ impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
         },
     ];
 
-    fn project(key: &SourceKey) -> (SourceIndexId, Vec<i32>) {
+    fn project(key: &SourceKey) -> (SourceIndexId, Vec<i64>) {
         match *key {
             SourceKey::Customer(c) => (CUSTOMER, vec![c]),
             SourceKey::Orders(c, o) => (ORDERS, vec![c, o]),
-            SourceKey::Lineitem(c, o, l) => (LINEITEM, vec![c, o, l]),
+            SourceKey::Lineitem(c, o, l) => (LINEITEM, vec![c, o, i64::from(l)]),
         }
     }
 
-    fn construct(source_index: SourceIndexId, fields: &[i32]) -> Option<SourceKey> {
+    fn construct(source_index: SourceIndexId, fields: &[i64]) -> Option<SourceKey> {
         match (source_index, fields) {
             (CUSTOMER, [c]) => Some(SourceKey::Customer(*c)),
             (ORDERS, [c, o]) => Some(SourceKey::Orders(*c, *o)),
-            (LINEITEM, [c, o, l]) => Some(SourceKey::Lineitem(*c, *o, *l)),
+            (LINEITEM, [c, o, l]) => Some(SourceKey::Lineitem(*c, *o, (*l).try_into().ok()?)),
             _ => None,
         }
     }
@@ -142,42 +145,42 @@ impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[archive_attr(derive(rkyv::CheckBytes))]
-pub(crate) struct CustomerPayload {
-    pub segment: String,
+pub struct CustomerPayload {
+    pub segment: SqlString,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[archive_attr(derive(rkyv::CheckBytes))]
-pub(crate) struct OrdersPayload {
-    pub order_day: i32,
+pub struct OrdersPayload {
+    pub order_date: Date,
     pub ship_priority: i32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[archive_attr(derive(rkyv::CheckBytes))]
-pub(crate) struct LineitemPayload {
-    pub ship_day: i32,
-    pub extended_price_cents: i64,
-    pub discount_hundredths: i64,
+pub struct LineitemPayload {
+    pub ship_date: Date,
+    pub extended_price: SqlDecimal<15, 2>,
+    pub discount: SqlDecimal<4, 2>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SourcePayload {
+pub enum SourcePayload {
     Customer(CustomerPayload),
     Orders(OrdersPayload),
     Lineitem(LineitemPayload),
 }
 
 #[derive(Default)]
-pub(crate) struct CustomerOrdersLineitemIndex {
-    pub(super) base: MergedIndex<CustomerOrdersLineitemDefinition>,
+pub struct CustomerOrdersLineitemIndex {
+    pub base: MergedIndex<CustomerOrdersLineitemDefinition>,
 }
 
 impl CustomerOrdersLineitemIndex {
     pub fn build_batch(
         &self,
         rows: impl IntoIterator<Item = (SourceKey, SourcePayload, i64)>,
-    ) -> Result<super::MergedIndexBatch, String> {
+    ) -> Result<dbsp::trace::merged_index::MergedIndexBatch, String> {
         let encoded = rows
             .into_iter()
             .map(|(key, payload, weight)| {
@@ -189,7 +192,7 @@ impl CustomerOrdersLineitemIndex {
                 Ok((folded, bytes, weight))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        super::batch::build_batch(encoded)
+        dbsp::trace::merged_index::batch::build_batch(encoded)
     }
 
     pub fn fold(&self, key: &SourceKey) -> Result<FoldedKey, String> {
@@ -200,15 +203,15 @@ impl CustomerOrdersLineitemIndex {
         self.base.unfold(key)
     }
 
-    pub fn customer_prefix(&self, customer_id: i32) -> Vec<u8> {
+    pub fn customer_prefix(&self, customer_id: i64) -> Vec<u8> {
         self.base.prefix(CUSTOMER, &[customer_id]).unwrap()
     }
 
-    pub fn order_prefix(&self, customer_id: i32, order_id: i32) -> Vec<u8> {
+    pub fn order_prefix(&self, customer_id: i64, order_id: i64) -> Vec<u8> {
         self.base.prefix(ORDERS, &[customer_id, order_id]).unwrap()
     }
 
-    pub fn line_prefix(&self, customer_id: i32, order_id: i32) -> Vec<u8> {
+    pub fn line_prefix(&self, customer_id: i64, order_id: i64) -> Vec<u8> {
         self.base
             .prefix_with_next_tag(LINEITEM, &[customer_id, order_id])
             .unwrap()
@@ -221,7 +224,7 @@ impl CustomerOrdersLineitemIndex {
             SourcePayload::Lineitem(value) => to_bytes(value),
         }
         .map_err(|error| format!("payload serialization failed: {error:?}"))?;
-        Ok(PayloadBytes(bytes.as_slice().to_vec()))
+        Ok(PayloadBytes::from(bytes.as_slice().to_vec()))
     }
 
     pub fn decode_payload(&self, key: &[u8], bytes: &[u8]) -> Result<SourcePayload, String> {
@@ -241,7 +244,7 @@ where
     T::Archived: for<'a> bytecheck::CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>
         + Deserialize<T, Deserializer>,
 {
-    let mut aligned = crate::storage::buffer_cache::FBuf::new();
+    let mut aligned = dbsp::storage::buffer_cache::FBuf::new();
     aligned.extend_from_slice(bytes);
     let archived = rkyv::check_archived_root::<T>(&aligned)
         .map_err(|error| format!("corrupt payload: {error}"))?;
@@ -249,3 +252,9 @@ where
         .deserialize(&mut Deserializer::default())
         .map_err(|error| format!("corrupt payload: {error}"))
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod storage_tests;

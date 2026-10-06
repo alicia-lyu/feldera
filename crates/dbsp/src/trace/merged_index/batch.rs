@@ -13,12 +13,12 @@ use crate::{
 
 use super::{FoldedKey, PayloadBytes};
 
-pub(crate) type MergedIndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
+pub type MergedIndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
 type BatchCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 
 /// Sorts and consolidates contributions within one immutable initial batch.
 /// A zero net weight has no stored row.
-pub(crate) fn build_batch(
+pub fn build_batch(
     rows: impl IntoIterator<Item = (FoldedKey, PayloadBytes, ZWeight)>,
 ) -> Result<MergedIndexBatch, String> {
     let mut rows: Vec<_> = rows.into_iter().collect();
@@ -67,7 +67,7 @@ pub(crate) fn build_batch(
 }
 
 /// Consolidates matching pairs without changing or copying the underlying batches.
-pub(crate) fn batch_cursor(
+pub fn batch_cursor(
     batches: &[MergedIndexBatch],
 ) -> CursorList<DynData, DynData, (), DynZWeight, BatchCursor<'_>> {
     let factories =

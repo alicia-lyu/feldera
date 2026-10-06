@@ -228,9 +228,9 @@ The following operations are confirmed in the inspected source:
    retains cloned batch references. Both memory-backed and file-backed batches
    can be retained; snapshot acquisition does not require spilling in-memory
    batches. The existing
-   [storage test](../../../crates/dbsp/src/trace/merged_index/storage_tests.rs#L216)
+   [storage test](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/storage_tests.rs)
    preserves a memory-backed snapshot across compaction and later checks a
-   [snapshot containing both batch locations](../../../crates/dbsp/src/trace/merged_index/storage_tests.rs#L321).
+   snapshot containing both batch locations.
    Reading that view does not append updates or merge its batches. These
    snapshot and notification operations do not define a memory-limit policy.
    For a consolidated read, the
@@ -353,11 +353,11 @@ establish these generated typed relations or their runtime substitution.
 
 | Observed boundary | Native request | Current storage prototype evidence |
 | --- | --- | --- |
-| Key placement | `B⁺` and `L⁻` request order-ID keys; `O⁻` requests customer-ID keys. | [Source key fields](../../../crates/dbsp/src/trace/merged_index/customer_orders_lineitem.rs#L17) place Customer at `(c)`, Orders at `(c,o)`, and extended Lineitem at `(c,o,l)`. [Order/line prefix helpers](../../../crates/dbsp/src/trace/merged_index/customer_orders_lineitem.rs#L203) require customer ID as well as order ID. |
-| Identity widths | Customer and order IDs are `i64`; line number is `i32`. | [Key domains and SourceKey](../../../crates/dbsp/src/trace/merged_index/customer_orders_lineitem.rs#L46) use `i32` for all three identity domains. |
-| Payload representation | Values use `SqlString`, `Date`, and fixed-precision `SqlDecimal` types as listed above. | [Prototype payloads](../../../crates/dbsp/src/trace/merged_index/customer_orders_lineitem.rs#L143) use `String`, `i32` day fields, and `i64` price-cents/discount-hundredths fields. |
-| Cursor representation | Each join reads its typed key/value relation, including the joined `B` projection. | [MergedIndexBatch and batch_cursor](../../../crates/dbsp/src/trace/merged_index/batch.rs#L16) store folded `Vec<u8>` keys and serialized `Vec<u8>` payloads through dynamic types and expose consolidated source rows. |
-| Logical versus physical Lineitem | `s5` contains order ID and line number, with no customer ID. | [LineitemByCustomer](../../../crates/dbsp/src/trace/merged_index/customer_orders_lineitem.rs#L71) stores `ExtendedLineitem` under a customer-leading key. Its producer and related placement changes remain separate work under the [storage contract](folded-key-layer-file-plan.md#contract-and-references). |
+| Key placement | `B⁺` and `L⁻` request order-ID keys; `O⁻` requests customer-ID keys. Logical equality uses native IDs; folded bytes encode physical placement. | The [reusable COL definition](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs) places Customer at `(c)`, Orders at `(c,o)`, and extended Lineitem at `(c,o,l)`. Prefix helpers require customer ID as well as order ID. |
+| Identity widths | Customer and order IDs are `i64`; line number is `i32`. | COL uses `SourceKey::Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`, with corresponding key-domain widths. |
+| Payload representation | Values use `SqlString`, `Date`, and fixed-precision `SqlDecimal` types as listed above. | COL stores segment as `SqlString`, order and ship dates as `Date`, ship priority as `i32`, extended price as `SqlDecimal<15, 2>`, and discount as `SqlDecimal<4, 2>`. |
+| Cursor representation | Each join reads its typed key/value relation, including the joined `B` projection. | DBSP's [general merged-index batch](../../../crates/dbsp/src/trace/merged_index/batch.rs) stores folded byte keys and serialized payload bytes and exposes consolidated byte rows. Concrete payload codecs live in COL; typed join projections remain deferred. |
+| Logical versus physical Lineitem | `s5` contains order ID and line number, with no customer ID; logical equality still uses native IDs. | [LineitemByCustomer](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs) folds the extended row under a customer-leading physical key. Its producer and related placement changes remain separate work under the [storage contract](folded-key-layer-file-plan.md#contract-and-references). |
 | Runtime integration | The generated joins build native retained traces and read current/delayed snapshots. | The [generated calls](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487) do not instantiate the merged-index prototype or redirect any accumulated read to it. |
 
 R3 must investigate these compatibility boundaries and implement the four
