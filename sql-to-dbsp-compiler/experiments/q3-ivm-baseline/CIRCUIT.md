@@ -7,6 +7,11 @@ IDs, edges, ports, and clusters emitted by their source graph. The source code
 and runtime operator behavior referenced below explain how to read those
 graphs; they do not reconstruct the topology.
 
+Run [generate.sh](generate.sh) before following local `src/lib.rs` and
+`plan.json` links below. Those compiler outputs and `src/stubs.rs` are
+Git-ignored; the [experiment instructions](README.md#generate-and-run)
+describe their regeneration.
+
 ## Compiler-expanded logical graph
 
 The compiler graph is the existing `DBSPCircuit` after

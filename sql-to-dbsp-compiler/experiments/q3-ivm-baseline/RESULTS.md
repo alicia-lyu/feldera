@@ -1,8 +1,10 @@
 # Native Q3 baseline verification
 
-The checked-in [query](query.sql), [optimized relational plan](plan.json),
-and [generated circuit](src/lib.rs) were produced with `./generate.sh` on
-2026-10-01. The compiler was built by
+The checked-in [query](query.sql) was compiled with `./generate.sh` on
+2026-10-01 to produce the [optimized relational plan](plan.json),
+[generated circuit](src/lib.rs), and UDF stubs. These outputs are now
+Git-ignored; run `./generate.sh` before inspecting their local links.
+The compiler was built by
 `sql-to-dbsp-compiler/build.sh` against pinned Apache Calcite commit
 `f840e7ab3f8121e71035a7a1ed3fc1372f0139d5` with OpenJDK `21.0.12.1`.
 The compiler invocation uses `-i`, Catalog mode, and default `-O2`.

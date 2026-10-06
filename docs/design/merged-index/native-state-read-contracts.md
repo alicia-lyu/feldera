@@ -2,7 +2,10 @@
 
 Inspected on 2026-10-06 at Feldera revision
 `308950de73a28bb014c8ad002365d2aa64f1f152`. The source links below refer to the
-checked-in generated program and runtime inspected at that revision. The
+generated program and runtime inspected at that revision. The generated files
+were tracked at that revision; they are now Git-ignored. Run
+[generate.sh](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/generate.sh)
+before following their local source links. The
 [native circuit note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md#reading-the-generated-program)
 records the generated topology; this document binds its accumulated-state reads.
 R1–R5 name the [README roadmap](README.md#next-steps). The older storage Step 2

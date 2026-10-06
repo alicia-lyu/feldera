@@ -30,8 +30,12 @@ circuit with:
 ./generate.sh
 ```
 
-This is Catalog mode and the compiler's default optimization level 2. The
-generated file is checked in so the experiment's actual circuit is reviewable.
+This is Catalog mode and the compiler's default optimization level 2. Run
+`./generate.sh` before building or testing a fresh checkout. It produces
+`src/lib.rs`, `src/stubs.rs`, and `plan.json`; these compiler artifacts are
+Git-ignored. The handwritten `src/main.rs` driver, `src/data.rs` parser,
+`src/udf.rs` scaffolding, SQL, and generator remain tracked. The generated
+circuit and plan are available locally for inspection after generation.
 Run the deterministic native transactions with:
 
 ```sh

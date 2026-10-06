@@ -51,7 +51,9 @@ as a universal physical allocation count.
 - Architecture review and documentation are complete, committed in `8897e3293` and `a9789d911`.
 - The native experiment is implemented and committed in `830ec4f43`. The pinned compiler
   generates Orders–Customer followed by Lineitem–joined-orders, using two balanced binary joins. Its generated Rust, relational
-  plan, and circuit explanation are retained with the experiment.
+  plan, and circuit explanation are documented with the experiment. Since 2026-10-06,
+  generated Rust, UDF stubs, and the relational plan are Git-ignored and regenerated
+  with `generate.sh`; SQL, the generator, and handwritten sources remain tracked.
 - All six native/parser/refresh tests pass, including simultaneous changes to all three
   sources with one and two workers. Rust formatting and strict Clippy checks pass.
 - Generated Rust and relational-plan bytes reproduce exactly. Markdown formatting, links,

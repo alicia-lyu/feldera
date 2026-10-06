@@ -152,12 +152,15 @@ and explains their signed-delta semantics.
 
 ```bash
 cd "$EXPERIMENT"
+./generate.sh
 cargo +1.96.1 build --release --offline -j2 \
   > "$RUN_DIR/release-build.log" 2>&1
 ```
 
-Cargo builds the checked-in generated `src/lib.rs`, handwritten `src/main.rs`
-driver and `src/data.rs` parser, and native runtime dependencies declared in
+`generate.sh` recreates Git-ignored `src/lib.rs`, `src/stubs.rs`, and `plan.json`
+from the tracked SQL using the compiler built above. Cargo builds that generated
+`src/lib.rs`, the handwritten `src/main.rs` driver and `src/data.rs` parser,
+the handwritten `src/udf.rs` scaffolding, and native runtime dependencies declared in
 [`Cargo.toml`](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/Cargo.toml).
 `CARGO_TARGET_DIR` selects the repository target directory. Cargo does not
 build run-directory Rust copies.
@@ -308,4 +311,3 @@ enabled. The compiler and runtime SVGs are rendered from their corresponding
 DOT files. Provenance records revisions, commands, configurations, and capture
 stages. Markdown and local artifact links should be checked when updating the
 local capture set.
-
