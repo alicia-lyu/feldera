@@ -5,8 +5,8 @@ use super::*;
 #[cfg(feature = "merged-index")]
 use dbsp::{
     dynamic::DowncastTrait,
-    trace::Cursor,
-    typed_batch::{SpineSnapshot, TypedBatch},
+    trace::{BatchReader as DynamicBatchReader, Cursor, WithSnapshot},
+    typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
     DBData, OrdIndexedZSet,
 };
