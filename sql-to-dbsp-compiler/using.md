@@ -173,6 +173,14 @@ Here is a description of the non-obvious command-line options:
      using serialization/deserialization.  All Java tests use the
      typed API; production pipelines use the untyped API.
 
+--q3-merged-index: Experimental opt-in for the predicate-free Q3 baseline
+     under `experiments/q3-ivm-baseline`. Requires `-i` and single-crate
+     Catalog Rust output. The generated circuit accepts a
+     `merged_index_col::q3::Q3State` argument and calls the specialized
+     reconstruction joins. The compiler checks the source schemas, index
+     projections, join orientation, join projections, and output view;
+     unsupported changes fail compilation.
+
 --ignoreOrder: `ORDER BY` clauses are not naturally incrementalizable.
      Using this flag directs the compiler to ignore `ORDER BY` clauses
      that occur *last* in a view definition (the result will thus not sort
