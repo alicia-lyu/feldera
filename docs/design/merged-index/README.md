@@ -2,9 +2,11 @@
 
 **Range-aligned IVM** supplies selected accumulated state to a logical delta program from
 source records in a merged index. Compatible join/group key domains and the chosen physical
-ordering align delta locations with the state ranges needed for maintenance. This is a future
-integration design; the [native Q3 baseline](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
-uses ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
+ordering align delta locations with the state ranges needed for maintenance. The
+[RF1/RF2 reconstruction prototype](r3-rf1-rf2-reconstruction-implementation-plan.md)
+uses externally maintained COL state; the
+[native Q3 baseline](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+continues to use ordinary Feldera state. The [implementation plan](range-aligned-ivm-native-q3-baseline-plan.md)
 records the scope settled on 2026-10-01 and supersedes earlier assumptions about a fixed Q3 circuit.
 The [compilation and run workflow](WORKFLOW.md) explains the native baseline's commands,
 generated compiler/runtime graphs, raw artifacts, and provenance. All future
@@ -543,10 +545,17 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    identify all four generated accumulated reads, concrete key/value types, before/after
    semantics, and existing snapshot, fetch, and cursor behavior at the inspected revision.
    They record compatibility gaps with the [native storage substrate](phase-4-implementation-note.md).
-3. **R3 — Direct reconstruction.** Investigate those compatibility gaps and implement the
-   generated bindings. Redirect selected reads and stop replaced accumulation. Reconstruction,
-   ordering, memory, publication, and recovery decisions belong to this implementation stage.
-   Shared scan sessions remain optional.
+3. **R3 — Direct reconstruction.** The [implementation contract](r3-rf1-rf2-reconstruction-implementation-plan.md)
+   selects an opt-in compiler path for the four generated reads. The RF1/RF2 prototype
+   manually maintains the COL index before Q3 consumes logical deltas. Orders records in
+   the same delta batch supply customer placement; initial loading keeps complete order/line
+   groups together under referential integrity. Replaced historical join traces are omitted;
+   transaction delta collectors and materialized `V` remain. Reconstruction copies only
+   requested accumulated ranges into temporary native batches. This copying and possible
+   sorting is suboptimal; direct reconstructed cursors are a future optimization. Initial
+   loading prepares state, and subsequent RF1/RF2 maintenance is the measurement target.
+   General updates and complete circuit stacking, including checkpoint coordination between
+   independently running circuits, remain future work. Shared scan sessions remain optional.
 4. **R4 — Correctness verification.** Compare native and reconstructed reads, deltas, and `V` with
    independent evaluation for simultaneous changes, replacements, distinct lines with identical
    payloads, fan-out, and supplied key moves. Verify residual Q3 separately.

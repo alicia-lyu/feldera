@@ -1,5 +1,7 @@
 //! Concrete native Customer, Orders, and Lineitem merged-index definition.
 
+pub mod q3;
+
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 use rkyv::{bytecheck, Archive, Deserialize, Serialize};
 

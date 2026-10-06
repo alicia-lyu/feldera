@@ -13,8 +13,10 @@ and its Phase numbering retain their meaning.
 
 R2 documents existing behavior and observed compatibility gaps. R3 owns
 reconstruction and runtime integration, including decisions about adapters,
-ordering strategies, memory policies, and recovery. No such implementation is
-claimed here. Maintenance targets one DBSP worker; initial loading may use
+ordering strategies, memory policies, and recovery. The
+[RF1/RF2 implementation contract](r3-rf1-rf2-reconstruction-implementation-plan.md)
+narrows the current integration workload; the native behavior inspected here
+remains the comparison contract. Maintenance targets one DBSP worker; initial loading may use
 multiple workers under the [worker policy](README.md).
 
 ## Relations and state notation
@@ -365,7 +367,35 @@ bindings with the documented tuples, signed weights, key/value order, absence,
 and before/after visibility. It must identify the actual trace owners and
 consumers so redirecting selected reads also stops their independent
 accumulation. Base input storage, the secondary merged index, materialized `V`,
-and unreplaced state remain separately accounted for. This document selects no
-remedy for the observed gaps; reconstruction, integration, and lifecycle
-implementation decisions belong to R3. R4 owns the broader correctness
+and unreplaced state remain separately accounted for. R4 owns the broader correctness
 verification, and R5 owns maintenance measurements.
+
+### R3 RF1/RF2 binding
+
+The opt-in compiler emits calls to the COL library's
+[Q3 readers](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/q3.rs).
+The manually maintained index has already received its physical updates when Q3
+starts. Its immutable before/after snapshots and a temporary order/customer map
+from the current Orders delta serve all four readers. RF2 discovery supplies the
+complete deleted Orders and Lineitems; it runs outside Q3. Customer deltas occur
+only during initial loading, before any Orders are loaded. RF1/RF2 change only
+complete order/line groups. Referential integrity is assumed; orphan lines,
+customer updates, replacements, and key moves are outside this prototype.
+
+The supplied-state join retains transaction delta collection and `JoinTrace`,
+including its flush barrier and signed-delta equations. It omits the four
+independent historical join traces. At that barrier, readers decode and copy only
+the requested accumulated ranges into typed native batches. Native batch sorting
+and snapshot cursors establish tuple order, consolidate matching complete tuples,
+and omit zero weights. Source snapshots share batch references without copying
+source rows. Temporary reconstructed rows are released when the join finishes.
+
+This requested-range materialization is suboptimal. Its copying, decoding, and
+possible sorting are included in Q3 maintenance time. A future direct reconstructed
+cursor could avoid temporary batches while preserving the same read contract.
+Native memory/file policy applies to these batches; a hard memory cap is not claimed.
+
+Complete circuit stacking is deferred. A future upstream maintenance circuit
+would publish source views before Q3 consumes deltas and would coordinate its
+checkpoint boundary with Q3. The current manual prototype tests native save/restore
+at a completed boundary; it does not implement a cross-circuit recovery protocol.
