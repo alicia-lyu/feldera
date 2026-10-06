@@ -281,6 +281,13 @@ does not imply that its delta always drives a selective lookup.
 
 ## Worked signed examples
 
+**Validation status:** These are agent-authored algebraic illustrations, not
+executable test cases. They have not been executed as written or reviewed or
+validated by a human expert. R2 added no runtime code or executable tests.
+The native baseline has [tests for related scenarios](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs#L858),
+but those do not establish validation of these exact examples. The examples
+illustrate the equations above; they are not correctness evidence for R3.
+
 All examples use unit source weights and matching identities: customer 7,
 order 10 owned by customer 7, and line 1 of order 10. Unmentioned payload
 fields are fixed. `{+x}` means tuple `x` with weight `+1`; `{-x}` means weight
