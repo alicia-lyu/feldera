@@ -199,6 +199,12 @@ not batch placement, storage writes, or compaction.
 
 ### Snapshot, fetch, and cursor operations
 
+`Cursor<K, V, T, R>` is the interface for navigating one weighted collection.
+`JointKeyCursor` is a private join helper that contains two such cursors, one
+for the delta and one for the accumulated trace, and positions them at matching
+keys. It does not define another storage cursor interface. The join loop uses
+the two underlying cursors to enumerate value pairs and multiply their weights.
+
 The following operations are confirmed in the inspected source:
 
 1. [JoinTrace::eval](../../../crates/dbsp/src/operator/dynamic/join.rs#L1633)
@@ -234,11 +240,13 @@ The following operations are confirmed in the inspected source:
    batch cursors for batches without a specialized fetch result. The join
    uses the fetched cursor when present, otherwise the snapshot's full cursor.
 4. [JointKeyCursor](../../../crates/dbsp/src/operator/dynamic/join.rs#L1572)
-   enumerates one side's keys and calls `seek_key_exact` on the other. For
+   coordinates the delta and trace cursors at the key level: it enumerates
+   one side's keys and calls `seek_key_exact` on the other. For
    these inner joins, fetched state makes the delta drive; otherwise
    [estimated key counts](../../../crates/dbsp/src/operator/dynamic/join.rs#L1667)
    choose which side drives. Missing keys produce no joined rows.
-5. The [cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42)
+5. Each underlying cursor implements the
+   [Cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42), which
    visits ordered keys, then ordered values within each key, and returns
    borrowed key/value references. The root-time
    [join loop](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
