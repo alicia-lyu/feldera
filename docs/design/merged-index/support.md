@@ -24,13 +24,15 @@ Logical Lineitem has order and line identities and joins Orders on order ID, wit
 ID column. Customer-led extended Lineitem is a physical index representation; its producer is
 separate work. Extended records and related key changes are assumed supplied and available
 **before associated join maintenance runs**. They locate logical `ΔL` without changing its schema.
-Local SQL views belong at order-destroying decomposition boundaries; illustrative `B = O ⋈ C`
-is neither a required SQL declaration nor the native compiler's prescribed intermediate.
+Local SQL views belong at order-destroying decomposition boundaries. `B` names the actual
+generated Orders–Customer intermediate; it is not a required SQL declaration. The
+[R2 contracts](native-state-read-contracts.md) define its projection, all four accumulated
+read bindings, concrete types, runtime snapshot/cursor behavior, and observed prototype gaps.
 
 The [native baseline circuit](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
-explains the generated Step 1 program. The earlier two-join formulas below remain illustrations,
-superseded as a circuit prescription on 2026-10-01 by the
-[new plan](range-aligned-ivm-native-q3-baseline-plan.md). Verified storage evidence remains unchanged.
+explains the generated R1 program. The [native-baseline plan](range-aligned-ivm-native-q3-baseline-plan.md)
+superseded earlier circuit prescriptions on 2026-10-01; R2 now records the verified bindings.
+Verified storage evidence remains unchanged.
 
 ## Storage differences from RocksDB
 
@@ -294,7 +296,7 @@ rule to the same source. Their physical positions `(c)`,
 opaque byte strings; the access layer knows the encodings, constructs range bounds, and decodes record types.
 The key ends with the index-identifier domain tag and its identifier; no additional END marker or redundant
 value kind field is needed. Encoding must preserve the required cross-type order. The
-[Step 2 plan](folded-key-layer-file-plan.md#record-representation) specifies the concrete prototype bytes and
+[storage Step 2 plan](folded-key-layer-file-plan.md#record-representation) specifies the concrete prototype bytes and
 the mapping to Feldera's existing file columns and cursors. Prefix scans seek and step until the prefix changes;
 they do not need a function computing the next existing key.
 
@@ -341,7 +343,7 @@ Signed-change consolidation also compares payloads to cancel the matching retrac
 alone would lose a payload replacement whose net weight change is zero. The intermediate
 raw or partially merged state may contain several payload contributions at K. Accumulated K
 uniqueness follows when enforced source identity is preserved by folding and index maintenance;
-Step 3 must establish that implication for the actual sources and update/recovery paths. The
+R3 must establish that implication for the actual sources and update/recovery paths. The
 former Phase 3 custom-merger/validator plan is withdrawn. The generic spine internally orders same-K delta values;
 this does not require an order-preserving payload encoding or add V to the merged-index search key.
 The transaction supplies all intended related-row
@@ -662,9 +664,12 @@ retained-state baseline; report high-water bytes and every spill, reread, sort, 
 ## Merged index reconstructs integrator outputs
 
 The logical Q3 maintenance boundary is the unfiltered, unaggregated three-way join `V`
-(`J` in earlier notes). The following decomposition illustrates its semantics, not a prescribed circuit.
-Here `O`, `C`, and `L` are logical accumulated Orders, Customers, and standard Lineitems; `B = O ⋈ C`
-is the intermediate join. The join equalities match customer and order identities. They are part
+(`J` in earlier notes). Here `O`, `C`, and `L` are logical accumulated Orders, Customers,
+and standard Lineitems; `B` is the actual generated Orders–Customer intermediate projection.
+The [R2 contracts](native-state-read-contracts.md#generated-bindings-and-equations) define
+`X⁻` as accumulated state before the update set, `X⁺` as state afterward, and
+`ΔX = X⁺ − X⁻`. Superscripts denote states, not weight signs; unchanged tuples belong to both.
+The join equalities match customer and order identities. They are part
 of the relation definition. Market-segment and date predicates belong to a query consuming `J`.
 The maintained `J` includes customer, order, and line identities, segment, order and ship dates,
 ship priority, price, and discount, with the joined weight. Keeping line identity prevents two
@@ -674,7 +679,7 @@ otherwise identical Q3-visible lines from being collapsed before the query group
 flowchart LR
     DO[Order changes] --> O[Accumulated O]
     DC[Customer changes] --> C[Accumulated C]
-    O --> B[Join B = O join C]
+    O --> B[Generated B = projected O join C]
     C --> B
     DL[Logical line changes] --> L[Accumulated L]
     B --> J[Maintained J = B join L]
@@ -684,28 +689,24 @@ flowchart LR
 
 The merged-index provider supplies requested accumulated state to the **existing** incremental join
 operators. Its reads of before-maintenance state exclude pending contributions. Reads of after-maintenance
-state include them. With `ΔO`, `ΔC`, and `ΔL` as signed input changes, this illustrative join orientation gives:
+state include them. With `ΔO`, `ΔC`, and `ΔL` as signed input changes, the generated orientation gives:
 
 ```text
-B_before = O_before ⋈ C_before
-B_after  = O_after  ⋈ C_after
-ΔB       = O_before ⋈ ΔC + ΔO ⋈ C_after
-
-J_before = B_before ⋈ L_before
-J_after  = B_after  ⋈ L_after
-ΔJ       = B_before ⋈ ΔL + ΔB ⋈ L_after
+ΔB = ΔO ⋈ C⁺ + O⁻ ⋈ ΔC
+ΔV = ΔL ⋈ B⁺ + L⁻ ⋈ ΔB
+V⁺ = V⁻ + ΔV
 ```
 
 These are the same old/current-trace choices made by Feldera's
 [incremental join](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/join.rs#L698-L749).
-For this illustration, the provider supplies state tuples; the operator computes `ΔB` and `ΔJ`. The circuit
-binding must identify
-its actual accumulated read sites and preserve their key/value ordering and weighted cursor behavior.
+R2 [binds the actual accumulated read sites](native-state-read-contracts.md#generated-bindings-and-equations)
+and records their key/value ordering and weighted cursor behavior. In the future reconstruction
+path, the provider supplies state tuples; the operator computes `ΔB` and `ΔV`.
 The provider reads the appropriate snapshot and returns weighted tuples to join operators. The input
 delta is retained separately and supplied to their existing delta ports.
 
 ```text
-# Illustrative relation set; bind actual read sites from the generated circuit.
+# Future provider sketch; R2 documents native reads, not this implementation.
 provider.open(relation, requested_keys, state):
     assert relation in {O, C, L, B}
     assert state in {BEFORE_MAINTENANCE, AFTER_MAINTENANCE}
@@ -730,8 +731,8 @@ into a delta input.
 The [lecture note's Q3 figure](../../../../DBSP_w_merged_index/figures/q3-dbsp-circuit.tex#L59)
 and [five-state account](../../../../DBSP_w_merged_index/dbsp-merged-index-feasibility.tex#L405)
 illustrate a filtered, aggregate-first circuit with `H` and `A` states. They document another maintenance
-boundary and are not the maintained join boundary. Neither that figure nor the illustrative `B` wiring
-prescribes the compiler-selected native circuit. Feldera's generic
+boundary and are not the maintained join boundary. That figure does not prescribe the
+compiler-selected native circuit documented in R2. Feldera's generic
 [aggregation implementation](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/operator/dynamic/aggregate.rs#L766-L796)
 remains relevant when Q3's consuming query groups the maintained joined rows.
 
@@ -917,7 +918,7 @@ storage/query evidence. The `mi_db` scan-session section is validated input for 
 sharing design, without implying validation of its other sections or implementation of this report's
 Feldera-specific extensions.
 
-Step 1 checks native deltas and materialized `V` against independent joins and validates exact
+R1 checks native deltas and materialized `V` against independent joins and validates exact
 parsing and paired RF1/RF2 updates. It measures native load/refresh transaction latency and
 throughput including `V` maintenance, with preparation, driver memory, and end-to-end time
 reported separately. It implements no merged-index access, extension producer, reconstruction,

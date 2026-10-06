@@ -24,7 +24,7 @@ scope. No multiworker maintenance extension is planned.
    order, and line ranges available for reconstruction.
 3. **Translate the pipeline result into logical SQL.** Define maintained result `V` (`J` in
    the earlier Q3 discussion) and obtain a DBSP program. SQL need not preserve the authored
-   physical shape, and the physical plan used to load `V` may differ. Step 1 bootstraps and
+   physical shape, and the physical plan used to load `V` may differ. R1 bootstraps and
    updates `V` through the same compiler-generated incremental circuit.
 4. **Supply accumulated state to the logical `ΔV` program.** Replace selected independently
    maintained integrator traces with reconstructed state. Preserve logical delta computation,
@@ -45,8 +45,9 @@ reconstruct requested accumulated relations within common or nested prefixes. In
 prefix contains order prefixes, which contain line prefixes. Different consumers may request
 different levels of that hierarchy. Alignment requires neither identical leaf keys, a single
 coordinated scan, nor global sorting of delta execution. A small customer delta can affect a
-large descendant range. Grouping belongs to the broader architecture; Step 1's Q3 join has
-no aggregation. See the [state-read contracts](support.md#range-alignment-and-native-state-read-contracts).
+large descendant range. Grouping belongs to the broader architecture; R1's Q3 join has
+no aggregation. See the [generated state-read contracts](native-state-read-contracts.md)
+and [range-alignment discussion](support.md#range-alignment-and-native-state-read-contracts).
 
 ## References and how each helps
 
@@ -113,6 +114,7 @@ Local links assume the sibling checkout layout; public code links pin the inspec
 | Reference | How it helps |
 | --- | --- |
 | [Native Q3 baseline experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md) | Implements native incremental bootstrap and refreshes; the circuit note maps generated joins and state reads, and the results note records verification and measurements. |
+| [Generated native state-read contracts (R2)](native-state-read-contracts.md) | Binds all four generated accumulated reads to concrete types, before/after states, runtime snapshots and cursors; records prototype gaps for R3. |
 | [Storage differences from RocksDB](support.md#storage-differences-from-rocksdb) | Connects the baseline comparison to concrete storage sources. |
 | [Trace access traverses keys then weighted values](support.md#trace-access-traverses-keys-then-weighted-values) | Provides interface pseudocode, an array layout, traversal/lookup examples, and interchangeable read providers. |
 | [Folded keys in Feldera layer files](support.md#folded-keys-in-feldera-layer-files) | Defines the record representation and weighted-update requirements for reusing the LSM machinery. |
@@ -140,8 +142,9 @@ Feldera permits explicit, named intermediate SQL views. `CREATE LOCAL VIEW` defi
 calculation for dependent views without exposing its change stream as a pipeline output. `CREATE VIEW`
 exposes output changes; `CREATE MATERIALIZED VIEW` also retains the complete current result for ad-hoc
 queries and snapshots. In the intended decomposition, local SQL views belong at order-destroying boundaries.
-`B = O ⋈ C` below is explanatory internal-state notation, not a required SQL declaration or
-a compiler-selected intermediate. Step 1 declares one three-way view and lets the compiler choose its shape. See the
+`B` below names the actual generated Orders–Customer intermediate, not a required SQL declaration.
+R1 declares one three-way view and lets the compiler choose its shape; the
+[R2 contracts](native-state-read-contracts.md#relations-and-state-notation) record that choice. See the
 [SQL view grammar](https://docs.feldera.com/sql/grammar/) and
 [materialized-view behavior](https://docs.feldera.com/sql/materialized/).
 
@@ -170,7 +173,7 @@ materialized input reads; that does not imply sharing with our different folded 
 See the [settled storage scope](folded-key-layer-file-plan.md#settled-scope-before-phase-4).
 
 Reuse Feldera's native signed merging. K uniqueness should follow from enforced source keys,
-identity-preserving folding, and correct secondary-index maintenance; Step 3 must establish
+identity-preserving folding, and correct secondary-index maintenance; R3 must establish
 those conditions for the actual source and recovery paths. No new merger or mandatory
 changed-key validation scan is planned. The former Phase 3 plan is withdrawn. The
 [Phase 4 plan](phase-4-file-backed-storage-implementation-plan.md) verifies native
@@ -256,7 +259,7 @@ that optimization in the baseline comparison.
 
 ## What changes in our design
 
-The [Step 2 storage plan](folded-key-layer-file-plan.md) records the current implementation contract and the
+The [storage Step 2 plan](folded-key-layer-file-plan.md) records the current implementation contract and the
 user's clarifications: folded keys, weighted payload rows, transaction-supplied related-row
 changes, and temporary read handles without multi-versioning or expiration policies.
 The [Phase 1 implementation note](phase-1-implementation-note.md) records the verified
@@ -380,7 +383,8 @@ is a historical alternative with a different maintained-view boundary.
 
 Maintain the unfiltered, unaggregated logical Customer–Orders–Lineitem join `V = J`.
 Logical `L` has order and line identities, without customer ID; it joins Orders on order ID.
-`B = O ⋈ C` joins on customer ID and merely illustrates a possible intermediate.
+`B` is the generated Orders–Customer intermediate, joined on customer ID and keyed by order ID.
+The [R2 contracts](native-state-read-contracts.md) specify its projection and accumulated reads.
 Customer-led extended Lineitem records are physical merged-index representations. Producing them
 is a separate index/view maintenance problem. Corresponding extended records and related key
 changes are assumed supplied and available **before associated join maintenance runs**; they
@@ -390,7 +394,7 @@ locate logical `ΔL` physically without changing its schema. Storage does not in
 | --- | --- | --- |
 | `O` | Order ID, customer ID, order date, ship priority, signed weight | Order records. |
 | `C` | Customer ID, market segment, signed weight | Customer records. |
-| Illustrative `B = O ⋈ C` | All fields above, with joined weight | Customer and order prefixes, if requested by the circuit. |
+| Generated `B` | Order ID key; customer ID, market segment, order date, ship priority; joined weight | Customer and order source records; order-ID requests are a documented compatibility gap. |
 | Logical `L` | Order ID, line ID, ship date, extended price, discount, signed weight | Physical extended records also carry the customer prefix. |
 | Maintained `V = J` | Customer, order, and line identities; market segment, order date, ship priority, ship date, price, and discount; joined weight | Separate materialized pipeline result. |
 
@@ -411,7 +415,9 @@ ORDER BY revenue DESC, order_date
 LIMIT 10;
 ```
 
-The before-maintenance state excludes pending source changes; the after-maintenance state includes them.
+For any accumulated relation `X`, `X⁻` is state immediately before the update set and `X⁺`
+is state afterward; `ΔX = X⁺ − X⁻`, so `X⁺ = X⁻ + ΔX`. The superscripts identify states,
+not negative and positive tuple weights. Unchanged tuples belong to both states.
 For a joined relation, Feldera's incremental join uses a before-state input on one branch and an
 after-state input on the other, so simultaneous changes contribute once. If a line changes price and its
 customer changes segment in the same supplied update set, the maintained `J` retracts the old joined row
@@ -450,9 +456,9 @@ flowchart LR
 Before-maintenance reads use the snapshot taken before the append. After-maintenance reads use the snapshot
 taken afterward, which includes the signed changes. The same input delta remains available separately to
 the existing operators. No record status bit is needed: snapshot membership determines which contributions
-each read sees. If `B` is the pre-append index state and `D` the signed delta, the manuscript's `R−`
-is read from `B` and `R+` from `B + D`. A negative weight in `D` retracts an old payload in `R+`;
-it does not place that delta record in `R−`. See the
+each read sees. If `S` is the pre-append index state and `D` the signed delta, `X⁻`
+is read from `S` and `X⁺` from `S + D`. A negative weight in `D` retracts an old payload in `X⁺`;
+it does not place that delta record in `X⁻`. See the
 [runtime compatibility contract](folded-key-layer-file-plan.md#compatibility-with-feldera-operators).
 The transaction explicitly supplies any intended Lineitem placement changes; storage neither invents
 related-row updates nor enforces relational consistency. Completion does not append the same delta again.
@@ -468,7 +474,7 @@ See [Consumers determine the required payload](support.md#consumers-determine-th
 ## Why this could improve I/O
 
 The hypothesis is that avoiding selected retained intermediate collections reduces writes;
-Step 1 only establishes the native baseline, and any saving requires measurement. Source changes
+R1 only establishes the native baseline, and any saving requires measurement. Source changes
 still incur KV update, consolidation, and persistence work, but a selected reconstructed intermediate need not have
 separate accumulated storage. Co-location also lets several logical consumers use one physical range read.
 Neither benefit implies that every update becomes cheaper.
@@ -506,7 +512,10 @@ source provenance and implementation acceptance criteria.
 
 ## Next Steps
 
-1. **Use the native baseline.** The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
+The roadmap uses **R1–R5**. These labels are distinct from the older
+**storage Step 2** and its Phase numbering, which remain in the storage plans and notes.
+
+1. **R1 — Native baseline.** The [experiment](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)
    uses one predicate-free materialized SQL view, default optimization, Catalog mode, and native
    incremental bootstrap/update execution. Inspect its actual state reads, compare signed deltas
    and snapshots with independent full joins, and measure load and RF1/RF2 separately. Defaults
@@ -516,17 +525,18 @@ source provenance and implementation acceptance criteria.
    while the [circuit note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
    records actual before/after read choices. See [verified results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
    for executed checks and measurements.
-2. **Bind the generated state requests.** Identify concrete accumulated read sites, their
-   before/after semantics, partitioning, fetches, and cursor operations. Use the verified
-   [native storage substrate](phase-4-implementation-note.md); extension production, runtime
-   integration, and recovery remain later work.
-3. **Implement direct reconstruction.** Supply requested state with explicit temporary-storage
-   limits and ordering paths. Redirect reads and stop replaced accumulation. Verify cursor,
-   snapshot, publication, and recovery behavior. Shared scan sessions remain optional.
-4. **Verify range-aligned IVM.** Compare native and reconstructed reads, deltas, and `V` with
+2. **R2 — State-read bindings.** The [completed contracts](native-state-read-contracts.md)
+   identify all four generated accumulated reads, concrete key/value types, before/after
+   semantics, and existing snapshot, fetch, and cursor behavior at the inspected revision.
+   They record compatibility gaps with the [native storage substrate](phase-4-implementation-note.md).
+3. **R3 — Direct reconstruction.** Investigate those compatibility gaps and implement the
+   generated bindings. Redirect selected reads and stop replaced accumulation. Reconstruction,
+   ordering, memory, publication, and recovery decisions belong to this implementation stage.
+   Shared scan sessions remain optional.
+4. **R4 — Correctness verification.** Compare native and reconstructed reads, deltas, and `V` with
    independent evaluation for simultaneous changes, replacements, distinct lines with identical
    payloads, fan-out, and supplied key moves. Verify residual Q3 separately.
-5. **Measure total maintenance cost.** Compare beyond-memory state under equal total memory and
+5. **R5 — Maintenance measurements.** Compare beyond-memory state under equal total memory and
    comparable durability, including discovery, reads, writes, sorting, spill, and background work.
-   Step 1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3
+   R1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3
    integration passes its [acceptance criteria](support.md#evidence-and-measurements-bound-the-claim).
