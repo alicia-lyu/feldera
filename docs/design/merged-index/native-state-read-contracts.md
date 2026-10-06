@@ -233,30 +233,34 @@ The following operations are confirmed in the inspected source:
    [snapshot containing both batch locations](../../../crates/dbsp/src/trace/merged_index/storage_tests.rs#L321).
    Reading that view does not append updates or merge its batches. These
    snapshot and notification operations do not define a memory-limit policy.
+   For a consolidated read, the
+   [unit-time CursorList](../../../crates/dbsp/src/trace/cursor/cursor_list.rs#L150)
+   sums contributions for identical key/value pairs across batches and skips
+   zero totals.
 3. When `fetch_join == Some(true)`, the join invokes
    [trace.fetch(&delta)](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661).
    [SpineSnapshot::fetch](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L252)
    delegates to `FetchList`, which concurrently fetches each batch and keeps
    batch cursors for batches without a specialized fetch result. The join
    uses the fetched cursor when present, otherwise the snapshot's full cursor.
-4. [JointKeyCursor](../../../crates/dbsp/src/operator/dynamic/join.rs#L1572)
-   coordinates the delta and trace cursors at the key level: it enumerates
-   one side's keys and calls `seek_key_exact` on the other. For
+4. **Join traversal and output.** Each input cursor implements the
+   [Cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42): ordered
+   key/value navigation and borrowed key/value references.
+   [JointKeyCursor](../../../crates/dbsp/src/operator/dynamic/join.rs#L1572)
+   coordinates the two input cursors at the key level, enumerating one side's
+   keys and calling `seek_key_exact` on the other. For
    these inner joins, fetched state makes the delta drive; otherwise
    [estimated key counts](../../../crates/dbsp/src/operator/dynamic/join.rs#L1667)
-   choose which side drives. Missing keys produce no joined rows.
-5. Each underlying cursor implements the
-   [Cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42), which
-   visits ordered keys, then ordered values within each key, and returns
-   borrowed key/value references. The root-time
-   [join loop](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
+   choose which side drives. Missing keys produce no joined rows. At each
+   matching key, the root-time
+   [JoinTrace loop](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
    reads `key_valid`/`val_valid`, `key`/`val`, delta `weight` and trace
    `weight_checked`, enumerates matching value pairs with `step_val`, rewinds
    trace values with `rewind_vals`, and advances with `step_key`.
    It multiplies the signed weights and sends resulting tuples to the native
-   batcher for consolidation. The
-   [unit-time CursorList](../../../crates/dbsp/src/trace/cursor/cursor_list.rs#L150)
-   sums matching values' contributions across batches and skips zero totals.
+   batcher for consolidation. Value pairing, weight multiplication, and output
+   construction belong to this loop, not to `JointKeyCursor` or the cursor
+   interface itself.
 
 Root-circuit [time is `()`](../../../crates/dbsp/src/time.rs#L214).
 Before/after states describe logical update visibility, not additional runtime
