@@ -86,12 +86,14 @@ presentation only.
 | `[S]` | Other state, including delta-batch accumulators, trace append components, and other stateful components. |
 | `[U]` | Runtime operator name is not classified by the table. |
 
-Runtime `Accumulator` coalesces deltas within a clock cycle and resets when
-processing inputs after the runtime's notification that transaction inputs are complete
-([Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)).
-Here `flush` is a transaction-scheduling notification, not a memory-limit
-flush to storage. Snapshots can retain memory-backed and file-backed batches
-without requiring a spill; see the
+Runtime `Accumulator` collects transaction deltas in a Spine.
+[Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)
+asks an operator to finish processing that transaction and emit its remaining
+outputs. The accumulator's next evaluation returns its transaction Spine and
+replaces it with an empty one. The returned Spine can still contain multiple
+memory batches or files; `flush` does not consolidate it into a single batch
+or request a storage write. Snapshots can retain memory-backed and file-backed
+batches without requiring a spill; see the
 [R2 snapshot contract](../../../docs/design/merged-index/native-state-read-contracts.md#existing-snapshot-fetch-and-cursor-behavior).
 `AccumulateDelayTrace` snapshots an already-maintained trace; it does
 not create or update the historical integral. The join's historical keyed
@@ -101,7 +103,7 @@ applies to the named integration regions and `AccumulateDelayTrace`
 snapshots. The snapshot represents historical integrator state, although it
 does not itself append new deltas to that state. See the
 [trace builders](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs)
-and [delta accumulator](../../../crates/dbsp/src/operator/accumulator.rs).
+and [delta accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303).
 
 The local one-worker capture is
 [`worker-0-styled.svg`](../../../target/q3-circuit-exports/runtime-1/run-1/worker-0-styled.svg). The

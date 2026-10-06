@@ -111,8 +111,25 @@ the four accumulated join-read bindings above.
 ## Existing snapshot, fetch, and cursor behavior
 
 All four bindings use the same `JoinTrace` implementation with their respective
-types and current or delayed trace. The following operations are confirmed in
-the inspected source:
+types and current or delayed trace.
+
+`Operator::flush` means **finish processing the current transaction's inputs
+and emit the remaining outputs**. The
+[scheduler](../../../crates/dbsp/src/circuit/schedule.rs#L219)
+invokes it on an operator after all predecessors have finished producing their
+outputs for that transaction, then waits for the operator to finish before
+flushing downstream operators. It flushes pending computation downstream;
+it does not request a storage write or consolidation into one batch or file.
+
+For example, the
+[delta accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303)
+inserts incoming batches into its transaction Spine. After its `flush`
+notification, the next evaluation returns that Spine and replaces it with an
+empty one. The returned delta is one logical collection, which may still
+contain multiple memory-backed or file-backed batches. The retained historical
+trace is a separate collection and can likewise span multiple batches and files.
+
+The following operations are confirmed in the inspected source:
 
 1. [JoinTrace::eval](../../../crates/dbsp/src/operator/dynamic/join.rs#L1633)
    takes a read-only snapshot of an arriving delta and retains it until
@@ -122,9 +139,9 @@ the inspected source:
    [join's notification handler](../../../crates/dbsp/src/operator/dynamic/join.rs#L1454)
    sets a flag; the following evaluation snapshots the supplied accumulated
    trace and processes the retained delta. That trace's wiring determines
-   whether it represents the before or after state. Here `flush` denotes
-   transaction readiness, not a memory-limit flush to storage or a prerequisite
-   for taking a snapshot.
+   whether it represents the before or after state. This scheduling ensures
+   that the join consumes complete transaction inputs. Snapshot acquisition
+   itself neither requires spilling nor consolidating the referenced batches.
 2. [WithSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L23)
    defines read-only, non-merging snapshots. A
    [SpineSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L55)
