@@ -44,7 +44,7 @@ circuit and plan are available locally for inspection after generation.
 Run the deterministic native transactions with:
 
 ```sh
-cargo test --offline
+cargo +1.96.1 test --offline --locked
 ```
 
 The native path is the default: use `./generate.sh` and Cargo without the
@@ -52,35 +52,69 @@ The native path is the default: use `./generate.sh` and Cargo without the
 
 ```sh
 ./generate.sh --q3-merged-index
-cargo build --offline --features merged-index
-cargo +1.96.1 test --offline --features merged-index
+cargo +1.96.1 build --offline --locked --features merged-index
+cargo +1.96.1 test --offline --locked --features merged-index
 ```
 
 The generated compiler option and Cargo feature must be enabled together. Run
 the executable with the same input arguments as the native command. Initial
-loading prepares the base relations and merged index; it is setup, not part of
-the RF1/RF2 comparison. The reconstructed mode loads Customers initially,
-then keeps complete Order and Lineitem groups together. Its measured workload
+loading prepares the base relations and merged index as setup for maintenance
+measurements. R4 verifies this loading in both modes. The reconstructed mode loads
+Customers initially, then keeps complete Order and Lineitem groups together. Its measured workload
 is limited to RF1 insertion and RF2 deletion under referential integrity.
-Replacements, key moves, orphan rows, and independent Lineitem changes are
-unsupported.
+Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
+updates (including changing a customer and all its joined rows) are unsupported.
 
 The harness maintains the merged index manually on a DBSP auxiliary thread
 outside the Q3 graph. Before each logical refresh, it captures the previous
 index snapshot, appends physical signed changes, waits for insertion, and
-publishes previous and current snapshots to Q3. The temporary order-to-customer
-map is built from complete Orders records in that refresh's delta. No persistent
-lookup is kept. Views remain published until Q3 finishes the transaction.
+publishes previous and current snapshots to Q3. The temporary placement map is
+built from complete Orders records in that refresh's delta, supplying a singleton
+customer set per order. The readers' support for multiple candidates is documented
+in the [separate placement correction](../../../docs/design/merged-index/placement-lookup-multimap-plan.md)
+and does not extend the supported refresh workload. No persistent lookup is kept.
+Views remain published until Q3 finishes the transaction.
 
 Reconstruction reads only requested matching key ranges, decodes their rows,
 and copies them into temporary native batches for the existing joins. This
 copying path is suboptimal: decoding, copying, and possible sorting are charged
-to `q3_ms`. A direct reconstructed cursor is a future optimization. Report
+to `q3_ms`. A direct reconstructed cursor is a future optimization. The temporary
+placement map currently uses `BTreeMap` and `BTreeSet`; container selection is also
+a future optimization, preserving its transaction-local contents. Report
 `index_ms`, `q3_ms`, and `combined_maintenance_ms` for each RF1/RF2 refresh;
 input preparation and RF2 discovery remain separate. The prototype makes no
 performance-gain or hard-memory-cap claim. Its checkpoint test covers save and
 restore at a completed transaction boundary; circuit stacking and coordinated
 cross-circuit checkpoints are deferred.
+
+## RF1/RF2 verification
+
+From this directory, run the complete verification workflow with Java 21 available
+through `JAVA_HOME` or `PATH` and the compiler already built:
+
+```sh
+./verify.sh
+```
+
+The script generates both circuit modes and runs each full experiment suite,
+plus the COL suite, using Rust 1.96.1 and offline locked dependencies. It checks
+Rust formatting, Clippy with warnings denied, shell syntax, and whitespace. It
+restores default native generation on exit, including when a check fails. Logs and
+canonical transcripts are stored in a fresh ignored `target/r4-verification/`
+directory; `CARGO_TARGET_DIR` can select an existing compilation cache.
+
+The shared `src/verification.rs` fixture loads Customers first, then complete
+Order/Lineitem groups, and repeats RF1 insertion and RF2 deletion. It covers
+multiple customers/orders, distinct lines with identical payloads, oversized
+groups crossing batch boundaries, empty transactions, and multiple runtime
+steps within a transaction. Every committed emitted delta and materialized `V`
+is compared with `Reference::evaluate` over logical primary-key source maps.
+The reconstructed run also compares all four readers with independent source-map
+projections restricted to the transaction's requested keys. The script compares
+the two sorted transaction transcripts byte for byte. See [RESULTS.md](RESULTS.md)
+for executed evidence. These checks cover the supported loading and RF1/RF2
+workload with singleton placements; broader updates, residual Q3, and performance
+comparisons are deferred.
 
 For a local dbgen run, supply exact paths to complete base files and one
 refresh batch. For example, after setting `TPCH_DATA` to a dbgen output

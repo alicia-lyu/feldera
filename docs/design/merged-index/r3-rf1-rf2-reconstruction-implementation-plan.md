@@ -31,7 +31,11 @@ delta batch; no historical placement map or Q3-owned index accumulation is added
 The reconstructed native batches copy only requested accumulated key ranges.
 This copying, decoding, and possible sorting is suboptimal and charged to Q3
 maintenance. A future direct reconstructed cursor could avoid materializing these
-temporary rows; it is not required for this implementation.
+temporary rows; it is not required for this implementation. Selecting the
+transaction-local placement map's container is also a future optimization; the
+current implementation uses `BTreeMap` and `BTreeSet` following the
+[separate placement correction](placement-lookup-multimap-plan.md). Supported
+RF1/RF2 preparation supplies singleton customer sets.
 
 ## Validation
 
@@ -46,8 +50,10 @@ temporary rows; it is not required for this implementation.
 - Run focused compiler/Rust tests, formatting, lint, and documentation checks.
 
 Preserve the native baseline's broader tests and the other agent's COL changes.
-Maintenance uses one worker. Broader R4 verification and R5 beyond-memory
-comparisons remain separate.
+Maintenance uses one worker. The [R4 verification plan](r4-rf1-rf2-verification-implementation-plan.md)
+adds shared fixtures and exact native/reconstructed transcript comparison for
+supported loading and RF1/RF2. Broader update cases and R5 beyond-memory
+comparisons remain deferred.
 
 ## Implementation outcome
 

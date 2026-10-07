@@ -552,13 +552,26 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    groups together under referential integrity. Replaced historical join traces are omitted;
    transaction delta collectors and materialized `V` remain. Reconstruction copies only
    requested accumulated ranges into temporary native batches. This copying and possible
-   sorting is suboptimal; direct reconstructed cursors are a future optimization. Initial
+   sorting is suboptimal; direct reconstructed cursors are a future optimization.
+   The transaction-local placement map uses `BTreeMap` and `BTreeSet`; container
+   selection is another future optimization. The
+   [separate placement correction](placement-lookup-multimap-plan.md) allows
+   candidate customer sets in the readers; RF1/RF2 supplies singleton sets and
+   retains the restricted workload. Initial
    loading prepares state, and subsequent RF1/RF2 maintenance is the measurement target.
    General updates and complete circuit stacking, including checkpoint coordination between
    independently running circuits, remain future work. Shared scan sessions remain optional.
-4. **R4 — Correctness verification.** Compare native and reconstructed reads, deltas, and `V` with
-   independent evaluation for simultaneous changes, replacements, distinct lines with identical
-   payloads, fan-out, and supplied key moves. Verify residual Q3 separately.
+4. **R4 — RF1/RF2 correctness verification, completed.** The
+   [verification plan](r4-rf1-rf2-verification-implementation-plan.md) covers
+   Customers-first loading and complete Order/Lineitem RF1 insertion and RF2 deletion.
+   Shared deterministic fixtures compare requested reconstructed reads with independent
+   source-map projections and both modes' signed deltas and materialized `V` with full
+   evaluation. The verification script compares canonical transaction transcripts exactly.
+   Fixtures include multiple customers/orders, identical-payload distinct lines, oversized
+   groups, repeated cycles, empty transactions, and multiple runtime steps. Replacements,
+   key moves, independent line updates, and customer updates (including customer-only fan-out)
+   remain deferred. Multimap changes are tracked separately from R4; these fixtures
+   use singleton placements. Residual Q3 verification is separate future work.
 5. **R5 — Maintenance measurements.** Compare beyond-memory state under equal total memory and
    comparable durability, including discovery, reads, writes, sorting, spill, and background work.
    R1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3
