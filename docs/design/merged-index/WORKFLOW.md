@@ -36,15 +36,14 @@ In reconstructed mode Customers are loaded initially, then complete Order and
 Lineitem groups are loaded together. The supported measured changes are RF1 insertion and RF2
 deletion under referential integrity. Replacements, key moves, orphan rows,
 independent Lineitem changes, and Customer updates are outside the prototype
-workload. Customer-only fan-out, meaning changing a customer and consequently
-all its joined rows, is deferred too.
+workload.
 
 The manual merged-index owner runs on a DBSP auxiliary thread outside the Q3
 circuit graph. For each refresh, it captures the previous snapshot, applies
 physical signed index rows, waits for insertion, then publishes previous and
 current snapshots to Q3 before logical deltas are submitted. Customer placement
 for changed orders comes from complete Orders records in that same delta batch,
-supplying singleton candidate sets to the placement map. The
+supplying one candidate customer per order to the placement map. The
 [separate placement correction](placement-lookup-multimap-plan.md) adds support for
 multiple candidates in readers without extending the RF1/RF2 workload. No persistent
 order-to-customer lookup is maintained. Snapshot views stay
@@ -78,21 +77,25 @@ With the compiler built and Java 21 configured, run:
 
 This runs the native and reconstructed experiment suites and the COL suite with
 Rust 1.96.1, `--offline --locked`, formatting checks, strict Clippy, shell syntax,
-and whitespace checks. Both generated modes execute identical shared fixtures with one
-worker. Initial loading is included in correctness verification; it remains
+and whitespace checks. Both generated modes run the same loading and RF1/RF2
+test transactions with one worker. Initial loading is included in correctness verification; it remains
 setup for maintenance measurements. Each committed transaction compares emitted
-`ΔV` and materialized `V` with the independent full join of logical source maps.
-The reconstructed fixtures also compare requested reader relations with source-map
-projections. Canonical transaction transcripts are compared exactly with `cmp`.
+`ΔV` and materialized `V` with a full join recomputed from the logical input records.
+The reconstructed run also checks each reader's rows against expected rows computed
+directly from those records for the requested keys. Each run writes a JSON file with
+sorted emitted rows and materialized rows, including their weights, for every
+transaction. The script uses `cmp` to check that the native and reconstructed files
+are identical byte for byte.
 
-The fixtures cover multiple customers and orders, identical-payload distinct
-lines, oversized groups crossing batch boundaries, repeated refresh cycles,
-empty transactions, and multiple runtime steps. Existing native broader-update,
+The RF1/RF2 test transactions insert and delete complete Order/Lineitem groups
+for multiple customers and orders. The tests also cover distinct lines with
+identical payloads, oversized groups crossing batch boundaries, repeated refresh
+cycles, empty transactions, and multiple runtime steps. Existing native broader-update,
 storage, checkpoint, and unsupported-workload checks remain separate regressions.
 This completes RF1/RF2 R4 verification; broader updates and residual Q3 remain
 deferred, and no performance measurement is produced.
 
-Logs and transcripts go to a fresh ignored experiment-local
+Logs and JSON result files go to a fresh ignored experiment-local
 `target/r4-verification/` directory. Set `CARGO_TARGET_DIR` to reuse a different
 compilation cache if needed. The script restores default native generation on
 exit even after a failed check; restoration failures are reported explicitly.

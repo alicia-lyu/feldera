@@ -277,7 +277,7 @@ The [storage Step 2 plan](folded-key-layer-file-plan.md) records the current imp
 user's clarifications: folded keys, weighted payload rows, transaction-supplied related-row
 changes, and temporary read handles without multi-versioning or expiration policies.
 The [Phase 1 implementation note](phase-1-implementation-note.md) records the verified
-encoding and two-column layer-file fixture.
+encoding and two-column layer-file test.
 The [Phase 2 implementation note](phase-2-implementation-note.md) records native
 consolidated memory reads. The [Phase 4 implementation plan](phase-4-file-backed-storage-implementation-plan.md)
 specifies native Spine storage and snapshot tests; the
@@ -556,22 +556,28 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    The transaction-local placement map uses `BTreeMap` and `BTreeSet`; container
    selection is another future optimization. The
    [separate placement correction](placement-lookup-multimap-plan.md) allows
-   candidate customer sets in the readers; RF1/RF2 supplies singleton sets and
-   retains the restricted workload. Initial
+   multiple candidate customers in the readers; RF1/RF2 supplies one candidate customer
+   per order and retains the restricted workload. Initial
    loading prepares state, and subsequent RF1/RF2 maintenance is the measurement target.
    General updates and complete circuit stacking, including checkpoint coordination between
    independently running circuits, remain future work. Shared scan sessions remain optional.
 4. **R4 — RF1/RF2 correctness verification, completed.** The
    [verification plan](r4-rf1-rf2-verification-implementation-plan.md) covers
-   Customers-first loading and complete Order/Lineitem RF1 insertion and RF2 deletion.
-   Shared deterministic fixtures compare requested reconstructed reads with independent
-   source-map projections and both modes' signed deltas and materialized `V` with full
-   evaluation. The verification script compares canonical transaction transcripts exactly.
-   Fixtures include multiple customers/orders, identical-payload distinct lines, oversized
-   groups, repeated cycles, empty transactions, and multiple runtime steps. Replacements,
-   key moves, independent line updates, and customer updates (including customer-only fan-out)
-   remain deferred. Multimap changes are tracked separately from R4; these fixtures
-   use singleton placements. Residual Q3 verification is separate future work.
+   loading Customers first, then complete Order/Lineitem groups, followed by RF1
+   insertion and RF2 deletion.
+   The tests compute expected reader rows directly from logical Customer, Orders,
+   and Lineitem records. They compare both modes' signed output deltas and materialized
+   `V` with an independently recomputed full join. Each run writes a JSON file
+   containing sorted emitted rows and materialized rows with their weights for
+   every transaction.
+   The script checks that the native and reconstructed files are identical byte for byte.
+   RF1/RF2 test transactions insert and delete complete Order/Lineitem groups
+   for multiple customers and orders. Customers remain unchanged after initial loading.
+   The tests also cover distinct lines with identical payloads, oversized groups,
+   repeated cycles, empty transactions, and multiple runtime steps. Replacements,
+   key moves, independent line updates, and customer updates remain deferred.
+   Multimap changes are tracked separately from R4; every order in these tests has
+   only one candidate customer. Residual Q3 verification is separate future work.
 5. **R5 — Maintenance measurements.** Compare beyond-memory state under equal total memory and
    comparable durability, including discovery, reads, writes, sorting, spill, and background work.
    R1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3

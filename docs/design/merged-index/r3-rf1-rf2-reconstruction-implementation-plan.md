@@ -35,7 +35,7 @@ temporary rows; it is not required for this implementation. Selecting the
 transaction-local placement map's container is also a future optimization; the
 current implementation uses `BTreeMap` and `BTreeSet` following the
 [separate placement correction](placement-lookup-multimap-plan.md). Supported
-RF1/RF2 preparation supplies singleton customer sets.
+RF1/RF2 preparation supplies one candidate customer for each order.
 
 ## Validation
 
@@ -51,9 +51,9 @@ RF1/RF2 preparation supplies singleton customer sets.
 
 Preserve the native baseline's broader tests and the other agent's COL changes.
 Maintenance uses one worker. The [R4 verification plan](r4-rf1-rf2-verification-implementation-plan.md)
-adds shared fixtures and exact native/reconstructed transcript comparison for
-supported loading and RF1/RF2. Broader update cases and R5 beyond-memory
-comparisons remain deferred.
+adds shared tests for supported loading and RF1/RF2 and checks that the native
+and reconstructed JSON result files are identical byte for byte. Broader update
+cases and R5 beyond-memory comparisons remain deferred.
 
 ## Implementation outcome
 

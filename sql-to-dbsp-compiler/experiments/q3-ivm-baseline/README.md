@@ -21,7 +21,7 @@ its current scope. No multiworker maintenance extension is planned.
 The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
 walks through compiler builds, incremental inspection artifacts,
 baseline comparisons, native execution, and the agent-added report formatting.
-The concrete Customer–Orders–Lineitem codecs and storage fixture are also
+The concrete Customer–Orders–Lineitem codecs and storage tests are also
 available as a reusable standalone library in
 [`merged-index-col`](../merged-index-col/src/lib.rs). This baseline does not
 instantiate that library on its default path. The opt-in `merged-index`
@@ -63,14 +63,14 @@ measurements. R4 verifies this loading in both modes. The reconstructed mode loa
 Customers initially, then keeps complete Order and Lineitem groups together. Its measured workload
 is limited to RF1 insertion and RF2 deletion under referential integrity.
 Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
-updates (including changing a customer and all its joined rows) are unsupported.
+updates are unsupported.
 
 The harness maintains the merged index manually on a DBSP auxiliary thread
 outside the Q3 graph. Before each logical refresh, it captures the previous
 index snapshot, appends physical signed changes, waits for insertion, and
 publishes previous and current snapshots to Q3. The temporary placement map is
-built from complete Orders records in that refresh's delta, supplying a singleton
-customer set per order. The readers' support for multiple candidates is documented
+built from complete Orders records in that refresh's delta, supplying one candidate
+customer per order. The readers' support for multiple candidates is documented
 in the [separate placement correction](../../../docs/design/merged-index/placement-lookup-multimap-plan.md)
 and does not extend the supported refresh workload. No persistent lookup is kept.
 Views remain published until Q3 finishes the transaction.
@@ -100,21 +100,24 @@ The script generates both circuit modes and runs each full experiment suite,
 plus the COL suite, using Rust 1.96.1 and offline locked dependencies. It checks
 Rust formatting, Clippy with warnings denied, shell syntax, and whitespace. It
 restores default native generation on exit, including when a check fails. Logs and
-canonical transcripts are stored in a fresh ignored `target/r4-verification/`
+JSON result files are stored in a fresh ignored `target/r4-verification/`
 directory; `CARGO_TARGET_DIR` can select an existing compilation cache.
 
-The shared `src/verification.rs` fixture loads Customers first, then complete
-Order/Lineitem groups, and repeats RF1 insertion and RF2 deletion. It covers
+The shared tests in `src/verification.rs` load Customers first, then complete
+Order/Lineitem groups, and repeat RF1 insertion and RF2 deletion. They cover
 multiple customers/orders, distinct lines with identical payloads, oversized
 groups crossing batch boundaries, empty transactions, and multiple runtime
 steps within a transaction. Every committed emitted delta and materialized `V`
-is compared with `Reference::evaluate` over logical primary-key source maps.
-The reconstructed run also compares all four readers with independent source-map
-projections restricted to the transaction's requested keys. The script compares
-the two sorted transaction transcripts byte for byte. See [RESULTS.md](RESULTS.md)
-for executed evidence. These checks cover the supported loading and RF1/RF2
-workload with singleton placements; broader updates, residual Q3, and performance
-comparisons are deferred.
+is compared with the full join computed by `Reference::evaluate` from logical
+input records.
+The reconstructed run also checks all four readers against expected rows computed
+directly from logical Customer, Orders, and Lineitem records for the requested keys.
+Each run writes a JSON file containing each transaction's name, sorted emitted rows
+and weights, and sorted materialized rows and weights. The script checks that the
+native and reconstructed JSON files are identical byte for byte. See
+[RESULTS.md](RESULTS.md) for executed evidence. These checks cover the supported
+loading and RF1/RF2 workload, where each order has one candidate customer.
+Broader updates, residual Q3, and performance comparisons are deferred.
 
 For a local dbgen run, supply exact paths to complete base files and one
 refresh batch. For example, after setting `TPCH_DATA` to a dbgen output
@@ -136,8 +139,9 @@ independent runs, full delta and materialized snapshot verification, and
 memory-backed DBSP state. `--batch` and `--runs` override these counts;
 retain `--workers 1` for IVM maintenance runs. `--storage-path DIR` enables native file-backed state in a distinct
 `run-N` subdirectory for each run. `--no-verify` excludes the independent
-full-join oracle from measurement runs. RF1 submits related Orders and Lineitem inserts in one
-transaction. RF2 removes each present order and its lines in one transaction.
+full-join checks from measurement runs. RF1 submits related Orders
+and Lineitem inserts in one transaction. RF2 removes each present order and its
+lines in one transaction.
 The initial load is submitted through the same incremental circuit in batches.
 
 Each phase prints native transaction time, minimum/median/p95/maximum native

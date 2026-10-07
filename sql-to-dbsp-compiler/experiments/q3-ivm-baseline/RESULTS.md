@@ -48,7 +48,7 @@ These produced complete SF 0.01 base inputs and one RF1/RF2 batch:
 ## Correctness
 
 The original `cargo +1.96.1 test --offline -j2` run passed all six tests. The native
-transaction fixture checked emitted signed deltas and the integrated `V`
+transaction test checked emitted signed deltas and the integrated `V`
 snapshot after unmatched input, duplicate line payloads with distinct line
 identities, customer and line payload replacements, a stable-order customer
 move, an order and line key move, simultaneous changes, deletions, and an
@@ -72,9 +72,9 @@ related order and line changes is submitted in one native transaction.
 
 ## R4 shared RF1/RF2 verification
 
-The shared fixture in [src/verification.rs](src/verification.rs) verifies both
-generated modes with the same Customers-first initial loading, complete
-Order/Lineitem groups, and three RF1/RF2 cycles. It uses one worker and a native
+The shared tests in [src/verification.rs](src/verification.rs) verify both
+generated modes with the same initial loading of Customers followed by complete
+Order/Lineitem groups, and three RF1/RF2 cycles. They use one worker and a native
 splitter chunk size of eight records; groups with 13, 11, and nine lines cross
 batch boundaries. Three transactions use explicit start/step/commit, submitting
 Orders and two Lineitem chunks in separate steps; one of these transactions is
@@ -83,13 +83,13 @@ empty. Other transactions use the normal transaction call.
 The independent evaluator uses logical primary-key maps, enumerates Lines, and
 looks up their Orders and Customers. Its before/after difference supplies
 expected signed `ΔV`; its after result supplies expected materialized `V`.
-Reconstructed reader expectations are projected directly from those source maps
+Expected reader rows are computed directly from the logical input records
 for the requested keys, including independently joining Customers and Orders.
 Neither expected result uses merged-index reads or incremental join logic.
 Customer-first loading makes the requested `orders_before` relation empty in
 this workload; existing COL weighted-reader tests retain its nonempty coverage.
 
-The canonical transcript records each transaction's actual emitted rows and
+Each run's JSON result file records the transaction names, actual emitted rows and
 materialized rows, sorted with their weights. It contains no timings or
 mode-specific fields. The verified cardinalities are:
 
@@ -109,32 +109,32 @@ mode-specific fields. The verified cardinalities are:
 | RF2 C | −11 | 6 |
 | Empty final | 0 | 6 |
 
-The fixture covers three customers, four initially loaded orders, five RF1
+The test data includes three customers, four initially loaded orders, five RF1
 orders, 44 total inserted lines, and six RF2 orders with 38 deleted lines.
 Distinct line identities have identical payloads. Broader replacements, key
-moves, independent line updates, customer updates (including customer-only
-fan-out), and multimap changes are outside R4. The
+moves, independent line updates, customer updates, and multimap changes are
+outside R4. The
 [separate placement correction](../../../docs/design/merged-index/placement-lookup-multimap-plan.md)
-was present in the verified tree; R4 fixtures supply one candidate customer per
+was present in the verified tree; R4 test transactions supply one candidate customer per
 order and do not establish broader maintenance support. Residual Q3 and performance
 measurements remain deferred; the original native measurements below are
 separate evidence.
 
 Run [verify.sh](verify.sh) with Java 21 and the compiler already built. It runs
 both experiment suites and COL with Rust 1.96.1 and offline locked dependencies,
-compares transcripts exactly, checks formatting, strict Clippy, shell syntax,
-and whitespace, and restores default native generation on exit. Script lifecycle
-checks also verified native restoration after success, a failed reconstructed test,
-and a transcript mismatch.
+compares the native and reconstructed JSON result files byte for byte, checks
+formatting, strict Clippy, shell syntax, and whitespace, and restores default
+native generation on exit. Separate checks confirmed restoration after success,
+a failed reconstructed test, and a difference between the two result files.
 
 The complete run on 2026-10-06 passed all 10 native tests, all seven reconstructed
 tests, and all 21 COL tests. Existing storage, compaction, checkpoint, and
 unsupported-workload regressions passed. Formatting, Clippy with warnings denied,
 shell syntax, and whitespace checks passed, and default native generation was
-restored. The 13-transaction transcripts matched byte for byte: each is 97,718
-bytes with SHA-256
+restored. The JSON result files covering 13 transactions were identical byte for
+byte: each is 97,718 bytes with SHA-256
 `826d6d3fe047f95752e42cdc88f3633def2ee83033fd24a548a08fb3aa3d67bc`.
-Logs and transcripts are stored in the experiment's ignored
+Logs and JSON result files are stored in the experiment's ignored
 `target/r4-verification/20261006T222308Z-60261/` directory. The COL count includes
 the separately committed candidate-location tests; R4 did not modify placement
 or publication behavior.

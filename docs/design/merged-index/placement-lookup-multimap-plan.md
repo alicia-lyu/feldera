@@ -17,14 +17,16 @@ does not extend the driver's supported workloads.
   after snapshot for `joined_orders_after`, and line prefixes in the before
   snapshot for `lineitems_before`. Missing or empty candidate sets retain the
   missing-placement error.
-- Update RF1/RF2 preparation and existing callers to supply singleton sets.
+- Update RF1/RF2 preparation and existing callers to supply one candidate
+  customer per order.
   Preserve workload validation and `ManualIndex::append`.
 - Deduplicate addresses without cancelling them by delta signs. The lookup
   contains neither payloads nor weights; no additional delta snapshot is published.
 
 ## Verification and documentation
 
-- Run existing singleton RF1/RF2 and reader regressions.
+- Run existing RF1/RF2 and reader regression tests with one candidate customer
+  per order.
 - Add direct reader tests for an order under customer 2 before and customer 3
   afterward, repeated locations, absent prefixes, and missing/empty candidates.
 - Run the COL suite, reconstructed harness regressions, formatting, and strict Clippy.
@@ -36,7 +38,7 @@ does not extend the driver's supported workloads.
 
 The lookup now stores one customer set per order, and both readers probe the
 same candidates in their respective snapshots. RF1/RF2 preparation supplies
-singleton sets and retains its existing validation.
+one candidate customer for each order and retains its existing validation.
 
 Completed checks with Rust 1.96.1 and offline locked dependencies:
 
