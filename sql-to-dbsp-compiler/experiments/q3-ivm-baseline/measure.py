@@ -201,12 +201,13 @@ def qualification(system: str, limit: int | None, result: dict[str, Any],
         return {"status": "nonqualifying", "reason": "cgroup enforcement was not verified"}
     if verify:
         return {"status": "nonqualifying", "reason": "independent verification was enabled"}
-    settled = result.get("sequence", {}).get("settled_storage_bytes")
-    if not isinstance(settled, int):
-        return {"status": "nonqualifying", "reason": "settled storage size unavailable"}
-    if settled <= limit:
-        return {"status": "nonqualifying", "reason": "settled storage does not exceed total memory"}
-    return {"status": "qualifying", "reason": "settled storage exceeds enforced total memory"}
+    loaded = result.get("load", {}).get("observed_storage_bytes")
+    if isinstance(loaded, bool) or not isinstance(loaded, int) or loaded < 0:
+        return {"status": "nonqualifying", "reason": "loaded storage size unavailable"}
+    if loaded <= limit:
+        return {"status": "nonqualifying", "reason": "loaded storage does not exceed total memory"}
+    return {"status": "qualifying", "reason":
+            "loaded state exceeds enforced total memory; runtime pressure is not established"}
 
 
 def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:

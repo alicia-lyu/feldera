@@ -99,7 +99,9 @@ class MeasureTest(unittest.TestCase):
             if command[0].endswith("generate.sh"):
                 raise subprocess.CalledProcessError(1, command)
             driver_report = Path(command[command.index("--report") + 1])
-            driver_report.write_text('{"sequence":{"settled_storage_bytes":4096}}')
+            driver_report.write_text('{"measurement_version":2,"load":'
+                                     '{"observed_storage_bytes":4096},"sequence":'
+                                     '{"observed_storage_bytes":4096}}')
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         binaries = {mode: self.root / mode for mode in measure.MODES}
@@ -115,8 +117,8 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(manifest["git_status_short"], " M source.rs\n")
 
     def test_linux_qualification_requires_storage_larger_than_limit(self) -> None:
-        below = {"sequence": {"settled_storage_bytes": 100}}
-        above = {"sequence": {"settled_storage_bytes": 101}}
+        below = {"load": {"observed_storage_bytes": 100}}
+        above = {"load": {"observed_storage_bytes": 101}}
         self.assertEqual(measure.qualification("Linux", 100, below, enforced=True)["status"],
                          "nonqualifying")
         self.assertEqual(measure.qualification("Linux", 100, above, enforced=True)["status"],
@@ -129,6 +131,21 @@ class MeasureTest(unittest.TestCase):
                          "nonqualifying")
         self.assertEqual(measure.qualification("Linux", 100, above)["status"],
                          "nonqualifying")
+
+    def test_end_of_sequence_growth_does_not_qualify_small_loaded_state(self) -> None:
+        report = {"measurement_version": 2,
+                  "load": {"observed_storage_bytes": 99},
+                  "sequence": {"observed_storage_bytes": 1_000_000}}
+        result = measure.qualification("Linux", 100, report, enforced=True)
+        self.assertEqual(result["status"], "nonqualifying")
+        self.assertIn("loaded storage", result["reason"])
+
+    def test_missing_or_invalid_loaded_size_does_not_qualify(self) -> None:
+        for loaded in (None, True, -1, "101"):
+            with self.subTest(loaded=loaded):
+                report = {"load": {"observed_storage_bytes": loaded}}
+                result = measure.qualification("Linux", 100, report, enforced=True)
+                self.assertEqual(result["status"], "nonqualifying")
 
     def test_private_input_copy_rewrites_refresh_paths(self) -> None:
         refreshes, files = measure.refresh_inputs(self.refresh)
