@@ -61,3 +61,26 @@ Generated artifacts and logs remain under ignored `target/` directories.
 Broader updates, residual Q3, periodic checkpoint measurements and Q5/Q10 remain
 deferred. Fetch and merge the tracking branch before each commit; stage explicit
 files only.
+
+## Verified integration findings
+
+Catalog `concat()` consumes its output mailbox. The driver therefore retains
+one `BaseState` of snapshot references and replaces it after each transaction,
+reusing the same snapshot for RF2 discovery and operational checks. Snapshots
+share maintained batches rather than copying rows.
+
+At low memory pressure, insertion leaves batches in memory even when
+`min_storage_bytes=0`. Explicit compaction previously skipped a lone memory
+batch. R5 corrects this case using the existing merge destination policy: a
+single memory batch is rewritten only when that policy selects storage.
+`SerBatch::location()` exposes the existing immutable batch location for direct
+Catalog assertions. Loading and final drainage include one empty transaction
+to publish compacted snapshots, release obsolete mailbox snapshots, and clean
+outputs. It changes no logical rows; its cost is included in drainage.
+
+Driver snapshot reads and the manual-index auxiliary owner otherwise select the
+runtime's fixed 256 MiB fallback cache, which is outside `StorageOptions.cache_mib`.
+A scoped `Runtime::with_buffer_cache` binding makes both reuse the configured
+worker cache. It restores prior thread-local cache state, including on unwind;
+no new cache or storage system is introduced. The reported cache capacity then
+covers driver reads, Q3 workers, manual-index ownership, and merger tasks.

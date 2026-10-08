@@ -5,10 +5,10 @@ use std::sync::{mpsc, Arc};
 
 use anyhow::{bail, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
-use dbsp::dynamic::DynData;
+use dbsp::dynamic::{DowncastTrait, DynData, Erase};
 use dbsp::trace::{
-    BatchReaderFactories, OrdIndexedWSetFactories, Spine, SpineSnapshot, Trace, TraceRole,
-    WithSnapshot,
+    BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSetFactories, Spine,
+    SpineSnapshot, Trace, TraceRole, WithSnapshot,
 };
 use dbsp::{DynZWeight, Runtime, ZWeight};
 use feldera_sqllib::{Date, SqlDecimal};
@@ -19,7 +19,7 @@ use merged_index_col::{
 };
 
 use crate::data::{Customer, Line, Order};
-use crate::{Change, Reference};
+use crate::Change;
 
 type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
@@ -27,6 +27,9 @@ type SourceRow = (SourceKey, SourcePayload, ZWeight);
 type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
+    Compact(mpsc::SyncSender<()>),
+    Complete(mpsc::SyncSender<bool>),
+    FileBacked(mpsc::SyncSender<bool>),
     Snapshot(mpsc::SyncSender<Snapshot>),
     Append(Vec<SourceRow>, mpsc::SyncSender<Result<Snapshot, String>>),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
@@ -43,53 +46,71 @@ impl ManualIndex {
         let (requests, incoming) = mpsc::channel();
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
+        let cache_runtime = runtime.clone();
         runtime.spawn_aux_thread("q3-manual-merged-index", parker, move |parker| {
-            let index = CustomerOrdersLineitemIndex::default();
-            let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
-                Vec<u8>,
-                Vec<u8>,
-                ZWeight,
-            >();
-            let mut trace = Spine::<IndexBatch>::new(
-                &factories,
-                Arc::new("q3_manual_merged_index".to_owned()),
-                TraceRole::Integral,
-            );
-            while !Runtime::kill_in_progress() {
-                match incoming.try_recv() {
-                    Ok(Request::Snapshot(reply)) => {
-                        let _ = reply.send(trace.ro_snapshot());
+            cache_runtime.with_buffer_cache(0, || {
+                let index = CustomerOrdersLineitemIndex::default();
+                let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    ZWeight,
+                >();
+                let mut trace = Spine::<IndexBatch>::new(
+                    &factories,
+                    Arc::new("q3_manual_merged_index".to_owned()),
+                    TraceRole::Integral,
+                );
+                while !Runtime::kill_in_progress() {
+                    match incoming.try_recv() {
+                        Ok(Request::Compact(reply)) => {
+                            trace.initiate_compaction();
+                            let _ = reply.send(());
+                        }
+                        Ok(Request::Complete(reply)) => {
+                            let _ = reply.send(trace.is_compaction_complete());
+                        }
+                        Ok(Request::FileBacked(reply)) => {
+                            let _ = reply.send(
+                                trace
+                                    .get_batches()
+                                    .iter()
+                                    .all(|batch| batch.location() == BatchLocation::Storage),
+                            );
+                        }
+                        Ok(Request::Snapshot(reply)) => {
+                            let _ = reply.send(trace.ro_snapshot());
+                        }
+                        Ok(Request::Append(rows, reply)) => {
+                            let result = index.build_batch(rows).map(|batch| {
+                                feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
+                                trace.ro_snapshot()
+                            });
+                            let _ = reply.send(result);
+                        }
+                        Ok(Request::Save(path, reply)) => {
+                            let result = (|| {
+                                let mut files = Vec::new();
+                                trace
+                                    .save(&path, "q3_manual_merged_index", &mut files)
+                                    .map_err(|error| error.to_string())?;
+                                Runtime::storage_backend()
+                                    .map_err(|error| error.to_string())?
+                                    .commit_all(&files)
+                                    .map_err(|error| error.to_string())
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        Ok(Request::Restore(path, reply)) => {
+                            let result = trace
+                                .restore(&path, "q3_manual_merged_index")
+                                .map_err(|error| error.to_string());
+                            let _ = reply.send(result);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => parker.park(),
+                        Err(mpsc::TryRecvError::Disconnected) => break,
                     }
-                    Ok(Request::Append(rows, reply)) => {
-                        let result = index.build_batch(rows).map(|batch| {
-                            feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
-                            trace.ro_snapshot()
-                        });
-                        let _ = reply.send(result);
-                    }
-                    Ok(Request::Save(path, reply)) => {
-                        let result = (|| {
-                            let mut files = Vec::new();
-                            trace
-                                .save(&path, "q3_manual_merged_index", &mut files)
-                                .map_err(|error| error.to_string())?;
-                            Runtime::storage_backend()
-                                .map_err(|error| error.to_string())?
-                                .commit_all(&files)
-                                .map_err(|error| error.to_string())
-                        })();
-                        let _ = reply.send(result);
-                    }
-                    Ok(Request::Restore(path, reply)) => {
-                        let result = trace
-                            .restore(&path, "q3_manual_merged_index")
-                            .map_err(|error| error.to_string());
-                        let _ = reply.send(result);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => parker.park(),
-                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-            }
+            });
         });
         Self { requests, unparker }
     }
@@ -111,6 +132,18 @@ impl ManualIndex {
         let before = self.snapshot()?;
         let after = self.request(|reply| Request::Append(rows, reply))?;
         Ok((before, after.map_err(anyhow::Error::msg)?))
+    }
+
+    pub(crate) fn start_compaction(&self) -> Result<()> {
+        self.request(Request::Compact)
+    }
+
+    pub(crate) fn is_compaction_complete(&self) -> Result<bool> {
+        self.request(Request::Complete)
+    }
+
+    pub(crate) fn is_file_backed(&self) -> Result<bool> {
+        self.request(Request::FileBacked)
     }
 
     #[allow(dead_code)]
@@ -169,47 +202,19 @@ fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
     ))
 }
 
-/// Validate the entire transaction before either owner is mutated. Only complete
-/// insert/delete order groups, plus initial customer inserts, are supported.
-pub(crate) fn prepare(
-    change: &Change,
-    state: &Reference,
-) -> Result<(OrderLocations, Vec<SourceRow>)> {
+/// Convert checked logical deltas; physical folding/encoding stays in batch construction.
+pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>)> {
     let mut placements = OrderLocations::new();
-    let mut seen_customers = BTreeSet::new();
-    let mut seen_orders = BTreeSet::new();
-    let mut seen_lines = BTreeSet::new();
+    let orders: BTreeMap<_, _> = change
+        .orders
+        .iter()
+        .map(|(row, insert)| (row.key, (row, insert)))
+        .collect();
     let mut rows = Vec::with_capacity(change.len());
     for (customer, insert) in &change.customers {
-        if !insert
-            || !state.orders.is_empty()
-            || state.customers.contains_key(&customer.key)
-            || !seen_customers.insert(customer.key)
-        {
-            bail!("only initial Customer insertion is supported");
-        }
         rows.push(customer_row(customer, *insert));
     }
     for (order, insert) in &change.orders {
-        if !seen_orders.insert(order.key) {
-            bail!("duplicate or replacement Orders delta for {}", order.key);
-        }
-        if *insert {
-            if state.orders.contains_key(&order.key)
-                || !(state.customers.contains_key(&order.customer_key)
-                    || change
-                        .customers
-                        .iter()
-                        .any(|(c, plus)| *plus && c.key == order.customer_key))
-            {
-                bail!(
-                    "RF1 Order {} has missing Customer or already exists",
-                    order.key
-                );
-            }
-        } else if state.orders.get(&order.key) != Some(order) {
-            bail!("RF2 Order {} is missing or has changed payload", order.key);
-        }
         placements
             .entry(order.key)
             .or_default()
@@ -217,41 +222,72 @@ pub(crate) fn prepare(
         rows.push(order_row(order, *insert)?);
     }
     for (line, insert) in &change.lines {
-        let key = (line.order_key, line.number);
-        if !seen_lines.insert(key) {
-            bail!("duplicate or replacement Lineitem delta for {key:?}");
+        let (order, direction) = orders.get(&line.order_key).with_context(|| {
+            format!(
+                "Lineitem ({}, {}) has no Orders record in this transaction",
+                line.order_key, line.number
+            )
+        })?;
+        if insert != *direction {
+            bail!("Lineitem direction differs from Orders delta");
         }
-        let order = change
-            .orders
-            .iter()
-            .find(|(order, _)| order.key == line.order_key)
-            .with_context(|| {
-                format!("Lineitem {key:?} has no Orders record in this transaction")
-            })?;
-        if *insert != order.1 {
-            bail!("Lineitem {key:?} direction differs from its Orders delta");
-        }
-        if *insert && state.lines.contains_key(&key) {
-            bail!("RF1 Lineitem {key:?} already exists");
-        }
-        if !insert && state.lines.get(&key) != Some(line) {
-            bail!("RF2 Lineitem {key:?} is missing or has changed payload");
-        }
-        rows.push(line_row(line, order.0.customer_key, *insert)?);
-    }
-    for (order, insert) in &change.orders {
-        if !insert
-            && state.lines.values().any(|line| {
-                line.order_key == order.key && !seen_lines.contains(&(line.order_key, line.number))
-            })
-        {
-            bail!("RF2 Order {} does not delete all its Lineitems", order.key);
-        }
+        rows.push(line_row(line, order.customer_key, *insert)?);
     }
     Ok((placements, rows))
 }
 
+/// Seek one current complete Lineitem range, decoding only matching rows.
+pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
+    let index = CustomerOrdersLineitemIndex::default();
+    let prefix = index.line_prefix(order.customer_key, order.key);
+    let mut cursor = snapshot.cursor();
+    cursor.seek_key(prefix.erase());
+    let mut rows = Vec::new();
+    while cursor.key_valid() {
+        let key = cursor.key().downcast_checked::<Vec<u8>>().clone();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let SourceKey::Lineitem(customer, order_key, number) =
+            index.unfold(&key).map_err(anyhow::Error::msg)?
+        else {
+            bail!("non-Lineitem row inside Lineitem range");
+        };
+        if customer != order.customer_key || order_key != order.key {
+            bail!("Lineitem range has unexpected identity");
+        }
+        while cursor.val_valid() {
+            if **cursor.weight() != 1 {
+                bail!("current Lineitem does not have unit multiplicity");
+            }
+            let SourcePayload::Lineitem(payload) = index
+                .decode_payload(&key, cursor.val().downcast_checked::<Vec<u8>>())
+                .map_err(anyhow::Error::msg)?
+            else {
+                bail!("Lineitem payload has unexpected type");
+            };
+            rows.push(Line {
+                order_key,
+                number,
+                price_cents: crate::data::decimal_hundredths(
+                    &payload.extended_price.to_string(),
+                    false,
+                )?,
+                discount_hundredths: crate::data::decimal_hundredths(
+                    &payload.discount.to_string(),
+                    false,
+                )?,
+                ship_date: payload.ship_date.to_string(),
+            });
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    Ok(rows)
+}
+
 /// Group each order and all of its lines so loading never exposes an orphan.
+#[cfg(test)]
 pub(crate) fn grouped_load(load: Change, target: usize) -> Result<Vec<Change>> {
     let mut batches = Vec::new();
     let mut customers = Change::default();

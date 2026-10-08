@@ -11,6 +11,14 @@ with large data sets that change frequently in small ways.
 The DBSP computational engine is a component of the [Feldera
 Continuous Analytics Platform](https://www.feldera.com).
 
+## Storage compaction
+
+An explicit spine compaction request drains pending merges. If one memory batch
+remains and the configured merge threshold selects storage, compaction writes
+that batch to storage as well. Without storage, or below the merge threshold,
+the single batch stays in memory. Callers can use `Trace::is_compaction_complete`
+to wait for the request to finish.
+
 # Resources
 
 ## Learning Materials

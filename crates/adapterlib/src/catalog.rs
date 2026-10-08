@@ -340,6 +340,9 @@ impl Debug for dyn SerBatch {
 
 /// A type-erased `Batch`.
 pub trait SerBatch: SerBatchReader {
+    /// Report where this immutable batch's data is stored without scanning it.
+    fn location(&self) -> dbsp::trace::BatchLocation;
+
     /// Convert to `Arc<Any>`, which can then be downcast to a reference
     /// to a concrete batch type.
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;

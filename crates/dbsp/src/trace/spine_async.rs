@@ -38,7 +38,7 @@ use crate::{
         TraceRole,
         cursor::{CursorList, Position},
         merge_batches,
-        ord::fallback::pick_insert_destination,
+        ord::fallback::{pick_insert_destination, pick_merge_destination},
         sample_keys_from_batches,
         spine_async::{
             list_merger::ArcListMerger, push_merger::ArcPushMerger, snapshot::FetchList,
@@ -175,8 +175,9 @@ impl<B: Batch + Send + Sync> From<(Vec<String>, &Spine<B>)> for CommittedSpine {
 ///   - the merge completes; the resulting batch is pushed to the next slot regardless of
 ///     its size; compaction is initiated at the next slot.
 /// * requested -> none:
-///   - there is <=1 batches in the current slot. Compaction completes instantly and the
-///     batch is pushed to the next slot; compaction is initiated at the next slot.
+///   - there is <=1 batches in the current slot and no memory batch needs to move to storage.
+///     Compaction completes instantly and the batch is pushed to the next slot, where
+///     compaction continues.
 ///
 /// The following invariant guarantees that the compaction process completes after processing all
 /// batches in the spine:
@@ -308,12 +309,18 @@ where
 
         // Start a merge if there is no ongoing merge and there are either enough loose batches to start a merge,
         // or we are under high memory pressure and there's at least one in-memory batch in this slot, or
-        // compaction has been requested and there are more than one batches in the slot.
+        // compaction has been requested and there are multiple batches or one memory batch
+        // whose merge destination is storage.
+        let requested = self.compaction_status == CompactionStatus::Requested;
+        let flush_single_memory_batch = requested
+            && self.loose_batches.len() == 1
+            && self.loose_batches[0].location() == BatchLocation::Memory
+            && pick_merge_destination([self.loose_batches[0].as_ref()], None)
+                == BatchLocation::Storage;
         if self.merging_batches.is_none()
             && (self.loose_batches.len() >= min_batches
                 || self.must_relieve_memory_pressure()
-                || (self.compaction_status == CompactionStatus::Requested
-                    && self.loose_batches.len() > 1))
+                || (requested && (self.loose_batches.len() > 1 || flush_single_memory_batch)))
         {
             // Compaction requested - merge all batches in the slot.
             let max_batches = if self.compaction_status == CompactionStatus::Requested {
@@ -2811,5 +2818,96 @@ mod merge_threshold_test {
                 "level {level}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod single_batch_compaction_test {
+    use super::BatchLocation;
+    use crate::{
+        OrdZSet as TypedOrdZSet, ZWeight,
+        algebra::OrdZSet,
+        circuit::{CircuitConfig, mkconfig},
+        dynamic::DynData,
+        trace::{
+            BatchReader, BatchReaderFactories, Spine, Trace, TraceRole, WithSnapshot,
+            test::run_in_circuit_with_storage_config,
+        },
+        utils::Tup2,
+    };
+    use feldera_storage::tokio::TOKIO;
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+    use tempfile::tempdir;
+
+    fn compact_one(config: CircuitConfig) -> (Vec<BatchLocation>, Vec<BatchLocation>, bool) {
+        let result = Arc::new(Mutex::new(None));
+        let report = Arc::clone(&result);
+        run_in_circuit_with_storage_config(config, move || {
+            let factories = BatchReaderFactories::new::<i32, (), ZWeight>();
+            let mut trace = Spine::<OrdZSet<DynData>>::new(
+                &factories,
+                Arc::new("single_batch_compaction_test".to_owned()),
+                TraceRole::Integral,
+            );
+            let batch = TypedOrdZSet::<i32>::from_tuples((), vec![Tup2(Tup2(7, ()), 1)]);
+            TOKIO.block_on(trace.insert(batch.into_inner()));
+            let before = trace
+                .ro_snapshot()
+                .batches()
+                .iter()
+                .map(|batch| batch.location())
+                .collect();
+
+            trace.initiate_compaction();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !trace.is_compaction_complete() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let complete = trace.is_compaction_complete();
+            let after = trace
+                .ro_snapshot()
+                .batches()
+                .iter()
+                .map(|batch| batch.location())
+                .collect();
+            *report.lock().unwrap() = Some((before, after, complete));
+        });
+        Arc::try_unwrap(result)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn requested_compaction_spills_one_memory_batch_when_merge_targets_storage() {
+        let directory = tempdir().unwrap();
+        let config = mkconfig(directory.path());
+        let (before, after, complete) = compact_one(config);
+        assert_eq!(before, vec![BatchLocation::Memory]);
+        assert!(complete, "compaction did not finish within five seconds");
+        assert_eq!(after, vec![BatchLocation::Storage]);
+    }
+
+    #[test]
+    fn requested_compaction_keeps_one_memory_batch_without_storage() {
+        let (before, after, complete) = compact_one(CircuitConfig::with_workers(1));
+        assert_eq!(before, vec![BatchLocation::Memory]);
+        assert!(complete, "compaction did not finish within five seconds");
+        assert_eq!(after, vec![BatchLocation::Memory]);
+    }
+
+    #[test]
+    fn requested_compaction_keeps_one_memory_batch_below_storage_threshold() {
+        let directory = tempdir().unwrap();
+        let mut config = mkconfig(directory.path());
+        config.storage.as_mut().unwrap().options.min_storage_bytes = Some(usize::MAX);
+        let (before, after, complete) = compact_one(config);
+        assert_eq!(before, vec![BatchLocation::Memory]);
+        assert!(complete, "compaction did not finish within five seconds");
+        assert_eq!(after, vec![BatchLocation::Memory]);
     }
 }

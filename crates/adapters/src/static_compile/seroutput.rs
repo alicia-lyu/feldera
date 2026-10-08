@@ -560,6 +560,10 @@ where
     KD: From<B::Key> + SerializeWithContext<SqlSerdeConfig> + 'static + Send + Debug,
     VD: From<B::Val> + SerializeWithContext<SqlSerdeConfig> + 'static + Send + Debug,
 {
+    fn location(&self) -> dbsp::trace::BatchLocation {
+        self.batch.inner().location()
+    }
+
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send> {
         self
     }

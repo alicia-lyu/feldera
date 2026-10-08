@@ -1094,6 +1094,30 @@ impl Runtime {
         self.0.buffer_caches[local_worker_offset][thread_type].clone()
     }
 
+    /// Runs `f` with this runtime's foreground cache bound to the current thread.
+    ///
+    /// External snapshot readers and auxiliary threads can use this to share
+    /// the runtime's configured cache instead of the process-wide auxiliary
+    /// fallback. This only changes the thread-local cache; it does not make
+    /// the current thread a DBSP worker. The prior binding is restored even if
+    /// `f` panics.
+    pub fn with_buffer_cache<T>(&self, local_worker_offset: usize, f: impl FnOnce() -> T) -> T {
+        struct RestoreCache(Option<Arc<BufferCache>>);
+
+        impl Drop for RestoreCache {
+            fn drop(&mut self) {
+                BUFFER_CACHE.with(|cache| {
+                    cache.replace(self.0.take());
+                });
+            }
+        }
+
+        let cache = self.get_buffer_cache(local_worker_offset, ThreadType::Foreground);
+        let previous = BUFFER_CACHE.with(|binding| binding.replace(Some(cache)));
+        let _restore = RestoreCache(previous);
+        f()
+    }
+
     pub(crate) fn get_fbuf_slab_allocator(
         &self,
         local_worker_offset: usize,
@@ -1844,7 +1868,7 @@ impl ExactSizeIterator for WorkerLocations {}
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Parker, Runtime, RuntimeInner};
+    use super::{BUFFER_CACHE, BufferCache, Parker, Runtime, RuntimeInner};
     use crate::{
         Circuit, RootCircuit,
         circuit::{
@@ -2183,6 +2207,69 @@ pub(crate) mod tests {
         );
 
         assert_eq!(runtime.cache_occupancy(), (1024, 8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn external_reader_uses_configured_cache_and_restores_nested_binding() {
+        let path = tempfile::tempdir().unwrap();
+        let storage = CircuitStorageConfig::for_config(
+            StorageConfig {
+                path: path.path().to_string_lossy().into_owned(),
+                cache: StorageCacheConfig::default(),
+            },
+            StorageOptions {
+                cache_mib: Some(8),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        let runtime = Runtime(Arc::new(
+            RuntimeInner::new(CircuitConfig::with_workers(1).with_storage(Some(storage))).unwrap(),
+        ));
+        let other_runtime = Runtime(Arc::new(
+            RuntimeInner::new(CircuitConfig::with_workers(1)).unwrap(),
+        ));
+        let original = Arc::new(BufferCache::new(1024));
+        let previous = BUFFER_CACHE.with(|binding| binding.replace(Some(original.clone())));
+        let configured = runtime.get_buffer_cache(0, ThreadType::Foreground);
+
+        runtime.with_buffer_cache(0, || {
+            let bound = Runtime::buffer_cache().unwrap();
+            assert!(bound.shares_backend_with(&configured));
+            assert_eq!(bound.backend_id(), configured.backend_id());
+            assert_eq!(bound.occupancy().1, 8 * 1024 * 1024);
+            assert_eq!(runtime.cache_occupancy().1, 8 * 1024 * 1024);
+            other_runtime.with_buffer_cache(0, || {
+                assert!(Arc::ptr_eq(
+                    &Runtime::buffer_cache().unwrap(),
+                    &other_runtime.get_buffer_cache(0, ThreadType::Foreground),
+                ));
+            });
+            assert!(Arc::ptr_eq(&Runtime::buffer_cache().unwrap(), &configured));
+        });
+
+        assert!(Arc::ptr_eq(&Runtime::buffer_cache().unwrap(), &original));
+        BUFFER_CACHE.with(|binding| binding.replace(previous));
+    }
+
+    #[test]
+    fn external_reader_restores_cache_after_panic() {
+        let runtime = Runtime(Arc::new(
+            RuntimeInner::new(CircuitConfig::with_workers(1)).unwrap(),
+        ));
+        let original = Arc::new(BufferCache::new(1024));
+        let previous = BUFFER_CACHE.with(|binding| binding.replace(Some(original.clone())));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.with_buffer_cache(0, || {
+                assert!(!Arc::ptr_eq(&Runtime::buffer_cache().unwrap(), &original));
+                panic!("test cache restoration");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(&Runtime::buffer_cache().unwrap(), &original));
+        BUFFER_CACHE.with(|binding| binding.replace(previous));
     }
 
     #[test]

@@ -59,6 +59,7 @@ run_check col-format cargo +1.96.1 fmt --manifest-path "${col_manifest}" --all -
 run_check col-tests cargo +1.96.1 test --manifest-path "${col_manifest}" --offline --locked -j2
 run_check col-clippy cargo +1.96.1 clippy --manifest-path "${col_manifest}" \
   --offline --locked --all-targets -j2 -- -D warnings
+run_check runner-tests python3 -m unittest discover -s "${experiment_dir}" -p test_measure.py -v
 run_check shell-syntax bash -n "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh"
 run_check whitespace git -C "${experiment_dir}" diff --check
 echo "RF1/RF2 suites, reader projections, and exact transaction transcripts agree."

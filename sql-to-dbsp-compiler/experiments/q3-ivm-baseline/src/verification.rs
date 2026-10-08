@@ -332,7 +332,7 @@ fn publish(
     before: &Reference,
     after: &Reference,
 ) -> Result<()> {
-    let (placements, rows) = reconstruction::prepare(change, before)?;
+    let (placements, rows) = reconstruction::prepare(change)?;
     let (old, new) = index.append(rows)?;
     q3.publish(old, new, placements)
         .map_err(anyhow::Error::msg)?;

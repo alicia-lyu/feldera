@@ -42,6 +42,17 @@ impl BaseState {
         })
     }
 
+    pub(crate) fn storage_evidence(&self) -> serde_json::Map<String, Value> {
+        [
+            ("CUSTOMER", &self.customers),
+            ("ORDERS", &self.orders),
+            ("LINEITEM", &self.lines),
+        ]
+        .into_iter()
+        .map(|(name, reader)| (name.to_owned(), batch_storage_evidence(&**reader)))
+        .collect()
+    }
+
     fn keyed_row(
         reader: &dyn SerBatchReader,
         key: &dbsp::dynamic::DynData,
@@ -204,6 +215,18 @@ impl BaseState {
         }
         Ok(())
     }
+}
+
+pub(crate) fn batch_storage_evidence(reader: &dyn SerBatchReader) -> Value {
+    let batches = reader.batches();
+    let memory_batches = batches
+        .iter()
+        .filter(|batch| {
+            !batch.is_empty() && batch.location() != dbsp::trace::BatchLocation::Storage
+        })
+        .count();
+    serde_json::json!({"snapshot_batch_count": batches.len(), "memory_batch_count": memory_batches,
+        "file_backed": memory_batches == 0})
 }
 
 pub(crate) fn rf2_changes(
@@ -520,6 +543,7 @@ mod tests {
         #[cfg(not(feature = "merged-index"))]
         submit_test_change(&mut circuit, &mut input, &mut reference, customers)?;
         let state = BaseState::new(&catalog)?;
+        assert_eq!(state.storage_evidence()["CUSTOMER"]["file_backed"], false);
         let load = Change {
             orders: vec![(order.clone(), true)],
             lines: vec![(first.clone(), true), (second.clone(), true)],

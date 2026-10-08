@@ -1,8 +1,10 @@
 mod data;
+mod measurement;
 #[cfg(feature = "merged-index")]
 mod reconstruction;
 #[cfg(test)]
 mod verification;
+mod workload;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -134,30 +136,41 @@ impl Change {
         self.customers.len() + self.orders.len() + self.lines.len()
     }
 
+    #[cfg(test)]
     fn apply(self, state: &mut Reference, input: &mut Inputs) -> Result<()> {
+        self.apply_optional(Some(state), input)
+    }
+
+    fn apply_optional(self, mut state: Option<&mut Reference>, input: &mut Inputs) -> Result<()> {
         for (row, insert) in self.customers {
             input.customer(&row, insert)?;
-            if insert {
-                state.customers.insert(row.key, row);
-            } else {
-                state.customers.remove(&row.key);
+            if let Some(state) = state.as_deref_mut() {
+                if insert {
+                    state.customers.insert(row.key, row);
+                } else {
+                    state.customers.remove(&row.key);
+                }
             }
         }
         for (row, insert) in self.orders {
             input.order(&row, insert)?;
-            if insert {
-                state.orders.insert(row.key, row);
-            } else {
-                state.orders.remove(&row.key);
+            if let Some(state) = state.as_deref_mut() {
+                if insert {
+                    state.orders.insert(row.key, row);
+                } else {
+                    state.orders.remove(&row.key);
+                }
             }
         }
         for (row, insert) in self.lines {
             input.line(&row, insert)?;
             let key = (row.order_key, row.number);
-            if insert {
-                state.lines.insert(key, row);
-            } else {
-                state.lines.remove(&key);
+            if let Some(state) = state.as_deref_mut() {
+                if insert {
+                    state.lines.insert(key, row);
+                } else {
+                    state.lines.remove(&key);
+                }
             }
         }
         input.flush();
@@ -276,8 +289,11 @@ fn difference(
 struct Measurements {
     preparation: Duration,
     native: Duration,
-    #[cfg(feature = "merged-index")]
     index: Duration,
+    discovery: Duration,
+    publication_cleanup: Duration,
+    foreground: Duration,
+    verification: Duration,
     transactions: usize,
     rows: usize,
     latencies: Vec<Duration>,
@@ -290,30 +306,40 @@ struct Measurements {
     feature = "merged-index",
     expect(
         clippy::too_many_arguments,
-        reason = "the experiment transaction coordinates circuit and external index owners"
+        reason = "coordinates the circuit, optional validation, and external index owners"
     )
 )]
-fn transact(
+fn transact_inner(
     circuit: &mut dbsp::DBSPHandle,
     catalog: &impl CircuitCatalog,
     input: &mut Inputs,
-    state: &mut Reference,
+    mut state: Option<&mut Reference>,
     change: Change,
-    verify: bool,
+    check: Option<(&workload::BaseState, bool)>,
     stats: &mut Measurements,
     #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
 ) -> Result<()> {
     #[cfg(feature = "merged-index")]
     let (index, q3_state) = reconstruction;
-    let before = if verify {
-        state.evaluate()
-    } else {
-        BTreeMap::new()
-    };
+    let verification_started = Instant::now();
+    let before = state
+        .as_ref()
+        .map(|state| state.evaluate())
+        .unwrap_or_default();
+    let reference_change = state.as_ref().map(|_| change.clone());
+    stats.verification += verification_started.elapsed();
+    let foreground_started = Instant::now();
     stats.rows += change.len();
     let preparation_started = Instant::now();
+    if let Some((base, discovered)) = check {
+        if discovered {
+            base.validate_discovered(&change)?;
+        } else {
+            base.validate(&change)?;
+        }
+    }
     #[cfg(feature = "merged-index")]
-    let (placements, index_rows) = reconstruction::prepare(&change, state)?;
+    let (placements, index_rows) = reconstruction::prepare(&change)?;
     #[cfg(feature = "merged-index")]
     {
         stats.preparation += preparation_started.elapsed();
@@ -327,24 +353,33 @@ fn transact(
         q3_state
             .publish(before_index, after_index, placements)
             .map_err(anyhow::Error::msg)?;
-        stats.preparation += publish_started.elapsed();
+        stats.publication_cleanup += publish_started.elapsed();
     }
     #[cfg(feature = "merged-index")]
     let preparation_started = Instant::now();
-    change.apply(state, input)?;
+    change.apply_optional(None, input)?;
     stats.preparation += preparation_started.elapsed();
     let native_started = Instant::now();
     let transaction_result = circuit.transaction();
     let latency = native_started.elapsed();
     #[cfg(feature = "merged-index")]
-    let finish_result = q3_state.finish().map_err(anyhow::Error::msg);
+    let finish_result = {
+        let cleanup_started = Instant::now();
+        let result = q3_state.finish().map_err(anyhow::Error::msg);
+        stats.publication_cleanup += cleanup_started.elapsed();
+        result
+    };
     transaction_result?;
     #[cfg(feature = "merged-index")]
     finish_result?;
     stats.native += latency;
     stats.latencies.push(latency);
     stats.transactions += 1;
-    if verify {
+    stats.foreground += foreground_started.elapsed();
+    let verification_started = Instant::now();
+    if let (Some(state), Some(change)) = (state.as_deref_mut(), reference_change) {
+        // Reference maintenance belongs exclusively to independent validation.
+        update_reference(state, change);
         let after = state.evaluate();
         let output = catalog
             .output_handles(&SqlIdentifier::from("V"))
@@ -373,13 +408,75 @@ fn transact(
             .sum::<i64>();
         stats.view_rows = Some(after.values().sum());
     } else {
-        // Keep the output mailbox bounded without including deserialization in native time.
+        let cleanup_started = Instant::now();
         let output = catalog
             .output_handles(&SqlIdentifier::from("V"))
             .context("missing V output")?;
         let _ = output.delta_handle.concat();
+        let cleanup = cleanup_started.elapsed();
+        stats.publication_cleanup += cleanup;
+        stats.foreground += cleanup;
+    }
+    if state.is_some() {
+        stats.verification += verification_started.elapsed();
     }
     Ok(())
+}
+
+fn update_reference(state: &mut Reference, change: Change) {
+    for (row, insert) in change.customers {
+        if insert {
+            state.customers.insert(row.key, row);
+        } else {
+            state.customers.remove(&row.key);
+        }
+    }
+    for (row, insert) in change.orders {
+        if insert {
+            state.orders.insert(row.key, row);
+        } else {
+            state.orders.remove(&row.key);
+        }
+    }
+    for (row, insert) in change.lines {
+        let key = (row.order_key, row.number);
+        if insert {
+            state.lines.insert(key, row);
+        } else {
+            state.lines.remove(&key);
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    feature = "merged-index",
+    expect(
+        clippy::too_many_arguments,
+        reason = "test helper preserves existing circuit transaction fixtures"
+    )
+)]
+fn transact(
+    circuit: &mut dbsp::DBSPHandle,
+    catalog: &impl CircuitCatalog,
+    input: &mut Inputs,
+    state: &mut Reference,
+    change: Change,
+    verify: bool,
+    stats: &mut Measurements,
+    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
+) -> Result<()> {
+    transact_inner(
+        circuit,
+        catalog,
+        input,
+        verify.then_some(state),
+        change,
+        None,
+        stats,
+        #[cfg(feature = "merged-index")]
+        reconstruction,
+    )
 }
 
 fn latency_summary(latencies: &[Duration]) -> String {
@@ -410,6 +507,7 @@ fn rows<T>(path: &Path, parse: impl Fn(&str) -> Result<T>) -> Result<Vec<T>> {
         .collect()
 }
 
+#[cfg(test)]
 fn rf2_changes(state: &Reference, keys: &HashSet<i64>) -> Change {
     let mut change = Change {
         orders: state
@@ -451,14 +549,6 @@ fn rss_bytes() -> u64 {
     }
 }
 
-fn throughput(rows: usize, elapsed: Duration) -> f64 {
-    if elapsed.is_zero() {
-        0.0
-    } else {
-        rows as f64 / elapsed.as_secs_f64()
-    }
-}
-
 fn milliseconds(elapsed: Duration) -> f64 {
     elapsed.as_secs_f64() * 1000.0
 }
@@ -472,6 +562,12 @@ struct Config {
     rf1_lines: Option<PathBuf>,
     rf2: Option<PathBuf>,
     storage_path: Option<PathBuf>,
+    refresh_list: Option<PathBuf>,
+    report: Option<PathBuf>,
+    cache_bytes: Option<usize>,
+    memory_target_bytes: Option<u64>,
+    compaction_timeout_secs: f64,
+    r5: bool,
     dump_runtime_circuit: Option<PathBuf>,
     workers: usize,
     batch: usize,
@@ -490,6 +586,7 @@ impl Config {
             batch: 10_000,
             runs: 3,
             verify: true,
+            compaction_timeout_secs: 300.0,
             ..Self::default()
         };
         let mut args = arguments.into_iter();
@@ -528,6 +625,31 @@ impl Config {
                 "--batch" => config.batch = args.next().context("--batch needs number")?.parse()?,
                 "--runs" => config.runs = args.next().context("--runs needs number")?.parse()?,
                 "--no-verify" => config.verify = false,
+                "--r5" => config.r5 = true,
+                "--refresh-list" => {
+                    config.refresh_list =
+                        Some(args.next().context("--refresh-list needs path")?.into())
+                }
+                "--report" => {
+                    config.report = Some(args.next().context("--report needs path")?.into())
+                }
+                "--cache-bytes" => {
+                    config.cache_bytes =
+                        Some(args.next().context("--cache-bytes needs number")?.parse()?)
+                }
+                "--memory-target-bytes" => {
+                    config.memory_target_bytes = Some(
+                        args.next()
+                            .context("--memory-target-bytes needs number")?
+                            .parse()?,
+                    )
+                }
+                "--compaction-timeout-secs" => {
+                    config.compaction_timeout_secs = args
+                        .next()
+                        .context("--compaction-timeout-secs needs number")?
+                        .parse()?
+                }
                 other => bail!("unknown argument {other}"),
             }
         }
@@ -541,8 +663,95 @@ impl Config {
         if config.rf1_orders.is_some() != config.rf1_lines.is_some() {
             bail!("RF1 orders and lines must be provided together");
         }
+        if Duration::try_from_secs_f64(config.compaction_timeout_secs).is_err()
+            || config.compaction_timeout_secs <= 0.0
+        {
+            bail!("compaction timeout must be finite and positive");
+        }
+        if config
+            .cache_bytes
+            .is_some_and(|n| n == 0 || n % (1024 * 1024) != 0)
+        {
+            bail!("cache capacity must be a positive whole number of MiB");
+        }
+        if config.memory_target_bytes == Some(0) {
+            bail!("memory pressure target must be positive");
+        }
+        if config.refresh_list.is_some() && (config.rf1_orders.is_some() || config.rf2.is_some()) {
+            bail!("refresh list cannot be combined with individual refresh arguments");
+        }
+        if config.r5
+            && (config.workers != 1
+                || config.runs != 1
+                || config.storage_path.is_none()
+                || config.cache_bytes.is_none()
+                || config.memory_target_bytes.is_none()
+                || config.report.is_none())
+        {
+            bail!("R5 requires one worker, one run per process, file storage, explicit cache and memory target, and --report");
+        }
+        if config.report.is_some() && config.runs != 1 {
+            bail!("--report requires one run per process");
+        }
         Ok(config)
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Refresh {
+    rf1_orders: Option<PathBuf>,
+    rf1_lines: Option<PathBuf>,
+    rf2: Option<PathBuf>,
+}
+
+fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
+    let mut refreshes = if let Some(path) = &config.refresh_list {
+        let mut list: Vec<Refresh> = serde_json::from_reader(File::open(path)?)?;
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        for refresh in &mut list {
+            for source in [
+                &mut refresh.rf1_orders,
+                &mut refresh.rf1_lines,
+                &mut refresh.rf2,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if source.is_relative() {
+                    *source = directory.join(&*source);
+                }
+            }
+        }
+        list
+    } else {
+        let mut list = Vec::new();
+        if config.rf1_orders.is_some() {
+            list.push(Refresh {
+                rf1_orders: config.rf1_orders.clone(),
+                rf1_lines: config.rf1_lines.clone(),
+                rf2: None,
+            });
+        }
+        if config.rf2.is_some() {
+            list.push(Refresh {
+                rf1_orders: None,
+                rf1_lines: None,
+                rf2: config.rf2.clone(),
+            });
+        }
+        list
+    };
+    for refresh in &mut refreshes {
+        if !((refresh.rf1_orders.is_some() && refresh.rf1_lines.is_some() && refresh.rf2.is_none())
+            || (refresh.rf1_orders.is_none()
+                && refresh.rf1_lines.is_none()
+                && refresh.rf2.is_some()))
+        {
+            bail!("each refresh requires RF1 Orders/Lineitem paths or one RF2 path");
+        }
+    }
+    Ok(refreshes)
 }
 
 /// Classify only operator names whose state behavior is established by the
@@ -682,22 +891,137 @@ fn dump_runtime_circuit(circuit: &mut dbsp::DBSPHandle, directory: &Path) -> Res
     Ok(())
 }
 
-fn run(config: &Config, run_number: usize) -> Result<()> {
-    #[cfg(not(feature = "merged-index"))]
+fn drain(
+    circuit: &mut dbsp::DBSPHandle,
+    timeout: Duration,
+    #[cfg(feature = "merged-index")] index: &ManualIndex,
+) -> Result<Duration> {
     let started = Instant::now();
-    let mut circuit_config = CircuitConfig::with_workers(config.workers);
-    if let Some(root) = &config.storage_path {
-        let path = root.join(format!("run-{run_number}"));
+    circuit.start_compaction()?;
+    #[cfg(feature = "merged-index")]
+    index.start_compaction()?;
+    measurement::drain_until(timeout.saturating_sub(started.elapsed()), || {
+        let complete = circuit.is_compaction_complete()?;
+        #[cfg(feature = "merged-index")]
+        let complete = complete && index.is_compaction_complete()?;
+        Ok(complete)
+    })?;
+    Ok(started.elapsed())
+}
+
+/// Publish compacted batches to Catalog without changing logical input.
+/// The extra transaction and mailbox cleanup belong to compaction drainage.
+fn settle(
+    circuit: &mut dbsp::DBSPHandle,
+    catalog: &impl CircuitCatalog,
+    base: &mut workload::BaseState,
+    timeout: Duration,
+    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
+) -> Result<Duration> {
+    let started = Instant::now();
+    #[cfg(feature = "merged-index")]
+    let (index, q3_state) = reconstruction;
+    drain(
+        circuit,
+        timeout,
+        #[cfg(feature = "merged-index")]
+        index,
+    )?;
+    for name in ["CUSTOMER", "ORDERS", "LINEITEM", "V"] {
+        let output = catalog
+            .output_handles(&SqlIdentifier::from(name))
+            .context("missing output")?;
+        drop(
+            output
+                .integrate_handle
+                .as_ref()
+                .context("missing integrated output")?
+                .take_from_all(),
+        );
+    }
+    #[cfg(feature = "merged-index")]
+    {
+        let snapshot = index.snapshot()?;
+        q3_state
+            .publish(snapshot.clone(), snapshot, BTreeMap::new())
+            .map_err(anyhow::Error::msg)?;
+    }
+    let transaction = circuit.transaction();
+    #[cfg(feature = "merged-index")]
+    let finish = q3_state.finish().map_err(anyhow::Error::msg);
+    transaction?;
+    #[cfg(feature = "merged-index")]
+    finish?;
+    *base = workload::BaseState::new(catalog)?;
+    for name in ["CUSTOMER", "ORDERS", "LINEITEM", "V", "ERROR_VIEW"] {
+        let output = catalog
+            .output_handles(&SqlIdentifier::from(name))
+            .context("missing output")?;
+        drop(output.delta_handle.concat());
+    }
+    drain(
+        circuit,
+        timeout.saturating_sub(started.elapsed()),
+        #[cfg(feature = "merged-index")]
+        index,
+    )?;
+    Ok(started.elapsed())
+}
+
+fn phase_json(stats: &Measurements) -> Value {
+    json!({
+        "rows": stats.rows,
+        "transactions": stats.transactions,
+        "discovery_ms": milliseconds(stats.discovery),
+        "checks_input_preparation_ms": milliseconds(stats.preparation),
+        "index_ms": milliseconds(stats.index),
+        "q3_ms": milliseconds(stats.native),
+        "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
+        "foreground_ms": milliseconds(stats.foreground),
+        "combined_maintenance_ms": milliseconds(stats.index + stats.native),
+        "combined_maintenance_note": "index_ms + q3_ms excludes discovery, preparation and publication/cleanup",
+        "verification_ms_excluded": milliseconds(stats.verification),
+    })
+}
+
+/// Inspect the actual batches behind Catalog snapshots, without scanning rows.
+fn storage_evidence(base: &workload::BaseState, catalog: &impl CircuitCatalog) -> Result<Value> {
+    let mut evidence = base.storage_evidence();
+    let reader = catalog
+        .output_handles(&SqlIdentifier::from("V"))
+        .context("missing V materialization")?
+        .integrate_handle
+        .as_ref()
+        .context("missing integrated V output")?
+        .concat();
+    evidence.insert("V".into(), workload::batch_storage_evidence(&*reader));
+    Ok(Value::Object(evidence))
+}
+
+fn run(config: &Config, run_number: usize) -> Result<()> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs_f64(config.compaction_timeout_secs);
+    let mut circuit_config =
+        CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
+    circuit_config.dev_tweaks.fetch_join = Some(config.r5);
+    let storage_path = config
+        .storage_path
+        .as_ref()
+        .map(|root| root.join(format!("run-{run_number}")));
+    if let Some(path) = &storage_path {
         if path.exists() {
             bail!("storage directory already exists: {}", path.display());
         }
+        std::fs::create_dir_all(path)?;
         circuit_config = circuit_config.with_storage(Some(CircuitStorageConfig::for_config(
             StorageConfig {
                 path: path.to_string_lossy().into_owned(),
-                cache: StorageCacheConfig::default(),
+                cache: StorageCacheConfig::FelderaCache,
             },
             StorageOptions {
                 min_storage_bytes: Some(0),
+                cache_mib: config.cache_bytes.map(|bytes| bytes / (1024 * 1024)),
+                compression: feldera_types::config::StorageCompression::None,
                 ..StorageOptions::default()
             },
         )?));
@@ -708,154 +1032,264 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config, q3_state.clone())?;
     #[cfg(not(feature = "merged-index"))]
     let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config)?;
+    let runtime = circuit.runtime().clone();
+    runtime.with_buffer_cache(0, || {
     #[cfg(feature = "merged-index")]
     let index = ManualIndex::new(circuit.runtime());
+    let sampler = storage_path
+        .clone()
+        .map(measurement::StorageSampler::start)
+        .transpose()?;
     let mut inputs = Inputs::new(&catalog)?;
-    let mut state = Reference::default();
+    let mut state = config.verify.then(Reference::default);
     let mut stats = Measurements::default();
-
-    let parse_started = Instant::now();
-    let customers = rows(
+    let mut base = workload::BaseState::new(&catalog)?;
+    let load = workload::load_batches(
         config.customer.as_deref().context("--customer required")?,
-        Customer::parse,
-    )?;
-    let orders = rows(
         config.orders.as_deref().context("--orders required")?,
-        Order::parse,
-    )?;
-    let lines = rows(
         config.lineitem.as_deref().context("--lineitem required")?,
-        Line::parse,
-    )?;
-    let load = Change {
-        customers: customers.into_iter().map(|row| (row, true)).collect(),
-        orders: orders.into_iter().map(|row| (row, true)).collect(),
-        lines: lines.into_iter().map(|row| (row, true)).collect(),
-    };
-    let load_rows = load.len();
-    stats.preparation += parse_started.elapsed();
-    #[cfg(feature = "merged-index")]
-    let batches = reconstruction::grouped_load(load, config.batch)?;
-    #[cfg(not(feature = "merged-index"))]
-    {
-        // Submit all related records in each transaction; the final partial batch is still stepped.
-        let mut customers = load.customers.into_iter();
-        let mut orders = load.orders.into_iter();
-        let mut lines = load.lines.into_iter();
-        while customers.len() + orders.len() + lines.len() > 0 {
-            let batch_started = Instant::now();
-            let mut batch = Change::default();
-            for _ in 0..config.batch {
-                if let Some(row) = customers.next() {
-                    batch.customers.push(row);
-                } else if let Some(row) = orders.next() {
-                    batch.orders.push(row);
-                } else if let Some(row) = lines.next() {
-                    batch.lines.push(row);
-                }
-            }
-            stats.preparation += batch_started.elapsed();
-            transact(
+        config.batch,
+        |batch| {
+            transact_inner(
                 &mut circuit,
                 &catalog,
                 &mut inputs,
-                &mut state,
+                state.as_mut(),
                 batch,
-                config.verify,
+                Some((&base, false)),
                 &mut stats,
+                #[cfg(feature = "merged-index")]
+                (&index, &q3_state),
             )?;
-        }
+            base = workload::BaseState::new(&catalog)?;
+            Ok(())
+        },
+    )?;
+    let load_drain = settle(
+        &mut circuit,
+        &catalog,
+        &mut base,
+        timeout,
+        #[cfg(feature = "merged-index")]
+        (&index, &q3_state),
+    )?;
+    let load_storage = storage_evidence(&base, &catalog)?;
+    if config.r5
+        && load_storage
+            .as_object()
+            .context("storage evidence object")?
+            .values()
+            .any(|e| e["file_backed"] != true)
+    {
+        bail!("loading left Catalog state in memory: {load_storage}");
     }
     #[cfg(feature = "merged-index")]
-    for batch in batches {
-        transact(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
-            &mut state,
-            batch,
-            config.verify,
-            &mut stats,
-            (&index, &q3_state),
-        )?;
+    if config.r5 && !index.is_file_backed()? {
+        bail!("loading left the manual index in memory");
     }
-    #[cfg(not(feature = "merged-index"))]
-    println!("run={run_number} phase=load rows={load_rows} transactions={} delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
-        stats.transactions, stats.delta_positive, stats.delta_negative, stats.view_rows, config.verify,
-        milliseconds(stats.native), throughput(load_rows, stats.native),
-        milliseconds(stats.preparation), milliseconds(started.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&stats.latencies));
-    #[cfg(feature = "merged-index")]
-    println!(
-        "run={run_number} phase=setup rows={load_rows} transactions={} view_rows={:?} verified={}",
-        stats.transactions, stats.view_rows, config.verify
-    );
+    let load_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
+    let load_elapsed = started.elapsed();
+    let load_rows = load.customer_rows + load.order_rows + load.line_rows;
+    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} q3_ms={:.3} prep_ms={:.3} compaction_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
+        stats.transactions, config.verify, milliseconds(stats.native), milliseconds(stats.preparation),
+        milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
-    if let (Some(order_path), Some(line_path)) = (&config.rf1_orders, &config.rf1_lines) {
-        let phase = Instant::now();
-        let mut change = Change::default();
+    let refresh_list = refreshes(config)?;
+    let sampler = storage_path
+        .clone()
+        .map(measurement::StorageSampler::start)
+        .transpose()?;
+    let sequence_resources = measurement::ResourceSnapshot::capture()?;
+    let sequence_started = Instant::now();
+    let mut reports = Vec::new();
+    let mut verification_time = Duration::ZERO;
+    let mut foreground_total = Duration::ZERO;
+    for (number, refresh) in refresh_list.into_iter().enumerate() {
+        let resources_before = measurement::ResourceSnapshot::capture()?;
+        let phase_started = Instant::now();
         let mut measurement = Measurements::default();
-        change.orders = rows(order_path, Order::parse)?
-            .into_iter()
-            .map(|row| (row, true))
+        let (change, absent, phase, discovered) = if let Some(path) = refresh.rf2 {
+            let keys: HashSet<_> = rows(&path, data::delete_order_key)?.into_iter().collect();
+            #[cfg(feature = "merged-index")]
+            let snapshot = index.snapshot()?;
+            let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
+                #[cfg(feature = "merged-index")]
+                {
+                    reconstruction::lines(&snapshot, order)
+                }
+                #[cfg(not(feature = "merged-index"))]
+                {
+                    base.native_lines(order.key)
+                }
+            })?;
+            measurement.discovery += phase_started.elapsed();
+            (change, absent, "rf2", true)
+        } else {
+            let change = Change {
+                orders: rows(
+                    refresh
+                        .rf1_orders
+                        .as_deref()
+                        .context("RF1 Orders required")?,
+                    Order::parse,
+                )?
+                .into_iter()
+                .map(|row| (row, true))
+                .collect(),
+                lines: rows(
+                    refresh
+                        .rf1_lines
+                        .as_deref()
+                        .context("RF1 Lineitem required")?,
+                    Line::parse,
+                )?
+                .into_iter()
+                .map(|row| (row, true))
+                .collect(),
+                ..Change::default()
+            };
+            measurement.preparation += phase_started.elapsed();
+            (change, 0, "rf1", false)
+        };
+        let workload_stats_started = Instant::now();
+        let customers: HashSet<_> = change
+            .orders
+            .iter()
+            .map(|(order, _)| order.customer_key)
             .collect();
-        change.lines = rows(line_path, Line::parse)?
-            .into_iter()
-            .map(|row| (row, true))
-            .collect();
-        measurement.preparation += phase.elapsed();
-        let count = change.len();
-        transact(
+        let order_count = change.orders.len();
+        let mut fanout = HashMap::<i64, usize>::new();
+        for (line, _) in &change.lines {
+            *fanout.entry(line.order_key).or_default() += 1;
+        }
+        let line_count = change.lines.len();
+        let customer_count = customers.len();
+        let maximum_fanout = fanout.values().max().copied().unwrap_or(0);
+        measurement.preparation += workload_stats_started.elapsed();
+        transact_inner(
             &mut circuit,
             &catalog,
             &mut inputs,
-            &mut state,
+            state.as_mut(),
             change,
-            config.verify,
+            Some((&base, discovered)),
             &mut measurement,
             #[cfg(feature = "merged-index")]
             (&index, &q3_state),
         )?;
-        println!("run={run_number} phase=rf1 rows={count} transactions=1 delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
-            measurement.delta_positive, measurement.delta_negative, measurement.view_rows, config.verify,
-            milliseconds(measurement.native), throughput(count, measurement.native),
-            milliseconds(measurement.preparation), milliseconds(phase.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&measurement.latencies));
-        #[cfg(feature = "merged-index")]
+        let cleanup_started = Instant::now();
+        base = workload::BaseState::new(&catalog)?;
+        drop(customers);
+        drop(fanout);
+        measurement.publication_cleanup += cleanup_started.elapsed();
+        // Wall time covers file reads, discovery and all foreground cleanup.
+        measurement.foreground = phase_started
+            .elapsed()
+            .saturating_sub(measurement.verification);
+        verification_time += measurement.verification;
+        foreground_total += measurement.foreground;
+        let resource_delta = resources_before.delta(&measurement::ResourceSnapshot::capture()?);
+        let mut report = phase_json(&measurement);
+        report["refresh"] = json!(number + 1);
+        report["phase"] = json!(phase);
+        report["absent_orders"] = json!(absent);
+        report["affected_customers"] = json!(customer_count);
+        report["affected_orders"] = json!(order_count);
+        report["line_count"] = json!(line_count);
+        report["line_fanout_max"] = json!(maximum_fanout);
+        report["line_fanout_mean"] = json!(if order_count == 0 {
+            0.0
+        } else {
+            line_count as f64 / order_count as f64
+        });
+        report["resources"] = if config.verify {
+            json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"})
+        } else {
+            resource_delta
+        };
         println!(
-            "run={run_number} phase=rf1 index_ms={:.3} q3_ms={:.3} combined_maintenance_ms={:.3}",
-            milliseconds(measurement.index),
-            milliseconds(measurement.native),
-            milliseconds(measurement.index + measurement.native)
+            "run={run_number} refresh={} phase={phase} {}",
+            number + 1,
+            report
         );
+        reports.push(report);
     }
-    if let Some(path) = &config.rf2 {
-        let phase = Instant::now();
-        let keys: HashSet<_> = rows(path, data::delete_order_key)?.into_iter().collect();
-        let change = rf2_changes(&state, &keys);
-        let count = change.len();
-        let mut measurement = Measurements::default();
-        measurement.preparation += phase.elapsed();
-        transact(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
-            &mut state,
-            change,
-            config.verify,
-            &mut measurement,
-            #[cfg(feature = "merged-index")]
-            (&index, &q3_state),
-        )?;
-        println!("run={run_number} phase=rf2 rows={count} transactions=1 delta_plus={:?} delta_minus={:?} view_rows={:?} verified={} native_ms={:.3} native_rows_per_s={:.1} prep_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} peak_process_rss_bytes={} {}",
-            measurement.delta_positive, measurement.delta_negative, measurement.view_rows, config.verify,
-            milliseconds(measurement.native), throughput(count, measurement.native),
-            milliseconds(measurement.preparation), milliseconds(phase.elapsed()), state.size_of().total_bytes(), rss_bytes(), latency_summary(&measurement.latencies));
+    let final_drain = settle(
+        &mut circuit,
+        &catalog,
+        &mut base,
+        timeout,
         #[cfg(feature = "merged-index")]
-        println!(
-            "run={run_number} phase=rf2 index_ms={:.3} q3_ms={:.3} combined_maintenance_ms={:.3}",
-            milliseconds(measurement.index),
-            milliseconds(measurement.native),
-            milliseconds(measurement.index + measurement.native)
-        );
+        (&index, &q3_state),
+    )?;
+    let sequence_elapsed = sequence_started.elapsed().saturating_sub(verification_time);
+    let resources_after = measurement::ResourceSnapshot::capture()?;
+    let settled_storage_bytes = storage_path
+        .as_deref()
+        .map(measurement::storage_size_bytes)
+        .transpose()?;
+    let sampled_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
+    let (cache_occupancy, cache_capacity) = circuit.runtime().cache_occupancy();
+    #[cfg(feature = "merged-index")]
+    let manual_file_backed = index.is_file_backed()?;
+    #[cfg(not(feature = "merged-index"))]
+    let manual_file_backed: Option<bool> = None;
+    #[cfg(feature = "merged-index")]
+    if config.r5 && !manual_file_backed {
+        bail!("manual merged index is not file-backed");
+    }
+    let profile = circuit.retrieve_profile()?;
+    let graph = circuit.graph_profile()?.worker_graphs[0].to_json();
+    if cfg!(feature = "merged-index") && graph.contains("shard_accumulate_trace") {
+        bail!("replaced historical join trace remains in reconstructed circuit");
+    }
+    if let Some(path) = &config.report {
+        std::fs::write(path.with_extension("profile.json"), profile.as_json())?;
+        std::fs::write(path.with_extension("graph.json"), &graph)?;
+    }
+    let storage_evidence = storage_evidence(&base, &catalog)?;
+    if config.r5
+        && storage_evidence
+            .as_object()
+            .context("storage evidence object")?
+            .values()
+            .any(|e| e["file_backed"] != true)
+    {
+        bail!("Catalog base state or V is not file-backed: {storage_evidence}");
+    }
+    let report = json!({
+        "status": "complete",
+        "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
+        "qualification": "runner determines cgroup qualification; macOS is smoke only",
+        "configuration": {
+            "workers": config.workers, "load_batch_target": config.batch, "verification": config.verify,
+            "driver_reference_bytes": state.as_ref().map_or(0, |s| s.size_of().total_bytes()),
+            "rf2_discovery_full_scans": 0,
+            "cache_bytes": config.cache_bytes, "memory_pressure_target_bytes": config.memory_target_bytes,
+            "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
+            "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
+            "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
+            "durability": "no checkpoint; refresh completion is not a durability guarantee",
+        },
+        "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
+            "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
+            "sampled_peak_storage_bytes": load_peak_storage_bytes,
+            "compaction_drain_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed)},
+        "refreshes": reports,
+        "sequence": {
+            "foreground_ms": milliseconds(foreground_total), "final_compaction_drain_ms": milliseconds(final_drain),
+            "end_to_end_ms": milliseconds(sequence_elapsed), "settled_storage_bytes": settled_storage_bytes,
+            "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
+            "cache_occupancy_bytes": cache_occupancy, "snapshot_publication_transactions": 1, "cache_capacity_bytes": cache_capacity,
+            "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
+            "manual_index_file_backed": manual_file_backed,
+            "catalog_storage": storage_evidence,
+            "replaced_historical_join_traces_absent": if cfg!(feature = "merged-index") { Some(true) } else { None },
+            "circuit_profile": serde_json::to_value(profile)?,
+        },
+    });
+    if let Some(path) = &config.report {
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
     if let Some(root) = &config.dump_runtime_circuit {
         let directory = root.join(format!("run-{run_number}"));
@@ -904,6 +1338,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         capture_result?;
     }
     Ok(())
+    })
 }
 
 fn main() -> Result<()> {
@@ -1369,22 +1804,40 @@ mod reconstructed_tests {
 
     #[test]
     fn rejects_missing_placement_and_incomplete_rf2() -> Result<()> {
-        let state = Reference::default();
+        let q3_state = Q3State::default();
+        let (mut circuit, catalog) =
+            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
+        let index = ManualIndex::new(circuit.runtime());
+        let mut input = Inputs::new(&catalog)?;
+        let mut reference = Reference::default();
         let no_order = Change {
             lines: vec![(line(20, 1), true)],
             ..Change::default()
         };
-        assert!(reconstruction::prepare(&no_order, &state).is_err());
-
-        let mut state = Reference::default();
-        state.customers.insert(2, customer(2));
-        state.orders.insert(20, order(20, 2));
-        state.lines.insert((20, 1), line(20, 1));
+        assert!(workload::BaseState::new(&catalog)?
+            .validate(&no_order)
+            .is_err());
+        transact(
+            &mut circuit,
+            &catalog,
+            &mut input,
+            &mut reference,
+            Change {
+                customers: vec![(customer(2), true)],
+                orders: vec![(order(20, 2), true)],
+                lines: vec![(line(20, 1), true)],
+            },
+            true,
+            &mut Measurements::default(),
+            (&index, &q3_state),
+        )?;
         let missing_line = Change {
             orders: vec![(order(20, 2), false)],
             ..Change::default()
         };
-        assert!(reconstruction::prepare(&missing_line, &state).is_err());
+        assert!(workload::BaseState::new(&catalog)?
+            .validate(&missing_line)
+            .is_err());
         Ok(())
     }
 
@@ -1438,7 +1891,7 @@ mod reconstructed_tests {
             ..Change::default()
         };
         let before = reference.evaluate();
-        let (placements, rows) = reconstruction::prepare(&complete, &reference)?;
+        let (placements, rows) = reconstruction::prepare(&complete)?;
         let (before_index, after_index) = index.append(rows)?;
         q3_state
             .publish(before_index, after_index, placements)
@@ -1567,6 +2020,145 @@ mod reconstructed_tests {
             (&restored_index, &restored_q3),
         )?;
         assert_eq!(stats.view_rows, Some(1));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_RUN: AtomicUsize = AtomicUsize::new(0);
+
+    fn directory() -> Result<PathBuf> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/r5-tests")
+            .join(format!(
+                "{}-{}-{}",
+                std::process::id(),
+                cfg!(feature = "merged-index"),
+                NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn r5_rejects_unconfigured_storage_and_invalid_budgets() {
+        for args in [
+            vec!["--r5"],
+            vec!["--cache-bytes", "1"],
+            vec!["--compaction-timeout-secs", "NaN"],
+            vec!["--memory-target-bytes", "0"],
+            vec!["--refresh-list", "list.json", "--rf2", "delete.tbl"],
+        ] {
+            assert!(Config::from_args(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn file_backed_driver_loads_complete_groups_and_discovers_repeated_refreshes() -> Result<()> {
+        let directory = directory()?;
+        let customers = directory.join("customer.tbl");
+        let orders = directory.join("orders.tbl");
+        let lines = directory.join("lineitem.tbl");
+        let inserted_orders = directory.join("insert-orders.tbl");
+        let inserted_lines = directory.join("insert-lines.tbl");
+        let deletes = directory.join("delete.tbl");
+        let empty = directory.join("empty.tbl");
+        let list = directory.join("refreshes.json");
+        let report = directory.join("report.json");
+        std::fs::write(&customers, "1|n|a|1|p|1.00|BUILDING|comment|\n")?;
+        std::fs::write(&orders, "1|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n")?;
+        std::fs::write(
+            &lines,
+            "1|2|3|1|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n",
+        )?;
+        std::fs::write(&inserted_orders, "2|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n")?;
+        std::fs::write(
+            &inserted_lines,
+            (1..=130)
+                .map(|n| {
+                    format!(
+                        "2|2|3|{n}|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n"
+                    )
+                })
+                .collect::<String>(),
+        )?;
+        std::fs::write(&deletes, "2|\n2|\n999|\n")?;
+        std::fs::write(&empty, "")?;
+        std::fs::write(
+            &list,
+            serde_json::to_vec(&json!([
+                {"rf1_orders": "insert-orders.tbl", "rf1_lines": "insert-lines.tbl"},
+                {"rf2": "delete.tbl"}, {"rf2": "delete.tbl"},
+                {"rf1_orders": "insert-orders.tbl", "rf1_lines": "insert-lines.tbl"},
+                {"rf2": "delete.tbl"}, {"rf2": "empty.tbl"}
+            ]))?,
+        )?;
+        let config = Config {
+            customer: Some(customers),
+            orders: Some(orders),
+            lineitem: Some(lines),
+            refresh_list: Some(list),
+            report: Some(report.clone()),
+            storage_path: Some(directory.join("storage")),
+            workers: 1,
+            runs: 1,
+            batch: 2,
+            cache_bytes: Some(8 * 1024 * 1024),
+            memory_target_bytes: Some(512 * 1024 * 1024),
+            compaction_timeout_secs: 10.0,
+            verify: true,
+            r5: true,
+            ..Config::default()
+        };
+        run(&config, 1)?;
+        let output: Value = serde_json::from_reader(File::open(report)?)?;
+        let refreshes = output["refreshes"].as_array().unwrap();
+        assert_eq!(refreshes.len(), 6);
+        assert_eq!(refreshes[0]["line_fanout_max"], 130);
+        assert_eq!(refreshes[1]["absent_orders"], 1);
+        assert_eq!(refreshes[2]["absent_orders"], 2);
+        assert_eq!(refreshes[5]["rows"], 0);
+        assert!(
+            output["sequence"]["settled_storage_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        for evidence in output["sequence"]["catalog_storage"]
+            .as_object()
+            .unwrap()
+            .values()
+        {
+            assert_eq!(evidence["file_backed"], true);
+        }
+        let foreground = output["sequence"]["foreground_ms"].as_f64().unwrap();
+        let total = output["sequence"]["end_to_end_ms"].as_f64().unwrap();
+        assert!(total >= foreground);
+        // Verification I/O and CPU counters are omitted from performance data.
+        assert!(output["sequence"]["resources"]["unavailable"].is_string());
+        let config = Config {
+            verify: false,
+            storage_path: Some(directory.join("unverified-storage")),
+            report: Some(directory.join("unverified-report.json")),
+            ..config
+        };
+        run(&config, 1)?;
+        let measured: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        assert_eq!(measured["configuration"]["driver_reference_bytes"], 0);
+        assert!(measured["sequence"]["resources"]["backend_read_operations"].is_u64());
+        assert!(measured["sequence"]["resources"]["cpu_microseconds"].is_u64());
+        assert!(
+            measured["sequence"]["sampled_peak_storage_bytes"]
+                .as_u64()
+                .unwrap()
+                >= measured["sequence"]["settled_storage_bytes"]
+                    .as_u64()
+                    .unwrap()
+        );
         Ok(())
     }
 }
