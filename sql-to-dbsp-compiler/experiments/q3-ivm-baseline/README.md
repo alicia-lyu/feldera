@@ -64,6 +64,7 @@ then complete Order/Lineitem groups. It requires ascending Order keys and
 Lineitem rows grouped by Order, and reports unsupported ordering. Both modes use
 the same load transactions. Independent `Reference` validation is allocated
 only when verification is enabled; `--no-verify` retains no reference maps.
+The JSON configuration reports `driver_reference_bytes: 0` in this mode.
 The measured workload is limited to RF1 insertion and RF2 deletion under
 referential integrity.
 Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
@@ -93,12 +94,16 @@ cross-circuit checkpoints are deferred.
 
 ## R5 maintenance measurements
 
-R5 resolves RF2 IDs from the current maintained Orders snapshot. It obtains
-complete deletion rows from native Lineitem primary-key ranges or the manual
-merged index's `(custkey, orderkey)` line range. Requested IDs are deduplicated;
-absent Orders are ignored and counted. Discovery uses maintained storage rather
-than rescanning base files or replaying refreshes. Operational checks enforce
-the supported workload against maintained state and the current delta.
+R5 keeps one `BaseState` backed by shared Catalog batch snapshots and refreshes
+it after each transaction for discovery and workload checks.
+`CatalogHandle::concat` consumes its input mailbox, so this state avoids
+retaining or rebuilding a second set of full relation maps. RF2 IDs are resolved
+from the current maintained Orders snapshot. Complete deletion rows come from
+native Lineitem primary-key ranges or the manual merged index's `(custkey,
+orderkey)` line range. Requested IDs are deduplicated; absent Orders are ignored
+and counted. Discovery uses maintained storage rather than rescanning base files
+or replaying refreshes. Operational checks enforce the supported workload
+against maintained state and the current delta.
 
 The R5 runner builds and preserves separate native and reconstructed release
 executables, then restores default native generation. It starts a fresh process
@@ -126,8 +131,15 @@ storage, one worker, native join fetch, no compression, and
 `min_storage_bytes=0`. It records the cache capacity, runtime memory-pressure
 target, and compaction timeout. Loading compaction completes before measurement;
 after the refresh sequence, circuit and manual-index compaction drain with the
-configured timeout. A complete refresh that cannot execute within its budget
-fails the run rather than being split.
+configured timeout. Because inserts with `min_storage_bytes=0` can leave batches
+in memory at low pressure, explicit compaction rewrites an eligible lone memory
+batch when the existing merge policy selects storage. File backing is confirmed
+from `SerBatch::location`, not inferred from a graph profile. Loading and final
+drainage each include an empty logical transaction to publish compacted
+snapshots and release old output-mailbox references. Its cost is included in
+drainage, and reports count these transactions in
+`snapshot_publication_transactions`. A complete refresh that cannot execute
+within its budget fails the run rather than being split.
 
 The JSON report records input and executable hashes, revision, configuration,
 per-phase measurements, and qualification status. It separates RF2 discovery,

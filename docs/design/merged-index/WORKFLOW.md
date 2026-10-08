@@ -86,9 +86,17 @@ each run, with three repetitions by default. It runs with Java 21 and Rust
 Each run requires file-backed base state, materialized `V`, and manual merged
 index; explicit cache capacity, memory-pressure target, and compaction timeout;
 one worker; native join fetch; no compression; and `min_storage_bytes=0`.
-Loading compaction finishes before the measured sequence. Circuit and manual
-index compaction drain after the refreshes, with a timeout. Drainage is included
-in sequence totals. The JSON report includes hashes, revision, configuration,
+One shared `BaseState` uses Catalog batch snapshots and is refreshed after each
+transaction for RF2 discovery and workload checks. File backing is checked from
+`SerBatch::location`. Since `min_storage_bytes=0` may leave inserts in memory at
+low pressure, explicit compaction rewrites an eligible lone memory batch when
+the existing merge policy selects storage. Loading compaction finishes before
+measurement. Loading and final drainage each include an empty logical
+transaction that publishes compacted snapshots and releases old output-mailbox
+references. Circuit and manual-index compaction then drain with a timeout; these
+publication transactions are included in drainage and counted as
+`snapshot_publication_transactions`. Drainage is included in sequence totals.
+The JSON report includes hashes, revision, configuration,
 interval measurements, and qualification status. Backend read/write operations
 and bytes are distinct from OS physical I/O. CPU time, process RSS high-water,
 cache occupancy, settled storage, sampled peak storage, affected customers and
