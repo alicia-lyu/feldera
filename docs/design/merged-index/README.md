@@ -582,8 +582,14 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    [experiment guide](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#r5-maintenance-measurements)
    describes bounded loading, maintained-storage RF2 discovery, per-phase accounting,
    fresh native and reconstructed runs, scoped use of the configured worker cache, and
-   the JSON report. macOS runs are smoke tests;
+   the JSON report. R5 requests no full compaction during loading or refreshes;
+   sequence time ends with the last refresh's publication and cleanup, while normal
+   background compaction can continue. Loading alone waits for normally eligible
+   merges and preserves below-threshold runs. macOS runs are smoke tests;
    equal enforced total-memory qualification requires Linux cgroup v2 runs with swap
-   disabled and remains pending. Refresh completion has no durability guarantee, so
+   disabled and remains pending. The
+   [Linux campaign plan](r5-pressure-and-linux-campaign-documentation-plan.md)
+   specifies SF10 clustered/scattered cold-deletion inputs, a 1 GiB pilot, and the
+   pressure instrumentation still required. Refresh completion has no durability guarantee, so
    comparable checkpoint costs are deferred. Broader updates, residual Q3, and Q5/Q10
    remain future work pending the [acceptance criteria](support.md#evidence-and-measurements-bound-the-claim).

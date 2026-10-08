@@ -91,19 +91,26 @@ covers driver reads, Q3 workers, manual-index ownership, and merger tasks.
 
 ## Completion evidence
 
-The original R5 v1 implementation and macOS smoke work completed. Its results
-include forced final compaction and are retained as historical evidence; the
-revised completion boundary and smoke rerun remain pending. `verify.sh` passed native
-(18), reconstructed (15), COL (21), and runner (10) tests, exact R4 transcript
-comparison, formatting, strict experiment/COL Clippy, shell syntax, and whitespace
-checks. Five focused DBSP cache/compaction tests and strict production-library
-Clippy passed. Broader DBSP test-code Clippy reported 56 existing lints outside
-the modified files; its log is retained under ignored experiment `target/`.
+The R5 v2 correction and macOS smoke rerun completed on 2026-10-08. There is no
+forced compaction during loading or refreshes, and no final wait or empty
+publication transaction. `verify.sh` passed native (18), reconstructed (15),
+COL (21), and runner (12) tests, exact R4 transcript comparison, formatting,
+strict experiment/COL Clippy, shell syntax, and experiment-scoped whitespace
+checks. Five focused Spine/DBSPHandle tests and strict production-library
+Clippy passed. The earlier broader DBSP test-code Clippy check reported 56
+existing lints outside the modified files; its log remains under ignored
+experiment `target/`.
 
-Clustered, scattered, and complete 10,000-line-group campaigns each completed
-three fresh runs per mode under the original v1 completion boundary. They do not
-establish runtime memory pressure. The current v2 smoke rerun and Linux
-equal-total-memory, beyond-memory qualification remain pending. See the
+Clustered, scattered, and complete 10,000-line-group campaigns completed three
+fresh runs per mode: 18 processes total. Every report has measurement version 2,
+`last_refresh_complete`, zero final publication transactions, and no final
+compaction wait. The tiny initial base stayed in RAM; ordinary refresh merges
+produced disk batches without eliminating all RAM runs. The highest RSS was
+43.2 MiB against the 512 MiB runtime target. These are smoke tests and do not
+establish memory pressure or beyond-memory behavior. The previous forced-drain
+v1 results are retained as historical evidence.
+
+Linux equal-total-memory qualification, direct pressure instrumentation, and
+campaign input preparation remain pending. See the
 [experiment results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
 and [Linux pressure campaign plan](r5-pressure-and-linux-campaign-documentation-plan.md).
-Deferred items remain as listed above.

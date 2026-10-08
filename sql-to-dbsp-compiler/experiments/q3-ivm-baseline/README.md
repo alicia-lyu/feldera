@@ -70,7 +70,8 @@ verification enabled it maintains independent Customer, Orders, and Lineitem
 hash maps and checks each transaction's emitted delta and materialized `V`
 against a full join. With `--no-verify`, neither mode allocates or updates those
 maps. Native RF2 discovery still reads the maintained Catalog Orders and
-Lineitem snapshots; both modes use the same logical refreshes.
+Lineitem snapshots; both modes use the same logical refreshes. Earlier baseline
+results with verification enabled include the reference maps in their RSS.
 The measured workload is limited to RF1 insertion and RF2 deletion under
 referential integrity.
 Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
@@ -163,7 +164,8 @@ publication/cleanup, and complete foreground latency. `index_ms + q3_ms` is a
 subtotal that excludes discovery and preparation. The sequence ends at the last
 refresh's publication/cleanup, with `completion_boundary` set to
 `last_refresh_complete` and `snapshot_publication_transactions` set to zero.
-`sequence.observed_storage_bytes` records storage at that boundary; it is not a
+`sequence.observed_storage_bytes` records storage after the last refresh without
+waiting for compaction; background merges can still be active. It is not a
 settled post-compaction size. `load.background_merge_wait_ms` and
 `load.observed_storage_bytes` describe the loading wait and its observed size.
 The configuration's `compaction_policy` value is `no forced compaction; loading
@@ -182,8 +184,10 @@ Independent correctness checking is excluded from measured runs.
 macOS reports are smoke tests and do not establish equal enforced total memory.
 Linux qualification requires equal cgroup v2 total-memory limits, swap disabled,
 and private copies of every input prepared inside each run's cgroup during
-loading. The current R5 smoke rerun and qualifying Linux campaign are pending;
-the earlier forced-drain smoke results are historical R5 v1 evidence. Refresh
+loading. The current R5 v2 smoke comparisons completed 18 fresh processes without forced
+compaction; the qualifying Linux campaign remains pending. The tiny loaded base
+stayed in RAM and did not demonstrate memory pressure. Earlier forced-drain
+smoke results are historical R5 v1 evidence. Refresh
 completion has no durability guarantee. Periodic checkpoint measurement,
 broader updates, residual Q3, and Q5/Q10 remain deferred. See the
 [Linux pressure campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md)

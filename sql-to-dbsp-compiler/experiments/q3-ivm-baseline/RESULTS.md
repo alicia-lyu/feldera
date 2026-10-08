@@ -195,28 +195,161 @@ preparation and checking.
 The generator scopes four allowances to compiler-generated `src/lib.rs` syntax;
 the handwritten driver and parser remain subject to strict Clippy.
 
-## Current R5 v2 evidence (pending)
+## Current R5 v2 verification and macOS smoke evidence
 
-The revised harness no longer forces compaction. Loading waits only for natural
-eligible background merges, publishes once with an empty transaction, and
-records `load.background_merge_wait_ms` and `load.observed_storage_bytes`. The
-measured sequence ends at the last refresh's publication and cleanup, with
-`completion_boundary=last_refresh_complete` and
-`snapshot_publication_transactions=0`; no final wait or transaction is run.
-`sequence.observed_storage_bytes` is the storage size at that completion
-boundary, not a settled post-compaction size. Process CPU includes natural
-background merge work that runs during the sequence.
-The JSON configuration's `compaction_policy` states that there is no forced
-compaction, loading waits only for normal background merges, and there is no
-final wait. Catalog storage summaries report snapshot, memory, and storage
-batch counts plus `file_backed` for each relation. `manual_index_storage`
-reports the auxiliary index separately; memory batches can remain at completion.
+**Maintenance ends at the last refresh's publication and cleanup. No forced
+compaction or final compaction wait is performed.** Background merges can run
+across refresh transactions and continue after the measured interval. Loading
+waits only for normally eligible merges, preserves below-threshold runs, and
+publishes its snapshots once with an empty transaction. Loading is excluded
+from maintenance measurements.
 
-New smoke measurements for this completion boundary have not yet been recorded.
-The prior table below is retained as historical R5 v1 evidence and must not be
-treated as results from the revised harness. The Linux pressure campaign is
-also pending; see the
-[campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md).
+On 2026-10-08, the revised `verify.sh` passed **18 native, 15 reconstructed,
+21 COL, and 12 Python runner tests**, with exact R4 transcript agreement.
+Formatting, strict experiment/COL Clippy, shell syntax, and experiment-scoped
+whitespace checks passed. Artifacts are in
+`target/r4-verification/20261008T215445Z-46398/` within this experiment.
+Five focused DBSP tests passed, covering background-idle versus full-compaction
+status and existing single-batch compaction cases. Strict production DBSP
+library Clippy passed. Default native generation was restored. Regression
+coverage includes RAM/disk runs surviving refresh completion and an empty
+sequence recording zero sequence time and CPU.
+
+### Workload definitions
+
+All three smoke workloads start with **64 Customers, 512 Orders, and 2,048
+Lines**. The label describes each RF1's inserted groups:
+
+| Workload type | Orders per RF1 | Customers referenced | Lines per Order | Total Lines per RF1 |
+| --- | ---: | ---: | ---: | ---: |
+| **clustered** | 16 | 1 shared Customer | 4 | 64 |
+| **scattered** | 16 | 16 distinct Customers | 4 | 64 |
+| **large-group** | 1 | 1 Customer | 10,000 | 10,000 |
+
+Each sequence is **RF1, RF2, repeated RF2 for absent Orders, RF1 reinsertion,
+RF2, and empty RF2**. RF1 inserts complete groups; RF2 deletes each requested
+Order and every current Line belonging to it. Requested duplicate IDs are
+removed and absent Orders counted. Both modes receive the same inputs.
+
+**Native** uses the generated native Q3 circuit and its traces.
+**Reconstructed** maintains the merged index in an auxiliary thread and uses
+it alongside the remaining circuit traces. The index uses the ordinary DBSP
+Spine background merger; its compaction can continue across transactions.
+
+### Timing definitions
+
+**All columns below cover the six refreshes; loading and independent correctness
+checking are excluded.** The performance processes use `--no-verify` and retain
+zero `Reference` map bytes.
+
+| Column | Definition |
+| --- | --- |
+| **Foreground ms** | Sum of the six refresh wall times, including input reads/discovery, operational checks, input preparation, index maintenance, Q3, publication, and cleanup. |
+| **Sequence ms** | Wall time from the start of the refresh sequence through the last refresh's publication/cleanup. Includes between-refresh measurement/logging overhead; excludes final reporting and any subsequent compaction. |
+| **Sequence CPU ms** | Process user + system CPU over the sequence, summed across driver, runtime, and auxiliary threads. Includes naturally scheduled background merge work executed inside that interval. |
+
+**Per-refresh JSON phases:**
+
+| Field | Definition |
+| --- | --- |
+| **discovery_ms** | RF2 delete-ID reads, deduplication, maintained-state lookups, and assembly of complete current deletion rows, including decoding. |
+| **checks_input_preparation_ms** | RF1 input reads, operational checks, workload statistics, logical-row conversion, and circuit input serialization. |
+| **index_ms** | Reconstructed index batch construction and append, including folded-key/payload encoding, copying, sorting, and snapshot acquisition. Zero in native mode. |
+| **q3_ms** | Circuit transaction, including materialized `V`; reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. |
+| **publication_cleanup_ms** | Snapshot publication/release, refreshed Catalog snapshots, and foreground output/driver cleanup. |
+| **combined_maintenance_ms** | `index_ms + q3_ms`; excludes discovery, preparation, and publication/cleanup. |
+
+**Final drainage ms is absent in v2.** The report records
+`measurement_version=2`, `completion_boundary=last_refresh_complete`, and zero
+sequence `snapshot_publication_transactions`.
+
+### Resource definitions
+
+**Backend counters cover the sequence interval. Storage, RSS, and cache columns
+are bytes.** Storage observations do not require compaction to finish.
+
+| Column | Definition |
+| --- | --- |
+| **Read/write ops and bytes** | Storage-backend operation counts and bytes submitted during the sequence; distinct from OS physical I/O. |
+| **Observed storage** | Regular-file lengths in the storage directory observed after the last refresh without a compaction wait; background merges can still be active. |
+| **Sampled peak storage** | Largest directory size sampled during the sequence and its final storage observation, every 10 ms and once at the end. Shorter peaks may be missed. |
+| **Peak RSS** | Process resident-memory high-water mark since process start, including loading, driver, runtime, and auxiliary threads. |
+| **Cache occupancy** | Configured worker-cache occupancy observed after the last refresh; capacity is 32 MiB. |
+| **Memory/storage batches** | Counts of nonempty RAM and disk batches in the retained Catalog snapshots; the auxiliary index reports its current batches separately. File-backed configuration permits RAM batches. |
+
+`load.background_merge_wait_ms` includes the loading wait, its snapshot
+publication, and associated cleanup. `load.observed_storage_bytes` is the
+loaded storage observation used by the Linux size qualification check. Neither
+loading field is part of the refresh sequence.
+
+### Results and qualification
+
+All **18 fresh processes completed**: three repetitions per mode for each
+workload. Settings were one maintenance worker, a 512-row loading target,
+32 MiB cache, 512 MiB runtime RSS target, no compression, native join fetch,
+`min_storage_bytes=0`, and a 300-second loading merge-wait timeout. All reports
+use measurement version 2 and the last-refresh completion boundary. Source
+revisions were `603e02be3` for clustered and `a718f8fce` for scattered/large-group;
+the latter adds documentation only. The host was macOS 26.3.1 on arm64.
+
+**Each timing value, write counter, observed storage value, and cache occupancy
+is its own median. Maximum sampled storage and maximum RSS are maxima across
+three fresh runs.** Medians need not add up.
+
+| Workload | Mode | Foreground ms | Sequence ms | Sequence CPU ms |
+| --- | --- | ---: | ---: | ---: |
+| clustered | native | 2.114 | 2.193 | 3.558 |
+| clustered | reconstructed | 4.013 | 4.092 | 6.942 |
+| scattered | native | 2.367 | 2.448 | 3.759 |
+| scattered | reconstructed | 3.696 | 3.789 | 6.450 |
+| large-group | native | 112.944 | 113.154 | 104.047 |
+| large-group | reconstructed | 133.199 | 133.343 | 135.723 |
+
+| Workload | Mode | Write ops | Write bytes | Observed storage | Max sampled peak storage | Max peak RSS | Cache occupancy |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clustered | native | 3 | 218,624 | 218,624 | 392,192 | 20,774,912 | 431,592 |
+| clustered | reconstructed | 4 | 813,056 | 818,688 | 827,392 | 26,247,168 | 895,648 |
+| scattered | native | 3 | 348,672 | 359,424 | 364,032 | 20,791,296 | 439,880 |
+| scattered | reconstructed | 4 | 822,272 | 822,272 | 826,880 | 26,296,320 | 903,936 |
+| large-group | native | 6 | 765,952 | 765,952 | 765,952 | 34,848,768 | 788,152 |
+| large-group | reconstructed | 72 | 2,171,392 | 2,171,392 | 2,171,392 | 45,285,376 | 2,163,872 |
+
+Backend reads were **zero operations and zero bytes in every run**. OS physical
+I/O counters are unavailable on macOS. Natural background activity can continue
+after the sequence counter interval, while final storage/cache observations are
+collected. These observations are not settled sizes or a measurement of all
+subsequent compaction costs.
+
+Every process retained zero `Reference` bytes, used seven logical loading
+transactions plus one loading publication transaction, and retained at most
+516 loading rows. **The initial tiny base remained entirely in RAM, with zero
+stored file bytes.** Natural refresh merges produced disk batches alongside RAM
+runs; Customers remained in RAM. The reconstructed reports confirm absence of
+the replaced historical join traces. Large-group fan-out was 10,000 without
+splitting the refresh. Independent full-join correctness checks were performed
+in the separate verification suites, outside these performance processes.
+
+The maximum RSS over all 18 processes was **45,285,376 bytes (43.2 MiB)**. This is
+below the first runtime pressure threshold, **85% of 512 MiB = 435.2 MiB**.
+The runs did not reach DBSP RSS pressure. They are **macOS smoke tests**, not
+beyond-memory measurements or equal-total-memory comparisons. The Linux
+campaign and direct pressure instrumentation remain pending; the
+[campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md)
+specifies SF10 existing-base deletion workloads, equal memory limits, the pilot
+command, and evidence required to establish actual pressure. Refresh completion
+has no durability guarantee; checkpoint costs remain deferred.
+
+Input/executable hashes, configurations, phases, profiles, and graphs are
+preserved under ignored `target/r5-smoke-natural/`:
+
+- [Clustered manifest](../../../target/r5-smoke-natural/clustered/manifest.json).
+- [Scattered manifest](../../../target/r5-smoke-natural/scattered/manifest.json).
+- [Large-group manifest](../../../target/r5-smoke-natural/large-group/manifest.json).
+- [Aggregate summary](../../../target/r5-smoke-natural/summary.json).
+
+The runner restored default native generation after every campaign. The v1
+section below preserves historical forced-consolidation results and their
+previous timing boundaries.
 
 ## Historical R5 v1 harness verification and macOS smoke evidence
 
@@ -273,7 +406,7 @@ loading excluded.** Independent correctness checking is disabled in these runs.
 | --- | --- |
 | **Foreground ms** | Sum of each refresh's elapsed wall time: input reads/RF2 discovery, operational checks, input preparation, index maintenance, Q3 transaction, and publication/cleanup. Final drainage is measured separately. |
 | **Sequence ms** | Elapsed wall time from the start of the first refresh through completion of final drainage. Includes foreground work, final drainage, and between-refresh measurement/logging overhead. |
-| **Final drainage ms** | Elapsed wall time after the six refreshes to drain circuit/manual-index compaction, publish compacted snapshots through an empty logical transaction, release obsolete snapshots, and clean outputs. Included in Sequence ms. |
+| **Final drainage ms** | Historical forced consolidation after the six refreshes: native requests compaction of all circuit traces; reconstructed requests it for its remaining circuit traces plus the auxiliary merged index. Each trace is reduced to at most one batch. Includes waits, an empty snapshot-publication transaction, and cleanup; included only in the v1 Sequence ms. |
 | **Sequence CPU ms** | Process user + system CPU time over the sequence, summed across driver, runtime, and auxiliary threads, including final drainage. |
 
 The results are from three fresh runs on

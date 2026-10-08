@@ -106,10 +106,11 @@ but the R5 path does not use it.
 The JSON report includes hashes, revision, configuration, interval measurements,
 and qualification status. `load.background_merge_wait_ms` and
 `load.observed_storage_bytes` describe loading.
-`sequence.observed_storage_bytes` is sampled at
 `completion_boundary=last_refresh_complete`, and
-`snapshot_publication_transactions` is zero in the sequence. These are observed
-sizes, not settled post-compaction sizes. Process CPU time includes natural
+`snapshot_publication_transactions` is zero in the sequence.
+`sequence.observed_storage_bytes` is observed after the last refresh without
+waiting for compaction; background merges can still be active. It is not a
+settled post-compaction size. Process CPU time includes natural
 background merges that run during the measured sequence. The report's
 `compaction_policy` is `no forced compaction; loading waits for normal background
 merges only; no final wait`. Catalog storage summaries expose
@@ -133,7 +134,9 @@ used retained source maps for RF2 discovery, and still retained those maps with
 macOS runs are smoke tests only and do not establish equal enforced total
 memory. Linux qualification requires matching cgroup v2 total-memory limits
 with swap disabled and private inputs copied inside each run's cgroup during
-loading. The revised R5 smoke rerun and qualifying campaign are pending. See the
+loading. The revised R5 v2 smoke comparisons completed 18 fresh processes; the
+qualifying Linux campaign remains pending. The tiny initial base stayed in RAM
+and the smoke did not reach DBSP memory pressure. See the
 [Linux pressure campaign plan](r5-pressure-and-linux-campaign-documentation-plan.md)
 for the workload and required pressure evidence. Broader updates, residual Q3,
 checkpoint measurement, and Q5/Q10 remain deferred.
