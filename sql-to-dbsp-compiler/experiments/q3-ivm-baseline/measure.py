@@ -181,11 +181,14 @@ def build_executables(destination: Path) -> dict[str, Path]:
     return binaries
 
 
-def qualification(system: str, limit: int | None, result: dict[str, Any]) -> dict[str, Any]:
+def qualification(system: str, limit: int | None, result: dict[str, Any],
+                  verify: bool = False) -> dict[str, Any]:
     if system != "Linux":
         return {"status": "smoke", "reason": "total memory is not enforced on macOS"}
     if limit is None:
         return {"status": "nonqualifying", "reason": "no cgroup v2 total memory limit"}
+    if verify:
+        return {"status": "nonqualifying", "reason": "independent verification was enabled"}
     settled = result.get("sequence", {}).get("settled_storage_bytes")
     if not isinstance(settled, int):
         return {"status": "nonqualifying", "reason": "settled storage size unavailable"}
@@ -291,8 +294,10 @@ def run(argv: list[str]) -> int:
                                        f"{completed.stderr[-2000:]}")
                 raw = json.loads((run_dir / "driver.json").read_text())
                 record["driver"] = raw
+                if raw.get("status") not in (None, "complete"):
+                    raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
                 record["qualification"] = qualification(platform.system(),
-                    args.total_memory_bytes, raw)
+                    args.total_memory_bytes, raw, verify=not args.no_verify)
                 record["status"] = "complete"
                 write_json(report, manifest)
         manifest["status"] = "complete"

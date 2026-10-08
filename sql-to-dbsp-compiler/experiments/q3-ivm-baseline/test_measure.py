@@ -69,6 +69,24 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("exited 7", manifest["errors"][0])
         self.assertEqual(calls[-1], [str(measure.EXPERIMENT / "generate.sh")])
 
+    def test_invalid_refresh_list_records_failure_before_build(self) -> None:
+        self.refresh.write_text('[{"rf2":"missing"}]')
+
+        def process(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(measure, "build_executables") as build, \
+             patch.object(measure.subprocess, "run", side_effect=process) as launch:
+            self.assertEqual(measure.run(self.args), 1)
+        build.assert_not_called()
+        self.assertEqual(launch.call_args.args[0], [str(measure.EXPERIMENT / "generate.sh")])
+        manifest = json.loads(self.report.read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["runs"], [])
+        self.assertIn("FileNotFoundError", manifest["errors"][0])
+
     def test_restoration_failure_invalidates_success(self) -> None:
         calls = []
 
@@ -103,6 +121,8 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure.qualification("Darwin", 100, above)["status"], "smoke")
         self.assertEqual(measure.qualification("Linux", None, above)["status"],
                          "nonqualifying")
+        self.assertEqual(measure.qualification("Linux", 100, above, verify=True)["status"],
+                         "nonqualifying")
 
     def test_private_input_copy_rewrites_refresh_paths(self) -> None:
         refreshes, files = measure.refresh_inputs(self.refresh)
@@ -123,6 +143,33 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual((group / "memory.swap.max").read_text(), "0")
         with self.assertRaises(ValueError):
             measure.cgroup_available(self.root)
+
+    def test_cgroup_child_copies_before_driver_exec(self) -> None:
+        refreshes, files = measure.refresh_inputs(self.refresh)
+        group = self.root / "cgroup"
+        group.mkdir()
+        (group / "memory.max").write_text("4096")
+        run_dir = self.root / "run"
+        spec = {"run_dir": str(run_dir), "cgroup": str(group),
+                "total_memory_bytes": 4096, "executable": "/bin/driver",
+                "refreshes": refreshes,
+                "inputs": {**{key: str(self.root / key)
+                               for key in ("customer", "orders", "lineitem")},
+                           **{key: str(path) for key, path in files.items()}},
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True}}
+        spec_path = self.root / "spec.json"
+        spec_path.write_text(json.dumps(spec))
+        with patch.object(measure, "verify_membership") as membership, \
+             patch.object(measure.os, "execv", side_effect=RuntimeError("stop")) as execute:
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                measure.run_inside_cgroup(spec_path)
+        membership.assert_called_once_with(group)
+        command = execute.call_args.args[1]
+        self.assertEqual(command[0], "/bin/driver")
+        customer = Path(command[command.index("--customer") + 1])
+        self.assertEqual(customer.read_text(), "customer")
+        self.assertTrue(customer.is_relative_to(run_dir / "input"))
 
 
 if __name__ == "__main__":
