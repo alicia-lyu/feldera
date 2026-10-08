@@ -7,7 +7,9 @@ raw artifacts, and the agent-added presentation steps. The
 [circuit note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md)
 owns the generated operator and state-read explanation; the
 [results note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
-owns the original dataset, correctness tests, and measurements.
+owns the original dataset, correctness tests, and historical R1 measurements.
+The experiment README documents the implemented R5 measurement harness; its
+qualifying Linux campaign is pending.
 
 The local graph captures and raw logs are in the repository’s
 [`target/q3-circuit-exports/`](../../../target/q3-circuit-exports/) directory. The local native benchmark reports in
@@ -30,13 +32,15 @@ cargo +1.96.1 build --release --offline -j2 --features merged-index
 ```
 
 Run the resulting executable with the same base and refresh file arguments
-shown below. Initial loading builds the reference relations and merged index
-as setup for maintenance measurements. R4 verifies this loading in both modes.
-In reconstructed mode Customers are loaded initially, then complete Order and
-Lineitem groups are loaded together. The supported measured changes are RF1 insertion and RF2
-deletion under referential integrity. Replacements, key moves, orphan rows,
-independent Lineitem changes, and Customer updates are outside the prototype
-workload.
+shown below. Initial loading builds maintained state as setup for maintenance
+measurements. The R5 driver reads bounded batches, loading Customers first and
+then complete Order/Lineitem groups in identical transactions in both modes. It
+requires ascending Order keys and Lineitem rows grouped by Order, and reports
+unsupported ordering. Independent `Reference` maps are allocated only for
+correctness verification; `--no-verify` retains none. The supported workload
+is RF1 insertion and RF2 deletion under referential integrity. Replacements,
+key moves, orphan rows, independent Lineitem changes, and Customer updates are
+outside the prototype workload.
 
 The manual merged-index owner runs on a DBSP auxiliary thread outside the Q3
 circuit graph. For each refresh, it captures the previous snapshot, applies
@@ -59,12 +63,50 @@ placement map uses `BTreeMap` and `BTreeSet`; container selection is another fut
 optimization that preserves its transaction-local contents. The current
 prototype makes no performance-gain or hard-memory-cap claim.
 
-For each measured RF1/RF2 refresh, report `index_ms`, `q3_ms`, and
-`combined_maintenance_ms` from the reconstructed run. Keep input preparation,
-including RF2 discovery, separate. Initial load is setup, not comparison data.
-The checkpoint test saves and restores Q3 and the manual index at a completed
-transaction boundary; circuit stacking and cross-circuit checkpoint
-coordination remain future work.
+For the R1 measurements, `index_ms`, `q3_ms`, and
+`combined_maintenance_ms` were reported from the reconstructed run. R5 reports
+discovery, preparation and checks, index maintenance, the Q3 transaction,
+publication/cleanup, and complete foreground latency separately. The
+`index_ms + q3_ms` subtotal excludes discovery and preparation. Initial load
+remains setup rather than comparison data. Refresh completion carries no
+durability guarantee; periodic checkpoint measurement and cross-circuit
+checkpoint coordination are deferred.
+
+## R5 measurement runner
+
+See the [experiment README](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#r5-maintenance-measurements)
+for the runner command and ordered refresh-list format. The list contains
+`{"rf1_orders":"...","rf1_lines":"..."}` entries or `{"rf2":"..."}`
+entries; relative paths resolve against the list file. The runner builds and
+preserves separate native and reconstructed release executables, restores
+default native generation, and uses fresh processes and storage directories for
+each run, with three repetitions by default. It runs with Java 21 and Rust
+1.96.1. An optional `CARGO_TARGET_DIR` can point to a reusable root cache.
+
+Each run requires file-backed base state, materialized `V`, and manual merged
+index; explicit cache capacity, memory-pressure target, and compaction timeout;
+one worker; native join fetch; no compression; and `min_storage_bytes=0`.
+Loading compaction finishes before the measured sequence. Circuit and manual
+index compaction drain after the refreshes, with a timeout. Drainage is included
+in sequence totals. The JSON report includes hashes, revision, configuration,
+interval measurements, and qualification status. Backend read/write operations
+and bytes are distinct from OS physical I/O. CPU time, process RSS high-water,
+cache occupancy, settled storage, sampled peak storage, affected customers and
+orders, and line fan-out are reported; unavailable counters are marked
+explicitly. On macOS OS physical byte counters are null. Independent checking
+is excluded from measurement.
+
+The old execution notes below describe the original R1 driver and remain to
+interpret its saved logs and results. That driver buffered complete base files,
+used retained source maps for RF2 discovery, and still retained those maps with
+`--no-verify`. These statements do not describe the current R5 driver.
+
+macOS runs are smoke tests only and do not establish equal enforced total
+memory. Linux qualification requires matching cgroup v2 total-memory limits
+with swap disabled and private inputs copied inside each run's cgroup during
+loading. R5's harness is implemented, while the qualifying campaign is pending.
+Broader updates, residual Q3, checkpoint measurement, and Q5/Q10 remain
+deferred.
 
 ## Verify supported loading and RF1/RF2
 

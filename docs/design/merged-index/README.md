@@ -578,7 +578,11 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
    key moves, independent line updates, and customer updates remain deferred.
    Multimap changes are tracked separately from R4; every order in these tests has
    only one candidate customer. Residual Q3 verification is separate future work.
-5. **R5 — Maintenance measurements.** Compare beyond-memory state under equal total memory and
-   comparable durability, including discovery, reads, writes, sorting, spill, and background work.
-   R1 supplies a baseline and makes no performance-gain claim. Extend to Q5/Q10 after Q3
-   integration passes its [acceptance criteria](support.md#evidence-and-measurements-bound-the-claim).
+5. **R5 — Maintenance measurement harness, implemented; qualification pending.** The
+   [experiment guide](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#r5-maintenance-measurements)
+   describes bounded loading, maintained-storage RF2 discovery, per-phase accounting,
+   fresh native and reconstructed runs, and the JSON report. macOS runs are smoke tests;
+   equal enforced total-memory qualification requires Linux cgroup v2 runs with swap
+   disabled and remains pending. Refresh completion has no durability guarantee, so
+   comparable checkpoint costs are deferred. Broader updates, residual Q3, and Q5/Q10
+   remain future work pending the [acceptance criteria](support.md#evidence-and-measurements-bound-the-claim).

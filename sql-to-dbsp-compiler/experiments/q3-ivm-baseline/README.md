@@ -59,9 +59,13 @@ cargo +1.96.1 test --offline --locked --features merged-index
 The generated compiler option and Cargo feature must be enabled together. Run
 the executable with the same input arguments as the native command. Initial
 loading prepares the base relations and merged index as setup for maintenance
-measurements. R4 verifies this loading in both modes. The reconstructed mode loads
-Customers initially, then keeps complete Order and Lineitem groups together. Its measured workload
-is limited to RF1 insertion and RF2 deletion under referential integrity.
+measurements. The R5 driver reads bounded batches, loading Customers first and
+then complete Order/Lineitem groups. It requires ascending Order keys and
+Lineitem rows grouped by Order, and reports unsupported ordering. Both modes use
+the same load transactions. Independent `Reference` validation is allocated
+only when verification is enabled; `--no-verify` retains no reference maps.
+The measured workload is limited to RF1 insertion and RF2 deletion under
+referential integrity.
 Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
 updates are unsupported.
 
@@ -86,6 +90,63 @@ input preparation and RF2 discovery remain separate. The prototype makes no
 performance-gain or hard-memory-cap claim. Its checkpoint test covers save and
 restore at a completed transaction boundary; circuit stacking and coordinated
 cross-circuit checkpoints are deferred.
+
+## R5 maintenance measurements
+
+R5 resolves RF2 IDs from the current maintained Orders snapshot. It obtains
+complete deletion rows from native Lineitem primary-key ranges or the manual
+merged index's `(custkey, orderkey)` line range. Requested IDs are deduplicated;
+absent Orders are ignored and counted. Discovery uses maintained storage rather
+than rescanning base files or replaying refreshes. Operational checks enforce
+the supported workload against maintained state and the current delta.
+
+The R5 runner builds and preserves separate native and reconstructed release
+executables, then restores default native generation. It starts a fresh process
+and storage directory for each mode and repetition; three repetitions are the
+default. Run from this directory with Java 21, Rust 1.96.1, and the compiler
+already built:
+
+```sh
+python3 measure.py \
+  --customer "$TPCH_DATA/customer.tbl" \
+  --orders "$TPCH_DATA/orders.tbl" \
+  --lineitem "$TPCH_DATA/lineitem.tbl" \
+  --refresh-list "$TPCH_DATA/refreshes.json" \
+  --report target/r5-measurements/report.json \
+  --cache-bytes 1073741824 \
+  --memory-target-bytes 4294967296 \
+  --no-verify
+```
+
+The refresh list is a JSON array in execution order. Each item is either
+`{"rf1_orders":"orders.tbl.u1","rf1_lines":"lineitem.tbl.u1"}` or
+`{"rf2":"delete.1"}`; relative paths resolve against the list's directory.
+`--cache-bytes` must be a whole number of MiB. The R5 driver requires file-backed
+storage, one worker, native join fetch, no compression, and
+`min_storage_bytes=0`. It records the cache capacity, runtime memory-pressure
+target, and compaction timeout. Loading compaction completes before measurement;
+after the refresh sequence, circuit and manual-index compaction drain with the
+configured timeout. A complete refresh that cannot execute within its budget
+fails the run rather than being split.
+
+The JSON report records input and executable hashes, revision, configuration,
+per-phase measurements, and qualification status. It separates RF2 discovery,
+input preparation and operational checks, index maintenance, the Q3 transaction,
+publication/cleanup, and complete foreground latency. Final compaction drainage
+is included in sequence totals. `index_ms + q3_ms` is a subtotal that excludes
+discovery and preparation. Backend operations and bytes are reported separately
+from OS physical I/O; OS physical byte counters are unavailable on macOS and
+appear as null. Reports include CPU time, process RSS high-water mark, cache
+occupancy, settled and sampled peak storage, affected customers/orders, and line
+fan-out; unavailable counters are marked explicitly. Independent correctness
+checking is excluded from measured runs.
+
+macOS reports are smoke tests and do not establish equal enforced total memory.
+Linux qualification requires equal cgroup v2 total-memory limits, swap disabled,
+and private copies of every input prepared inside each run's cgroup during
+loading. The R5 harness is implemented; the qualifying measurement campaign is
+pending. Refresh completion has no durability guarantee. Periodic checkpoint
+measurement, broader updates, residual Q3, and Q5/Q10 remain deferred.
 
 ## RF1/RF2 verification
 
@@ -144,21 +205,12 @@ and Lineitem inserts in one transaction. RF2 removes each present order and its
 lines in one transaction.
 The initial load is submitted through the same incremental circuit in batches.
 
-Each phase prints native transaction time, minimum/median/p95/maximum native
-transaction latency, input-record throughput, input preparation time,
-end-to-end time, retained driver reference bytes, and peak process RSS. Native time includes
-maintenance of materialized `V`; it excludes parsing, input serialization,
-the independent checker, and output inspection. Preparation includes dbgen
-parsing, refresh discovery, batch assembly, and input serialization. The
-end-to-end load interval includes circuit initialization and checking; RF1 and
-RF2 intervals cover their respective phase preparation, native step, and
-checking. Peak process RSS includes the
-driver and embedded DBSP runtime, so it is not a measure of retained operator
-state alone. The driver buffers each entire base file during load; the
-reported reference bytes measure its retained source maps after a phase.
-`--no-verify` still retains those maps for RF2 discovery. The
-memory-backed configuration uses `CircuitConfig::with_workers` with no storage
-backend.
+The original R1 driver buffered each entire base file, retained source maps for
+RF2 discovery even with `--no-verify`, and used memory-backed state unless
+`--storage-path` was supplied. Its phase reports and reference-byte counters
+describe those original measurements only. The R5 driver uses bounded loading,
+maintained-storage RF2 discovery, and file-backed state; see the R5 section
+above for its intervals and report fields.
 With verification enabled, `delta_plus`, `delta_minus`, and `view_rows` report
 signed output multiplicities and the materialized cardinality. With
 `--no-verify`, those counters are not computed and `verified=false` marks them
