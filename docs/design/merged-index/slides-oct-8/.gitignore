@@ -1,0 +1,14 @@
+/build/
+__pycache__/
+
+# Editor-triggered TeX builds in the source directory.
+/*.aux
+/*.fdb_latexmk
+/*.fls
+/*.log
+/*.nav
+/*.out
+/*.pdf
+/*.snm
+/*.synctex.gz
+/*.toc

@@ -1,0 +1,11 @@
+\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
+  \node[align=center] (delta) at (0,1.5) {Changed Customer\\key $7$};
+  \node[stage,minimum width=5cm,minimum height=2.7cm] (group) at (5,1.5) {};
+  \node[font=\small\bfseries] at (5,2.4) {Orders-before cursor};
+  \node[align=left] at (5,1.4) {$7:\ (42,\text{1995-03-01},0):+1$\\
+    $\phantom{7:}\ (43,\text{1995-03-02},0):+1$};
+  \node[align=center] (out) at (9.6,1.5) {Signed joined rows\\for Orders 42 and 43};
+  \draw[flow] (delta.east) -- (group.west);
+  \draw[flow] (group.east) -- (out.west);
+  \node[font=\small,text=quiet] at (5,-.15) {One logical group may span several visible batches.};
+\end{tikzpicture}

@@ -1,0 +1,12 @@
+\begin{tikzpicture}[x=1cm,y=.8cm,font=\normalsize]
+  \node[stage,minimum width=3cm] (old) at (1,2.3) {Before read};
+  \node[stage,minimum width=3cm] (new) at (8,2.3) {Current read};
+  \node[batch,minimum width=3.0cm] (a) at (3.0,0) {$a:\ +O_{42}$};
+  \node[batch,minimum width=3.0cm] (b) at (8.0,0) {$b:\ +O_{43}$};
+  \draw[ref] (old.south) -- (a.north west);
+  \draw[ref] (new.south west) -- (a.north east);
+  \draw[ref] (new.south) -- (b.north);
+  \node[font=\small,text=quiet] at (3,-.85) {Shared retained batch};
+  \node[font=\small,text=quiet] at (8,-.85) {Pending insertion};
+  \node[font=\small,text=quiet] at (4.5,3.3) {Dashed arrows are owning references.};
+\end{tikzpicture}

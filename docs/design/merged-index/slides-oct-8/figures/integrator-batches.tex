@@ -1,0 +1,10 @@
+\begin{tikzpicture}[x=1cm,y=1cm,font=\small]
+  \node (delta) at (1.7,1.9) {Successive changes};
+  \node[diagram stage] (i) at (1.7,1.0) {$I$};
+  \node[batch,minimum width=.7cm] (a) at (.5,0) {$a$};
+  \node[batch,minimum width=.7cm] (b) at (1.7,0) {$b$};
+  \node[batch,minimum width=.7cm] (c) at (2.9,0) {$c$};
+  \draw[link] (delta) -- (i);
+  \draw[link] (i.south) -- (b.north);
+  \node at (1.7,-.8) {Read: $a+b+c$};
+\end{tikzpicture}

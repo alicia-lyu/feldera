@@ -1,0 +1,12 @@
+\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
+  \node[align=center] (update) at (0,1.4) {Update Order 42\\priority $0\mapsto1$};
+  \node[stage] (upsert) at (3.5,1.4) {Read old row\\emit signed change};
+  \node[stage,minimum width=5.6cm,minimum height=2.1cm] (trace) at (9.3,1.4) {};
+  \node[font=\small\bfseries] at (9.3,2.12) {Retained primary-key trace};
+  \node[batch,font=\small,text width=2cm] (mem) at (7.9,1.12) {Recent batches\\in memory};
+  \node[batch,font=\small,text width=2.5cm] (disk) at (10.5,1.12) {Immutable indexed\\files on disk};
+  \draw[flow] (update.east) -- (upsert.west);
+  \draw[flow] (upsert.east) -- (trace.west);
+  \draw[ref] (trace.south) -- ++(0,-.55) -| (upsert.south);
+  \node[font=\small] at (6.4,-.6) {Previous Order 42 remains readable.};
+\end{tikzpicture}

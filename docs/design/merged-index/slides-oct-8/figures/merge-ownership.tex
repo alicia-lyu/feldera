@@ -1,0 +1,23 @@
+\begin{tikzpicture}[x=1cm,y=.8cm,font=\small]
+  \foreach \x/\id/\label in {0/one/Before,4.6/two/During,9.2/three/After} {
+    \node[font=\normalsize\bfseries] at (\x+1.3,3.4) {\label};
+    \node (s\id) at (\x,2.5) {Spine};
+    \node (r\id) at (\x+2.6,2.5) {Old snapshot};
+    \node[batch,minimum width=.75cm] (a\id) at (\x+.6,1.2) {$a$};
+    \node[batch,minimum width=.75cm] (b\id) at (\x+2,1.2) {$b$};
+    \draw[ref] (r\id.south) -- (a\id.north east);
+    \draw[ref] (r\id.south) -- (b\id.north);
+  }
+  \draw[ref] (sone.south) -- (aone.north);
+  \draw[ref] (sone.south) -- (bone.north west);
+  \draw[ref] (stwo.south) -- (atwo.north);
+  \draw[ref] (stwo.south) -- (btwo.north west);
+  \node[batch,fill=teal!8,minimum width=.75cm] (m4) at (5.9,-.15) {$m$};
+  \draw[link] (atwo.south) -- (m4.north west);
+  \draw[link] (btwo.south) -- (m4.north east);
+  \node[font=\small,text=quiet] at (5.9,-.95) {Merge builds replacement};
+  \node[batch,fill=teal!8,minimum width=.75cm] (m9) at (9.2,-.15) {$m$};
+  \draw[ref] (sthree.west) -- ++(-.4,0) |- (m9.west);
+  \node[font=\small,text=quiet] at (11,-.95) {$a,b$ remain pinned};
+  \node[font=\small,text=quiet] at (1.3,-.95) {Sources retained};
+\end{tikzpicture}

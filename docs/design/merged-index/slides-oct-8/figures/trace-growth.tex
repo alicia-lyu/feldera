@@ -1,0 +1,11 @@
+\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
+  \node[font=\small,text=quiet] at (1,2.2) {Retain incoming batches};
+  \node[batch,minimum width=2.7cm] (a) at (0,1.2) {$a:\ +O_{42}$};
+  \node[batch,minimum width=2.7cm] (b) at (3.2,1.2) {$b:\ +O_{43}$};
+  \node[batch,minimum width=2.7cm] (c) at (6.4,1.2) {$c:\ -O_{42}$};
+  \node[draw=ink,fit=(a)(b)(c),inner sep=6pt] (trace) {};
+  \node[stage,minimum width=2.7cm] (m) at (10.4,1.2) {$m:\ +O_{43}$};
+  \draw[flow] (trace.east) -- node[above,font=\small] {merge} (m.west);
+  \node[font=\small,text=quiet] at (10.4,2.2) {Replacement batch};
+  \node[align=center] at (4,-.2) {Trace contents before merge:\\$+O_{42}+O_{43}-O_{42}=+O_{43}$};
+\end{tikzpicture}

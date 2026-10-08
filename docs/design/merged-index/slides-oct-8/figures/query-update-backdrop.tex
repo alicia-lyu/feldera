@@ -1,0 +1,45 @@
+% Adapted from advisor-deck/main.tex, query-time/update-time macros.
+\newcommand{\querytimepipeline}{%
+  \node[small label,font=\bfseries\normalsize,text=teal] at (2.5,5.3)
+    {query-time pipeline};
+  \node[diagram stage,fill=teal!10,minimum width=5.2cm,
+    minimum height=1.5cm] at (2.5,1.2) {};
+  \node (qr) at (1.1,1.5) {$\operatorname{IndexScan}(R)$};
+  \node (qs) at (3.9,1.5) {$\operatorname{IndexScan}(S)$};
+  \node[font=\small\bfseries,text=teal] at (2.5,.7) {merged index};
+  \node[diagram stage,minimum width=2cm] (q) at (2.5,3.15)
+    {pipeline $Q$};
+  \node[diagram stage,minimum width=2.35cm] (qout) at (2.5,4.5)
+    {$Q(\mathrm{DB})$};
+  \draw[flow] (qr.north) -- (q.south west);
+  \draw[flow] (qs.north) -- (q.south east);
+  \draw[flow] (q.north) -- (qout.south);
+}
+\newcommand{\updatetimepipeline}{%
+  \node[small label,font=\bfseries\normalsize,text=amber] at (9.8,5.3)
+    {update-time pipeline};
+  \node[diagram proposed,fill=amber!10,minimum width=5.45cm,
+    minimum height=1.5cm] at (9.8,1.2) {};
+  \node (r) at (7.55,1.5) {$R$};
+  \node (dr) at (9.05,1.5) {$\Delta R$};
+  \node (s) at (10.55,1.5) {$S$};
+  \node (ds) at (12.05,1.5) {$\Delta S$};
+  \node[font=\small\bfseries,text=amber] at (9.8,.7) {merged index};
+  \node[diagram proposed,minimum width=2.3cm] (dq) at (9.8,3.15)
+    {pipeline $Q^\Delta$};
+  \node[diagram proposed,minimum width=2.3cm] (dout) at (9.8,4.5)
+    {$\Delta V$};
+  \draw[proposed] (r.north) -- ($(dq.south west)!.125!(dq.south east)$);
+  \draw[proposed] (dr.north) -- ($(dq.south west)!.375!(dq.south east)$);
+  \draw[proposed] (s.north) -- ($(dq.south west)!.625!(dq.south east)$);
+  \draw[proposed] (ds.north) -- ($(dq.south west)!.875!(dq.south east)$);
+  \draw[proposed] (dq.north) -- (dout.south);
+  \node[font=\small,text=amber] at (9.8,-.25)
+    {$Q^\Delta=Q(\mathrm{DB}+\Delta\mathrm{DB})-Q(\mathrm{DB})$};
+}
+
+
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \querytimepipeline
+  \updatetimepipeline
+\end{tikzpicture}
