@@ -65,6 +65,12 @@ Lineitem rows grouped by Order, and reports unsupported ordering. Both modes use
 the same load transactions. Independent `Reference` validation is allocated
 only when verification is enabled; `--no-verify` retains no reference maps.
 The JSON configuration reports `driver_reference_bytes: 0` in this mode.
+`Reference` is a measurement-harness checker, not native DBSP state: with
+verification enabled it maintains independent Customer, Orders, and Lineitem
+hash maps and checks each transaction's emitted delta and materialized `V`
+against a full join. With `--no-verify`, neither mode allocates or updates those
+maps. Native RF2 discovery still reads the maintained Catalog Orders and
+Lineitem snapshots; both modes use the same logical refreshes.
 The measured workload is limited to RF1 insertion and RF2 deletion under
 referential integrity.
 Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
@@ -126,20 +132,23 @@ python3 measure.py \
 The refresh list is a JSON array in execution order. Each item is either
 `{"rf1_orders":"orders.tbl.u1","rf1_lines":"lineitem.tbl.u1"}` or
 `{"rf2":"delete.1"}`; relative paths resolve against the list's directory.
-`--cache-bytes` must be a whole number of MiB. The R5 driver requires file-backed
-storage, one worker, native join fetch, no compression, and
-`min_storage_bytes=0`. It records the cache capacity, runtime memory-pressure
-target, and compaction timeout. Loading compaction completes before measurement;
-after the refresh sequence, circuit and manual-index compaction drain with the
-configured timeout. Because inserts with `min_storage_bytes=0` can leave batches
-in memory at low pressure, explicit compaction rewrites an eligible lone memory
-batch when the existing merge policy selects storage. File backing is confirmed
-from `SerBatch::location`, not inferred from a graph profile. Loading and final
-drainage each include an empty logical transaction to publish compacted
-snapshots and release old output-mailbox references. Its cost is included in
-drainage, and reports count these transactions in
-`snapshot_publication_transactions`. A complete refresh that cannot execute
-within its budget fails the run rather than being split.
+`--cache-bytes` must be a whole number of MiB. The R5 driver requires the
+file-backed storage configuration, one worker, native join fetch, no compression,
+and `min_storage_bytes=0`. It records the cache capacity, runtime memory-pressure
+target, and loading merge-wait timeout. Loading waits for naturally eligible
+background merges to become idle; it does not force full compaction and keeps
+multiple below-threshold runs. One empty loading transaction publishes the
+resulting snapshots. Batch locations are read from `SerBatch::location`, not
+inferred from a graph profile; below-threshold memory batches may remain. No
+final merge wait or extra transaction follows the refresh sequence. A complete
+refresh that cannot execute within its budget fails the run rather than being
+split.
+
+Maintenance compaction can continue across refresh transactions. In native
+mode, this includes all circuit traces. In reconstructed mode, it includes the
+remaining circuit traces and the auxiliary-thread manual merged index. The
+existing full-compaction API can merge eligible batches until at most one batch
+remains per trace, but R5 does not call it.
 
 Storage lookups by the driver and manual-index owner run inside
 `Runtime::with_buffer_cache`, bound to the already configured worker cache.
@@ -150,21 +159,35 @@ binding is restored during unwind.
 The JSON report records input and executable hashes, revision, configuration,
 per-phase measurements, and qualification status. It separates RF2 discovery,
 input preparation and operational checks, index maintenance, the Q3 transaction,
-publication/cleanup, and complete foreground latency. Final compaction drainage
-is included in sequence totals. `index_ms + q3_ms` is a subtotal that excludes
-discovery and preparation. Backend operations and bytes are reported separately
-from OS physical I/O; OS physical byte counters are unavailable on macOS and
-appear as null. Reports include CPU time, process RSS high-water mark, cache
-occupancy, settled and sampled peak storage, affected customers/orders, and line
-fan-out; unavailable counters are marked explicitly. Independent correctness
-checking is excluded from measured runs.
+publication/cleanup, and complete foreground latency. `index_ms + q3_ms` is a
+subtotal that excludes discovery and preparation. The sequence ends at the last
+refresh's publication/cleanup, with `completion_boundary` set to
+`last_refresh_complete` and `snapshot_publication_transactions` set to zero.
+`sequence.observed_storage_bytes` records storage at that boundary; it is not a
+settled post-compaction size. `load.background_merge_wait_ms` and
+`load.observed_storage_bytes` describe the loading wait and its observed size.
+The configuration's `compaction_policy` value is `no forced compaction; loading
+waits for normal background merges only; no final wait`. Storage summaries
+report each Catalog relation's `snapshot_batch_count`, `memory_batch_count`,
+`storage_batch_count`, and `file_backed` state; `manual_index_storage` reports
+the auxiliary index separately. These fields permit memory batches and do not
+imply that every live batch is file-backed.
+Process CPU includes natural background merges that run during the measured
+interval. Backend operations and bytes are reported separately from OS physical
+I/O; OS physical byte counters are unavailable on macOS and appear as null.
+Reports include process RSS high-water mark, cache occupancy, affected
+customers/orders, and line fan-out; unavailable counters are marked explicitly.
+Independent correctness checking is excluded from measured runs.
 
 macOS reports are smoke tests and do not establish equal enforced total memory.
 Linux qualification requires equal cgroup v2 total-memory limits, swap disabled,
 and private copies of every input prepared inside each run's cgroup during
-loading. The R5 harness is implemented; the qualifying measurement campaign is
-pending. Refresh completion has no durability guarantee. Periodic checkpoint
-measurement, broader updates, residual Q3, and Q5/Q10 remain deferred.
+loading. The current R5 smoke rerun and qualifying Linux campaign are pending;
+the earlier forced-drain smoke results are historical R5 v1 evidence. Refresh
+completion has no durability guarantee. Periodic checkpoint measurement,
+broader updates, residual Q3, and Q5/Q10 remain deferred. See the
+[Linux pressure campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md)
+for the pending workload and pressure instrumentation.
 
 ## RF1/RF2 verification
 

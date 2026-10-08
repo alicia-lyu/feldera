@@ -83,30 +83,47 @@ default native generation, and uses fresh processes and storage directories for
 each run, with three repetitions by default. It runs with Java 21 and Rust
 1.96.1. An optional `CARGO_TARGET_DIR` can point to a reusable root cache.
 
-Each run requires file-backed base state, materialized `V`, and manual merged
-index; explicit cache capacity, memory-pressure target, and compaction timeout;
-one worker; native join fetch; no compression; and `min_storage_bytes=0`.
+Each run uses a file-backed storage backend for base relations, materialized
+`V`, and the manual merged index, with explicit cache capacity,
+memory-pressure target, and loading merge-wait timeout; one worker; native join
+fetch; no compression; and `min_storage_bytes=0`.
 Driver and manual-index storage lookups are scoped with
 `Runtime::with_buffer_cache` to the existing configured worker cache, without
 allocating an additional cache. An unbound lookup uses the runtime's global
 256 MiB cache; the scoped binding is restored during unwind.
 One shared `BaseState` uses Catalog batch snapshots and is refreshed after each
-transaction for RF2 discovery and workload checks. File backing is checked from
-`SerBatch::location`. Since `min_storage_bytes=0` may leave inserts in memory at
-low pressure, explicit compaction rewrites an eligible lone memory batch when
-the existing merge policy selects storage. Loading compaction finishes before
-measurement. Loading and final drainage each include an empty logical
-transaction that publishes compacted snapshots and releases old output-mailbox
-references. Circuit and manual-index compaction then drain with a timeout; these
-publication transactions are included in drainage and counted as
-`snapshot_publication_transactions`. Drainage is included in sequence totals.
-The JSON report includes hashes, revision, configuration,
-interval measurements, and qualification status. Backend read/write operations
-and bytes are distinct from OS physical I/O. CPU time, process RSS high-water,
-cache occupancy, settled storage, sampled peak storage, affected customers and
-orders, and line fan-out are reported; unavailable counters are marked
-explicitly. On macOS OS physical byte counters are null. Independent checking
-is excluded from measurement.
+transaction for RF2 discovery and workload checks. Batch locations come from
+`SerBatch::location`, rather than a graph profile. The loading wait observes
+eligible background merges becoming idle without requesting full compaction.
+Multiple below-threshold runs remain. One empty logical transaction publishes
+the loading snapshots. Refreshes do not force compaction, and the sequence ends after the
+last refresh's publication and cleanup without a final wait or extra
+transaction. Compaction may continue across refreshes: native mode has all
+circuit traces, while reconstructed mode also has the auxiliary manual index.
+The existing full-compaction API can reduce each trace to at most one batch,
+but the R5 path does not use it.
+
+The JSON report includes hashes, revision, configuration, interval measurements,
+and qualification status. `load.background_merge_wait_ms` and
+`load.observed_storage_bytes` describe loading.
+`sequence.observed_storage_bytes` is sampled at
+`completion_boundary=last_refresh_complete`, and
+`snapshot_publication_transactions` is zero in the sequence. These are observed
+sizes, not settled post-compaction sizes. Process CPU time includes natural
+background merges that run during the measured sequence. The report's
+`compaction_policy` is `no forced compaction; loading waits for normal background
+merges only; no final wait`. Catalog storage summaries expose
+`snapshot_batch_count`, `memory_batch_count`, `storage_batch_count`, and
+`file_backed` per relation; `manual_index_storage` describes the auxiliary
+index. Below-threshold memory batches can remain at completion, so the report
+does not claim that every live batch is on disk.
+
+Backend read/write operations and bytes are distinct from OS physical I/O. CPU
+time, process RSS high-water, cache occupancy, observed storage, affected
+customers and orders, and line fan-out are reported; unavailable counters are
+marked explicitly. On
+macOS OS physical byte counters are null. Independent checking is excluded from
+measurement.
 
 The old execution notes below describe the original R1 driver and remain to
 interpret its saved logs and results. That driver buffered complete base files,
@@ -116,9 +133,10 @@ used retained source maps for RF2 discovery, and still retained those maps with
 macOS runs are smoke tests only and do not establish equal enforced total
 memory. Linux qualification requires matching cgroup v2 total-memory limits
 with swap disabled and private inputs copied inside each run's cgroup during
-loading. R5's harness is implemented, while the qualifying campaign is pending.
-Broader updates, residual Q3, checkpoint measurement, and Q5/Q10 remain
-deferred.
+loading. The revised R5 smoke rerun and qualifying campaign are pending. See the
+[Linux pressure campaign plan](r5-pressure-and-linux-campaign-documentation-plan.md)
+for the workload and required pressure evidence. Broader updates, residual Q3,
+checkpoint measurement, and Q5/Q10 remain deferred.
 
 ## Verify supported loading and RF1/RF2
 

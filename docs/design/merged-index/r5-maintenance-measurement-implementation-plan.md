@@ -37,10 +37,13 @@ Refresh completion does not imply durability; checkpoint costs are deferred.
    ranges or merged-index ranges. Deduplicate IDs and report absent Orders.
    Validate identities, references, payloads and complete change directions
    against current maintained storage before mutation in both modes.
-3. Add ordered refresh-list parsing, explicit R5 storage configuration,
-   index/circuit drainage with timeout, and JSON measurement reports. Attribute
-   discovery, checks/preparation, index insertion, Q3 and publication/cleanup;
-   exclude correctness validation. Count drainage in sequence totals.
+3. Add ordered refresh-list parsing, explicit R5 storage configuration, and
+   JSON measurement reports. Attribute discovery, checks/preparation, index
+   insertion, Q3 and publication/cleanup; exclude correctness validation. During
+   loading, wait for naturally eligible background merges to become idle, then
+   publish with one empty transaction. Do not force full compaction during load
+   or refresh, and do not wait or run an extra transaction after the final
+   refresh. End sequence timing at its publication/cleanup boundary.
 4. Build a runner preserving both release executables and restoring native
    generation on exit. Use fresh processes/directories, three repetitions,
    hashes and revision/configuration provenance. Linux qualification requires
@@ -69,14 +72,15 @@ one `BaseState` of snapshot references and replaces it after each transaction,
 reusing the same snapshot for RF2 discovery and operational checks. Snapshots
 share maintained batches rather than copying rows.
 
-At low memory pressure, insertion leaves batches in memory even when
-`min_storage_bytes=0`. Explicit compaction previously skipped a lone memory
-batch. R5 corrects this case using the existing merge destination policy: a
-single memory batch is rewritten only when that policy selects storage.
-`SerBatch::location()` exposes the existing immutable batch location for direct
-Catalog assertions. Loading and final drainage include one empty transaction
-to publish compacted snapshots, release obsolete mailbox snapshots, and clean
-outputs. It changes no logical rows; its cost is included in drainage.
+At low memory pressure, insertion may leave batches in memory even when
+`min_storage_bytes=0`. `SerBatch::location()` reports the actual location;
+storage summaries include snapshot, memory, and storage batch counts for each
+Catalog relation. `manual_index_storage` describes the separately maintained
+index. The existing full-compaction API can reduce eligible state to at most one
+batch per trace, but R5 does not invoke it. Loading waits only for natural
+background merges to become idle and uses one empty publication transaction.
+There is no final wait or extra transaction; sequence completion follows the
+last refresh's publication and cleanup.
 
 Driver snapshot reads and the manual-index auxiliary owner otherwise select the
 runtime's fixed 256 MiB fallback cache, which is outside `StorageOptions.cache_mib`.
@@ -87,7 +91,9 @@ covers driver reads, Q3 workers, manual-index ownership, and merger tasks.
 
 ## Completion evidence
 
-The implementation and macOS smoke work are complete. `verify.sh` passed native
+The original R5 v1 implementation and macOS smoke work completed. Its results
+include forced final compaction and are retained as historical evidence; the
+revised completion boundary and smoke rerun remain pending. `verify.sh` passed native
 (18), reconstructed (15), COL (21), and runner (10) tests, exact R4 transcript
 comparison, formatting, strict experiment/COL Clippy, shell syntax, and whitespace
 checks. Five focused DBSP cache/compaction tests and strict production-library
@@ -95,7 +101,9 @@ Clippy passed. Broader DBSP test-code Clippy reported 56 existing lints outside
 the modified files; its log is retained under ignored experiment `target/`.
 
 Clustered, scattered, and complete 10,000-line-group campaigns each completed
-three fresh runs per mode. The measurements and qualifications are recorded in
-[experiment results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md).
-Native generation was restored. Linux equal-total-memory, beyond-memory
-qualification remains pending, as do the deferred items above.
+three fresh runs per mode under the original v1 completion boundary. They do not
+establish runtime memory pressure. The current v2 smoke rerun and Linux
+equal-total-memory, beyond-memory qualification remain pending. See the
+[experiment results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md)
+and [Linux pressure campaign plan](r5-pressure-and-linux-campaign-documentation-plan.md).
+Deferred items remain as listed above.

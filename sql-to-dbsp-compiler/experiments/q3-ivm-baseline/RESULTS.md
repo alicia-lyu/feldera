@@ -195,7 +195,33 @@ preparation and checking.
 The generator scopes four allowances to compiler-generated `src/lib.rs` syntax;
 the handwritten driver and parser remain subject to strict Clippy.
 
-## R5 harness verification and macOS smoke evidence
+## Current R5 v2 evidence (pending)
+
+The revised harness no longer forces compaction. Loading waits only for natural
+eligible background merges, publishes once with an empty transaction, and
+records `load.background_merge_wait_ms` and `load.observed_storage_bytes`. The
+measured sequence ends at the last refresh's publication and cleanup, with
+`completion_boundary=last_refresh_complete` and
+`snapshot_publication_transactions=0`; no final wait or transaction is run.
+`sequence.observed_storage_bytes` is the storage size at that completion
+boundary, not a settled post-compaction size. Process CPU includes natural
+background merge work that runs during the sequence.
+The JSON configuration's `compaction_policy` states that there is no forced
+compaction, loading waits only for normal background merges, and there is no
+final wait. Catalog storage summaries report snapshot, memory, and storage
+batch counts plus `file_backed` for each relation. `manual_index_storage`
+reports the auxiliary index separately; memory batches can remain at completion.
+
+New smoke measurements for this completion boundary have not yet been recorded.
+The prior table below is retained as historical R5 v1 evidence and must not be
+treated as results from the revised harness. The Linux pressure campaign is
+also pending; see the
+[campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md).
+
+## Historical R5 v1 harness verification and macOS smoke evidence
+
+These measurements used forced final compaction and an extra publication
+transaction. They preserve the earlier implementation's behavior and costs.
 
 On 2026-10-08, `./verify.sh` passed 18 native tests, 15 reconstructed tests,
 21 COL tests, and 10 Python runner tests. The native and reconstructed R4
@@ -298,6 +324,12 @@ Lineitems and `V`, a file-backed manual index in reconstructed mode, and absence
 of the replaced historical join traces there. Repeated RF2 reported the deleted
 Orders as absent, while duplicate requested IDs were deduplicated. Large-group
 refreshes reported a maximum fan-out of 10,000 without splitting the refresh.
+
+These old runs used a 512 MiB runtime RSS target, whose 85% pressure threshold
+was 435.2 MiB. The highest reported RSS was 50,135,040 bytes (about 47.8 MiB),
+well below that threshold. The configured cache was 32 MiB, but occupancy stayed
+below 2 MiB and backend reads were zero. The smoke therefore does not establish
+runtime memory pressure or beyond-memory behavior.
 
 Campaign manifests, input/executable SHA-256 hashes, full phase measurements,
 and driver/profile/graph artifacts are retained under the repository's ignored
