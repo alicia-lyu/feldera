@@ -1241,6 +1241,12 @@ where
             .as_ref()
             .is_none_or(|t| t.is_compaction_complete())
     }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.trace
+            .as_ref()
+            .is_none_or(|t| t.is_background_merge_idle())
+    }
 }
 
 impl<C, B, T> StrictOperator<T> for Z1Trace<C, B, T>

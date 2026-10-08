@@ -387,6 +387,12 @@ pub trait Trace: BatchReader {
     /// requests have been processed, no background merge is in progress, and
     /// the trace has been reduced to at most one batch.
     fn is_compaction_complete(&self) -> bool;
+
+    /// Returns `true` when no background merge is running or eligible to start
+    /// under the current merge policy. Multiple below-threshold batches may remain.
+    fn is_background_merge_idle(&self) -> bool {
+        true
+    }
 }
 
 /// Where a batch is stored.

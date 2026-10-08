@@ -384,6 +384,12 @@ pub trait Operator: 'static {
     fn is_compaction_complete(&self) -> bool {
         true
     }
+
+    /// Returns `true` when this operator has no background merge running or
+    /// eligible to start. Operators without a trace are idle.
+    fn is_background_merge_idle(&self) -> bool {
+        true
+    }
 }
 
 /// A source operator that injects data from the outside world or from the

@@ -996,6 +996,15 @@ impl Runtime {
                             return;
                         }
                     }
+                    Ok(Command::IsBackgroundMergeIdle) => {
+                        let idle = circuit.is_background_merge_idle();
+                        if status_sender
+                            .send(Ok(Response::IsBackgroundMergeIdle(idle)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Ok(Command::CreateBootstrapCircuit(checkpoint)) => {
                         let status = if bootstrap_circuit.is_some() {
                             Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(
@@ -1287,6 +1296,7 @@ enum Command {
     SetAutoRebalance(bool),
     StartCompaction,
     IsCompactionComplete,
+    IsBackgroundMergeIdle,
     /// Build the bootstrap circuit: a second copy of the circuit, built from
     /// the same constructor as the main one (see
     /// [`DBSPHandle::create_bootstrap_circuit`]).  When a checkpoint path is
@@ -1351,6 +1361,7 @@ impl Debug for Command {
             }
             Command::StartCompaction => write!(f, "StartCompaction"),
             Command::IsCompactionComplete => write!(f, "IsCompactionComplete"),
+            Command::IsBackgroundMergeIdle => write!(f, "IsBackgroundMergeIdle"),
             Command::CreateBootstrapCircuit(checkpoint) => f
                 .debug_tuple("CreateBootstrapCircuit")
                 .field(checkpoint)
@@ -1375,6 +1386,7 @@ enum Response {
     CommitComplete(bool),
     BootstrapComplete(bool),
     IsCompactionComplete(bool),
+    IsBackgroundMergeIdle(bool),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2591,6 +2603,21 @@ impl DBSPHandle {
             }
         })?;
         Ok(complete)
+    }
+
+    /// Returns `true` when no worker has a running, pending, or currently
+    /// eligible background merge. Several below-threshold batches may remain.
+    ///
+    /// This is a nonblocking point-in-time status query; it does not request
+    /// full compaction or guarantee that future input will not start a merge.
+    pub fn is_background_merge_idle(&mut self) -> Result<bool, DbspError> {
+        let mut idle = true;
+        self.broadcast_command(Command::IsBackgroundMergeIdle, |_, response| {
+            if let Response::IsBackgroundMergeIdle(worker_idle) = response {
+                idle &= worker_idle;
+            }
+        })?;
+        Ok(idle)
     }
 
     /// Block until background compaction has fully converged on every worker,
@@ -3938,10 +3965,13 @@ pub(crate) mod tests {
             counts_before.iter().any(|&n| n > 1),
             "expected at least one spine with >1 batch before compaction, got {counts_before:?}"
         );
+        assert!(dbsp.is_background_merge_idle().unwrap());
+        assert!(!dbsp.is_compaction_complete().unwrap());
 
         // Request a full compaction and block until all spines converge.
         dbsp.start_compaction().unwrap();
         dbsp.wait_for_compaction(Duration::from_secs(60)).unwrap();
+        assert!(dbsp.is_background_merge_idle().unwrap());
 
         // After convergence every spine must have at most one batch.
         let counts_after = batch_counts(&mut dbsp);

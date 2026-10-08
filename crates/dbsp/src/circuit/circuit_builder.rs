@@ -1130,6 +1130,11 @@ pub trait Node: Any {
     /// Call [`Operator::is_compaction_complete`](super::operator_traits::Operator::is_compaction_complete) on the operator this node encapsulates.
     fn is_compaction_complete(&self) -> bool;
 
+    /// Call [`Operator::is_background_merge_idle`](super::operator_traits::Operator::is_background_merge_idle) on the operator this node encapsulates.
+    fn is_background_merge_idle(&self) -> bool {
+        true
+    }
+
     /// Call
     /// [`Operator::start_bootstrap_output_caching`](super::operator_traits::Operator::start_bootstrap_output_caching)
     /// on the operator this node encapsulates.
@@ -2016,6 +2021,10 @@ pub trait CircuitBase: 'static {
     /// Returns `true` when all operators' background compaction has fully
     /// converged.
     fn is_compaction_complete(&self) -> bool;
+
+    /// Returns `true` when no operator has a running, pending, or eligible
+    /// background merge.
+    fn is_background_merge_idle(&self) -> bool;
 }
 
 /// The circuit interface.  All DBSP computation takes place within a circuit.
@@ -3766,6 +3775,15 @@ where
         });
         complete
     }
+
+    fn is_background_merge_idle(&self) -> bool {
+        let mut idle = true;
+        let _ = self.map_local_nodes(&mut |node| {
+            idle &= node.is_background_merge_idle();
+            Ok(())
+        });
+        idle
+    }
 }
 
 impl<P, T> Circuit for ChildCircuit<P, T>
@@ -4937,6 +4955,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -5109,6 +5131,10 @@ where
 
     fn is_compaction_complete(&self) -> bool {
         self.operator.is_compaction_complete()
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
     }
 
     fn start_bootstrap_output_caching(&mut self) {
@@ -5295,6 +5321,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -5470,6 +5500,10 @@ where
 
     fn is_compaction_complete(&self) -> bool {
         self.operator.is_compaction_complete()
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
     }
 
     fn start_bootstrap_output_caching(&mut self) {
@@ -5706,6 +5740,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -5914,6 +5952,10 @@ where
 
     fn is_compaction_complete(&self) -> bool {
         self.operator.is_compaction_complete()
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
     }
 
     fn start_bootstrap_output_caching(&mut self) {
@@ -6150,6 +6192,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -6356,6 +6402,10 @@ where
 
     fn is_compaction_complete(&self) -> bool {
         self.operator.is_compaction_complete()
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
     }
 
     fn start_bootstrap_output_caching(&mut self) {
@@ -6587,6 +6637,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -6801,6 +6855,10 @@ where
         self.operator.is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.is_background_merge_idle()
+    }
+
     fn start_bootstrap_output_caching(&mut self) {
         self.operator.start_bootstrap_output_caching()
     }
@@ -7005,6 +7063,10 @@ where
         self.operator.borrow().is_compaction_complete()
     }
 
+    fn is_background_merge_idle(&self) -> bool {
+        self.operator.borrow().is_background_merge_idle()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.borrow_mut().clear_state()
     }
@@ -7186,6 +7248,10 @@ where
     fn start_compaction(&mut self) {}
 
     fn is_compaction_complete(&self) -> bool {
+        true
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
         true
     }
 
@@ -7537,6 +7603,10 @@ where
 
     fn is_compaction_complete(&self) -> bool {
         self.circuit.is_compaction_complete()
+    }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.circuit.is_background_merge_idle()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -8873,6 +8943,10 @@ impl CircuitHandle {
 
     pub fn is_compaction_complete(&self) -> bool {
         self.circuit.is_compaction_complete()
+    }
+
+    pub fn is_background_merge_idle(&self) -> bool {
+        self.circuit.is_background_merge_idle()
     }
 }
 

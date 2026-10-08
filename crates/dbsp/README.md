@@ -19,6 +19,12 @@ that batch to storage as well. Without storage, or below the merge threshold,
 the single batch stays in memory. Callers can use `Trace::is_compaction_complete`
 to wait for the request to finish.
 
+`DBSPHandle::is_background_merge_idle` is a nonblocking status check for normal
+merge drainage. It returns true when no merge is running, no compaction request
+is pending, and no batch group currently meets the merge policy. It can return
+true while several below-threshold batches remain. Full compaction retains its
+stronger at-most-one-batch completion condition.
+
 # Resources
 
 ## Learning Materials

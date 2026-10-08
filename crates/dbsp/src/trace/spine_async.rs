@@ -303,25 +303,14 @@ where
     ///
     /// We merge the least recently added batches (ensuring that batches
     /// eventually get merged).
-    fn try_start_merge(&mut self, level: usize, min_merge_batches: usize) -> Option<Vec<Arc<B>>> {
+    fn try_start_merge(
+        &mut self,
+        level: usize,
+        min_merge_batches: usize,
+        memory_pressure: MemoryPressure,
+    ) -> Option<Vec<Arc<B>>> {
         let merge_counts = &MERGE_COUNTS[level];
-        let min_batches = min_batches_to_merge(level, min_merge_batches);
-
-        // Start a merge if there is no ongoing merge and there are either enough loose batches to start a merge,
-        // or we are under high memory pressure and there's at least one in-memory batch in this slot, or
-        // compaction has been requested and there are multiple batches or one memory batch
-        // whose merge destination is storage.
-        let requested = self.compaction_status == CompactionStatus::Requested;
-        let flush_single_memory_batch = requested
-            && self.loose_batches.len() == 1
-            && self.loose_batches[0].location() == BatchLocation::Memory
-            && pick_merge_destination([self.loose_batches[0].as_ref()], None)
-                == BatchLocation::Storage;
-        if self.merging_batches.is_none()
-            && (self.loose_batches.len() >= min_batches
-                || self.must_relieve_memory_pressure()
-                || (requested && (self.loose_batches.len() > 1 || flush_single_memory_batch)))
-        {
+        if self.merge_is_eligible(level, min_merge_batches, memory_pressure) {
             // Compaction requested - merge all batches in the slot.
             let max_batches = if self.compaction_status == CompactionStatus::Requested {
                 self.compaction_status = CompactionStatus::InProgress;
@@ -339,19 +328,34 @@ where
         }
     }
 
+    /// Mirrors the scheduler's merge-start decision without changing this slot.
+    fn merge_is_eligible(
+        &self,
+        level: usize,
+        min_merge_batches: usize,
+        memory_pressure: MemoryPressure,
+    ) -> bool {
+        let requested = self.compaction_status == CompactionStatus::Requested;
+        let flush_single_memory_batch = requested
+            && self.loose_batches.len() == 1
+            && self.loose_batches[0].location() == BatchLocation::Memory
+            && pick_merge_destination([self.loose_batches[0].as_ref()], None)
+                == BatchLocation::Storage;
+        self.merging_batches.is_none()
+            && (self.loose_batches.len() >= min_batches_to_merge(level, min_merge_batches)
+                || self.must_relieve_memory_pressure(memory_pressure)
+                || (requested && (self.loose_batches.len() > 1 || flush_single_memory_batch)))
+    }
+
     /// Returns true if the slot must relieve memory pressure, i.e., if the memory pressure level is >=high
     /// and there's at least one in-memory batch in this slot.
     /// In this case, we will initiate a new merge regardless of the number of loose batches.
-    fn must_relieve_memory_pressure(&self) -> bool {
-        if let Some(memory_pressure) = Runtime::memory_pressure() {
-            memory_pressure >= MemoryPressure::High
-                && self
-                    .loose_batches
-                    .iter()
-                    .any(|batch| batch.location() == BatchLocation::Memory)
-        } else {
-            false
-        }
+    fn must_relieve_memory_pressure(&self, memory_pressure: MemoryPressure) -> bool {
+        memory_pressure >= MemoryPressure::High
+            && self
+                .loose_batches
+                .iter()
+                .any(|batch| batch.location() == BatchLocation::Memory)
     }
 
     /// Returns the number of batches in the slot, whether loose or merging.
@@ -519,6 +523,17 @@ where
             .all(|s| s.compaction_status == CompactionStatus::None);
         let total_batches = self.count_all_batches();
         all_requests_processed && !self.is_merging() && total_batches <= 1
+    }
+
+    fn is_background_merge_idle(&self, memory_pressure: MemoryPressure) -> bool {
+        !self.is_merging()
+            && self
+                .slots
+                .iter()
+                .all(|slot| slot.compaction_status == CompactionStatus::None)
+            && self.slots.iter().enumerate().all(|(level, slot)| {
+                !slot.merge_is_eligible(level, self.min_merge_batches, memory_pressure)
+            })
     }
 
     /// Finishes up the ongoing merge at the given `level`, which completed in
@@ -1285,6 +1300,14 @@ where
     fn is_compaction_complete(&self) -> bool {
         self.state.lock().unwrap().is_compaction_complete()
     }
+
+    fn is_background_merge_idle(&self) -> bool {
+        let pressure = self.merge_workers.runtime.current_memory_pressure();
+        self.state
+            .lock()
+            .unwrap()
+            .is_background_merge_idle(pressure)
+    }
 }
 
 impl<B> Drop for AsyncMerger<B>
@@ -1438,8 +1461,9 @@ where
             // lock.
             let mut state = self.state.lock().unwrap();
             let min_merge_batches = state.min_merge_batches;
+            let memory_pressure = self.runtime.current_memory_pressure();
             let batches = if let Some(batches) =
-                state.slots[level].try_start_merge(level, min_merge_batches)
+                state.slots[level].try_start_merge(level, min_merge_batches, memory_pressure)
             {
                 batches
             } else {
@@ -2371,6 +2395,10 @@ where
     fn is_compaction_complete(&self) -> bool {
         self.merger.is_compaction_complete()
     }
+
+    fn is_background_merge_idle(&self) -> bool {
+        self.merger.is_background_merge_idle()
+    }
 }
 
 impl<B> Spine<B>
@@ -2823,7 +2851,7 @@ mod merge_threshold_test {
 
 #[cfg(test)]
 mod single_batch_compaction_test {
-    use super::BatchLocation;
+    use super::{BatchLocation, CompactionStatus, MIN_LEVEL0_MERGE_BATCHES, SharedState};
     use crate::{
         OrdZSet as TypedOrdZSet, ZWeight,
         algebra::OrdZSet,
@@ -2836,11 +2864,43 @@ mod single_batch_compaction_test {
         utils::Tup2,
     };
     use feldera_storage::tokio::TOKIO;
+    use feldera_types::memory_pressure::MemoryPressure;
     use std::{
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn idle_allows_below_threshold_batches_but_not_runnable_or_pending_work() {
+        let factories = BatchReaderFactories::new::<i32, (), ZWeight>();
+        let mut state = SharedState::<OrdZSet<DynData>>::new(
+            &factories,
+            Arc::new("idle_status_test".to_owned()),
+            0,
+            TraceRole::Integral,
+        );
+        let batch =
+            Arc::new(TypedOrdZSet::<i32>::from_tuples((), vec![Tup2(Tup2(7, ()), 1)]).into_inner());
+        for _ in 0..MIN_LEVEL0_MERGE_BATCHES - 1 {
+            state.slots[0].loose_batches.push_back(Arc::clone(&batch));
+        }
+        assert!(state.is_background_merge_idle(MemoryPressure::Low));
+        assert!(!state.is_background_merge_idle(MemoryPressure::High));
+        assert!(!state.is_compaction_complete());
+
+        state.slots[0].loose_batches.push_back(Arc::clone(&batch));
+        assert!(!state.is_background_merge_idle(MemoryPressure::Low));
+
+        state.slots[0].loose_batches.clear();
+        state.slots[0].merging_batches = Some(vec![Arc::clone(&batch)]);
+        assert!(!state.is_background_merge_idle(MemoryPressure::Low));
+
+        state.slots[0].merging_batches = None;
+        state.slots[0].loose_batches.push_back(batch);
+        state.slots[0].compaction_status = CompactionStatus::Requested;
+        assert!(!state.is_background_merge_idle(MemoryPressure::Low));
+    }
 
     fn compact_one(config: CircuitConfig) -> (Vec<BatchLocation>, Vec<BatchLocation>, bool) {
         let result = Arc::new(Mutex::new(None));
