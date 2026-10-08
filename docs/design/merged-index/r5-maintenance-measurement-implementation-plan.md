@@ -11,8 +11,8 @@ Refresh completion does not imply durability; checkpoint costs are deferred.
 
 ## Inspected implementation
 
-- `q3-ivm-baseline/src/main.rs` currently buffers base files, retains `Reference`
-  even without verification, and discovers RF2 rows from those maps.
+- `q3-ivm-baseline/src/main.rs` initially buffered base files, retained `Reference`
+  even without verification, and discovered RF2 rows from those maps.
 - Generated Catalog base maps expose indexed materialized snapshots keyed by
   `Tup1<i64>` (Customer/Orders) and `Tup2<i64, i32>` (Lineitem). Indexed serialized
   cursors support seeks and complete logical payload conversion.
@@ -84,3 +84,18 @@ A scoped `Runtime::with_buffer_cache` binding makes both reuse the configured
 worker cache. It restores prior thread-local cache state, including on unwind;
 no new cache or storage system is introduced. The reported cache capacity then
 covers driver reads, Q3 workers, manual-index ownership, and merger tasks.
+
+## Completion evidence
+
+The implementation and macOS smoke work are complete. `verify.sh` passed native
+(18), reconstructed (15), COL (21), and runner (10) tests, exact R4 transcript
+comparison, formatting, strict experiment/COL Clippy, shell syntax, and whitespace
+checks. Five focused DBSP cache/compaction tests and strict production-library
+Clippy passed. Broader DBSP test-code Clippy reported 56 existing lints outside
+the modified files; its log is retained under ignored experiment `target/`.
+
+Clustered, scattered, and complete 10,000-line-group campaigns each completed
+three fresh runs per mode. The measurements and qualifications are recorded in
+[experiment results](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md).
+Native generation was restored. Linux equal-total-memory, beyond-memory
+qualification remains pending, as do the deferred items above.

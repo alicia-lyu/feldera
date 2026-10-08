@@ -194,3 +194,84 @@ preparation and checking.
 `cargo +1.96.1 clippy --offline --all-targets -j2 -- -D warnings` passed.
 The generator scopes four allowances to compiler-generated `src/lib.rs` syntax;
 the handwritten driver and parser remain subject to strict Clippy.
+
+## R5 harness verification and macOS smoke evidence
+
+On 2026-10-08, `./verify.sh` passed 18 native tests, 15 reconstructed tests,
+21 COL tests, and 10 Python runner tests. The native and reconstructed R4
+transaction transcripts matched exactly. Formatting, strict experiment
+Clippy in both modes, COL Clippy, shell syntax, and whitespace checks passed.
+Artifacts are under `target/r4-verification/20261008T201153Z-91462/` in this
+experiment. Five focused DBSP tests also passed: three single-batch compaction
+cases and two configured-cache binding/restoration cases. Strict production
+DBSP library Clippy passed. The broader DBSP test-code Clippy check found 56
+existing lint errors outside the modified files; its output is retained at
+`target/r5-dbsp-clippy-tests.log` in this experiment.
+
+The release smoke fixtures contain 64 Customers, 512 Orders, and 2,048 Lines.
+Each campaign executes six complete refreshes: RF1, RF2, repeated RF2 after
+those Orders are absent, RF1 reinsertion, RF2, and an empty RF2. Delete lists
+include a duplicate requested ID and an absent ID. Clustered and scattered
+refreshes each insert 16 Orders and 64 Lines, assigned respectively to one
+Customer or 16 Customers. The large-group refresh inserts one Order with
+10,000 Lines. All base Orders are ascending and Lineitems are grouped by Order.
+
+Each mode uses a separate preserved release executable, three fresh processes,
+and fresh storage directories. Settings are one worker, a 512-row loading
+target, a 32 MiB configured cache, a 512 MiB runtime memory-pressure target,
+`min_storage_bytes=0`, no compression, native join fetch enabled, and a
+300-second drainage timeout. Independent verification is disabled for these
+measurements; the small-workload tests above supply separate full-join evidence.
+Initial loading is excluded. Sequence latency includes final compaction,
+publication of compacted snapshots, and output cleanup. The `index_ms + q3_ms`
+subtotal excludes discovery, checks/input preparation, and publication/cleanup.
+
+The following values are independent medians over three fresh runs on
+`macOS-26.3.1-arm64-arm-64bit-Mach-O`, at revision `42bbbfa3c`.
+
+| Workload | Mode | Foreground ms | Sequence ms | Final drainage ms | Sequence CPU ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| clustered | native | 2.635 | 17.147 | 13.957 | 6.253 |
+| clustered | reconstructed | 2.988 | 19.341 | 16.180 | 7.461 |
+| scattered | native | 2.471 | 16.325 | 13.722 | 6.942 |
+| scattered | reconstructed | 5.279 | 19.288 | 13.852 | 11.407 |
+| large-group | native | 99.263 | 121.413 | 24.168 | 105.249 |
+| large-group | reconstructed | 120.953 | 142.452 | 21.320 | 129.226 |
+
+Backend reads were zero operations and zero bytes in every run; this small
+maintained state fit in the configured cache. OS physical read/write bytes are
+explicitly unavailable on macOS. RSS is the process high-water value, including
+loading; sampled storage peaks use 10 ms samples and a final sample. The resource
+values below are also independent medians; storage, RSS, and cache columns are
+bytes.
+
+| Workload | Mode | Write ops | Write bytes | Settled storage | Sampled peak storage | Peak RSS | Cache occupancy |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clustered | native | 6 | 670,720 | 679,424 | 1,320,960 | 22,085,632 | 1,609,664 |
+| clustered | reconstructed | 4 | 803,840 | 808,448 | 1,293,312 | 27,213,824 | 1,807,976 |
+| scattered | native | 6 | 670,720 | 679,424 | 1,320,960 | 22,102,016 | 1,609,664 |
+| scattered | reconstructed | 4 | 803,840 | 808,448 | 1,293,312 | 27,213,824 | 1,807,976 |
+| large-group | native | 6 | 862,208 | 870,912 | 1,133,568 | 38,567,936 | 1,609,664 |
+| large-group | reconstructed | 4 | 1,091,072 | 1,095,680 | 1,484,288 | 50,118,656 | 1,807,976 |
+
+All 18 processes completed. Both modes used seven logical loading transactions
+and retained at most 516 loading rows. Reports confirmed zero retained
+`Reference` bytes, no normal RF2 full scans, file-backed Customers, Orders,
+Lineitems and `V`, a file-backed manual index in reconstructed mode, and absence
+of the replaced historical join traces there. Repeated RF2 reported the deleted
+Orders as absent, while duplicate requested IDs were deduplicated. Large-group
+refreshes reported a maximum fan-out of 10,000 without splitting the refresh.
+
+Campaign manifests, input/executable SHA-256 hashes, full phase measurements,
+and driver/profile/graph artifacts are retained under the repository's ignored
+`target/r5-smoke/` directory:
+
+- [Clustered campaign](../../../target/r5-smoke/clustered.json).
+- [Scattered campaign](../../../target/r5-smoke/scattered.json).
+- [Large-group campaign](../../../target/r5-smoke/large-group.json).
+
+The runner restored native generation after each campaign. These measurements
+are macOS smoke evidence. Equal enforced total memory and beyond-memory
+performance require the pending Linux cgroup v2 campaign with swap disabled.
+Refresh completion has no durability guarantee. Checkpoint costs, broader
+updates, residual Q3, and Q5/Q10 remain deferred.
