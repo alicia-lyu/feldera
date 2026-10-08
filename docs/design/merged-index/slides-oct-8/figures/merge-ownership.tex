@@ -1,8 +1,8 @@
 \begin{tikzpicture}[x=1cm,y=.8cm,font=\small]
-  \foreach \x/\id/\label in {0/one/Before,4.6/two/During,9.2/three/After} {
+  \foreach \x/\id/\label in {0/one/Before,4/two/During,8/three/Installed} {
     \node[font=\normalsize\bfseries] at (\x+1.3,3.4) {\label};
     \node (s\id) at (\x,2.5) {Spine};
-    \node (r\id) at (\x+2.6,2.5) {Old snapshot};
+    \node (r\id) at (\x+2.15,2.5) {Old snapshot};
     \node[batch,minimum width=.75cm] (a\id) at (\x+.6,1.2) {$a$};
     \node[batch,minimum width=.75cm] (b\id) at (\x+2,1.2) {$b$};
     \draw[ref] (r\id.south) -- (a\id.north east);
@@ -12,12 +12,17 @@
   \draw[ref] (sone.south) -- (bone.north west);
   \draw[ref] (stwo.south) -- (atwo.north);
   \draw[ref] (stwo.south) -- (btwo.north west);
-  \node[batch,fill=teal!8,minimum width=.75cm] (m4) at (5.9,-.15) {$m$};
+  \node[batch,fill=teal!8,minimum width=.75cm] (m4) at (5.3,-.15) {$m$};
   \draw[link] (atwo.south) -- (m4.north west);
   \draw[link] (btwo.south) -- (m4.north east);
-  \node[font=\small,text=quiet] at (5.9,-.95) {Merge builds replacement};
-  \node[batch,fill=teal!8,minimum width=.75cm] (m9) at (9.2,-.15) {$m$};
-  \draw[ref] (sthree.west) -- ++(-.4,0) |- (m9.west);
-  \node[font=\small,text=quiet] at (11,-.95) {$a,b$ remain pinned};
-  \node[font=\small,text=quiet] at (1.3,-.95) {Sources retained};
+  \node[batch,fill=teal!8,minimum width=.75cm] (m8) at (8,-.15) {$m$};
+  \draw[ref] (sthree.west) -- ++(-.35,0) |- (m8.west);
+  \node[font=\normalsize\bfseries,align=center] at (13.1,3.4) {Final owner\\releases sources};
+  \node (sfinal) at (13.1,2.3) {Spine};
+  \node[batch,fill=teal!8,minimum width=.75cm] (mfinal) at (13.1,.5) {$m$};
+  \draw[ref] (sfinal) -- (mfinal);
+  \node[align=center,text=quiet] at (1.3,-1) {Source runs retained};
+  \node[align=center,text=quiet] at (5.3,-1) {Sources and output coexist};
+  \node[align=center,text=quiet] at (9.3,-1) {Snapshot still owns $a,b$};
+  \node[align=center,text=quiet] at (13.1,-1) {$a,b$ memory reclaimed};
 \end{tikzpicture}

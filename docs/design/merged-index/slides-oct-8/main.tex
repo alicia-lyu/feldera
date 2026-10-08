@@ -44,52 +44,53 @@
 }
 \newcommand{\source}[1]{\par\vfill{\color{quiet}\scriptsize #1}}
 \newcommand{\lead}[1]{{\color{teal}\bfseries #1}}
-\newcommand{\before}{\mathrm{before}}
-\newcommand{\current}{\mathrm{current}}
+
+
 \newcommand{\join}{\mathbin{\bowtie}}
 \newcommand{\emptyrow}{\textcolor{quiet}{no rows}}
-\newcommand{\Brow}[1]{B_{#1}}
-\newcommand{\Vrow}[1]{V_{#1}}
+
+
 
 \title{DBSP Physical Design: Advisor Presentation}
 \date{2026-10-08}
 
 \begin{document}
 
+% Preserve geometry while revealing future rows and fading completed steps.
+\newcommand{\reveal}[3]{\uncover<#1->{\alt<#2>{\textcolor{teal}{#3}}{\textcolor{quiet}{#3}}}}
+
 % 1
-\begin{frame}{The physical-design question}
-  \centering
-  \resizebox{.78\textwidth}{!}{\input{figures/query-update-backdrop.tex}}
+\begin{frame}{DBSP: incremental computation and physical state}
+  \large
+  DBSP maintains query results as inputs change.
+  \par\bigskip\normalsize
+  Its theory expresses incremental programs over weighted relations,\par
+  with integration and composition as core operations.
+  \par\bigskip
+  \lead{This talk recovers physical implementation details from code.}
   \par\medskip
-  \large\lead{Which accumulated rows must we read to compute $\Delta V$?}
-  \source{Backdrop adapted from the prior advisor deck. Amber: proposed merged-index maintenance.}
-  \note{Timing: 1 minute. A query computes a result from accumulated rows. An update computes a signed change from changed rows and accumulated rows. The right side is the proposed merged-index maintenance path from our earlier deck, not a claim that every DBSP operator already uses a merged index. Today we first inspect the native DBSP state and reads that such a path must supply. DBSP's generality and composability are established theoretical foundations that we build on. The physical question here is narrower: which rows, keyed how, with which visibility? Source: prior advisor-deck/main.tex, querytimepipeline and updatetimepipeline. Theory: Budiu et al., VLDB 2023, Sections 2.3 and 3.}
+  Which accumulated rows does a join need?\par\smallskip
+  How does DBSP retain, share, merge, and place that state?
+  \source{Budiu et al., DBSP, VLDB 2023. Native sources and inspection identity: SOURCE-EVIDENCE.md.}
+  \note{Timing: 1 minute. DBSP supplies a theory and implementation of incremental computation: update a maintained result from signed input changes instead of evaluating the complete query again. A weighted relation can express insertions, retractions, and multiplicities. Integration accumulates changes. Generality and composability are established theoretical context, not the focus of this talk. We recover the physical behavior from the inspected implementation: retained state, indexed representations, immutable runs, snapshots, merging, and memory controls. The Orders--Lineitem-first program is an equivalent explanatory choice. The existing experiment uses Orders--Customer first and is identified separately at the end. Theory: VLDB 2023 Sections 2.3 and 3. Physical claims: SOURCE-EVIDENCE.md.}
 \end{frame}
 
 % 2
-\begin{frame}{Base-table storage, including disk backing}
-  \lead{Primary-key table state backed by the native trace/LSM}
+\begin{frame}{An already-loaded primary-key table}
+  \lead{Logical map semantics: one current row per primary key}
   \par\medskip
-  \centering\resizebox{.98\textwidth}{!}{\input{figures/base-storage.tex}}
-  \par\medskip
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{.47\textwidth}
-      \textbf{Input-map semantics}\par
-      Insert, update, or delete by primary key.\par\smallskip
-      Orders: key = Order ID.
-    \end{column}
-    \begin{column}{.50\textwidth}
-      \textbf{Overwrite Order 42}\par
-      Read its previous row, then emit\par
-      $-\text{old row}+\text{new row}$.
-    \end{column}
-  \end{columns}
-  \source{Native input state: input\_upsert.rs. Batch placement: trace/ord.rs and fallback/indexed\_wset.rs.}
-  \note{Timing: 1.5 minutes. ``Input map'' describes update semantics. The retained table is an indexed trace, so previous rows remain readable even when the state has disk-backed batches. The concrete chain is add\_input\_map\_persistent, input\_upsert, retained Spine<OrdIndexedZSet>, OrdIndexedWSet/FallbackIndexedWSet, memory or file indexed batches. InputUpsert seeks the trace for the old row and emits its retraction followed by the replacement. UntimedTraceAppend retains those changes. Disk backing requires storage configuration. Ordinary placement and merging can produce immutable indexed files. This proves storage support, without implying optimal update I/O or checkpoint durability. For our overwrite, ship priority changes from 0 to 1 and all other Order 42 fields stay fixed. Sources: operator/input.rs:465 and dynamic/input\_upsert.rs:266--333, 628--665; typed\_batch.rs:577; trace/ord.rs:5--9; fallback/indexed\_wset.rs:545--560; storage/file.rs:3--65.}
+  \centering\resizebox{.88\textwidth}{!}{\input{figures/base-storage.tex}}
+  \par\bigskip\raggedright
+  Orders uses Order ID as its primary key.\par\smallskip
+  The retained indexed trace exposes the loaded table's weighted contents.\par\smallskip
+  Its \textbf{LSM-like trace} can retain memory runs and,\par
+  with storage configured, immutable indexed files.
+  \source{input\_upsert.rs; trace/ord.rs; fallback/indexed\_wset.rs. Placement does not establish durability.}
+  \note{Timing: 1.5 minutes. Consider a table that is already loaded and currently static. The logical interface is a primary-key map, while its retained representation is an indexed trace of immutable sorted runs. A trace cursor reads the combined weighted contents. We do not introduce IVM or overwrite mechanics on this slide. The concrete construction is add\_input\_map\_persistent, input\_upsert, retained Spine<OrdIndexedZSet>, OrdIndexedWSet/FallbackIndexedWSet, memory or file indexed runs. Storage configuration permits indexed layer files. The spine is LSM-like, and the trees within each file index that run. Storage placement alone establishes neither checkpoint durability nor optimal update I/O. Sources: operator/input.rs:465; dynamic/input\_upsert.rs:266--333; typed\_batch.rs:577; trace/ord.rs:5--9; fallback/indexed\_wset.rs:545--560; storage/file.rs:3--65.}
 \end{frame}
 
 % 3
-\begin{frame}{The implemented three-way join}
+\begin{frame}{The predicate-free three-way join}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.53\textwidth}
       \small\ttfamily
@@ -107,219 +108,236 @@
       \begin{tabular}{ll}
         \toprule Customer & Segment\\\midrule
         7 & BUILDING\\\bottomrule
-      \end{tabular}\par\medskip
+      \end{tabular}\par\smallskip
       \begin{tabular}{ll}
         \toprule Order & Customer\\\midrule
         42 & 7\\\bottomrule
-      \end{tabular}\par\medskip
+      \end{tabular}\par\smallskip
       \begin{tabular}{lll}
         \toprule Order & Line & Price\\\midrule
         42 & 1 & 100\\\bottomrule
       \end{tabular}
     \end{column}
   \end{columns}
-  \par\medskip
-  \large $V=\text{Customer}\join\text{Orders}\join\text{Lineitem}$
-  \par\smallskip\normalsize
-  Predicate-free join. Q3's filtering, aggregation, and ranking follow later.
+  \par\smallskip
+  \normalsize $V=\text{Customer}\join\text{Orders}\join\text{Lineitem}$
+  \par\normalsize
+  $R^-$: before-state\quad $R^+$: after-state\quad $\Delta R=R^+-R^-$\\
+  Superscripts describe visibility. Signed weights describe tuple changes.
   \source{query.sql in experiments/q3-ivm-baseline. Column names abbreviated for display.}
-  \note{Timing: 1.5 minutes. This is the implemented maintained view, not full TPC-H Q3. It has two equijoins and retains all nine projected fields. There are no Q3 filters, aggregate, ranking, or limit here. Customer 7 has segment BUILDING. Order 42 has customer 7, date 1995-03-01, and ship priority 0. Its line 1 has price 100, discount 0, and ship date 1995-03-10. Primary keys are Customer ID, Order ID, and (Order ID, line number). We will insert Order 43, dated 1995-03-02 with priority 0, and its line 1, priced 30 with discount 0 and ship date 1995-03-11, in the same transaction. The tables show the identifying fields. Appendix A defines complete payloads. Source: experiments/q3-ivm-baseline/query.sql:1--30.}
+  \note{Timing: 1.5 minutes. This SQL projection is the experiment's maintained view, not full TPC-H Q3. It has two equijoins and retains all nine projected fields. There are no Q3 filters, aggregate, ranking, or limit here. Customer 7 has segment BUILDING. Order 42 has customer 7, date 1995-03-01, and ship priority 0. Its line 1 has price 100, discount 0, and ship date 1995-03-10. Primary keys are Customer ID, Order ID, and (Order ID, line number). We will insert Order 43, dated 1995-03-02 with priority 0, and its line 1, priced 30 with discount 0 and ship date 1995-03-11, in the same transaction. The tables show the identifying fields. Appendix A defines complete payloads. The chosen explanatory join order changes no SQL result. R superscript minus and plus name states, not negative and positive row weights. Source: experiments/q3-ivm-baseline/query.sql:1--30.}
 \end{frame}
 
 % 4
 \begin{frame}{The complete incremental program}
-  \centering
+  \lead{Equivalent explanatory program: Orders--Lineitem first}
+  \par\smallskip\centering
   \input{figures/ivm-program.tex}
-  \par\medskip
-  \vspace{-1.5em}
+  \vspace{-1.4em}
   \begin{align*}
-    \Delta B &= \Delta O\join C_{\current}+O_{\before}\join\Delta C\\
-    \Delta V &= \Delta L\join B_{\current}+L_{\before}\join\Delta B\\
-    V_{\current} &= V_{\before}+\Delta V
+    \Delta OL_{c,o} &= \Delta L_o\join O_o^+ + L_o^-\join\Delta O_o\\
+    \Delta V &= \Delta OL_{c,o}\join C_c^+ + OL_{c,o}^-\join\Delta C_c\\
+    V^+ &= V^-+\Delta V
   \end{align*}
-  \source{$I_X$ accumulates $\Delta X$. $B$: Orders--Customer projection, keyed by Order ID. Native join.rs:698--749.}
-  \note{Timing: 2 minutes. Here is the whole logical maintenance program, including both branches of each join and the output accumulation. Each I box adds successive signed changes to accumulated state. The first join matches Orders and Customer by customer ID, projects their result, and keys B by order ID. The second matches Lineitem and B by order ID. Current includes this transaction's changes. Before excludes them. A before read selects existing accumulated state through a delayed view. It does not independently integrate another copy. The asymmetry counts simultaneous changes once: delta Orders sees current Customer, while delta Customer sees only old Orders. The second join uses the same asymmetry. Sources: native-state-read-contracts.md:47--77; operator/dynamic/join.rs:698--749. Theorem 3.4 of the VLDB 2023 paper gives the bilinear incremental-join identity.}
+  \source{$I_R$ integrates $\Delta R$. Subscripts specify access ordering. Actual experiment: Appendix D.}
+  \note{Timing: 2 minutes. Each I box accumulates transaction deltas in a trace. Join 1 matches Order ID. Its output is rekeyed to Customer ID, with Order ID then line number leading the value tuple. Join 2 matches Customer ID and projects all nine output fields. The superscripts select after-state or before-state. The first join's changed Lineitem sees after-state Orders, while changed Orders sees only before-state Lineitem. The second join's changed OL sees after-state Customer, while changed Customer sees only before-state OL. Each simultaneous-change term occurs once. Before and after consumers can share a trace, with delayed access choosing visibility. This is a logically equivalent explanatory order, not a regeneration or relabeling of the existing circuit. Its actual order is Orders--Customer first (Appendix D). Source: dynamic/join.rs:698--749. Theory: VLDB 2023 Theorem 3.4.}
 \end{frame}
 
 % 5
-\begin{frame}{Accumulated state, indexes, and batches}
+\begin{frame}{Accumulated state and immutable runs}
   \begin{columns}[T,onlytextwidth]
-    \begin{column}{.60\textwidth}
+    \begin{column}{.48\textwidth}
       \small
       \begin{tabular}{@{}lll@{}}
-        \toprule State & Key & Visibility\\\midrule
-        Customer trace & Customer ID & current\\
-        Orders trace & Customer ID & before\\
-        $B$ trace & Order ID & current\\
-        Lineitem trace & Order ID & before\\
-        Materialized $V$ & Output row & accumulated\\\bottomrule
+        \toprule State & Access key & Reads\\\midrule
+        $O_o$ & Order ID & $O_o^+$\\
+        $L_o$ & Order ID & $L_o^-$\\
+        $OL_{c,o}$ & Customer ID & $OL_{c,o}^-$\\
+        $C_c$ & Customer ID & $C_c^+$\\
+        $V$ & Output row & integrate\\\bottomrule
       \end{tabular}
-      \par\medskip\normalsize
-      Base inputs also retain primary-key state:\par
-      $C$: Customer ID\quad $O$: Order ID\par
+      \par
+      Base identity: $C$: Customer ID; $O$: Order ID;\par
       $L$: (Order ID, line number).
     \end{column}
-    \begin{column}{.36\textwidth}
-      \textbf{Batch}\par
-      Immutable weighted changes.\par\medskip
-      \input{figures/integrator-batches.tex}
-      \par\smallskip
-      An integrator exposes their weighted sum.
+    \begin{column}{.49\textwidth}
+      \textbf{Run}: immutable sorted weighted records.\par\smallskip
+      \scalebox{.90}{\input{figures/integrator-batches.tex}}
     \end{column}
   \end{columns}
   \par\smallskip
-  \lead{Orders by Order ID does not supply Orders by Customer ID.}
-  \source{Logical storage roles can share traces. A delayed read is a visibility choice.}
-  \note{Timing: 1.5 minutes. The table names the four accumulated-state reads needed by the two joins and the materialized output. Base-table primary-key state is also retained. Orders demonstrates why base storage alone is insufficient: upsert identity is Order ID, while the first join needs Orders grouped by Customer ID. B is another projected and rekeyed representation. These are logical roles, not eight asserted physical allocations: repeated consumers of the same stream can share trace construction. A batch is an immutable weighted collection. An integrator retains successive batches and exposes their consolidated contents through a trace cursor. An insertion is positive, a deletion is negative, and equal opposite contributions cancel. Later merges can replace the original batches. Sources: native-state-read-contracts.md:87--111; input\_upsert.rs:266--333; accumulate\_trace.rs:773, 1416; trace.rs batch/trace interfaces. Theory: VLDB 2023 Section 2.3.}
+  \lead{$R^+$ and $R^-$ share one trace.}\par
+  \lead{Consumers of the same indexed stream can also reuse that trace.}
+  \par\smallskip\small
+  A run can hold one weighted record. Transactions do not fix run size.\par
+  \textbf{Native storage shortcoming:} no mutable memtable across transactions\par
+  in the inspected input and join paths. Small updates become separate runs.
+  \source{Construction and integration are separate. Merging, including in memory, builds larger runs (slide 11).}
+  \note{Timing: 2 minutes. The table lists logical roles, not a fixed allocation count. Before/after readers share one trace; consumers of the same indexed stream can also reuse it. A delayed read chooses visibility without another integrator. Lineitem's primary identity is (Order ID,line number), while its join access groups by Order ID. OL uses Customer ID as its native key, with Order ID then line number leading its value. The diagram shows join-output buffering, sorting/consolidation of complete pairs, an ordered builder, sealing, and separate trace insertion. Equal complete pairs add weights and zero totals disappear. Individual memory-builder pushes append ordered values and weights without consolidation. Input upsert consolidates per-key changes before its builder. A run can contain one record, and one transaction can produce several runs. The inspected paths have no mutable cross-transaction memtable; larger runs grow through merging, including in memory. This structural limitation has unmeasured performance effects. Sources: input\_upsert.rs:601--622,680--691; input\_upsert.rs:321; join.rs:1921--1957; trace.rs:865--875; merge\_batcher.rs:41--85; merge\_sorter.rs:101--130; indexed\_wset\_batch.rs:906--930.}
 \end{frame}
 
 % 6
-\begin{frame}{Join 1: a new Order meets an existing Customer}
-  \large\lead{One transaction inserts Order 43 and Lineitem (43, 1).}
-  \par\medskip\normalsize
+\begin{frame}<1-5>[t]{Join 1: Orders--Lineitem}
+  \small
+  Before: Customer 7, Order 42, Lineitem (42,1), all with weight $+1$.\par
+  \reveal{1}{1}{One transaction inserts Order 43 and Lineitem (43,1).}
+  \par\medskip
   \begin{tabular}{@{}p{.29\textwidth}p{.35\textwidth}p{.29\textwidth}@{}}
     \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    $\Delta O$: $+O_{43}$ & $C_{\current}$: $(7,\text{BUILDING})$ & $+B_{43}$\\[1em]
-    $\Delta C$: \emptyrow & $O_{\before}$: no key requested & \emptyrow\\\bottomrule
+    \reveal{2}{2}{$\Delta L_o$: $(43,1,30,0,$\newline $\text{1995-03-11}):+1$} &
+    \reveal{3}{3}{$O_o^+$: $(43,7,$\newline $\text{1995-03-02},0):+1$} &
+    \reveal{4}{4}{$\Delta OL_{c,o}$:\newline $(7;43,1,\ldots):+1$}\\[1.4em]
+    \reveal{5}{5}{$\Delta O_o$: Order 43, $+1$} &
+    \reveal{5}{5}{$L_o^-$: no old line for 43} &
+    \reveal{5}{5}{no rows}\\\bottomrule
   \end{tabular}
   \par\medskip
-  \[
-    B_{\current}=\{B_{42},B_{43}\},\qquad \Delta B=+B_{43}
-  \]
-  \normalsize
-  $B_{43}=(43;\ 7,\text{BUILDING},\text{1995-03-02},0)$\par\smallskip
-  Key = Order ID. Value = Customer, segment, Order date, priority.
-  \source{Running example: all input and accumulated rows have weight $+1$. Full payloads in Appendix A.}
-  \note{Timing: 1.5 minutes. Start from Customer 7, Order 42, and Lineitem (42,1). Order 43 identifies customer 7. In the first branch, changed Order 43 matches the accumulated Customer 7 row and produces positive B43. The complete output is keyed 43 with customer 7, BUILDING, date 1995-03-02, and priority 0. In the other branch there are no changed Customers, so it requests no matching Orders and produces nothing. B\_current contains old B42 plus new B43. The new Lineitem has not participated yet. These are the logical matching rows. The native join's cursor-driving direction can depend on relative sizes, so this example does not assert a mandatory delta-driven scan. Sources: native-state-read-contracts.md:59--77; join.rs:1760--1788.}
+  \uncover<4->{\textcolor{quiet}{$(7;43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}):+1$}}
+  \par\medskip
+  \reveal{5}{5}{$\Delta OL_{c,o}=\{(7;43,1,\ldots):+1\}$}\par\smallskip
+  \uncover<5->{$OL_{c,o}^+$ also retains $(7;42,1,\ldots):+1$.}
+  \source{Order ID match. Customer ID becomes the output key. Semicolon separates key and value.}
+  \note{Timing: 2 minutes over five advances. These columns stay fixed: changed rows, matching accumulated rows, signed output. Teal marks the active step and quiet ink retains completed information. The match is logical; native cursor-driving direction can depend on relative sizes. All dates and prices are retained. Sources: dynamic/join.rs:698--749,1760--1788; query.sql.}
+  \note<1>{\par Establish the before-state. Order 42 has customer 7, date 1995-03-01, priority 0. Its line 1 has price 100, discount 0, ship date 1995-03-10. Insert Order 43 and its line 1 simultaneously. Do not advance the Customer join yet.}
+  \note<2>{\par Reveal changed Lineitem (43,1) with price 30, discount 0, ship date 1995-03-11 and weight +1. Its Order ID requests a logical match in after-state Orders.}
+  \note<3>{\par Highlight matching Order 43 in O after-state: customer 7, date 1995-03-02, priority 0, weight +1. The newly inserted Order is visible in this branch.}
+  \note<4>{\par Multiply weights +1 times +1. Emit the complete OL pair with Customer ID key 7 and value (43,1,1995-03-02,0,30,0,1995-03-11). The native key is 7; 43 and 1 lead the value. OL subscripts name access ordering, not this row.}
+  \note<5>{\par Check the other branch: before-state Lineitem contains no line for changed Order 43, so it emits nothing. The combined intermediate delta contains the one new pair once. Integrating it preserves the old pair for Order 42 and adds the new pair for 43.}
 \end{frame}
 
 % 7
-\begin{frame}{Join 2: the new Lineitem meets current $B$}
+\begin{frame}<1-5>[t]{Join 2: the intermediate meets Customer}
+  \small
+  Carry forward $\Delta OL_{c,o}=\{(7;43,1,\ldots):+1\}$.\par
+  \reveal{2}{2}{Its Customer ID key is $7$.}
+  \par\medskip
   \begin{tabular}{@{}p{.29\textwidth}p{.35\textwidth}p{.29\textwidth}@{}}
     \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    $\Delta L$: $+L_{43,1}$ & $B_{\current}$: $B_{43}$ & $+V_{43}$\\[1em]
-    $\Delta B$: $+B_{43}$ & $L_{\before}$: no line for 43 & \emptyrow\\\bottomrule
+    \reveal{1}{1-2}{$\Delta OL_{c,o}$:\newline $(7;43,1,\ldots):+1$} &
+    \reveal{3}{3}{$C_c^+$:\newline $(7,\text{BUILDING}):+1$} &
+    \reveal{4}{4}{full projected row, $+1$}\\[1.4em]
+    \reveal{5}{5}{$\Delta C_c$: no rows} &
+    \reveal{5}{5}{$OL_{c,o}^-$: no key requested} &
+    \reveal{5}{5}{no rows}\\\bottomrule
   \end{tabular}
-  \par\bigskip
-  \large
-  $\Delta V=+V_{43}$\qquad $V_{\current}=\{V_{42},V_{43}\}$
-  \par\medskip\normalsize
-  $V_{43}=(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11})$
-  \par\bigskip
-  \lead{The new Order--Lineitem pair appears once.}\par\smallskip
-  The first branch sees new $B$. The second sees only old Lineitem.
-  \source{The simultaneous-change term is included once through current-state visibility.}
-  \note{Timing: 2 minutes. Changed Lineitem (43,1) reads current B43, which already incorporates the changed Order, and emits V43 with weight +1. Changed B43 also asks for old Lineitem rows for order 43, but there were none before the transaction. Hence the second branch is empty and the new pair occurs once. Reading current Lineitem in both branches would count that pair twice. Algebraically, delta L joined with current B equals delta L joined with old B plus delta L joined with delta B. The other branch adds old L joined with delta B. The simultaneous term therefore appears once. V42 stays unchanged. Multiplicities multiply across a match and signed branch outputs add. Appendix B covers customer overwrite and deletion.}
+  \par\medskip
+  \reveal{4}{4}{$(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11}):+1$}
+  \par\medskip
+  \reveal{5}{5}{$V^+=V^-+\Delta V$: one new output, for Order 43 / line 1.}\par\smallskip
+  \uncover<5->{The output for Order 42 / line 1 stays unchanged.}
+  \source{Customer ID match. Visibility superscripts and signed tuple weights have different meanings.}
+  \note{Timing: 2 minutes over five advances. Use the same stable columns as Join 1. The final projection contains Customer ID, segment, Order ID, date, priority, line number, price, discount, ship date. These are logical matches, not a mandatory delta-driven native scan. Source: query.sql; dynamic/join.rs:698--749,1760--1788.}
+  \note<1>{\par Carry the complete intermediate delta forward from the first join. OL has already joined Orders and Lineitem and carries all their fields. Its Customer ID grouping supplies the next join key.}
+  \note<2>{\par Highlight Customer ID 7. Order ID 43 and line number 1 are the leading fields of the intermediate value, not the key for this join.}
+  \note<3>{\par Reveal matching Customer 7 in after-state C, with segment BUILDING and weight +1. There is no Customer change in this transaction.}
+  \note<4>{\par Emit the full nine-field projected output with weight +1. The intermediate and Customer weights multiply. Preserve date 1995-03-02, priority 0, price 30, discount 0, ship date 1995-03-11.}
+  \note<5>{\par Check the second branch, before-state OL joined with changed Customer: the Customer delta is empty, so it contributes nothing. Add the single signed output to V before-state. One new row appears and the Order 42 row remains.}
 \end{frame}
 
 % 8
 \begin{frame}{Records and nested values}
-  \large $\text{record}=(K,V,\text{weight})$
+  \large $\text{record}=(\text{key},\text{value},\text{weight})$
   \par\medskip\normalsize
-  Orders indexed by Customer ID:
-  \begin{center}
-    \begin{tabular}{llll}
-      \toprule Key & Value & Weight & Meaning\\\midrule
-      7 & (42, 1995-03-01, 0) & $+1$ & one Order\\
-      7 & (43, 1995-03-02, 0) & $+1$ & another Order\\\bottomrule
+  $OL_{c,o}$: Customer ID groups, values ordered by Order ID then line number.
+  \begin{center}\small
+    \begin{tabular}{@{}lll@{}}
+      \toprule Key & Value & Weight\\\midrule
+      7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
+      7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
     \end{tabular}
   \end{center}
-  \par\smallskip
-  One key has several values. Weights belong to complete $(K,V)$ pairs.
+  One native key has multiple values. Weight belongs to the complete pair.
   \par\medskip
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.46\textwidth}
       \textbf{Multiplicity}\par
-      Weight $+2$ represents two equal rows.\par
+      $+2$: two equal complete rows.\par
       A join multiplies matching weights.
     \end{column}
     \begin{column}{.49\textwidth}
-      \textbf{Signed changes}\par
-      Retract a row with weight $-1$.\par
-      $+1+(-1)=0$: omit the canceled pair.
+      \textbf{Signed transaction delta}\par
+      $-1$: retract one row.\par
+      Equal pairs cancel: $+1+(-1)=0$.
     \end{column}
   \end{columns}
   \source{Weighted relations: VLDB 2023 \S4. Indexed/nested groups: \S7.3.}
-  \note{Timing: 1 minute. An indexed batch groups many distinct values under one key. Repeated equal key/value pairs consolidate into an integer weight. For Orders by customer, the customer key is 7 and the values contain order ID, date, and priority. Even though base Orders has a unique Order ID, this join representation allows many Orders under the same Customer. The weight is not an epoch or a record identifier. Negative weights represent signed changes, and integration adds them. When the consolidated weight is zero, the pair disappears. The paper defines Z-sets in Section 4 and indexed nested relations in Section 7.3. Section 7.4 applies grouping to aggregation, which this maintained join does not use.}
+  \note{Timing: 1 minute. The native indexed run key is Customer ID. The subscript c,o describes grouping and value ordering, not a composite native key: Order ID then line number lead the value tuple. A row is identified explicitly, for example (7;43,1,...). Remaining value fields are Order date, priority, line price, discount, ship date. No segment is present until the Customer join. Distinct complete values share key 7. Equal complete key/value pairs consolidate into integer multiplicities; zero totals disappear. Neither weight nor visibility superscript is a record identity or transaction timestamp. The underlying representation supports weighted bags even when source primary-key map semantics impose uniqueness. Sources: VLDB 2023 Sections 4 and 7.3; indexed\_wset\_batch.rs.}
 \end{frame}
 
 % 9
-\begin{frame}{Memory and file representations}
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{.47\textwidth}
-      \textbf{Memory indexed batch}\par\medskip
-      \small
-      \begin{tabular}{@{}ll@{}}
-        Keys & $[7,9]$\\[.7em]
-        Offsets & $[0,2,3]$\\[.7em]
-        Values & $[a,b,c]$\\[.7em]
-        Weights & $[1,1,1]$\\
-      \end{tabular}\par\medskip
-      $a=(42,\text{1995-03-01},0)$\par
-      $b=(43,\text{1995-03-02},0)$\par
-      $c=(44,\text{1995-03-03},0)$
-    \end{column}
-    \begin{column}{.47\textwidth}
-      \textbf{Immutable indexed file}\par\medskip
-      \input{figures/nested-file.tex}
-      \par\smallskip\small
-      Trees index groups within each file.\par
-      The spine organizes whole batches.
-    \end{column}
-  \end{columns}
-  \par\bigskip\normalsize
-  Compatible cursors navigate keys, values, and weights in either representation.
-  \source{VecIndexedWSet::from\_parts; storage/file.rs. Customer 9 / Order 44 added only for layout illustration.}
-  \note{Timing: 1.5 minutes. The memory representation uses sorted keys and value-group boundaries. Key 7 selects the half-open value range [0,2), so it has a and b. Key 9 selects [2,3), so it has c. Values and weights align by position. The file representation stores corresponding nested groups in an immutable layer file, with tree indexes per column. The drawing is logical, not a byte-level file layout. The spine's collection and merging of batches is separate from indexes inside an individual file. A trace can contain memory and file batches simultaneously. Both expose compatible cursor operations to seek keys and iterate their values. This layout-only extension does not change the running transaction. Sources: trace/ord/vec/indexed\_wset\_batch.rs:158--199; trace/ord/fallback/indexed\_wset.rs; storage/file.rs:3--65.}
+\begin{frame}{Memory arrays and indexed file groups}
+  \small
+  One illustrative $OL_{c,o}$ run. Arrays preserve complete values and weights.
+  \par\medskip
+  \begin{tabular}{@{}ll@{}}
+    Keys & $[7,9]$\\[.3em]
+    Group offsets & $[0,2,3]$\\[.3em]
+    Values & $[(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10}),$\\
+      & $\phantom{[}(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}),$\\
+      & $\phantom{[}(44,1,\text{1995-03-03},0,50,0,\text{1995-03-12})]$\\[.3em]
+    Weights & $[1,1,1]$\\
+  \end{tabular}
+  \par\smallskip\centering
+  \input{figures/nested-file.tex}
+  \par\smallskip\raggedright
+  Key 7 selects values $[0,2)$; key 9 selects $[2,3)$.\par
+  Compatible memory/file cursors seek keys and iterate values and weights.
+  \source{VecIndexedWSet::from\_parts; storage/file.rs. Customer 9 / Order 44 is a layout-only extension.}
+  \note{Timing: 1.5 minutes. The sorted key array and half-open group offsets identify contiguous value ranges. Each value carries the full OL payload. The immutable layer file contains the same concrete key/value groups, with tree indexes within the file. The diagram is a logical grouping, not a byte-level layout. The spine organizes runs separately from indexes within a file. A trace may retain both memory and file runs and expose compatible cursors. Extra Customer 9 and Order 44/line 1, price 50 and ship date 1995-03-12, illustrate a second group only. They do not change the running transaction. Sources: trace/ord/vec/indexed\_wset\_batch.rs:158--199; storage/file.rs:3--65.}
 \end{frame}
 
 % 10
-\begin{frame}{Finding matching rows}
-  \centering
-  \input{figures/matching-read.tex}
-  \par\bigskip
-  \large
-  Changed Customer 7 reads Orders 42 and 43.\par\medskip\normalsize
-  Consolidate matching values across the visible batches.\par\smallskip
-  Multiply row weights, project the result, and add signed outputs.
-  \source{Cursor seeks and value iteration: trace/cursor.rs. Logical reads: native-state-read-contracts.md.}
-  \note{Timing: 1.5 minutes. Suppose Customer 7 changes after the inserted Order 43 transaction has completed. Its changed key identifies the group of matching old Orders, including 42 and 43. A cursor over accumulated state combines the visible batches and consolidates equal values' weights. The join combines each changed Customer row with each matching Order and emits the projected signed B rows. For a segment overwrite, the changed Customer contains negative BUILDING and positive AUTOMOBILE. Both Orders then yield negative old B and positive replacement B. The illustration describes the logical keyed read, not a universal scan-driving choice. Optional fetch\_join requests delta keys ahead of joining and is configuration-gated. Ordinary joins may choose which cursor drives according to estimated key counts. Sources: operator/dynamic/join.rs:705--749, 1760--1788; trace/cursor.rs; cursor/cursor\_list.rs.}
+\begin{frame}{A changed Customer reads retained intermediate rows}
+  \centering\resizebox{.95\textwidth}{!}{\input{figures/matching-read.tex}}
+  \par\medskip\raggedright
+  Customer 7 changes BUILDING to AUTOMOBILE. $OL_{c,o}$ stays unchanged.
+  \par\smallskip\small
+  For each retained row $r=(7;o,1,\ldots)$, where $o\in\{42,43\}$:\par
+  $-(7,\text{BUILDING},o,\text{date},0,1,\text{price},0,\text{shipdate})$\par
+  $+(7,\text{AUTOMOBILE},o,\text{date},0,1,\text{price},0,\text{shipdate})$
+  \par\smallskip\normalsize
+  Consolidate matching values across visible runs, then project signed outputs.
+  \source{Logical match on Customer ID. Cursor seeks/value iteration: trace/cursor.rs. Full payloads: Appendix A.}
+  \note{Timing: 1.5 minutes. This occurs after the insertion transaction. Customer overwrite emits negative (7,BUILDING) and positive (7,AUTOMOBILE). The first Orders--Lineitem join has no changed inputs, so delta OL is empty and OL remains unchanged. The second join's Customer-change branch reads OL before-state directly and finds both retained lines for Orders 42 and 43. Their dates/prices/ship dates are respectively 1995-03-01/100/1995-03-10 and 1995-03-02/30/1995-03-11. Priority and discount are zero. Each yields a negative old nine-field output and positive new output, changing only the segment. Matching values may span several runs. Trace cursors consolidate complete key/value weights across those runs. The example shows logical matches, not a mandatory delta-led scan. Optional fetch\_join prepares requested keys and is configuration-gated; ordinary joins can choose driving direction by estimated key counts. Sources: join.rs:705--749,1760--1788; trace/cursor.rs; cursor/cursor\_list.rs.}
 \end{frame}
 
 % 11
-\begin{frame}{An integrator's growing LSM}
-  \lead{Orders-by-Customer integrator from slide 5}
-  \par\medskip
-  \centering\input{figures/trace-growth.tex}
-  \par\medskip\normalsize
-  A transaction can supply several physical batches.\par\smallskip
-  Merging replaces batches with their weighted sum.\par\smallskip
-  Integration preserves contents, not every original delta batch.
-  \source{Native retained batches and background merging: trace/spine\_async.rs. Diagram is schematic.}
-  \note{Timing: 1.5 minutes. This is the particular integrator that gives the first join Orders grouped by Customer ID. Batch a inserts Order 42, batch b inserts Order 43, and batch c later deletes Order 42. The retained trace initially holds them separately. A later merge replaces their sum with one batch containing Order 43, since the Order 42 contributions cancel. Incoming transaction deltas can themselves arrive in several physical batches, so batch count is not transaction count. A merged batch can combine several transactions. The spine supplies LSM-like batch retention and background consolidation, while each file supplies its own index. In these root-circuit relation batches, there is no per-record logical epoch timestamp. DBSP also supports timed batches elsewhere. Sources: spine\_async.rs insertion and merge lifecycle; time.rs:214--219; cursor/cursor\_list.rs consolidation.}
+\begin{frame}{Small updates become separate immutable runs}
+  \lead{Native storage shortcoming: no mutable memtable across transactions}
+  \par\smallskip\small
+  in the inspected input and join paths. Each output seals before trace insertion.
+  \par\medskip\centering
+  \resizebox{.98\textwidth}{!}{\input{figures/trace-growth.tex}}
+  \par\medskip\raggedright\normalsize
+  Larger runs grow through merging, including \textbf{merging in memory}.\par\smallskip
+  One transaction can produce several runs. A merged run can combine several\par
+  transactions, and cancellation can remove their contributions.\par\smallskip
+  There is no fixed number of transactions per run.
+  \source{Illustrative run sizes and merge timing. Structural limitation; performance consequences are unmeasured.}
+  \note{Timing: 1.5 minutes. The OL example shows one-record memory runs: a inserts (7;42,1,...), b inserts (7;43,1,...), c retracts the first pair. Each seals before separate trace insertion. There is no mutable memtable across transactions in these paths. A later memory merge constructs a replacement; cancellation leaves only the second pair. Run sizes and merge timing are illustrative. Native scheduling uses levels/counts and pressure/compaction triggers, not this exact three-run schedule. Merging can also choose file output. One transaction may yield several runs; merged runs may combine several transactions. Neither size nor transaction count is fixed. The default 10,000-record join-output chunk target can overshoot when buffered output is submitted and seals final partial output. It does not cap input-map or merged runs. Placement thresholds choose where runs live. Root-circuit untimed runs carry no per-record transaction epoch; timed batches exist elsewhere. Performance consequences remain unmeasured. Sources: input\_upsert.rs:691; input\_upsert.rs:321; join.rs:1926--1957; dev\_tweaks.rs:332; spine\_async.rs:310--365,446--463; fallback/indexed\_wset.rs:546--560.}
 \end{frame}
 
 % 12
-\begin{frame}{Before and current snapshots}
+\begin{frame}{Before-state and after-state snapshots}
   \centering\input{figures/snapshot-visibility.tex}
   \par\bigskip
   \large
-  A snapshot copies references to complete immutable batches.\par\medskip\normalsize
-  Unchanged batches can serve both reads.\par\smallskip
-  Current includes pending changes. Before excludes them.
-  \source{Snapshot strong references: trace/spine\_async/snapshot.rs:55--63, 170--179.}
-  \note{Timing: 1 minute. Return to the transaction that inserts Order 43. The before view references retained batch a containing Order 42. The current view references the same a plus the pending batch b containing Order 43. Making either view copies strong batch references, not all the records. This is a simplified snapshot membership diagram. Actual transactions can produce multiple batches, and completed merged batches can contain contributions from several prior epochs. ``Before'' and ``current'' describe which accumulated state is visible. They do not promise that each referenced batch has homogeneous record provenance. The delayed trace accessor supplies prior transaction visibility; a new independent integrator is unnecessary. Sources: snapshot.rs:55--63, 170--179; accumulate\_trace.rs delayed accessor and flush snapshot; native-state-read-contracts.md:67--77.}
+  A snapshot copies references to complete immutable runs.\par\medskip\normalsize
+  $OL_{c,o}^-$ and $OL_{c,o}^+$ share unchanged runs.\par\smallskip
+  After-state includes the new run. Before-state excludes it.
+  \source{Snapshot strong references: trace/spine\_async/snapshot.rs:55--63,170--179.}
+  \note{Timing: 1 minute. Return to the transaction inserting Order 43 and its line. Before-state OL references run a for Order 42/line 1. After-state references the same a plus newly inserted run b for Order 43/line 1. Snapshot creation clones strong references, not records. This is illustrative membership: actual transactions may supply several runs, and merged runs may combine contributions from several transactions. Superscripts identify visibility, not signed tuple weights or a homogeneous epoch for all records in a run. A delayed trace accessor selects before-state without another independent integrator. Sources: snapshot.rs:55--63,170--179; accumulate\_trace.rs delayed accessor and flush snapshot.}
 \end{frame}
 
 % 13
-\begin{frame}{Merging referenced batches}
-  \centering\input{figures/merge-ownership.tex}
-  \par\bigskip
+\begin{frame}{Merging referenced runs}
+  \centering\resizebox{.95\textwidth}{!}{\input{figures/merge-ownership.tex}}
+  \par\medskip
   \lead{Merge completion releases the spine's source references.}\par\smallskip
-  An old snapshot can still own the old batches.\par\medskip
-  Reclaim a memory batch after its last strong owner releases it.
+  An old snapshot can still own the old runs.\par\medskip
+  Reclaim a memory run after its last strong owner releases it.
   \source{Snapshot Arcs, merge slots, and merge\_complete: snapshot.rs and spine\_async.rs.}
-  \note{Timing: 1.5 minutes. Before the merge, the spine and old snapshot own a and b. During the merge, the merge machinery retains the inputs while building m, so source data and replacement data coexist. At completion the spine installs m and releases its source references. The snapshot still owns a and b until its consumers finish, so completion alone cannot reclaim their memory. The exact lifetime is the final strong owning reference, including any other readers. Spilling shared memory similarly writes a file-backed copy while readers retain the original. For newly created temporary file batches, reader ownership keeps the underlying file alive and DeleteOnDrop removes it when the last owner drops. Checkpoint-marked or reopened persistent files have different keep/delete behavior. That qualification is about retention, not a recovery-design claim. Sources: snapshot.rs:55--63; spine\_async.rs:527--575, 2457--2504; posixio\_impl.rs:615--635.}
+  \note{Timing: 1.5 minutes. Before the merge, the spine and old snapshot own a and b. During the merge, the merge machinery retains the inputs while building m, so source data and replacement data coexist. At completion the spine installs m and releases its source references. The snapshot still owns a and b until its consumers finish, so completion alone cannot reclaim their memory. The exact lifetime is the final strong owning reference, including any other readers. Spilling shared memory similarly writes a file-backed copy while readers retain the original. For newly created temporary file runs, reader ownership keeps the underlying file alive and DeleteOnDrop removes it when the last owner drops. Checkpoint-marked or reopened persistent files have different keep/delete behavior. That qualification is about retention, not a recovery-design claim. Sources: snapshot.rs:55--63; spine\_async.rs:527--575, 2457--2504; posixio\_impl.rs:615--635.}
 \end{frame}
 
 % 14
@@ -327,15 +345,15 @@
   \begin{tabular}{@{}p{.24\textwidth}p{.71\textwidth}@{}}
     \toprule Allocation & Examples\\\midrule
     Retained state & Base-input state, join traces, materialized $V$\\[.8em]
-    Temporary or pinned & Transaction batches, merge output under construction, obsolete batches held by snapshots\\[.8em]
+    Temporary or pinned & Transaction runs, merge output under construction, obsolete runs held by snapshots\\[.8em]
     Cache and lookup & Storage block cache, resident filters, index metadata\\[.8em]
     Other allocations & Connector buffers, stacks, allocator overhead, other work\\\bottomrule
   \end{tabular}
   \par\bigskip
   \large\lead{Process RSS measures resident memory across these allocations.}\par\medskip\normalsize
   Count shared allocations once. File bytes do not equal resident bytes.
-  \source{runtime.rs RSS sampling; batch/operator metrics; buffer\_cache/cache.rs; operations/memory.md.}
-  \note{Timing: 1.5 minutes. Memory accounting must include primary-key input traces as well as join and output state. During maintenance there are transaction batches, exchange or other in-flight batches, merge-building allocations, and old sources pinned by snapshots. Disk state still needs a memory cache and resident lookup filters/metadata. The process also contains connector buffers, thread stacks, allocator overhead, and other allocations. Operator allocation estimates, batch and merge metrics, cache occupancy, and filter memory are useful diagnostics, but they are not interchangeable with process RSS. Summing per-operator estimates blindly can count shared batches more than once. The on-disk file size is not its resident memory footprint. This slide classifies native allocations and makes no measured per-state or savings claim. Sources: circuit/runtime.rs:848--904; storage/buffer\_cache/cache.rs; docs.feldera.com/docs/operations/memory.md.}
+  \source{runtime.rs RSS sampling; operator/run metrics; buffer\_cache/cache.rs; operations/memory.md.}
+  \note{Timing: 1.5 minutes. Memory accounting must include primary-key input traces as well as join and output state. During maintenance there are transaction runs, exchange or other in-flight runs, merge-building allocations, and old sources pinned by snapshots. Disk state still needs a memory cache and resident lookup filters/metadata. The process also contains connector buffers, thread stacks, allocator overhead, and other allocations. Operator allocation estimates, run and merge metrics, cache occupancy, and filter memory are useful diagnostics, but they are not interchangeable with process RSS. Summing per-operator estimates blindly can count shared runs more than once. The on-disk file size is not its resident memory footprint. This slide classifies native allocations and makes no measured per-state or savings claim. Sources: circuit/runtime.rs:848--904; storage/buffer\_cache/cache.rs; docs.feldera.com/docs/operations/memory.md.}
 \end{frame}
 
 % 15
@@ -343,33 +361,34 @@
   \small
   \begin{tabular}{@{}lp{.75\textwidth}@{}}
     \toprule Raw RSS / target & Response with storage configured\\\midrule
-    $<85\%$ & Foreground placement normally waits for merging. Merge output uses the configured size threshold.\\[.65em]
-    $\geq85\%$ & Merge outputs target storage. Large inserted batches spill.\\[.65em]
-    $\geq90\%$ & All nonempty inserted batches target storage. Loose memory batches can trigger earlier merges.\\[.65em]
-    $\geq95\%$ & Transient per-step batches also target storage.\\\bottomrule
+    $<85\%$ & Inserted runs normally remain in memory. Merge output uses the configured size threshold.\\[.65em]
+    $\geq85\%$ & Merge outputs target storage. Large inserted runs spill.\\[.65em]
+    $\geq90\%$ & All nonempty inserted runs target storage. Loose memory runs can trigger earlier merges.\\[.65em]
+    $\geq95\%$ & Transient per-step runs also target storage.\\\bottomrule
   \end{tabular}
   \par\medskip\normalsize
   RSS sampling: about once per second, with hysteresis.\par\smallskip
-  Separate backpressure pauses insertion at \textbf{128 loose batches}.\par\medskip
+  Separate backpressure pauses insertion at \textbf{128 loose runs}.\par\medskip
   \lead{Spilling may copy shared data. Readers can delay reclamation.}
   \source{runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs. RSS target is not an allocator quota.}
-  \note{Timing: 2 minutes. The target is runtime max\_rss\_bytes. Raw pressure is Low below 85 percent, Moderate at 85, High at 90, and Critical at 95. Actions use effective pressure with hysteresis: High persists until raw pressure becomes Low, and Critical persists until raw pressure becomes Moderate or Low. At Moderate, the inserted-batch threshold is configured min\_storage\_bytes, or the default 10 MiB. At High the threshold is zero, and loose memory batches may cause merges below usual batch-count thresholds. At Critical, transient nonempty step batches also target storage. The controller samples roughly once per second, so it is not a strict allocator quota or an instantaneous cap. The 128-loose-batch limit controls merger backlog separately and excludes in-progress merging batches. Shared-memory spill writes a copy and may leave the original pinned. This pressure path does not resize the storage cache. Sources: runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs:455--463, 882--908, 2457--2504.}
+  \note{Timing: 2 minutes. The target is runtime max\_rss\_bytes. Raw pressure is Low below 85 percent, Moderate at 85, High at 90, and Critical at 95. Actions use effective pressure with hysteresis: High persists until raw pressure becomes Low, and Critical persists until raw pressure becomes Moderate or Low. At Moderate, the inserted-run threshold is configured min\_storage\_bytes, or the default 10 MiB. At High the threshold is zero, and loose memory runs may cause merges below usual run-count thresholds. At Critical, transient nonempty step runs also target storage. The controller samples roughly once per second, so it is not a strict allocator quota or an instantaneous cap. The 128-loose-run limit controls merger backlog separately and excludes in-progress merging runs. Shared-memory spill writes a copy and may leave the original pinned. This pressure path does not resize the storage cache. Sources: runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs:455--463,680--691,882--908, 2457--2504.}
 \end{frame}
 
 % 16
-\begin{frame}{Connection to merged-index work}
-  \begin{tabular}{@{}p{.21\textwidth}p{.73\textwidth}@{}}
-    \toprule Status & Accumulated-state reads\\\midrule
-    \textbf{Native} & Retained Customer, Orders, $B$, and Lineitem traces supply the four reads on slide 5.\\[1em]
-    \textbf{Prototype} & One COL merged index reconstructs requested ranges into temporary native batches for those joins.\\[1em]
-    \textcolor{amber}{\textbf{Deferred}} & Broader updates and direct reconstructed cursors. Comparative memory and performance results.\\\bottomrule
+\begin{frame}{Native mechanisms and reconstruction prototype}
+  \begin{tabular}{@{}p{.20\textwidth}p{.74\textwidth}@{}}
+    \toprule Status & State and reads\\\midrule
+    \textbf{Native} & Indexed traces retain immutable runs. Joins read accumulated state with the required visibility.\\[.8em]
+    \textbf{Prototype} & The restricted RF1/RF2 path reconstructs requested ranges into temporary native runs from one COL index.\\[.8em]
+    \textcolor{amber}{\textbf{Deferred}} & Broader updates, direct reconstructed cursors, and comparative memory/performance results.\\\bottomrule
   \end{tabular}
-  \par\bigskip
-  \lead{The logical delta program fixes the required keys, payloads, and visibility.}\par\medskip
-  Prototype scope: subsequent RF1 inserts / RF2 deletes under referential integrity.\par\smallskip
-  Base primary-key state and materialized $V$ remain separately retained.
-  \source{native-state-read-contracts.md; experiment README; WORKFLOW.md. No measured gains claimed.}
-  \note{Timing: 1.5 minutes. Native execution retains ordinary keyed traces for the four logical reads. The opt-in RF1/RF2 prototype publishes previous/current COL snapshots and reconstructs only requested matching ranges into temporary native batches. It decodes, copies, and may sort data before the existing joins consume it. It replaces selected independent trace accumulation and redirects their reads. Base primary-key state and materialized V stay native. The manual index owner is outside the Q3 circuit graph. The supported workload is subsequent complete Order/Lineitem insertions and deletions with referential integrity after setup. Customer updates, replacements, key moves, orphans, and independent Lineitem updates are excluded. Our general signed examples explain native semantics and do not extend prototype scope. Direct cursors and broader updates remain future work. The qualifying measurement campaign is pending, so neither memory savings nor performance gains are established here. Sources: experiment README:50--93; WORKFLOW.md:20--73; native-state-read-contracts.md:373--409.}
+  \par\medskip
+  \lead{The existing prototype uses Orders--Customer first, then Lineitem.}\par\smallskip
+  Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$ (Appendix D).\par\smallskip
+  Subsequent RF1 inserts / RF2 deletes require referential integrity.\par
+  Base primary-key state and $V$ remain separately retained.
+  \source{Explanatory program: slides 4--7. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
+  \note{Timing: 1.5 minutes. The actual experiment joins Orders--Customer first, then Lineitem with B. Its reconstructed accesses are C after-state and O before-state keyed by Customer ID, B after-state and L before-state keyed by Order ID. It does not retain our explanatory OL-first intermediate. Reconstruction decodes/copies and may sort requested ranges into temporary native runs. Base primary-key state and materialized V stay native; the manual COL owner runs outside the Q3 graph. Supported work is subsequent complete Order/Lineitem RF1 insertion and RF2 deletion under referential integrity after setup. Customer updates, replacements, key moves, orphans, and independent Lineitem updates are excluded. General native signed examples do not expand prototype support. Direct cursors and broader updates remain deferred. The measurement qualification campaign is pending; this deck claims no measured savings, update costs, or comparative performance. Sources: experiment README; WORKFLOW.md; native-state-read-contracts.md:373--409; CIRCUIT.md:140.}
 \end{frame}
 
 \pdfstringdefDisableCommands{\def\translate#1{#1}}
@@ -379,48 +398,50 @@
 \begin{frame}{Appendix A: complete example payloads}
   \small
   \begin{tabular}{@{}ll@{}}
-    \toprule Alias & Full row / indexed pair (all weights $+1$)\\\midrule
-    $C_7$ & $(7,\text{BUILDING})$\\[.3em]
-    $O_{42}$ & $(42,7,\text{1995-03-01},0)$\\
-    $O_{43}$ & $(43,7,\text{1995-03-02},0)$\\[.3em]
-    $L_{42,1}$ & $(42,1,100,0,\text{1995-03-10})$\\
-    $L_{43,1}$ & $(43,1,30,0,\text{1995-03-11})$\\[.3em]
-    $B_{42}$ & $(42;\ 7,\text{BUILDING},\text{1995-03-01},0)$\\
-    $B_{43}$ & $(43;\ 7,\text{BUILDING},\text{1995-03-02},0)$\\[.3em]
-    $V_{42}$ & $(7,\text{BUILDING},42,\text{1995-03-01},0,1,100,0,\text{1995-03-10})$\\
-    $V_{43}$ & $(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11})$\\\bottomrule
+    \toprule Relation & Full row / indexed pair (weights $+1$)\\\midrule
+    $C_c$ & $(7,\text{BUILDING})$\\[.3em]
+    $O_o$ & $(42,7,\text{1995-03-01},0)$\\
+     & $(43,7,\text{1995-03-02},0)$\\[.3em]
+    $L_o$ & $(42,1,100,0,\text{1995-03-10})$\\
+     & $(43,1,30,0,\text{1995-03-11})$\\[.3em]
+    $OL_{c,o}$ & $(7;42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$\\
+     & $(7;43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$\\[.3em]
+    $V$ & $(7,\text{BUILDING},42,\text{1995-03-01},0,1,100,0,\text{1995-03-10})$\\
+     & $(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11})$\\\bottomrule
   \end{tabular}
   \par\medskip\normalsize
-  $B$'s semicolon separates key from value.\par
-  Dates, priorities, discounts, and ship dates remain in the maintained payload.
-  \source{Schema and field order: query.sql; native-state-read-contracts.md:87--108.}
-  \note{Use this appendix if the advisor asks what the short aliases carry. O fields are order ID, customer ID, date, ship priority. L fields are order ID, line number, extended price, discount, ship date. B uses order ID as key and customer ID, segment, date, priority as value. V has all nine SQL projection fields. SQL Decimal values are shown without trailing zeros for readability. The extra Customer 9 and Order 44 from the representation slide belong only to that layout illustration.}
+  Subscripts name access ordering. Explicit fields identify individual rows.\par
+  $OL_{c,o}$ uses Customer ID as key. Order ID and line number lead its value.
+  \source{Schema and output field order: query.sql. Semicolon separates indexed key and value.}
+  \note{O fields are Order ID, Customer ID, Order date, priority. L fields are Order ID, line number, price, discount, ship date. OL is our explanatory intermediate with Customer ID key and seven value fields, starting with Order ID and line number. It excludes Customer segment until the second join. V retains the nine SQL projection fields. Decimal values omit trailing zeros for readability. The representation slide's Customer 9 and Order 44/line 1 (date 1995-03-03, priority 0, price 50, discount 0, ship date 1995-03-12) are a layout-only extension. Actual experiment B is different and defined in Appendix D.}
 \end{frame}
 
-\begin{frame}{Appendix B: Customer overwrite and deletion}
-  \textbf{After Order 43's insertion, overwrite Customer 7's segment.}\par
-  $\Delta C=-C_{7,\mathrm{BUILDING}}+C_{7,\mathrm{AUTOMOBILE}}$
-  \par\smallskip\small
-  \begin{tabular}{@{}lll@{}}
+\begin{frame}{Appendix B: overwrite and simultaneous deletion}
+  \small
+  \textbf{Overwrite Customer 7 after Order 43's insertion.}\par
+  $\Delta C_c=\{(7,\text{BUILDING}):-1,(7,\text{AUTOMOBILE}):+1\}$\par
+  $\Delta OL_{c,o}=0$. Retained $OL_{c,o}$ remains unchanged.
+  \par\smallskip
+  \begin{tabular}{@{}p{.24\textwidth}p{.32\textwidth}p{.379\textwidth}@{}}
     \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    $\Delta O$: none & no request to $C_{\current}$ & none\\
-    $\Delta C$: $-C_7,+C'_7$ & $O_{\before}$: 42, 43 & $-B_{42}-B_{43}+B'_{42}+B'_{43}$\\
-    $\Delta L$: none & no request to $B_{\current}$ & none\\
-    $\Delta B$: above & $L_{\before}$: (42,1), (43,1) & $-V_{42}-V_{43}+V'_{42}+V'_{43}$\\\bottomrule
+    $\Delta OL_{c,o}$: none & no request to $C_c^+$ & none\\
+    $\Delta C_c$: $-\text{old},+\text{new}$ & $OL_{c,o}^-$: $(7;42,1,\ldots)$ & $(7,\text{BUILDING},42,\ldots):-1$\newline $(7,\text{AUTOMOBILE},42,\ldots):+1$\\
+      & $OL_{c,o}^-$: $(7;43,1,\ldots)$ & $(7,\text{BUILDING},43,\ldots):-1$\newline $(7,\text{AUTOMOBILE},43,\ldots):+1$\\\bottomrule
   \end{tabular}
-  \par\bigskip\normalsize
-  \textbf{Then delete Order 43 and its Lineitem together.}\par\smallskip
-  $\Delta B=-B'_{43}$\quad and $B_{\current}$ has no 43.\par
-  $-L_{43,1}\join B_{\current}=0$\quad
-  $L_{\before}\join(-B'_{43})=-V'_{43}$
-  \source{Native signed semantics. Customer updates and general overwrites exceed the RF1/RF2 prototype scope.}
-  \note{These are native semantics, not additional prototype features. Customer overwrite leaves dates, priorities, prices, discounts, and ship dates unchanged. Prime means only the segment changed to AUTOMOBILE. Read both Orders from O\_before, then both lines from L\_before. Each old output is retracted and its replacement inserted. In the subsequent simultaneous Order/Lineitem deletion, negative Lineitem sees no current B43. Negative B43 sees the old line and emits the single negative V43. The result occurs once with the correct sign. An Order overwrite similarly uses the input map's negative old row plus positive new row. For a priority change, joined outputs retract priority 0 and insert priority 1.}
+  \par\smallskip
+  All other output fields remain as in Appendix A.
+  \par\medskip
+  \textbf{Then delete Order 43 and Lineitem (43,1) together.}\par
+  $\Delta L_o\join O_o^+=0$; $L_o^-\join\Delta O_o=\{(7;43,1,\ldots):-1\}$.\par
+  $(7,\text{AUTOMOBILE},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11}):-1$.
+  \source{Native signed semantics. These Customer overwrites exceed the RF1/RF2 prototype scope.}
+  \note{Customer overwrite leaves OL unchanged and reads its retained rows directly in the Customer-change branch. Each complete output retracts BUILDING and inserts AUTOMOBILE, preserving all other payloads. Subsequent simultaneous deletion first checks negative Lineitem against after-state Orders: Order 43 is gone, so no output. Before-state Lineitem matches negative Order 43 and produces one negative OL pair. That pair matches current AUTOMOBILE Customer 7 and retracts the AUTOMOBILE output exactly once. Customer deletion alone would also leave OL unchanged and retract both outputs through OL before-state joined with negative Customer. Order priority overwrite emits negative old/positive new OL values; Lineitem price overwrite does likewise. The checker asserts all exact branches, multiplicities, and cancellation.}
 \end{frame}
 
 \begin{frame}{Appendix C: sources and scope}
   \begin{itemize}
     \item \href{https://docs.feldera.com/vldb23.pdf}{Budiu et al., DBSP, VLDB 2023}: integration \S2.3, incremental joins Theorem 3.4, weighted relations \S4, indexed groups \S7.3.
-    \item Native implementation: input upsert, dynamic join, memory/file indexed batches, spine snapshots, merge lifecycle, RSS controller.
+    \item Native implementation: input upsert, dynamic join, memory/file indexed runs, spine snapshots, merge lifecycle, RSS controller.
     \item Current experiment: \texttt{query.sql}, native state-read contracts, \texttt{CIRCUIT.md}, experiment README, workflow.
     \item \href{https://docs.feldera.com/operations/memory/}{Feldera memory documentation}: resident state, cache, lookup metadata, and process allocations.
   \end{itemize}
@@ -428,7 +449,26 @@
   \small Detailed paths, source hashes, configuration, and provenance:\par
   \texttt{SOURCE-EVIDENCE.md} alongside the editable deck.
   \source{Illustrations are schematic. No measurements, performance gains, or recovery guarantees are implied.}
-  \note{Native physical behavior here assumes storage configuration and ordinary non-adaptive joins. Optional fetch changes how keys are prepared for lookup. It does not change the four logical state-read contracts. Storage placement determines where state resides. Checkpoint and recovery design determine what survives a failure. These are separate properties. The source evidence record identifies the inspected implementation and its configuration. The existing RF1/RF2 prototype supports only the stated restricted workload. Detailed fetch tuning, distributed execution, broader reconstruction updates, and measured memory savings remain outside scope.}
+  \note{Native physical behavior here assumes storage configuration and ordinary non-adaptive joins. Optional fetch changes how keys are prepared for lookup. It does not change the logical state-read contracts of the actual experiment. Storage placement determines where state resides. Checkpoint and recovery design determine what survives a failure. These are separate properties. The source evidence record identifies the inspected implementation and its configuration. The existing RF1/RF2 prototype supports only the stated restricted workload. Detailed fetch tuning, distributed execution, broader reconstruction updates, and measured memory savings remain outside scope.}
+\end{frame}
+
+\begin{frame}{Appendix D: the actual experiment program}
+  \lead{Orders--Customer first, then Lineitem--joined Orders}
+  \par\smallskip
+  \begin{align*}
+    \Delta B_o &= \Delta O_c\join C_c^+ + O_c^-\join\Delta C_c\\
+    \Delta V &= \Delta L_o\join B_o^+ + L_o^-\join\Delta B_o\\
+    V^+ &= V^-+\Delta V
+  \end{align*}
+  \small
+  Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$.\par\smallskip
+  $B_o$ pair for Order 43: $(43;7,\text{BUILDING},\text{1995-03-02},0)$.\par
+  $B_o$ is keyed by Order ID. $O_c$ groups Orders by Customer ID.
+  \par\medskip\normalsize
+  This circuit and the slides 4--7 program compute the same maintained $V$.\par
+  The RF1/RF2 prototype reconstructs these actual reads.
+  \source{CIRCUIT.md; native-state-read-contracts.md; experiment README. No experiment changes in this revision.}
+  \note{The compiler's optimized grouping is Orders--Customer first, with Orders on the left. Its projected joined-orders B is then on the right of Lineitem. In the first join changed Orders read after-state Customers and changed Customers read before-state Orders. In the second changed Lineitem reads after-state B and changed B reads before-state Lineitem. The native key for B is Order ID and its value contains Customer ID, segment, Order date, priority. The prototype reconstructs exactly these four accesses; it is not OL-first. The standalone algebra checker verifies both groupings against the same full three-way join, including exact branch assertions for each order. Source: CIRCUIT.md:140; native-state-read-contracts.md:47--108; experiment generated src/lib.rs (ignored build artifact, not modified or regenerated here).}
 \end{frame}
 
 \end{document}

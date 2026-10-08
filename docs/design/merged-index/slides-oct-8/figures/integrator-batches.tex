@@ -1,10 +1,9 @@
-\begin{tikzpicture}[x=1cm,y=1cm,font=\small]
-  \node (delta) at (1.7,1.9) {Successive changes};
-  \node[diagram stage] (i) at (1.7,1.0) {$I$};
-  \node[batch,minimum width=.7cm] (a) at (.5,0) {$a$};
-  \node[batch,minimum width=.7cm] (b) at (1.7,0) {$b$};
-  \node[batch,minimum width=.7cm] (c) at (2.9,0) {$c$};
-  \draw[link] (delta) -- (i);
-  \draw[link] (i.south) -- (b.north);
-  \node at (1.7,-.8) {Read: $a+b+c$};
+\begin{tikzpicture}[x=1cm,y=.65cm,font=\scriptsize]
+  \node[align=left] (buffer) at (2,3.2) {Buffer pair: $(7;43,1,\text{1995-03-02},0,$\\$30,0,\text{1995-03-11})$ with $+1,+1,-1$};
+  \node[align=center] (sort) at (2,1.8) {Sort / consolidate complete pairs\\$(7;43,1,\ldots):+1$};
+  \node[batch,minimum height=.5cm] (sealed) at (2,.3) {Seal immutable run};
+  \node[diagram stage,minimum height=.5cm] (integrator) at (2,-1) {$I_{OL}$: insert into trace};
+  \draw[link] (buffer) -- (sort);
+  \draw[link] (sort) -- node[right] {ordered builder} (sealed);
+  \draw[link] (sealed) -- (integrator);
 \end{tikzpicture}

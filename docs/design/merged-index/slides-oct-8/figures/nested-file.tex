@@ -1,10 +1,11 @@
-\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
-  \node[draw=ink,minimum width=5cm,minimum height=2.8cm] at (2.5,0) {};
-  \node[font=\small,text=quiet] at (2.5,1.05) {Key tree and value-group trees};
-  \node (k7) at (.8,.25) {$7$};
-  \node[align=left] (v7) at (3.4,.25) {$a:\ +1$\quad $b:\ +1$};
-  \node (k9) at (.8,-.75) {$9$};
-  \node (v9) at (3.4,-.75) {$c:\ +1$};
+\begin{tikzpicture}[x=1cm,y=.65cm,font=\scriptsize]
+  \node[draw=ink,minimum width=12cm,minimum height=1.55cm] at (6,0) {};
+  \node[text=quiet,fill=white,inner sep=1pt] at (6,1.1) {Corresponding immutable file groups (key tree / value-group trees)};
+  \node (k7) at (.5,.25) {$7$};
+  \node[align=left] (v7) at (6,.25) {$(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10}):+1$\\
+    $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}):+1$};
+  \node (k9) at (.5,-.7) {$9$};
+  \node (v9) at (6,-.7) {$(44,1,\text{1995-03-03},0,50,0,\text{1995-03-12}):+1$};
   \draw[flow] (k7.east) -- (v7.west);
   \draw[flow] (k9.east) -- (v9.west);
 \end{tikzpicture}

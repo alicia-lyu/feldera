@@ -1,43 +1,44 @@
-\resizebox{.98\textwidth}{!}{%
+\resizebox{.94\textwidth}{!}{%
 \begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
-  % Two branches per join. Small I boxes name every retained input.
-  \node (do) at (0,3.4) {$\Delta O$};
-  \node (dc) at (0,.8) {$\Delta C$};
-  \node[diagram stage] (ic) at (1.8,.8) {$I_C$};
-  \node[diagram stage] (io) at (1.8,3.4) {$I_O$};
-  \node[diagram stage] (j1a) at (4.0,2.8) {$\Delta O\join C_{\current}$};
-  \node[diagram stage] (j1b) at (4.0,1.4) {$O_{\before}\join\Delta C$};
-  \node (db) at (6.3,2.1) {$\Delta B$};
+  \node (dl) at (0,3.4) {$\Delta L_o$};
+  \node (do) at (0,.8) {$\Delta O_o$};
+  \node[diagram stage] (il) at (1.8,3.4) {$I_L$};
+  \node[diagram stage] (io) at (1.8,.8) {$I_O$};
+  \node[diagram stage] (j1a) at (4,2.8) {$\Delta L_o\join O_o^+$};
+  \node[diagram stage] (j1b) at (4,1.4) {$L_o^-\join\Delta O_o$};
+  \node (dol) at (6.3,2.1) {$\Delta OL_{c,o}$};
+  \draw[link] (dl) -- (il);
   \draw[link] (do) -- (io);
-  \draw[link] (dc) -- (ic);
-  \draw[link] (do.north) -- ++(0,.5) -| (j1a.north);
-  \draw[link] (dc.south) -- ++(0,-.5) -| (j1b.south);
-  \draw[link] (io.east) -- (2.6,3.4) |- (j1b.west);
+  \draw[link] (dl.north) -- ++(0,.5) -| (j1a.north);
+  \draw[link] (do.south) -- ++(0,-.5) -| (j1b.south);
+  \draw[link] (il.east) -- (2.6,3.4) |- (j1b.west);
   \draw[link,preaction={draw=white,line width=4pt,-}]
-    (ic.east) -- (2.3,.8) |- (j1a.west);
-  \draw[link] (j1a.east) -| (db.north);
-  \draw[link] (j1b.east) -| (db.south);
+    (io.east) -- (2.3,.8) |- (j1a.west);
+  \draw[link] (j1a.east) -| (dol.north);
+  \draw[link] (j1b.east) -| (dol.south);
   \node[font=\small] at (6.1,2.75) {$+$};
-  \node[diagram stage] (ib) at (8.0,3.4) {$I_B$};
-  \node (dl) at (7.8,.8) {$\Delta L$};
-  \node[diagram stage] (il) at (9.0,.8) {$I_L$};
-  \node[diagram stage] (j2a) at (11.1,2.8) {$\Delta L\join B_{\current}$};
-  \node[diagram stage] (j2b) at (11.1,1.4) {$L_{\before}\join\Delta B$};
-  \node (dv) at (13.4,2.1) {$\Delta V$};
-  \node[diagram stage] (iv) at (15,2.1) {$I_V$};
-  \node (v) at (15,3.4) {$V_{\current}$};
-  \draw[link] (db.east) -- ++(.35,0) |- (ib.west);
-  \draw[link] (ib.east) -- ++(.6,0) |- (j2a.west);
-  \draw[link] (dl.east) -- (il.west);
-  \draw[link] (il.east) -- ++(.25,0) |- (j2b.west);
-  \draw[link] (db.south) -- ++(0,-1.85) -| (j2b.south);
+  \node (dol2) at (7.7,3.4) {$\Delta OL_{c,o}$};
+  \node[diagram stage] (iol) at (9.2,3.4) {$I_{OL}$};
+  \node (dc) at (7.7,.8) {$\Delta C_c$};
+  \node[diagram stage] (ic) at (9.2,.8) {$I_C$};
+  \node[diagram stage] (j2a) at (11.6,2.8) {$\Delta OL_{c,o}\join C_c^+$};
+  \node[diagram stage] (j2b) at (11.6,1.4) {$OL_{c,o}^-\join\Delta C_c$};
+  \node (dv) at (14.1,2.1) {$\Delta V$};
+  \node[diagram stage] (iv) at (15.6,2.1) {$I_V$};
+  \node (v) at (15.6,3.4) {$V^+$};
+  \draw[link] (dol.east) -- ++(.45,0) |- (dol2.west);
+  \draw[link] (dol2) -- (iol);
+  \draw[link] (dc) -- (ic);
+  \draw[link] (dol2.north) -- ++(0,.5) -| (j2a.north);
+  \draw[link] (dc.south) -- ++(0,-.5) -| (j2b.south);
+  \draw[link] (iol.east) -- (10,3.4) |- (j2b.west);
   \draw[link,preaction={draw=white,line width=4pt,-}]
-    (dl.south) -- (7.8,-.15) -- (9.7,-.15) -- (9.7,2.8) -- (j2a.west);
+    (ic.east) -- (9.7,.8) |- (j2a.west);
   \draw[link] (j2a.east) -| (dv.north);
   \draw[link] (j2b.east) -| (dv.south);
-  \node[font=\small] at (13.2,2.75) {$+$};
-  \draw[link] (dv.east) -- (iv.west);
-  \draw[link] (iv.north) -- (v.south);
-  \node[font=\small,text=quiet] at (3.5,4.3) {Join 1: Customer ID};
-  \node[font=\small,text=quiet] at (11,4.3) {Join 2: Order ID};
+  \node[font=\small] at (13.9,2.75) {$+$};
+  \draw[link] (dv) -- (iv);
+  \draw[link] (iv) -- (v);
+  \node[font=\small,text=quiet] at (3.5,4.3) {Join 1: Order ID};
+  \node[font=\small,text=quiet] at (11.6,4.3) {Join 2: Customer ID};
 \end{tikzpicture}}
