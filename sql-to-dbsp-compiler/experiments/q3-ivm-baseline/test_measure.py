@@ -35,7 +35,7 @@ class MeasureTest(unittest.TestCase):
                      "--refresh-list", str(self.refresh),
                      "--report", str(self.report),
                      "--storage-path", str(self.root / "campaign"),
-                     "--cache-bytes", "1024", "--memory-target-bytes", "2048",
+                     "--cache-bytes", str(1024 * 1024), "--memory-target-bytes", "2048",
                      "--runs", "1"]
 
     def test_refresh_paths_and_manifest_validation(self) -> None:
@@ -94,6 +94,8 @@ class MeasureTest(unittest.TestCase):
             calls.append(command)
             if command[:3] == ["git", "rev-parse", "HEAD"]:
                 return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            if command[:3] == ["git", "status", "--short"]:
+                return subprocess.CompletedProcess(command, 0, stdout=" M source.rs\n")
             if command[0].endswith("generate.sh"):
                 raise subprocess.CalledProcessError(1, command)
             driver_report = Path(command[command.index("--report") + 1])
@@ -110,18 +112,22 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(len(manifest["runs"]), 2)
         self.assertEqual(manifest["status"], "failed")
         self.assertIn("restoration failed", manifest["errors"][0])
+        self.assertEqual(manifest["git_status_short"], " M source.rs\n")
 
     def test_linux_qualification_requires_storage_larger_than_limit(self) -> None:
         below = {"sequence": {"settled_storage_bytes": 100}}
         above = {"sequence": {"settled_storage_bytes": 101}}
-        self.assertEqual(measure.qualification("Linux", 100, below)["status"],
+        self.assertEqual(measure.qualification("Linux", 100, below, enforced=True)["status"],
                          "nonqualifying")
-        self.assertEqual(measure.qualification("Linux", 100, above)["status"],
+        self.assertEqual(measure.qualification("Linux", 100, above, enforced=True)["status"],
                          "qualifying")
         self.assertEqual(measure.qualification("Darwin", 100, above)["status"], "smoke")
         self.assertEqual(measure.qualification("Linux", None, above)["status"],
                          "nonqualifying")
-        self.assertEqual(measure.qualification("Linux", 100, above, verify=True)["status"],
+        self.assertEqual(measure.qualification("Linux", 100, above, verify=True,
+                                               enforced=True)["status"],
+                         "nonqualifying")
+        self.assertEqual(measure.qualification("Linux", 100, above)["status"],
                          "nonqualifying")
 
     def test_private_input_copy_rewrites_refresh_paths(self) -> None:
@@ -130,12 +136,21 @@ class MeasureTest(unittest.TestCase):
                 "inputs": {**{key: str(self.root / key)
                                for key in ("customer", "orders", "lineitem")},
                            **{key: str(path) for key, path in files.items()}}}
+        spec["input_hashes"] = {key: measure.sha256(Path(path))
+                                for key, path in spec["inputs"].items()}
         copied = measure.private_inputs(spec)
         self.assertEqual(Path(copied["customer"]).read_text(), "customer")
         private_refresh = json.loads(Path(copied["refresh_list"]).read_text())
         self.assertEqual(Path(private_refresh[1]["rf2"]).read_text(), "rf2")
         self.assertTrue(all(str(self.root / "private-run") in value
                             for entry in private_refresh for value in entry.values()))
+
+    def test_private_copy_rejects_changed_source(self) -> None:
+        spec = {"run_dir": str(self.root / "changed"),
+                "inputs": {"customer": str(self.root / "customer")},
+                "input_hashes": {"customer": "0" * 64}, "refreshes": []}
+        with self.assertRaisesRegex(RuntimeError, "differs from recorded input hash"):
+            measure.private_inputs(spec)
 
     def test_cgroup_limit_and_swap_are_checked(self) -> None:
         group = measure.configure_cgroup(self.root, "run", 1024)
@@ -158,6 +173,8 @@ class MeasureTest(unittest.TestCase):
                            **{key: str(path) for key, path in files.items()}},
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
                          "compaction_timeout_secs": 5, "no_verify": True}}
+        spec["input_hashes"] = {key: measure.sha256(Path(path))
+                                for key, path in spec["inputs"].items()}
         spec_path = self.root / "spec.json"
         spec_path.write_text(json.dumps(spec))
         with patch.object(measure, "verify_membership") as membership, \
@@ -170,6 +187,26 @@ class MeasureTest(unittest.TestCase):
         customer = Path(command[command.index("--customer") + 1])
         self.assertEqual(customer.read_text(), "customer")
         self.assertTrue(customer.is_relative_to(run_dir / "input"))
+        self.assertEqual(command[command.index("--batch") + 1], "10000")
+        evidence = measure.cgroup_evidence(group, run_dir, 4096)
+        self.assertFalse(evidence["enforced"])
+        (group / "memory.swap.max").write_text("0")
+        (group / "memory.peak").write_text("12345\n")
+        (group / "memory.events").write_text("oom 0\n")
+        (group / "io.stat").write_text("8:0 rbytes=9 wbytes=10\n")
+        evidence = measure.cgroup_evidence(group, run_dir, 4096)
+        self.assertTrue(evidence["enforced"])
+        self.assertEqual(evidence["counters"], {
+            "memory.peak": "12345", "memory.events": "oom 0",
+            "io.stat": "8:0 rbytes=9 wbytes=10"})
+
+    def test_cli_rejects_invalid_cache_and_timeout(self) -> None:
+        with self.assertRaises(SystemExit):
+            measure.parse_args([*self.args, "--cache-bytes", "1024"])
+        with self.assertRaises(SystemExit):
+            measure.parse_args([*self.args, "--compaction-timeout-secs", "nan"])
+        parsed = measure.parse_args([*self.args, "--batch", "512"])
+        self.assertEqual(parsed.batch, 512)
 
 
 if __name__ == "__main__":

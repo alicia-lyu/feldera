@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -118,6 +119,9 @@ def private_inputs(spec: dict[str, Any]) -> dict[str, str]:
         source = Path(raw)
         target = destination / f"{name}{source.suffix}"
         shutil.copyfile(source, target)
+        expected = spec["input_hashes"][name]
+        if sha256(target) != expected:
+            raise RuntimeError(f"private copy of {name} differs from recorded input hash")
         copied[name] = str(target)
     refreshes = []
     for number, entry in enumerate(spec["refreshes"]):
@@ -135,6 +139,11 @@ def run_inside_cgroup(spec_path: Path) -> None:
     if (group / "memory.max").read_text().strip() != str(spec["total_memory_bytes"]):
         raise RuntimeError("run cgroup has an unexpected total memory limit")
     copied = private_inputs(spec)
+    write_json(Path(spec["run_dir"]) / "cgroup-proof.json", {
+        "cgroup": str(group), "memory_max": spec["total_memory_bytes"],
+        "memory_swap_max": 0, "membership_verified": True,
+        "private_input_hashes_verified": True,
+    })
     command = driver_command(spec, copied)
     os.execv(command[0], command)
 
@@ -151,6 +160,7 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         "--cache-bytes", str(args["cache_bytes"]),
         "--memory-target-bytes", str(args["memory_target_bytes"]),
         "--compaction-timeout-secs", str(args["compaction_timeout_secs"]),
+        "--batch", str(args.get("batch", 10000)),
         "--workers", "1", "--runs", "1",
         "--storage-path", str(Path(spec["run_dir"]) / "storage"),
     ]
@@ -182,11 +192,13 @@ def build_executables(destination: Path) -> dict[str, Path]:
 
 
 def qualification(system: str, limit: int | None, result: dict[str, Any],
-                  verify: bool = False) -> dict[str, Any]:
+                  verify: bool = False, enforced: bool = False) -> dict[str, Any]:
     if system != "Linux":
         return {"status": "smoke", "reason": "total memory is not enforced on macOS"}
     if limit is None:
         return {"status": "nonqualifying", "reason": "no cgroup v2 total memory limit"}
+    if not enforced:
+        return {"status": "nonqualifying", "reason": "cgroup enforcement was not verified"}
     if verify:
         return {"status": "nonqualifying", "reason": "independent verification was enabled"}
     settled = result.get("sequence", {}).get("settled_storage_bytes")
@@ -197,6 +209,26 @@ def qualification(system: str, limit: int | None, result: dict[str, Any],
     return {"status": "qualifying", "reason": "settled storage exceeds enforced total memory"}
 
 
+def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
+    """Record kernel counters and prove the child used the configured limit."""
+    proof_path = run_dir / "cgroup-proof.json"
+    proof = json.loads(proof_path.read_text()) if proof_path.is_file() else None
+    memory_max_path = group / "memory.max"
+    swap_max_path = group / "memory.swap.max"
+    memory_max = memory_max_path.read_text().strip() if memory_max_path.is_file() else None
+    swap_max = swap_max_path.read_text().strip() if swap_max_path.is_file() else None
+    enforced = proof == {
+        "cgroup": str(group), "memory_max": limit, "memory_swap_max": 0,
+        "membership_verified": True, "private_input_hashes_verified": True,
+    } and memory_max == str(limit) and swap_max == "0"
+    counters = {}
+    for name in ("memory.peak", "memory.events", "io.stat"):
+        path = group / name
+        counters[name] = path.read_text().strip() if path.is_file() else None
+    return {"enforced": enforced, "proof": proof, "memory_max": memory_max,
+            "memory_swap_max": swap_max, "counters": counters}
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("customer", "orders", "lineitem", "refresh-list", "report"):
@@ -204,16 +236,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cache-bytes", type=int, required=True)
     parser.add_argument("--memory-target-bytes", type=int, required=True)
     parser.add_argument("--compaction-timeout-secs", type=float, default=300)
+    parser.add_argument("--batch", type=int, default=10000)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--storage-path", type=Path)
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
-    if args.runs < 1 or args.cache_bytes < 1 or args.memory_target_bytes < 1:
-        parser.error("runs, cache bytes, and memory target bytes must be positive")
-    if args.compaction_timeout_secs <= 0:
-        parser.error("compaction timeout must be positive")
+    if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or args.memory_target_bytes < 1:
+        parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
+    if args.cache_bytes % (1024 * 1024):
+        parser.error("cache bytes must be a whole MiB")
+    if not math.isfinite(args.compaction_timeout_secs) or args.compaction_timeout_secs <= 0:
+        parser.error("compaction timeout must be finite and positive")
     if (args.cgroup_root is None) != (args.total_memory_bytes is None):
         parser.error("--cgroup-root and --total-memory-bytes must be supplied together")
     if args.total_memory_bytes is not None and args.total_memory_bytes < 1:
@@ -230,8 +265,10 @@ def run(argv: list[str]) -> int:
     root = (args.storage_path or EXPERIMENT / "target" / "r5-measurements" /
             campaign_id).resolve()
     manifest: dict[str, Any] = {
-        "status": "failed", "revision": None, "platform": platform.platform(),
+        "status": "failed", "revision": None, "git_status_short": None,
+        "platform": platform.platform(),
         "configuration": {"runs": args.runs, "cache_bytes": args.cache_bytes,
+                          "batch": args.batch,
                           "memory_target_bytes": args.memory_target_bytes,
                           "compaction_timeout_secs": args.compaction_timeout_secs,
                           "verify": not args.no_verify,
@@ -243,6 +280,9 @@ def run(argv: list[str]) -> int:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=EXPERIMENT,
                                   check=True, capture_output=True, text=True)
         manifest["revision"] = revision.stdout.strip()
+        status = subprocess.run(["git", "status", "--short"], cwd=EXPERIMENT,
+                                check=True, capture_output=True, text=True)
+        manifest["git_status_short"] = status.stdout
         refreshes, refresh_paths = refresh_inputs(args.refresh_list.resolve())
         inputs = {name: Path(getattr(args, name)).resolve()
                   for name in ("customer", "orders", "lineitem")}
@@ -266,7 +306,10 @@ def run(argv: list[str]) -> int:
                 manifest["runs"].append(record)
                 spec = {"run_dir": str(run_dir), "executable": str(binaries[mode]),
                         "refreshes": refreshes, "inputs": {k: str(v) for k, v in inputs.items()},
+                        "input_hashes": {k: item["sha256"]
+                                         for k, item in manifest["inputs"].items()},
                         "args": {"cache_bytes": args.cache_bytes,
+                                 "batch": args.batch,
                                  "memory_target_bytes": args.memory_target_bytes,
                                  "compaction_timeout_secs": args.compaction_timeout_secs,
                                  "no_verify": args.no_verify}}
@@ -289,6 +332,8 @@ def run(argv: list[str]) -> int:
                 record["returncode"] = completed.returncode
                 (run_dir / "stdout.log").write_text(completed.stdout)
                 (run_dir / "stderr.log").write_text(completed.stderr)
+                if group:
+                    record["cgroup"] = cgroup_evidence(group, run_dir, args.total_memory_bytes)
                 if completed.returncode:
                     raise RuntimeError(f"{mode} run {repetition} exited {completed.returncode}: "
                                        f"{completed.stderr[-2000:]}")
@@ -297,7 +342,8 @@ def run(argv: list[str]) -> int:
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
                 record["qualification"] = qualification(platform.system(),
-                    args.total_memory_bytes, raw, verify=not args.no_verify)
+                    args.total_memory_bytes, raw, verify=not args.no_verify,
+                    enforced=record.get("cgroup", {}).get("enforced", False))
                 record["status"] = "complete"
                 write_json(report, manifest)
         manifest["status"] = "complete"
