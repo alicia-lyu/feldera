@@ -62,45 +62,28 @@
 % 1
 \begin{frame}{DBSP: incremental computation and physical state}
   \large
-  DBSP maintains query results as inputs change.
-  \par\bigskip\normalsize
-  Its theory expresses incremental programs over weighted relations,\par
-  with integration and composition as core operations.
-  \par\bigskip
-  \lead{This talk recovers physical implementation details from code.}
+  Budiu et al., DBSP, VLDB 2023: Theoretical Generality\par
+  \lead{Physical Design: available only from codebase.}
   \par\medskip
-  Which accumulated rows does a join need?\par\smallskip
-  How does DBSP retain, share, merge, and place that state?
-  \source{Budiu et al., DBSP, VLDB 2023. Native sources and inspection identity: SOURCE-EVIDENCE.md.}
+  E.g., how does DBSP retain, share, merge, and place \emph{intermediate states} required
+  for incremental maintenance?
   \note{Timing: 1 minute. DBSP supplies a theory and implementation of incremental computation: update a maintained result from signed input changes instead of evaluating the complete query again. A weighted relation can express insertions, retractions, and multiplicities. Integration accumulates changes. Generality and composability are established theoretical context, not the focus of this talk. We recover the physical behavior from the inspected implementation: retained state, indexed representations, immutable runs, snapshots, merging, and memory controls. The Orders--Lineitem-first program is an equivalent explanatory choice. The existing experiment uses Orders--Customer first and is identified separately at the end. Theory: VLDB 2023 Sections 2.3 and 3. Physical claims: SOURCE-EVIDENCE.md.}
 \end{frame}
 
 % 2
-\begin{frame}{An already-loaded primary-key table}
-  \lead{Logical map semantics: one current row per primary key}
-  \par\medskip
-  \centering\resizebox{.88\textwidth}{!}{\input{figures/base-storage.tex}}
-  \par\bigskip\raggedright
-  Orders uses Order ID as its primary key.\par\smallskip
-  The retained indexed trace exposes the loaded table's weighted contents.\par\smallskip
-  Its \textbf{LSM-like trace} can retain memory runs and,\par
-  with storage configured, immutable indexed files.
-  \source{input\_upsert.rs; trace/ord.rs; fallback/indexed\_wset.rs. Placement does not establish durability.}
+\begin{frame}{Storage for base relations}
+  LSM-tree with PK uniqueness guarantees
+  \source{input\_upsert.rs; trace/ord.rs.}
   \note{Timing: 1.5 minutes. Consider a table that is already loaded and currently static. The logical interface is a primary-key map, while its retained representation is an indexed trace of immutable sorted runs. A trace cursor reads the combined weighted contents. We do not introduce IVM or overwrite mechanics on this slide. The concrete construction is add\_input\_map\_persistent, input\_upsert, retained Spine<OrdIndexedZSet>, OrdIndexedWSet/FallbackIndexedWSet, memory or file indexed runs. Storage configuration permits indexed layer files. The spine is LSM-like, and the trees within each file index that run. Storage placement alone establishes neither checkpoint durability nor optimal update I/O. Sources: operator/input.rs:465; dynamic/input\_upsert.rs:266--333; typed\_batch.rs:577; trace/ord.rs:5--9; fallback/indexed\_wset.rs:545--560; storage/file.rs:3--65.}
 \end{frame}
 
 % 3
-\begin{frame}{The predicate-free three-way join}
+\begin{frame}{Ex. predicate-free three-way join}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.53\textwidth}
-      \small\ttfamily
-      SELECT c.id, c.segment,\\
-      \hspace*{1em}o.id, o.date, o.priority,\\
-      \hspace*{1em}l.number, l.price,\\
-      \hspace*{1em}l.discount, l.shipdate\\
-      FROM Customer c\\
-      JOIN Orders o ON c.id = o.customer\\
-      JOIN Lineitem l ON o.id = l.order;
+      $V=\text{Customer}\join\text{Orders}\join\text{Lineitem}$\par
+      Notations:\par
+      $R^-$ \quad $R^+$ \quad $\Delta R=R^+-R^-$
     \end{column}
     \begin{column}{.44\textwidth}
       \textbf{Before the transaction}\par\smallskip
@@ -120,26 +103,19 @@
     \end{column}
   \end{columns}
   \par\smallskip
-  \normalsize $V=\text{Customer}\join\text{Orders}\join\text{Lineitem}$
-  \par\normalsize
-  $R^-$: before-state\quad $R^+$: after-state\quad $\Delta R=R^+-R^-$\\
-  Superscripts describe visibility. Signed weights describe tuple changes.
-  \source{query.sql in experiments/q3-ivm-baseline. Column names abbreviated for display.}
   \note{Timing: 1.5 minutes. This SQL projection is the experiment's maintained view, not full TPC-H Q3. It has two equijoins and retains all nine projected fields. There are no Q3 filters, aggregate, ranking, or limit here. Customer 7 has segment BUILDING. Order 42 has customer 7, date 1995-03-01, and ship priority 0. Its line 1 has price 100, discount 0, and ship date 1995-03-10. Primary keys are Customer ID, Order ID, and (Order ID, line number). We will insert Order 43, dated 1995-03-02 with priority 0, and its line 1, priced 30 with discount 0 and ship date 1995-03-11, in the same transaction. The tables show the identifying fields. Appendix A defines complete payloads. The chosen explanatory join order changes no SQL result. R superscript minus and plus name states, not negative and positive row weights. Source: experiments/q3-ivm-baseline/query.sql:1--30.}
 \end{frame}
 
 % 4
 \begin{frame}{The complete incremental program}
-  \lead{Equivalent explanatory program: Orders--Lineitem first}
-  \par\smallskip\centering
   \input{figures/ivm-program.tex}
-  \vspace{-1.4em}
+  \vspace{-1em}
   \begin{align*}
-    \Delta OL_{c,o} &= \Delta L_o\join O_o^+ + L_o^-\join\Delta O_o\\
-    \uncover<2->{\Delta V} &\uncover<2->{= \Delta OL_{c,o}\join C_c^+ + OL_{c,o}^-\join\Delta C_c}\\
-    V^+ &= V^-+\Delta V
+    \Delta OL &= \Delta L\join O^+ + L^-\join\Delta O\\
+    \uncover<2->{\Delta V} &\uncover<2->{= \Delta OL\join C^+ + OL^-\join\Delta C}
   \end{align*}
-  \source{$I_R$ integrates $\Delta R$. Subscripts specify access ordering. Actual experiment: Appendix D.}
+  \par\raggedright
+  $I_{\Delta R}$ ``integrates'' $\Delta R$
   \note<1>{\par Introduce the Orders--Lineitem circuit and its intermediate delta equation.\par}
   \note<2>{\par Reveal the downstream Customer circuit and the final view delta equation together.\par}
   \note{Timing: 2 minutes. Each I box accumulates transaction deltas in a trace. Join 1 matches Order ID. Its output is rekeyed to Customer ID, with Order ID then line number leading the value tuple. Join 2 matches Customer ID and projects all nine output fields. The superscripts select after-state or before-state. The first join's changed Lineitem sees after-state Orders, while changed Orders sees only before-state Lineitem. The second join's changed OL sees after-state Customer, while changed Customer sees only before-state OL. Each simultaneous-change term occurs once. Before and after consumers can share a trace, with delayed access choosing visibility. This is a logically equivalent explanatory order, not a regeneration or relabeling of the existing circuit. Its actual order is Orders--Customer first (Appendix D). Source: dynamic/join.rs:698--749. Theory: VLDB 2023 Theorem 3.4.}
@@ -150,13 +126,12 @@
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.48\textwidth}
       \small
-      \begin{tabular}{@{}lll@{}}
-        \toprule State & Access key & Reads\\\midrule
-        $O_o$ & Order ID & $O_o^+$\\
-        $L_o$ & Order ID & $L_o^-$\\
-        $OL_{c,o}$ & Customer ID & $OL_{c,o}^-$\\
-        $C_c$ & Customer ID & $C_c^+$\\
-        $V$ & Output row & integrate\\\bottomrule
+      \begin{tabular}{@{}ll}
+        \toprule State & Access key\\\midrule
+        $O_o$ & Order ID\\
+        $L_o$ & Order ID\\
+        $OL_{c,o}$ & Customer ID\\
+        $C_c$ & Customer ID\\\bottomrule
       \end{tabular}
       \par
       Base identity: $C$: Customer ID; $O$: Order ID;\par

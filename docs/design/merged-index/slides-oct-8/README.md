@@ -7,6 +7,14 @@ fixed-layout overlays, retaining their slide number. Each PDF therefore has
 **29 rendered pages**: 25 main-talk pages and four appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
+The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on
+2026-10-08. All 29 rebuilt presentation pages match that reference pixel for
+pixel at 144 dpi. The recovered opening slides simplify the introduction,
+base storage, and example notation; the circuit uses unsubscripted relations
+and delta-labeled integrators; the state table lists four indexed states.
+Existing speaker notes were retained because the reference has no notes.
+See [the recovery record](restore-user-pdf-plan.md) for scope and verification.
+
 ## Build and deliverables
 
 With Beamer, TikZ, Libertine, NewTX, `latexmk`, and Python 3.10 or newer:
@@ -27,8 +35,8 @@ No sibling checkout is required to build.
 
 The explanatory program joins **Orders–Lineitem first**, groups its `OL`
 intermediate by Customer ID with values ordered first by Order ID then line
-number, and then joins Customer. Both branches of both joins and output
-integration precede representation internals. The predicate-free SQL view and
+number, and then joins Customer. Both branches of both joins and the worked
+output integration precede representation internals. The predicate-free view and
 all nine output fields remain unchanged.
 
 The actual experiment and restricted RF1/RF2 reconstruction prototype use
@@ -74,7 +82,7 @@ Amber identifies deferred work on slide 16.
 
 | Topics | Subject | Minutes |
 | --- | --- | ---: |
-| 1–3 | DBSP context, loaded base storage, SQL and visibility | 4 |
+| 1–3 | DBSP context, base storage, example and notation | 4 |
 | 4–7 | Complete program, state/runs, both worked joins | 8 |
 | 8–10 | Records, representations, changed-Customer reads | 4 |
 | 11–13 | Separate small runs, snapshots, merge ownership | 4 |
