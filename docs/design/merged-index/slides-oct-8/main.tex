@@ -136,10 +136,12 @@
   \vspace{-1.4em}
   \begin{align*}
     \Delta OL_{c,o} &= \Delta L_o\join O_o^+ + L_o^-\join\Delta O_o\\
-    \Delta V &= \Delta OL_{c,o}\join C_c^+ + OL_{c,o}^-\join\Delta C_c\\
+    \uncover<2->{\Delta V} &\uncover<2->{= \Delta OL_{c,o}\join C_c^+ + OL_{c,o}^-\join\Delta C_c}\\
     V^+ &= V^-+\Delta V
   \end{align*}
   \source{$I_R$ integrates $\Delta R$. Subscripts specify access ordering. Actual experiment: Appendix D.}
+  \note<1>{\par Introduce the Orders--Lineitem circuit and its intermediate delta equation.\par}
+  \note<2>{\par Reveal the downstream Customer circuit and the final view delta equation together.\par}
   \note{Timing: 2 minutes. Each I box accumulates transaction deltas in a trace. Join 1 matches Order ID. Its output is rekeyed to Customer ID, with Order ID then line number leading the value tuple. Join 2 matches Customer ID and projects all nine output fields. The superscripts select after-state or before-state. The first join's changed Lineitem sees after-state Orders, while changed Orders sees only before-state Lineitem. The second join's changed OL sees after-state Customer, while changed Customer sees only before-state OL. Each simultaneous-change term occurs once. Before and after consumers can share a trace, with delayed access choosing visibility. This is a logically equivalent explanatory order, not a regeneration or relabeling of the existing circuit. Its actual order is Orders--Customer first (Appendix D). Source: dynamic/join.rs:698--749. Theory: VLDB 2023 Theorem 3.4.}
 \end{frame}
 

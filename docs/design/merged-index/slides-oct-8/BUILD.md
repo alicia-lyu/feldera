@@ -41,13 +41,15 @@ A successful TeX build alone does not establish visual correctness.
 
 | PDF pages | Topic / advance |
 | --- | --- |
-| 1–5 | Main slides 1–5 |
-| 6–10 | Slide 6, Orders–Lineitem join, advances 1–5 |
-| 11–15 | Slide 7, Customer join, advances 1–5 |
-| 16–24 | Main slides 8–16 |
-| 25–28 | Appendices A–D |
+| 1–3 | Main slides 1–3 |
+| 4–5 | Slide 4, complete program, advances 1–2 |
+| 6 | Main slide 5 |
+| 7–11 | Slide 6, Orders–Lineitem join, advances 1–5 |
+| 12–16 | Slide 7, Customer join, advances 1–5 |
+| 17–25 | Main slides 8–16 |
+| 26–29 | Appendices A–D |
 
-Both PDFs have 28 pages. The main talk still has 16 topics: advancing an
+Both PDFs have 29 pages. The main talk still has 16 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 

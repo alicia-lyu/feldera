@@ -17,7 +17,8 @@
   \draw[link] (j1a.east) -| (dol.north);
   \draw[link] (j1b.east) -| (dol.south);
   \node[font=\small] at (6.1,2.75) {$+$};
-  \node (dol2) at (7.7,3.4) {$\Delta OL_{c,o}$};
+  \uncover<2->{%
+  \coordinate (dol2) at (7.7,3.4);
   \node[diagram stage] (iol) at (9.2,3.4) {$I_{OL}$};
   \node (dc) at (7.7,.8) {$\Delta C_c$};
   \node[diagram stage] (ic) at (9.2,.8) {$I_C$};
@@ -26,10 +27,9 @@
   \node (dv) at (14.1,2.1) {$\Delta V$};
   \node[diagram stage] (iv) at (15.6,2.1) {$I_V$};
   \node (v) at (15.6,3.4) {$V^+$};
-  \draw[link] (dol.east) -- ++(.45,0) |- (dol2.west);
-  \draw[link] (dol2) -- (iol);
+  \draw[link] (dol.east) -- ++(.45,0) |- (dol2) -- (iol);
   \draw[link] (dc) -- (ic);
-  \draw[link] (dol2.north) -- ++(0,.5) -| (j2a.north);
+  \draw[link] (dol2) -- ++(0,.5) -| (j2a.north);
   \draw[link] (dc.south) -- ++(0,-.5) -| (j2b.south);
   \draw[link] (iol.east) -- (10,3.4) |- (j2b.west);
   \draw[link,preaction={draw=white,line width=4pt,-}]
@@ -39,6 +39,7 @@
   \node[font=\small] at (13.9,2.75) {$+$};
   \draw[link] (dv) -- (iv);
   \draw[link] (iv) -- (v);
-  \node[font=\small,text=quiet] at (3.5,4.3) {Join 1: Order ID};
   \node[font=\small,text=quiet] at (11.6,4.3) {Join 2: Customer ID};
+  }
+  \node[font=\small,text=quiet] at (3.5,4.3) {Join 1: Order ID};
 \end{tikzpicture}}

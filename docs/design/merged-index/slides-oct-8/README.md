@@ -1,9 +1,10 @@
 # DBSP physical design: advisor presentation
 
 This editable 16:9 Beamer/TikZ deck has **16 main slide topics** for a
-20–25 minute talk and four appendix topics. Slides 6 and 7 each have five
+20–25 minute talk and four appendix topics. Slide 4 reveals the downstream
+Customer circuit and its delta equation together on the second overlay. Slides 6 and 7 each have five
 fixed-layout overlays, retaining their slide number. Each PDF therefore has
-**28 rendered pages**: 24 main-talk pages and four appendix pages.
+**29 rendered pages**: 25 main-talk pages and four appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 ## Build and deliverables
