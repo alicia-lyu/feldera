@@ -53,7 +53,12 @@ impl BaseState {
         if !cursor.val_valid() || cursor.weight() != 1 {
             bail!("base relation has invalid primary-key multiplicity");
         }
-        Ok(Some(cursor.val_to_json()?))
+        let row = cursor.val_to_json()?;
+        cursor.step_val();
+        if cursor.val_valid() {
+            bail!("base relation has multiple values for one primary key");
+        }
+        Ok(Some(row))
     }
 
     pub(crate) fn customer_exists(&self, key: i64) -> Result<bool> {
@@ -93,6 +98,10 @@ impl BaseState {
                 discount_hundredths: cents(&val, "l_discount")?,
                 ship_date: string(&val, "l_shipdate")?,
             });
+            cursor.step_val();
+            if cursor.val_valid() {
+                bail!("Lineitem has multiple values for one primary key");
+            }
             cursor.step_key();
         }
         Ok(lines)
@@ -337,10 +346,40 @@ pub(crate) fn load_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(feature = "merged-index"))]
+    #[cfg(feature = "merged-index")]
+    use crate::{reconstruction, ManualIndex, Q3State};
     use crate::{Inputs, Reference};
-    #[cfg(not(feature = "merged-index"))]
     use dbsp::circuit::CircuitConfig;
+
+    #[cfg(feature = "merged-index")]
+    fn submit_test_change(
+        circuit: &mut dbsp::DBSPHandle,
+        input: &mut Inputs,
+        reference: &mut Reference,
+        change: Change,
+        index: &ManualIndex,
+        q3: &Q3State,
+    ) -> Result<()> {
+        let (placements, rows) = reconstruction::prepare(&change)?;
+        let (before, after) = index.append(rows)?;
+        q3.publish(before, after, placements)
+            .map_err(anyhow::Error::msg)?;
+        change.apply(reference, input)?;
+        circuit.transaction()?;
+        q3.finish().map_err(anyhow::Error::msg)
+    }
+
+    #[cfg(not(feature = "merged-index"))]
+    fn submit_test_change(
+        circuit: &mut dbsp::DBSPHandle,
+        input: &mut Inputs,
+        reference: &mut Reference,
+        change: Change,
+    ) -> Result<()> {
+        change.apply(reference, input)?;
+        circuit.transaction()?;
+        Ok(())
+    }
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -430,10 +469,17 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "merged-index"))]
     #[test]
     fn base_snapshot_supports_current_deletion_and_rejects_stale_rows() -> Result<()> {
+        #[cfg(feature = "merged-index")]
+        let q3 = Q3State::default();
+        #[cfg(feature = "merged-index")]
+        let (mut circuit, catalog) =
+            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3.clone())?;
+        #[cfg(not(feature = "merged-index"))]
         let (mut circuit, catalog) = q3_ivm_baseline::circuit(CircuitConfig::with_workers(1))?;
+        #[cfg(feature = "merged-index")]
+        let index = ManualIndex::new(circuit.runtime());
         let mut input = Inputs::new(&catalog)?;
         let mut reference = Reference::default();
         let customer = Customer {
@@ -462,8 +508,17 @@ mod tests {
             ..Change::default()
         };
         BaseState::new(&catalog)?.validate(&customers)?;
-        customers.apply(&mut reference, &mut input)?;
-        circuit.transaction()?;
+        #[cfg(feature = "merged-index")]
+        submit_test_change(
+            &mut circuit,
+            &mut input,
+            &mut reference,
+            customers,
+            &index,
+            &q3,
+        )?;
+        #[cfg(not(feature = "merged-index"))]
+        submit_test_change(&mut circuit, &mut input, &mut reference, customers)?;
         let state = BaseState::new(&catalog)?;
         let load = Change {
             orders: vec![(order.clone(), true)],
@@ -471,8 +526,10 @@ mod tests {
             ..Change::default()
         };
         state.validate(&load)?;
-        load.apply(&mut reference, &mut input)?;
-        circuit.transaction()?;
+        #[cfg(feature = "merged-index")]
+        submit_test_change(&mut circuit, &mut input, &mut reference, load, &index, &q3)?;
+        #[cfg(not(feature = "merged-index"))]
+        submit_test_change(&mut circuit, &mut input, &mut reference, load)?;
         let state = BaseState::new(&catalog)?;
         assert_eq!(state.order(7)?, Some(order.clone()));
         assert_eq!(state.native_lines(7)?, vec![first.clone(), second.clone()]);
@@ -533,8 +590,17 @@ mod tests {
         let mut stale = delete.clone();
         stale.lines[0].0.price_cents += 1;
         assert!(state.validate(&stale).is_err());
-        delete.apply(&mut reference, &mut input)?;
-        circuit.transaction()?;
+        #[cfg(feature = "merged-index")]
+        submit_test_change(
+            &mut circuit,
+            &mut input,
+            &mut reference,
+            delete,
+            &index,
+            &q3,
+        )?;
+        #[cfg(not(feature = "merged-index"))]
+        submit_test_change(&mut circuit, &mut input, &mut reference, delete)?;
         let state = BaseState::new(&catalog)?;
         assert!(state.order(7)?.is_none());
         assert!(state.native_lines(7)?.is_empty());
