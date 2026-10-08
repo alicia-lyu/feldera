@@ -581,7 +581,8 @@ The roadmap uses **R1–R5**. These labels are distinct from the older
 5. **R5 — Maintenance measurement harness, implemented; qualification pending.** The
    [experiment guide](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#r5-maintenance-measurements)
    describes bounded loading, maintained-storage RF2 discovery, per-phase accounting,
-   fresh native and reconstructed runs, and the JSON report. macOS runs are smoke tests;
+   fresh native and reconstructed runs, scoped use of the configured worker cache, and
+   the JSON report. macOS runs are smoke tests;
    equal enforced total-memory qualification requires Linux cgroup v2 runs with swap
    disabled and remains pending. Refresh completion has no durability guarantee, so
    comparable checkpoint costs are deferred. Broader updates, residual Q3, and Q5/Q10

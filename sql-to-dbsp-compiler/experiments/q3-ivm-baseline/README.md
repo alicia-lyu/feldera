@@ -141,6 +141,12 @@ drainage, and reports count these transactions in
 `snapshot_publication_transactions`. A complete refresh that cannot execute
 within its budget fails the run rather than being split.
 
+Storage lookups by the driver and manual-index owner run inside
+`Runtime::with_buffer_cache`, bound to the already configured worker cache.
+This scopes lookups to the selected cache without creating another cache; when
+no binding is active, the runtime falls back to its global 256 MiB cache. The
+binding is restored during unwind.
+
 The JSON report records input and executable hashes, revision, configuration,
 per-phase measurements, and qualification status. It separates RF2 discovery,
 input preparation and operational checks, index maintenance, the Q3 transaction,
@@ -170,9 +176,10 @@ through `JAVA_HOME` or `PATH` and the compiler already built:
 ```
 
 The script generates both circuit modes and runs each full experiment suite,
-plus the COL suite, using Rust 1.96.1 and offline locked dependencies. It checks
-Rust formatting, Clippy with warnings denied, shell syntax, and whitespace. It
-restores default native generation on exit, including when a check fails. Logs and
+plus the COL suite and Python runner tests, using Rust 1.96.1 and offline locked
+dependencies. It checks Rust formatting, Clippy with warnings denied, shell
+syntax, and whitespace. It restores default native generation on exit, including
+when a check fails. Logs and
 JSON result files are stored in a fresh ignored `target/r4-verification/`
 directory; `CARGO_TARGET_DIR` can select an existing compilation cache.
 

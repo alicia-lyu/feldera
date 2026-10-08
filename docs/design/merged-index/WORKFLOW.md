@@ -86,6 +86,10 @@ each run, with three repetitions by default. It runs with Java 21 and Rust
 Each run requires file-backed base state, materialized `V`, and manual merged
 index; explicit cache capacity, memory-pressure target, and compaction timeout;
 one worker; native join fetch; no compression; and `min_storage_bytes=0`.
+Driver and manual-index storage lookups are scoped with
+`Runtime::with_buffer_cache` to the existing configured worker cache, without
+allocating an additional cache. An unbound lookup uses the runtime's global
+256 MiB cache; the scoped binding is restored during unwind.
 One shared `BaseState` uses Catalog batch snapshots and is refreshed after each
 transaction for RF2 discovery and workload checks. File backing is checked from
 `SerBatch::location`. Since `min_storage_bytes=0` may leave inserts in memory at
@@ -125,11 +129,12 @@ With the compiler built and Java 21 configured, run:
 ./verify.sh
 ```
 
-This runs the native and reconstructed experiment suites and the COL suite with
-Rust 1.96.1, `--offline --locked`, formatting checks, strict Clippy, shell syntax,
-and whitespace checks. Both generated modes run the same loading and RF1/RF2
-test transactions with one worker. Initial loading is included in correctness verification; it remains
-setup for maintenance measurements. Each committed transaction compares emitted
+This runs the native and reconstructed experiment suites, the COL suite, and
+Python runner tests with Rust 1.96.1, `--offline --locked`, formatting checks,
+strict Clippy, shell syntax, and whitespace checks. Both generated modes run the
+same loading and RF1/RF2 test transactions with one worker. Initial loading is
+included in correctness verification; it remains setup for maintenance
+measurements. Each committed transaction compares emitted
 `ΔV` and materialized `V` with a full join recomputed from the logical input records.
 The reconstructed run also checks each reader's rows against expected rows computed
 directly from those records for the requested keys. Each run writes a JSON file with
