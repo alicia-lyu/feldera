@@ -208,13 +208,25 @@ DBSP library Clippy passed. The broader DBSP test-code Clippy check found 56
 existing lint errors outside the modified files; its output is retained at
 `target/r5-dbsp-clippy-tests.log` in this experiment.
 
-The release smoke fixtures contain 64 Customers, 512 Orders, and 2,048 Lines.
-Each campaign executes six complete refreshes: RF1, RF2, repeated RF2 after
-those Orders are absent, RF1 reinsertion, RF2, and an empty RF2. Delete lists
-include a duplicate requested ID and an absent ID. Clustered and scattered
-refreshes each insert 16 Orders and 64 Lines, assigned respectively to one
-Customer or 16 Customers. The large-group refresh inserts one Order with
-10,000 Lines. All base Orders are ascending and Lineitems are grouped by Order.
+### Workload definitions
+
+All three workloads start with **64 Customers, 512 Orders, and 2,048 Lines**.
+The workload label describes the Orders and Lines added by each RF1:
+
+| Workload type | Orders per RF1 | Customers referenced | Lines per Order | Total Lines per RF1 |
+| --- | ---: | ---: | ---: | ---: |
+| **clustered** | 16 | 1 shared Customer | 4 | 64 |
+| **scattered** | 16 | 16 distinct Customers | 4 | 64 |
+| **large-group** | 1 | 1 Customer | 10,000 | 10,000 |
+
+**RF1 inserts complete Order/Lineitem groups. RF2 deletes the requested Orders
+and all their current Lines.** Each campaign executes the same six-refresh
+sequence: RF1, RF2, repeated RF2 after those Orders are absent, RF1 reinsertion,
+RF2, and an empty RF2. Delete lists include a duplicate requested ID and an
+absent ID. All base Orders are ascending and Lineitems are grouped by Order.
+
+**Mode:** `native` uses the generated native Q3 circuit; `reconstructed` uses
+manual merged-index maintenance and the reconstructed Q3 circuit.
 
 Each mode uses a separate preserved release executable, three fresh processes,
 and fresh storage directories. Settings are one worker, a 512-row loading
@@ -226,8 +238,21 @@ Initial loading is excluded. Sequence latency includes final compaction,
 publication of compacted snapshots, and output cleanup. The `index_ms + q3_ms`
 subtotal excludes discovery, checks/input preparation, and publication/cleanup.
 
-The following values are independent medians over three fresh runs on
+### Timing definitions and results
+
+**All timing columns cover the complete six-refresh sequence, with initial
+loading excluded.** Independent correctness checking is disabled in these runs.
+
+| Column | Definition |
+| --- | --- |
+| **Foreground ms** | Sum of each refresh's elapsed wall time: input reads/RF2 discovery, operational checks, input preparation, index maintenance, Q3 transaction, and publication/cleanup. Final drainage is measured separately. |
+| **Sequence ms** | Elapsed wall time from the start of the first refresh through completion of final drainage. Includes foreground work, final drainage, and between-refresh measurement/logging overhead. |
+| **Final drainage ms** | Elapsed wall time after the six refreshes to drain circuit/manual-index compaction, publish compacted snapshots through an empty logical transaction, release obsolete snapshots, and clean outputs. Included in Sequence ms. |
+| **Sequence CPU ms** | Process user + system CPU time over the sequence, summed across driver, runtime, and auxiliary threads, including final drainage. |
+
+The results are from three fresh runs on
 `macOS-26.3.1-arm64-arm-64bit-Mach-O`, at revision `42bbbfa3c`.
+**Each numeric column is its own median; displayed medians need not add up.**
 
 | Workload | Mode | Foreground ms | Sequence ms | Final drainage ms | Sequence CPU ms |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -238,12 +263,24 @@ The following values are independent medians over three fresh runs on
 | large-group | native | 99.263 | 121.413 | 24.168 | 105.249 |
 | large-group | reconstructed | 120.953 | 142.452 | 21.320 | 129.226 |
 
-Backend reads were zero operations and zero bytes in every run; this small
-maintained state fit in the configured cache. OS physical read/write bytes are
-explicitly unavailable on macOS. RSS is the process high-water value, including
-loading; sampled storage peaks use 10 ms samples and a final sample. The resource
-values below are also independent medians; storage, RSS, and cache columns are
-bytes.
+### Resource definitions and results
+
+**Write counters cover the six refreshes and final drainage. Storage, RSS, and
+cache columns are bytes.** Each numeric column below is also its own median.
+
+| Column | Definition |
+| --- | --- |
+| **Write ops** | Number of storage-backend write operations during the sequence, from write-latency histogram counts. |
+| **Write bytes** | Bytes submitted to storage-backend writes during the sequence, from block-size histogram sums. |
+| **Settled storage** | Sum of regular-file lengths in the run's storage directory after final drainage. |
+| **Sampled peak storage** | Maximum observed sum of regular-file lengths in the storage directory during maintenance, sampled every 10 ms and once at the end. Shorter peaks may be missed. |
+| **Peak RSS** | Process resident-memory high-water mark since process start, including initial loading and all driver/runtime threads. |
+| **Cache occupancy** | Bytes occupied in the configured runtime cache after final drainage; its capacity is 32 MiB. |
+
+Backend reads were **zero operations and zero bytes in every run**; this small
+maintained state fit in the configured cache. **OS physical read/write bytes are
+unavailable on macOS.** The write counters above measure storage-backend activity;
+they do not establish physical device I/O or durability.
 
 | Workload | Mode | Write ops | Write bytes | Settled storage | Sampled peak storage | Peak RSS | Cache occupancy |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
