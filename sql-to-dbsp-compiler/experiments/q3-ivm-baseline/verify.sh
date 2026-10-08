@@ -61,5 +61,5 @@ run_check col-clippy cargo +1.96.1 clippy --manifest-path "${col_manifest}" \
   --offline --locked --all-targets -j2 -- -D warnings
 run_check runner-tests python3 -m unittest discover -s "${experiment_dir}" -p test_measure.py -v
 run_check shell-syntax bash -n "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh"
-run_check whitespace git -C "${experiment_dir}" diff --check
+run_check whitespace git -C "${experiment_dir}" diff --check -- . ../merged-index-col
 echo "RF1/RF2 suites, reader projections, and exact transaction transcripts agree."

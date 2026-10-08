@@ -225,8 +225,14 @@ pub(crate) fn batch_storage_evidence(reader: &dyn SerBatchReader) -> Value {
             !batch.is_empty() && batch.location() != dbsp::trace::BatchLocation::Storage
         })
         .count();
+    let storage_batches = batches
+        .iter()
+        .filter(|batch| {
+            !batch.is_empty() && batch.location() == dbsp::trace::BatchLocation::Storage
+        })
+        .count();
     serde_json::json!({"snapshot_batch_count": batches.len(), "memory_batch_count": memory_batches,
-        "file_backed": memory_batches == 0})
+        "storage_batch_count": storage_batches, "file_backed": memory_batches == 0})
 }
 
 pub(crate) fn rf2_changes(

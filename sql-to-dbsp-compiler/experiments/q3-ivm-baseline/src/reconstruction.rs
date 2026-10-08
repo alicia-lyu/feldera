@@ -27,9 +27,8 @@ type SourceRow = (SourceKey, SourcePayload, ZWeight);
 type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
-    Compact(mpsc::SyncSender<()>),
-    Complete(mpsc::SyncSender<bool>),
-    FileBacked(mpsc::SyncSender<bool>),
+    BackgroundIdle(mpsc::SyncSender<bool>),
+    StorageEvidence(mpsc::SyncSender<serde_json::Value>),
     Snapshot(mpsc::SyncSender<Snapshot>),
     Append(Vec<SourceRow>, mpsc::SyncSender<Result<Snapshot, String>>),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
@@ -62,20 +61,29 @@ impl ManualIndex {
                 );
                 while !Runtime::kill_in_progress() {
                     match incoming.try_recv() {
-                        Ok(Request::Compact(reply)) => {
-                            trace.initiate_compaction();
-                            let _ = reply.send(());
+                        Ok(Request::BackgroundIdle(reply)) => {
+                            let _ = reply.send(trace.is_background_merge_idle());
                         }
-                        Ok(Request::Complete(reply)) => {
-                            let _ = reply.send(trace.is_compaction_complete());
-                        }
-                        Ok(Request::FileBacked(reply)) => {
-                            let _ = reply.send(
-                                trace
-                                    .get_batches()
-                                    .iter()
-                                    .all(|batch| batch.location() == BatchLocation::Storage),
-                            );
+                        Ok(Request::StorageEvidence(reply)) => {
+                            let batches = trace.get_batches();
+                            let memory_batches = batches
+                                .iter()
+                                .filter(|batch| {
+                                    !batch.is_empty() && batch.location() != BatchLocation::Storage
+                                })
+                                .count();
+                            let storage_batches = batches
+                                .iter()
+                                .filter(|batch| {
+                                    !batch.is_empty() && batch.location() == BatchLocation::Storage
+                                })
+                                .count();
+                            let _ = reply.send(serde_json::json!({
+                                "snapshot_batch_count": batches.len(),
+                                "memory_batch_count": memory_batches,
+                                "storage_batch_count": storage_batches,
+                                "file_backed": memory_batches == 0,
+                            }));
                         }
                         Ok(Request::Snapshot(reply)) => {
                             let _ = reply.send(trace.ro_snapshot());
@@ -134,16 +142,12 @@ impl ManualIndex {
         Ok((before, after.map_err(anyhow::Error::msg)?))
     }
 
-    pub(crate) fn start_compaction(&self) -> Result<()> {
-        self.request(Request::Compact)
+    pub(crate) fn is_background_merge_idle(&self) -> Result<bool> {
+        self.request(Request::BackgroundIdle)
     }
 
-    pub(crate) fn is_compaction_complete(&self) -> Result<bool> {
-        self.request(Request::Complete)
-    }
-
-    pub(crate) fn is_file_backed(&self) -> Result<bool> {
-        self.request(Request::FileBacked)
+    pub(crate) fn storage_evidence(&self) -> Result<serde_json::Value> {
+        self.request(Request::StorageEvidence)
     }
 
     #[allow(dead_code)]

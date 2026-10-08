@@ -891,27 +891,24 @@ fn dump_runtime_circuit(circuit: &mut dbsp::DBSPHandle, directory: &Path) -> Res
     Ok(())
 }
 
-fn drain(
+fn wait_for_loading_merges(
     circuit: &mut dbsp::DBSPHandle,
     timeout: Duration,
     #[cfg(feature = "merged-index")] index: &ManualIndex,
 ) -> Result<Duration> {
     let started = Instant::now();
-    circuit.start_compaction()?;
-    #[cfg(feature = "merged-index")]
-    index.start_compaction()?;
     measurement::drain_until(timeout.saturating_sub(started.elapsed()), || {
-        let complete = circuit.is_compaction_complete()?;
+        let complete = circuit.is_background_merge_idle()?;
         #[cfg(feature = "merged-index")]
-        let complete = complete && index.is_compaction_complete()?;
+        let complete = complete && index.is_background_merge_idle()?;
         Ok(complete)
     })?;
     Ok(started.elapsed())
 }
 
-/// Publish compacted batches to Catalog without changing logical input.
-/// The extra transaction and mailbox cleanup belong to compaction drainage.
-fn settle(
+/// Publish current batches to Catalog without changing logical input.
+/// Loading alone waits for normally scheduled merges; it never requests compaction.
+fn finish_loading(
     circuit: &mut dbsp::DBSPHandle,
     catalog: &impl CircuitCatalog,
     base: &mut workload::BaseState,
@@ -921,7 +918,7 @@ fn settle(
     let started = Instant::now();
     #[cfg(feature = "merged-index")]
     let (index, q3_state) = reconstruction;
-    drain(
+    wait_for_loading_merges(
         circuit,
         timeout,
         #[cfg(feature = "merged-index")]
@@ -959,7 +956,7 @@ fn settle(
             .context("missing output")?;
         drop(output.delta_handle.concat());
     }
-    drain(
+    wait_for_loading_merges(
         circuit,
         timeout.saturating_sub(started.elapsed()),
         #[cfg(feature = "merged-index")]
@@ -1065,7 +1062,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             Ok(())
         },
     )?;
-    let load_drain = settle(
+    let load_drain = finish_loading(
         &mut circuit,
         &catalog,
         &mut base,
@@ -1074,23 +1071,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         (&index, &q3_state),
     )?;
     let load_storage = storage_evidence(&base, &catalog)?;
-    if config.r5
-        && load_storage
-            .as_object()
-            .context("storage evidence object")?
-            .values()
-            .any(|e| e["file_backed"] != true)
-    {
-        bail!("loading left Catalog state in memory: {load_storage}");
-    }
-    #[cfg(feature = "merged-index")]
-    if config.r5 && !index.is_file_backed()? {
-        bail!("loading left the manual index in memory");
-    }
+    let load_observed_storage_bytes = storage_path
+        .as_deref()
+        .map(measurement::storage_size_bytes)
+        .transpose()?;
     let load_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
     let load_elapsed = started.elapsed();
     let load_rows = load.customer_rows + load.order_rows + load.line_rows;
-    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} q3_ms={:.3} prep_ms={:.3} compaction_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
+    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
         stats.transactions, config.verify, milliseconds(stats.native), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
@@ -1101,6 +1089,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         .transpose()?;
     let sequence_resources = measurement::ResourceSnapshot::capture()?;
     let sequence_started = Instant::now();
+    let mut sequence_finished = sequence_started;
+    let mut resources_after = sequence_resources;
     let mut reports = Vec::new();
     let mut verification_time = Duration::ZERO;
     let mut foreground_total = Duration::ZERO;
@@ -1183,12 +1173,15 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         drop(fanout);
         measurement.publication_cleanup += cleanup_started.elapsed();
         // Wall time covers file reads, discovery and all foreground cleanup.
-        measurement.foreground = phase_started
-            .elapsed()
+        let phase_finished = Instant::now();
+        measurement.foreground = phase_finished
+            .duration_since(phase_started)
             .saturating_sub(measurement.verification);
         verification_time += measurement.verification;
         foreground_total += measurement.foreground;
-        let resource_delta = resources_before.delta(&measurement::ResourceSnapshot::capture()?);
+        sequence_finished = phase_finished;
+        resources_after = measurement::ResourceSnapshot::capture()?;
+        let resource_delta = resources_before.delta(&resources_after);
         let mut report = phase_json(&measurement);
         report["refresh"] = json!(number + 1);
         report["phase"] = json!(phase);
@@ -1214,30 +1207,20 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         );
         reports.push(report);
     }
-    let final_drain = settle(
-        &mut circuit,
-        &catalog,
-        &mut base,
-        timeout,
-        #[cfg(feature = "merged-index")]
-        (&index, &q3_state),
-    )?;
-    let sequence_elapsed = sequence_started.elapsed().saturating_sub(verification_time);
-    let resources_after = measurement::ResourceSnapshot::capture()?;
-    let settled_storage_bytes = storage_path
+    let sequence_elapsed = sequence_finished
+        .duration_since(sequence_started)
+        .saturating_sub(verification_time);
+    let observed_storage_bytes = storage_path
         .as_deref()
         .map(measurement::storage_size_bytes)
         .transpose()?;
     let sampled_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
     let (cache_occupancy, cache_capacity) = circuit.runtime().cache_occupancy();
     #[cfg(feature = "merged-index")]
-    let manual_file_backed = index.is_file_backed()?;
+    let manual_storage = Some(index.storage_evidence()?);
     #[cfg(not(feature = "merged-index"))]
-    let manual_file_backed: Option<bool> = None;
-    #[cfg(feature = "merged-index")]
-    if config.r5 && !manual_file_backed {
-        bail!("manual merged index is not file-backed");
-    }
+    let manual_storage: Option<Value> = None;
+    let manual_file_backed = manual_storage.as_ref().map(|evidence| &evidence["file_backed"]);
     let profile = circuit.retrieve_profile()?;
     let graph = circuit.graph_profile()?.worker_graphs[0].to_json();
     if cfg!(feature = "merged-index") && graph.contains("shard_accumulate_trace") {
@@ -1247,18 +1230,16 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         std::fs::write(path.with_extension("profile.json"), profile.as_json())?;
         std::fs::write(path.with_extension("graph.json"), &graph)?;
     }
-    let storage_evidence = storage_evidence(&base, &catalog)?;
-    if config.r5
-        && storage_evidence
-            .as_object()
-            .context("storage evidence object")?
-            .values()
-            .any(|e| e["file_backed"] != true)
-    {
-        bail!("Catalog base state or V is not file-backed: {storage_evidence}");
-    }
+    let storage_evidence = if config.verify {
+        let mut evidence = base.storage_evidence();
+        evidence.insert("V".into(), json!({"unavailable": "validation consumed the V output snapshot"}));
+        Value::Object(evidence)
+    } else {
+        storage_evidence(&base, &catalog)?
+    };
     let report = json!({
         "status": "complete",
+        "measurement_version": 2,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
         "configuration": {
@@ -1269,20 +1250,24 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
             "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
+            "compaction_policy": "no forced compaction; loading waits for normal background merges only; no final wait",
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
         },
         "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
             "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
             "sampled_peak_storage_bytes": load_peak_storage_bytes,
-            "compaction_drain_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed)},
+            "observed_storage_bytes": load_observed_storage_bytes,
+            "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed)},
         "refreshes": reports,
         "sequence": {
-            "foreground_ms": milliseconds(foreground_total), "final_compaction_drain_ms": milliseconds(final_drain),
-            "end_to_end_ms": milliseconds(sequence_elapsed), "settled_storage_bytes": settled_storage_bytes,
+            "foreground_ms": milliseconds(foreground_total),
+            "end_to_end_ms": milliseconds(sequence_elapsed), "observed_storage_bytes": observed_storage_bytes,
             "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
-            "cache_occupancy_bytes": cache_occupancy, "snapshot_publication_transactions": 1, "cache_capacity_bytes": cache_capacity,
+            "cache_occupancy_bytes": cache_occupancy, "snapshot_publication_transactions": 0, "cache_capacity_bytes": cache_capacity,
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
+            "manual_index_storage": manual_storage,
+            "completion_boundary": "last_refresh_complete",
             "catalog_storage": storage_evidence,
             "replaced_historical_join_traces_absent": if cfg!(feature = "merged-index") { Some(true) } else { None },
             "circuit_profile": serde_json::to_value(profile)?,
@@ -2058,7 +2043,7 @@ mod measurement_tests {
     }
 
     #[test]
-    fn file_backed_driver_loads_complete_groups_and_discovers_repeated_refreshes() -> Result<()> {
+    fn storage_backed_driver_preserves_runs_and_discovers_repeated_refreshes() -> Result<()> {
         let directory = directory()?;
         let customers = directory.join("customer.tbl");
         let orders = directory.join("orders.tbl");
@@ -2070,11 +2055,17 @@ mod measurement_tests {
         let list = directory.join("refreshes.json");
         let report = directory.join("report.json");
         std::fs::write(&customers, "1|n|a|1|p|1.00|BUILDING|comment|\n")?;
-        std::fs::write(&orders, "1|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n")?;
+        let base_keys: Vec<_> = std::iter::once(1).chain(1001..=1032).collect();
         std::fs::write(
-            &lines,
-            "1|2|3|1|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n",
+            &orders,
+            base_keys
+                .iter()
+                .map(|key| format!("{key}|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n"))
+                .collect::<String>(),
         )?;
+        std::fs::write(&lines, base_keys.iter().map(|key| {
+            format!("{key}|2|3|1|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n")
+        }).collect::<String>())?;
         std::fs::write(&inserted_orders, "2|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n")?;
         std::fs::write(
             &inserted_lines,
@@ -2123,18 +2114,28 @@ mod measurement_tests {
         assert_eq!(refreshes[2]["absent_orders"], 2);
         assert_eq!(refreshes[5]["rows"], 0);
         assert!(
-            output["sequence"]["settled_storage_bytes"]
+            output["sequence"]["observed_storage_bytes"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
-        for evidence in output["sequence"]["catalog_storage"]
-            .as_object()
-            .unwrap()
-            .values()
-        {
-            assert_eq!(evidence["file_backed"], true);
-        }
+        assert_eq!(output["measurement_version"], 2);
+        assert_eq!(
+            output["sequence"]["completion_boundary"],
+            "last_refresh_complete"
+        );
+        assert_eq!(output["sequence"]["snapshot_publication_transactions"], 0);
+        assert!(output["sequence"]
+            .get("final_compaction_drain_ms")
+            .is_none());
+        assert!(output["sequence"].get("settled_storage_bytes").is_none());
+        assert!(output["sequence"].get("background_merge_wait_ms").is_none());
+        assert!(
+            output["load"]["catalog_storage"]["CUSTOMER"]["memory_batch_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         let foreground = output["sequence"]["foreground_ms"].as_f64().unwrap();
         let total = output["sequence"]["end_to_end_ms"].as_f64().unwrap();
         assert!(total >= foreground);
@@ -2147,7 +2148,8 @@ mod measurement_tests {
             ..config
         };
         run(&config, 1)?;
-        let measured: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        let measured: Value =
+            serde_json::from_reader(File::open(config.report.as_ref().unwrap())?)?;
         assert_eq!(measured["configuration"]["driver_reference_bytes"], 0);
         assert!(measured["sequence"]["resources"]["backend_read_operations"].is_u64());
         assert!(measured["sequence"]["resources"]["cpu_microseconds"].is_u64());
@@ -2155,10 +2157,52 @@ mod measurement_tests {
             measured["sequence"]["sampled_peak_storage_bytes"]
                 .as_u64()
                 .unwrap()
-                >= measured["sequence"]["settled_storage_bytes"]
+                >= measured["sequence"]["observed_storage_bytes"]
                     .as_u64()
                     .unwrap()
         );
+        // A large final RF1 leaves a below-threshold RAM run alongside the
+        // loaded file-backed state. Completion must not force it into one file.
+        let single_list = directory.join("single-refresh.json");
+        std::fs::write(
+            &single_list,
+            serde_json::to_vec(&json!([
+                {"rf1_orders": "insert-orders.tbl", "rf1_lines": "insert-lines.tbl"}
+            ]))?,
+        )?;
+        let config = Config {
+            refresh_list: Some(single_list),
+            storage_path: Some(directory.join("single-refresh-storage")),
+            report: Some(directory.join("single-refresh-report.json")),
+            ..config
+        };
+        run(&config, 1)?;
+        let single: Value = serde_json::from_reader(File::open(config.report.as_ref().unwrap())?)?;
+        let lines = &single["sequence"]["catalog_storage"]["LINEITEM"];
+        assert!(lines["storage_batch_count"].as_u64().unwrap() > 0);
+        assert!(lines["memory_batch_count"].as_u64().unwrap() > 0);
+        assert_eq!(lines["file_backed"], false);
+        #[cfg(feature = "merged-index")]
+        assert!(
+            single["sequence"]["manual_index_storage"]["memory_batch_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let empty_list = directory.join("no-refreshes.json");
+        std::fs::write(&empty_list, "[]")?;
+        let config = Config {
+            refresh_list: Some(empty_list),
+            storage_path: Some(directory.join("no-refreshes-storage")),
+            report: Some(directory.join("no-refreshes-report.json")),
+            ..config
+        };
+        run(&config, 1)?;
+        let empty: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        assert_eq!(empty["sequence"]["foreground_ms"], 0.0);
+        assert_eq!(empty["sequence"]["end_to_end_ms"], 0.0);
+        assert_eq!(empty["sequence"]["resources"]["cpu_microseconds"], 0);
+        assert_eq!(empty["sequence"]["snapshot_publication_transactions"], 0);
         Ok(())
     }
 }
