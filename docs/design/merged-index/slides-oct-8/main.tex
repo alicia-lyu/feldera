@@ -115,10 +115,7 @@
     \uncover<2->{\Delta V} &\uncover<2->{= \Delta OL\join C^+ + OL^-\join\Delta C}
   \end{align*}
   \par\raggedright
-  $I_{\Delta R}$ ``integrates'' $\Delta R$
-  \note<1>{\par Introduce the Orders--Lineitem circuit and its intermediate delta equation.\par}
-  \note<2>{\par Reveal the downstream Customer circuit and the final view delta equation together.\par}
-  \note{Timing: 2 minutes. Each I box accumulates transaction deltas in a trace. Join 1 matches Order ID. Its output is rekeyed to Customer ID, with Order ID then line number leading the value tuple. Join 2 matches Customer ID and projects all nine output fields. The superscripts select after-state or before-state. The first join's changed Lineitem sees after-state Orders, while changed Orders sees only before-state Lineitem. The second join's changed OL sees after-state Customer, while changed Customer sees only before-state OL. Each simultaneous-change term occurs once. Before and after consumers can share a trace, with delayed access choosing visibility. This is a logically equivalent explanatory order, not a regeneration or relabeling of the existing circuit. Its actual order is Orders--Customer first (Appendix D). Source: dynamic/join.rs:698--749. Theory: VLDB 2023 Theorem 3.4.}
+  $\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$
 \end{frame}
 
 % 5
@@ -127,59 +124,42 @@
     \begin{column}{.48\textwidth}
       \small
       \begin{tabular}{@{}ll}
-        \toprule State & Access key\\\midrule
+        \toprule State/``Trace'' & Access key\\\midrule
         $O_o$ & Order ID\\
         $L_o$ & Order ID\\
         $OL_{c,o}$ & Customer ID\\
         $C_c$ & Customer ID\\\bottomrule
       \end{tabular}
-      \par
-      Base identity: $C$: Customer ID; $O$: Order ID;\par
-      $L$: (Order ID, line number).
+      \smallskip\par
+      Created by ``integrating'' or accumulating all deltas in the history.
     \end{column}
     \begin{column}{.49\textwidth}
-      \textbf{Run}: immutable sorted weighted records.\par\smallskip
-      \scalebox{.90}{\input{figures/integrator-batches.tex}}
+      \lead{$R^+$ and $R^-$ share one trace.}\par
+      \textbf{Native LSM storage insufficiency:} NO mutable memtable across transactions. Delta from ONE transaction become ONE IMMUTABLE run.
     \end{column}
   \end{columns}
-  \par\smallskip
-  \lead{$R^+$ and $R^-$ share one trace.}\par
-  \lead{Consumers of the same indexed stream can also reuse that trace.}
-  \par\smallskip\small
-  A run can hold one weighted record. Transactions do not fix run size.\par
-  \textbf{Native storage shortcoming:} no mutable memtable across transactions\par
-  in the inspected input and join paths. Small updates become separate runs.
-  \source{Construction and integration are separate. Merging, including in memory, builds larger runs (slide 11).}
-  \note{Timing: 2 minutes. The table lists logical roles, not a fixed allocation count. Before/after readers share one trace; consumers of the same indexed stream can also reuse it. A delayed read chooses visibility without another integrator. Lineitem's primary identity is (Order ID,line number), while its join access groups by Order ID. OL uses Customer ID as its native key, with Order ID then line number leading its value. The diagram shows join-output buffering, sorting/consolidation of complete pairs, an ordered builder, sealing, and separate trace insertion. Equal complete pairs add weights and zero totals disappear. Individual memory-builder pushes append ordered values and weights without consolidation. Input upsert consolidates per-key changes before its builder. A run can contain one record, and one transaction can produce several runs. The inspected paths have no mutable cross-transaction memtable; larger runs grow through merging, including in memory. This structural limitation has unmeasured performance effects. Sources: input\_upsert.rs:601--622,680--691; input\_upsert.rs:321; join.rs:1921--1957; trace.rs:865--875; merge\_batcher.rs:41--85; merge\_sorter.rs:101--130; indexed\_wset\_batch.rs:906--930.}
 \end{frame}
 
 % 6
-\begin{frame}<1-5>[t]{Join 1: Orders--Lineitem}
+\begin{frame}<1-5>[t]{Deriving $\Delta OL$}
   \small
   Before: Customer 7, Order 42, Lineitem (42,1), all with weight $+1$.\par
-  \reveal{1}{1}{One transaction inserts Order 43 and Lineitem (43,1).}
+  \reveal{1}{1}{One transaction inserts Order 43 and Lineitem (43,1) for Customer 7.}
   \par\medskip
   \begin{tabular}{@{}p{.29\textwidth}p{.35\textwidth}p{.29\textwidth}@{}}
     \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    \reveal{2}{2}{$\Delta L_o$: $(43,1,30,0,$\newline $\text{1995-03-11}):+1$} &
-    \reveal{3}{3}{$O_o^+$: $(43,7,$\newline $\text{1995-03-02},0):+1$} &
-    \reveal{4}{4}{$\Delta OL_{c,o}$:\newline $(7;43,1,\ldots):+1$}\\[1.4em]
-    \reveal{5}{5}{$\Delta O_o$: Order 43, $+1$} &
-    \reveal{5}{5}{$L_o^-$: no old line for 43} &
+    \reveal{2}{2}{$\Delta L$: $(43,1,30,0,$\newline $\text{1995-03-11}):+1$} &
+    \reveal{3}{3}{$O^+$: $(43,7,$\newline $\text{1995-03-02},0):+1$} &
+    \reveal{4}{4}{$\Delta OL$:\newline $(7;43,1,\ldots):+1$}\\[1.4em]
+    \reveal{5}{5}{$\Delta O$: Order 43, $+1$} &
+    \reveal{5}{5}{$L^-$: no old line for 43} &
     \reveal{5}{5}{no rows}\\\bottomrule
   \end{tabular}
   \par\medskip
   \uncover<4->{\textcolor{quiet}{$(7;43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}):+1$}}
   \par\medskip
-  \reveal{5}{5}{$\Delta OL_{c,o}=\{(7;43,1,\ldots):+1\}$}\par\smallskip
-  \uncover<5->{$OL_{c,o}^+$ also retains $(7;42,1,\ldots):+1$.}
-  \source{Order ID match. Customer ID becomes the output key. Semicolon separates key and value.}
-  \note{Timing: 2 minutes over five advances. These columns stay fixed: changed rows, matching accumulated rows, signed output. Teal marks the active step and quiet ink retains completed information. The match is logical; native cursor-driving direction can depend on relative sizes. All dates and prices are retained. Sources: dynamic/join.rs:698--749,1760--1788; query.sql.}
-  \note<1>{\par Establish the before-state. Order 42 has customer 7, date 1995-03-01, priority 0. Its line 1 has price 100, discount 0, ship date 1995-03-10. Insert Order 43 and its line 1 simultaneously. Do not advance the Customer join yet.}
-  \note<2>{\par Reveal changed Lineitem (43,1) with price 30, discount 0, ship date 1995-03-11 and weight +1. Its Order ID requests a logical match in after-state Orders.}
-  \note<3>{\par Highlight matching Order 43 in O after-state: customer 7, date 1995-03-02, priority 0, weight +1. The newly inserted Order is visible in this branch.}
-  \note<4>{\par Multiply weights +1 times +1. Emit the complete OL pair with Customer ID key 7 and value (43,1,1995-03-02,0,30,0,1995-03-11). The native key is 7; 43 and 1 lead the value. OL subscripts name access ordering, not this row.}
-  \note<5>{\par Check the other branch: before-state Lineitem contains no line for changed Order 43, so it emits nothing. The combined intermediate delta contains the one new pair once. Integrating it preserves the old pair for Order 42 and adds the new pair for 43.}
+  \reveal{5}{5}{$\Delta OL=\{(7;43,1,\ldots):+1\}$}\par\smallskip
+  \uncover<5->{$OL^+$ also retains $(7;42,1,\ldots):+1$.}
 \end{frame}
 
 % 7
