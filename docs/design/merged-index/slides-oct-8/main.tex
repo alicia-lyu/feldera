@@ -71,10 +71,12 @@
 \end{frame}
 
 % 2
-\begin{frame}{Storage for base relations}
-  LSM-tree with PK uniqueness guarantees
-  \source{input\_upsert.rs; trace/ord.rs.}
-  \note{Timing: 1.5 minutes. Consider a table that is already loaded and currently static. The logical interface is a primary-key map, while its retained representation is an indexed trace of immutable sorted runs. A trace cursor reads the combined weighted contents. We do not introduce IVM or overwrite mechanics on this slide. The concrete construction is add\_input\_map\_persistent, input\_upsert, retained Spine<OrdIndexedZSet>, OrdIndexedWSet/FallbackIndexedWSet, memory or file indexed runs. Storage configuration permits indexed layer files. The spine is LSM-like, and the trees within each file index that run. Storage placement alone establishes neither checkpoint durability nor optimal update I/O. Sources: operator/input.rs:465; dynamic/input\_upsert.rs:266--333; typed\_batch.rs:577; trace/ord.rs:5--9; fallback/indexed\_wset.rs:545--560; storage/file.rs:3--65.}
+\begin{frame}<1-2>{Storage for base relations}
+  \centering\input{figures/base-storage.tex}
+  \source{trace/spine\_async.rs; storage/file.rs; file/indexed\_wset\_batch.rs.}
+  \note{Timing: 1.5 minutes across two advances. An already-loaded static Orders table has a primary-key map interface and retains immutable indexed runs, in memory or configured file storage. Levels, run sizes, and gray merges are schematic, not disjoint key ranges or an exact schedule. Runs can overlap; a trace cursor combines matching key/value contents and signed weights. One B+ tree per file column has index blocks above data leaves. Untimed indexed leaf items are (K, ()) and (V, weight); values are ordered within each key's group. Sources: storage/file.rs:3--65; trace/ord/file/indexed\_wset\_batch.rs:41--83; trace/cursor/cursor\_list.rs.}
+  \note<1>{\par Structure: three, two, and one immutable runs illustrate the LSM-like spine. The dashed connector enlarges one file, with an index root and two leaves per tree. Key data-block metadata supplies the next-column row range, separately from (K, ()). Index blocks hold child bounds, cumulative row totals, byte offsets, and sizes. Data blocks hold item offsets and next-column row groups. Actual scheduling uses level counts and background merge/pressure triggers. Sources: storage/file/format.rs:15--62; trace/spine\_async.rs.}
+  \note<2>{\par Lookup: every teal branch denotes an independent seek for Order ID 43 in a retained run. In this file, descend to the matching key leaf, use its value-row range to restrict value-tree navigation to that key's group, then descend to a value leaf and iterate the group's contents. The arrow denotes row-range navigation, not a direct byte pointer to a separate per-key tree. Combine weighted matches across overlapping runs; do not assume one matching run or one physical value per key. Sources: storage/file/reader.rs; trace/cursor/cursor\_list.rs.}
 \end{frame}
 
 % 3
@@ -141,69 +143,18 @@
 \end{frame}
 
 % 6
-\begin{frame}<1-5>[t]{Deriving $\Delta OL$}
-  \small
-  Before: Customer 7, Order 42, Lineitem (42,1), all with weight $+1$.\par
-  \reveal{1}{1}{One transaction inserts Order 43 and Lineitem (43,1) for Customer 7.}
-  \par\medskip
-  \begin{tabular}{@{}p{.29\textwidth}p{.35\textwidth}p{.29\textwidth}@{}}
-    \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    \reveal{2}{2}{$\Delta L$: $(43,1,30,0,$\newline $\text{1995-03-11}):+1$} &
-    \reveal{3}{3}{$O^+$: $(43,7,$\newline $\text{1995-03-02},0):+1$} &
-    \reveal{4}{4}{$\Delta OL$:\newline $(7;43,1,\ldots):+1$}\\[1.4em]
-    \reveal{5}{5}{$\Delta O$: Order 43, $+1$} &
-    \reveal{5}{5}{$L^-$: no old line for 43} &
-    \reveal{5}{5}{no rows}\\\bottomrule
-  \end{tabular}
-  \par\medskip
-  \uncover<4->{\textcolor{quiet}{$(7;43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}):+1$}}
-  \par\medskip
-  \reveal{5}{5}{$\Delta OL=\{(7;43,1,\ldots):+1\}$}\par\smallskip
-  \uncover<5->{$OL^+$ also retains $(7;42,1,\ldots):+1$.}
-\end{frame}
-
-% 7
-\begin{frame}<1-5>[t]{Join 2: the intermediate meets Customer}
-  \small
-  Carry forward $\Delta OL_{c,o}=\{(7;43,1,\ldots):+1\}$.\par
-  \reveal{2}{2}{Its Customer ID key is $7$.}
-  \par\medskip
-  \begin{tabular}{@{}p{.29\textwidth}p{.35\textwidth}p{.29\textwidth}@{}}
-    \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
-    \reveal{1}{1-2}{$\Delta OL_{c,o}$:\newline $(7;43,1,\ldots):+1$} &
-    \reveal{3}{3}{$C_c^+$:\newline $(7,\text{BUILDING}):+1$} &
-    \reveal{4}{4}{full projected row, $+1$}\\[1.4em]
-    \reveal{5}{5}{$\Delta C_c$: no rows} &
-    \reveal{5}{5}{$OL_{c,o}^-$: no key requested} &
-    \reveal{5}{5}{no rows}\\\bottomrule
-  \end{tabular}
-  \par\medskip
-  \reveal{4}{4}{$(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11}):+1$}
-  \par\medskip
-  \reveal{5}{5}{$V^+=V^-+\Delta V$: one new output, for Order 43 / line 1.}\par\smallskip
-  \uncover<5->{The output for Order 42 / line 1 stays unchanged.}
-  \source{Customer ID match. Visibility superscripts and signed tuple weights have different meanings.}
-  \note{Timing: 2 minutes over five advances. Use the same stable columns as Join 1. The final projection contains Customer ID, segment, Order ID, date, priority, line number, price, discount, ship date. These are logical matches, not a mandatory delta-driven native scan. Source: query.sql; dynamic/join.rs:698--749,1760--1788.}
-  \note<1>{\par Carry the complete intermediate delta forward from the first join. OL has already joined Orders and Lineitem and carries all their fields. Its Customer ID grouping supplies the next join key.}
-  \note<2>{\par Highlight Customer ID 7. Order ID 43 and line number 1 are the leading fields of the intermediate value, not the key for this join.}
-  \note<3>{\par Reveal matching Customer 7 in after-state C, with segment BUILDING and weight +1. There is no Customer change in this transaction.}
-  \note<4>{\par Emit the full nine-field projected output with weight +1. The intermediate and Customer weights multiply. Preserve date 1995-03-02, priority 0, price 30, discount 0, ship date 1995-03-11.}
-  \note<5>{\par Check the second branch, before-state OL joined with changed Customer: the Customer delta is empty, so it contributes nothing. Add the single signed output to V before-state. One new row appears and the Order 42 row remains.}
-\end{frame}
-
-% 8
-\begin{frame}{Records and nested values}
-  \large $\text{record}=(\text{key},\text{value},\text{weight})$
+\begin{frame}{Record structure}
+  \large Logically, $\text{record}=(\text{key},\text{value},\text{weight})$---``bag semantics''
   \par\medskip\normalsize
-  $OL_{c,o}$: Customer ID groups, values ordered by Order ID then line number.
+  Physically, $OL_{c,o}$ is stored as
   \begin{center}\small
     \begin{tabular}{@{}lll@{}}
-      \toprule Key & Value & Weight\\\midrule
-      7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
-      7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
+      % Pending physical layout
+      % \toprule Key & Value & Weight\\\midrule
+      % 7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
+      % 7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
     \end{tabular}
   \end{center}
-  One native key has multiple values. Weight belongs to the complete pair.
   \par\medskip
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.46\textwidth}

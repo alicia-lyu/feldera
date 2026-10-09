@@ -136,7 +136,7 @@ V+ = V− + ΔV
 ```
 
 Its actual accesses remain `C_c+`, `O_c−`, `B_o+`, and `L_o−`.
-Slide 16 and Appendix D explicitly identify that different order. Prototype
+Slide 14 and Appendix D explicitly identify that different order. Prototype
 support remains subsequent RF1 complete Order/Lineitem insertion and RF2
 deletion under referential integrity after setup. Customer updates, replacements,
 key moves, orphans, and independent Lineitem updates remain excluded.
@@ -169,8 +169,15 @@ It compares intermediate changes and integrated output with full evaluation
 for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
-The final deck has 16 main topics with five overlays each on slides 6 and 7,
-plus four appendices: 28 rendered pages in each PDF. Final visual review and
+The current deck preserves the user's removal of the two worked-join topics.
+It has 14 main topics, two advances each on slides 2 and 4, and four
+appendices: 20 rendered pages in each PDF. Slide 2 shows a schematic
+LSM-like trace and one enlarged immutable file run. Its two column trees
+follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
+`trace/ord/file/indexed_wset_batch.rs:41–83`. Row-group metadata and index
+block offsets follow `storage/file/format.rs:15–62`. The notes distinguish
+per-key value ordering, overlapping runs, and illustrative merging from
+implementation scheduling. Final visual review and
 build results are recorded in [final-revision-handoff.md](final-revision-handoff.md).
 The original [planning handoff](advisor-presentation-implementation-plan.md)
 remains unchanged. The deck claims no measured savings, update costs, or

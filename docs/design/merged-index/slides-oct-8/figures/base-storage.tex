@@ -1,9 +1,77 @@
-\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
-  \node[align=center] (table) at (0,1.2) {Loaded Orders table\\key = Order ID};
-  \node[stage,minimum width=7.5cm,minimum height=2.4cm] (trace) at (7,1.2) {};
-  \node[font=\normalsize\bfseries] at (7,2) {Retained indexed trace (LSM-like spine)};
-  \node[batch,font=\small,text width=2.5cm] (mem) at (5.1,.9) {Sorted\\immutable\\memory runs};
-  \node[batch,font=\small,text width=2.8cm] (disk) at (8.8,.9) {Immutable indexed\\files with storage};
-  \draw[flow] (table.east) -- (trace.west);
-  \node[font=\small,text=quiet] at (7,-.4) {A trace cursor reads the combined weighted contents.};
+% Fixed bounds and overlay-only lookup marks keep both advances aligned.
+\begin{tikzpicture}[x=1cm,y=1cm,font=\small,
+  run/.style={draw=ink,fill=ink!4,line width=.8pt,minimum height=.48cm,
+    inner sep=0pt},
+  tree block/.style={draw=ink,fill=ink!4,line width=.8pt,
+    minimum width=1.15cm,minimum height=.6cm,inner sep=0pt},
+  merge/.style={-{Latex[length=1.8mm]},draw=quiet!65,line width=.8pt},
+  seek/.style={-{Latex[length=2mm]},draw=teal,line width=1.3pt}]
+  \path[use as bounding box] (0,0) rectangle (13.7,4.65);
+
+  \node[font=\normalsize\bfseries] at (2.25,4.05) {LSM-like trace};
+  \foreach \level/\height in {0/3.2,1/1.9,2/.6}
+    \node at (.2,\height) {L\level};
+  \node[run,minimum width=.8cm] (r00) at (1.05,3.2) {};
+  \node[run,minimum width=.8cm] (r01) at (2.25,3.2) {};
+  \node[run,minimum width=.8cm] (r02) at (3.45,3.2) {};
+  \node[run,minimum width=1.2cm] (r10) at (1.5,1.9) {};
+  \node[run,minimum width=1.2cm] (r11) at (3.1,1.9) {};
+  \node[run,minimum width=2.3cm] (r20) at (2.3,.6) {};
+
+  % Merge edges enter the corners, leaving the top centers for key seeks.
+  \draw[merge] (r00.south) -- (r10.north west);
+  \draw[merge] (r01.south) -- (r10.north east);
+  \draw[merge] (r02.south) -- (r11.north east);
+  \node[text=quiet,font=\small,fill=white,inner sep=1pt] at (2.7,2.55) {merge};
+  \draw[merge] (r10.south) -- (r20.north west);
+  \draw[merge] (r11.south) -- (r20.north east);
+  \node[text=quiet,font=\small,fill=white,inner sep=1pt] at (2.3,1.25) {merge};
+
+  % One retained file run is enlarged; this is not another trace level.
+  \draw[draw=quiet,dashed,line width=.7pt]
+    (r02.north east) -- (4.9,3.85)
+    (r02.south east) -- (4.9,.35);
+  \draw[draw=ink,line width=.8pt] (4.9,.35) rectangle (13.6,3.85);
+  \node[font=\normalsize\bfseries,fill=white,inner sep=3pt]
+    at (9.25,3.85) {Immutable file run};
+  \node[font=\normalsize] at (6.8,3.35) {Key tree};
+  \node[font=\normalsize] at (11.4,3.35) {Value tree};
+
+  \node[tree block] (kr) at (6.8,2.65) {};
+  \node[tree block] (kl0) at (5.95,1.4) {};
+  \node[tree block] (kl1) at (7.65,1.4) {};
+  \node[tree block] (vr) at (11.4,2.65) {};
+  \node[tree block] (vl0) at (10.55,1.4) {};
+  \node[tree block] (vl1) at (12.25,1.4) {};
+  \foreach \root/\left/\right in {kr/kl0/kl1,vr/vl0/vl1} {
+    \draw[link] (\root.south) -- (\left.north);
+    \draw[link] (\root.south) -- (\right.north);
+    \draw[draw=ink] (\root.north) -- (\root.south);
+  }
+  \foreach \leaf in {kl0,kl1,vl0,vl1} {
+    \draw[draw=ink] ($(\leaf.north west)!.33!(\leaf.north east)$)
+      -- ($(\leaf.south west)!.33!(\leaf.south east)$);
+    \draw[draw=ink] ($(\leaf.north west)!.67!(\leaf.north east)$)
+      -- ($(\leaf.south west)!.67!(\leaf.south east)$);
+  }
+  \node at (6.8,.7) {$(K, ())$};
+  \node at (11.4,.7) {$(V,\ \text{weight})$};
+
+  \only<2>{
+    \node[text=teal,font=\normalsize\bfseries] at (2.25,4.55)
+      {Search: Order ID 43};
+    % Every short branch denotes the same seek in a retained run.
+    \draw[draw=teal,line width=1.3pt] (1.05,3.7) -- (3.45,3.7);
+    \foreach \run in {r00,r01,r02,r10,r11,r20}
+      \draw[seek] ($(\run.north)+(0,.26)$) -- (\run.north);
+    \draw[draw=teal,line width=1.3pt] (kr.north west) rectangle (kr.south east);
+    \draw[seek] (kr.south) -- (kl1.north);
+    \draw[draw=teal,line width=1.3pt] (kl1.north west) rectangle (kl1.south east);
+    \node[text=teal,font=\scriptsize] at (kl1) {$43$};
+    \draw[seek] (kl1.east) -- (9,1.4) -- (9,2.65) -- (vr.west);
+    \node[text=teal,font=\small] at (9.3,3) {value-row range};
+    \draw[draw=teal,line width=1.3pt] (vr.north west) rectangle (vr.south east);
+    \draw[seek] (vr.south) -- (vl0.north);
+    \draw[draw=teal,line width=1.3pt] (vl0.north west) rectangle (vl0.south east);
+  }
 \end{tikzpicture}

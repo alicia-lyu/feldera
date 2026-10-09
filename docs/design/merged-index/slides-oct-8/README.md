@@ -1,15 +1,19 @@
 # DBSP physical design: advisor presentation
 
-This editable 16:9 Beamer/TikZ deck has **16 main slide topics** for a
-20–25 minute talk and four appendix topics. Slide 4 reveals the downstream
-Customer circuit and its delta equation together on the second overlay. Slides 6 and 7 each have five
-fixed-layout overlays, retaining their slide number. Each PDF therefore has
-**29 rendered pages**: 25 main-talk pages and four appendix pages.
+This editable 16:9 Beamer/TikZ deck has **14 main slide topics** and four
+appendix topics. Slide 2 first shows the LSM-like trace and the key/value trees
+inside one immutable file run, then reveals the teal search for Order ID 43.
+Slide 4 reveals the downstream Customer circuit and its delta equation on
+the second overlay. Both topics retain their slide number across advances.
+Each PDF has **20 rendered pages**: 16 main-talk pages and four appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on
-2026-10-08. All 29 rebuilt presentation pages match that reference pixel for
-pixel at 144 dpi. The recovered opening slides simplify the introduction,
+2026-10-08. At recovery, all 29 rebuilt presentation pages matched that
+reference pixel for pixel at 144 dpi. Subsequent user edits removed the two worked-join
+topics; the current slide-2 illustration adds one rendered advance. All
+other current presentation pages retain their pre-illustration rendering.
+The recovered opening slides simplify the introduction,
 base storage, and example notation; the circuit uses unsubscripted relations
 and delta-labeled integrators; the state table lists four indexed states.
 Existing speaker notes were retained because the reference has no notes.
@@ -35,12 +39,12 @@ No sibling checkout is required to build.
 
 The explanatory program joins **Orders–Lineitem first**, groups its `OL`
 intermediate by Customer ID with values ordered first by Order ID then line
-number, and then joins Customer. Both branches of both joins and the worked
-output integration precede representation internals. The predicate-free view and
+number, and then joins Customer. The circuit shows both branches of both
+joins; the current user edits omit the two step-by-step worked-join topics. The predicate-free view and
 all nine output fields remain unchanged.
 
 The actual experiment and restricted RF1/RF2 reconstruction prototype use
-**Orders–Customer first**, then Lineitem. Slide 16 and Appendix D retain their
+**Orders–Customer first**, then Lineitem. Slide 14 and Appendix D retain their
 actual accesses `C_c+`, `O_c−`, `B_o+`, and `L_o−`. The explanatory order is
 logically equivalent; this revision changes no runtime, compiler, API, or
 experiment code.
@@ -70,24 +74,23 @@ cancellation. It compares both orders with full evaluation for the original
 729 nonnegative weighted cases and an additional 729 signed cases. It checks
 algebra and examples, not storage behavior or runtime performance.
 
-## Style and talk timing
+## Style and talk structure
 
 Libertine/NewTX typography, ink titles, teal rules, and editable TikZ diagrams
 follow the prior advisor deck at
 `/Users/alicialyu/Local/query_execution_using_MI/advisor-deck/main.tex`.
 The former opening backdrop remains in `figures/query-update-backdrop.tex`
 for provenance, but this revision does not display it. Teal highlights the
-active worked-join step; completed information remains readable in quiet ink.
-Amber identifies deferred work on slide 16.
+key-search path on slide 2; gray arrows show schematic merging.
+Amber identifies deferred work on slide 14.
 
-| Topics | Subject | Minutes |
-| --- | --- | ---: |
-| 1–3 | DBSP context, base storage, example and notation | 4 |
-| 4–7 | Complete program, state/runs, both worked joins | 8 |
-| 8–10 | Records, representations, changed-Customer reads | 4 |
-| 11–13 | Separate small runs, snapshots, merge ownership | 4 |
-| 14–16 | Memory accounting/controls and prototype scope | 5 |
-| Total | Main talk | 25 |
+| Topics | Subject |
+| --- | --- |
+| 1–3 | DBSP context, base storage, example and notation |
+| 4–5 | Complete program and accumulated state/runs |
+| 6–8 | Records, representations, changed-Customer reads |
+| 9–11 | Separate small runs, snapshots, merge ownership |
+| 12–14 | Memory accounting/controls and prototype scope |
 
 Appendix A gives full payloads. Appendix B shows Customer overwrite and
 simultaneous Order/Lineitem deletion. Appendix C lists sources. Appendix D
