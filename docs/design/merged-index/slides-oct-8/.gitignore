@@ -1,7 +1,7 @@
 /build/
 __pycache__/
 
-# Editor-triggered TeX builds in the source directory.
+# Source-directory TeX side files, including Beamer verbatim frames.
 /*.aux
 /*.fdb_latexmk
 /*.fls
@@ -12,3 +12,4 @@ __pycache__/
 /*.snm
 /*.synctex.gz
 /*.toc
+/*.vrb

@@ -21,7 +21,8 @@ Beamer's two-screen layout; its draft-mode notice is expected.
 The two outputs are `build/dbsp-physical-design.pdf` and
 `build/dbsp-physical-design-notes.pdf`. Keep generated artifacts inside the
 ignored `build/` directory. Source-directory editor artifacts and Python
-caches are also ignored by the local `.gitignore`.
+caches are also ignored by the local `.gitignore`. Beamer's generated
+source-directory `*.vrb` files are ignored as well.
 
 ## Render and inspect
 
@@ -35,25 +36,41 @@ pdfinfo build/dbsp-physical-design-notes.pdf
 
 Inspect all presentation and notes pages at readable size, including both slide-2
 advances and their notes. Check clipping, overlap, stable positions, readable
-tree/merge/search connectors, fields/weights, grammar, and source labels.
+tree/search connectors, fields/weights, grammar, and source labels.
 Speaker notes must include the common context and only the appropriate overlay's step.
-On slide 2, check the six retained runs, separate gray merges and teal seeks,
-key-to-value row-range navigation, and identical geometry on both advances.
-For this change, compare every other presentation page to the pre-change
-PDF: page 1 stays page 1; old pages 3–19 become pages 4–20. Require identical
-rendering. Preserve the historical PDF-recovery record.
+On slide 2, check one independent rightward cursor inside each of the six
+unconnected runs, the dashed enlargement connector, the `K → [start,end)`
+caption, and identical geometry on both advances. The lookup locates the
+first value row and iterates the group without a target value.
+On slide 3, check pseudocode indentation, file-wide counters, the pending
+row-range reset, and the two-column layout. The notes qualify the one-run case.
+On Appendix E, inspect all four cumulative advances: three fixed block
+outlines, separate key items/boundaries, zero-based array indices, 512-byte
+descriptor units, symbolic leaf offsets, and connectors clear of labels.
+The leaf's first row is traversal context, not a header field.
+
+For this revision, use the freshly built 20-page baseline captured before edits:
+old page 1 stays page 1; old pages 4–20 become pages 5–21. Exclude only the
+renumbered main-slide footer in pixel comparisons. Old page 7 becomes page 8
+with the callout moved to the new page 4. Old pages 16 and 20 become pages 17
+and 21 with corrected explanatory-program references. Compare all other
+content and positions, reporting any subpixel TeX layout differences separately.
+Old pages 2–3 are the intentionally edited storage
+topic; new pages 22–25 are Appendix E. Preserve the historical PDF-recovery record.
 A successful TeX build alone does not establish visual correctness.
 
 | PDF pages | Topic / advance |
 | --- | --- |
 | 1 | Main slide 1 |
 | 2–3 | Slide 2, base storage, structure then lookup |
-| 4 | Main slide 3 |
-| 5–6 | Slide 4, complete program, advances 1–2 |
-| 7–16 | Main slides 5–14 |
-| 17–20 | Appendices A–D |
+| 4 | Slide 3, immutable-run construction |
+| 5 | Main slide 4, example and notation |
+| 6–7 | Slide 5, complete program, advances 1–2 |
+| 8–17 | Main slides 6–15 |
+| 18–21 | Appendices A–D |
+| 22–25 | Appendix E, traversal, advances 1–4 |
 
-Both PDFs have 20 pages. The main talk has 14 topics: advancing an
+Both PDFs have 25 pages. The main talk has 15 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 

@@ -74,12 +74,63 @@
 \begin{frame}<1-2>{Storage for base relations}
   \centering\input{figures/base-storage.tex}
   \source{trace/spine\_async.rs; storage/file.rs; file/indexed\_wset\_batch.rs.}
-  \note{Timing: 1.5 minutes across two advances. An already-loaded static Orders table has a primary-key map interface and retains immutable indexed runs, in memory or configured file storage. Levels, run sizes, and gray merges are schematic, not disjoint key ranges or an exact schedule. Runs can overlap; a trace cursor combines matching key/value contents and signed weights. One B+ tree per file column has index blocks above data leaves. Untimed indexed leaf items are (K, ()) and (V, weight); values are ordered within each key's group. Sources: storage/file.rs:3--65; trace/ord/file/indexed\_wset\_batch.rs:41--83; trace/cursor/cursor\_list.rs.}
+  \note{Timing: 1.5 minutes across two advances. An already-loaded static Orders table has a primary-key map interface and retains immutable indexed runs, in memory or configured file storage. Levels and run sizes are schematic, not disjoint key ranges or an exact schedule. Each run has an independent rightward cursor, visible on both advances. Runs can overlap; a trace cursor combines matching key/value contents and signed weights. Native file ``columns'' describe nested file trees, not SQL attribute columns. The key tree and value tree each have index blocks above data leaves. Untimed indexed leaf items are (K, ()) and (V, weight); values are ordered within each key's group. Sources: storage/file.rs:3--65; trace/ord/file/indexed\_wset\_batch.rs:41--83; trace/cursor/cursor\_list.rs.}
   \note<1>{\par Structure: three, two, and one immutable runs illustrate the LSM-like spine. The dashed connector enlarges one file, with an index root and two leaves per tree. Key data-block metadata supplies the next-column row range, separately from (K, ()). Index blocks hold child bounds, cumulative row totals, byte offsets, and sizes. Data blocks hold item offsets and next-column row groups. Actual scheduling uses level counts and background merge/pressure triggers. Sources: storage/file/format.rs:15--62; trace/spine\_async.rs.}
-  \note<2>{\par Lookup: every teal branch denotes an independent seek for Order ID 43 in a retained run. In this file, descend to the matching key leaf, use its value-row range to restrict value-tree navigation to that key's group, then descend to a value leaf and iterate the group's contents. The arrow denotes row-range navigation, not a direct byte pointer to a separate per-key tree. Combine weighted matches across overlapping runs; do not assume one matching run or one physical value per key. Sources: storage/file/reader.rs; trace/cursor/cursor\_list.rs.}
+  \note<2>{\par Lookup: seek Order ID 43 independently in each retained run. In the enlarged file, descend to the matching key leaf. Its two row boundaries give [start, end). Locate the first value row, start, by cumulative row totals in the value tree; then iterate the group until end. There is no target V in this lookup. The arrow denotes row-range navigation, not a direct byte pointer to a separate per-key tree. Appendix E expands this traversal. Combine weighted matches across overlapping runs; do not assume one matching run or one physical value per key. Sources: storage/file/reader.rs; trace/cursor/cursor\_list.rs.}
 \end{frame}
 
 % 3
+\begin{frame}[fragile]{Creating an immutable run}
+  \small
+  \textbf{Native LSM storage insufficiency:} NO mutable memtable across transactions.
+  Delta from ONE transaction becomes ONE IMMUTABLE run.
+  \par\smallskip
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{.56\textwidth}
+      \fontsize{8}{8}\selectfont
+\begin{verbatim}
+struct Writer:
+    key_tree: TreeWriter
+    value_tree: TreeWriter
+struct TreeWriter:
+    rows = [0, 0)
+    leaf_builder
+    index_builders
+
+write1(item):
+    value_tree.rows.end += 1
+    value_tree.append(item)
+
+write0(item):
+    r = value_tree.rows
+    assert r.start < r.end
+    value_tree.rows = [r.end, r.end)
+    key_tree.rows.end += 1
+    key_tree.append(item, row_group=r)
+\end{verbatim}
+    \end{column}
+    \begin{column}{.42\textwidth}
+      \fontsize{8}{8}\selectfont
+\begin{verbatim}
+// Input sorted lexicographically
+// by (K, V)
+for each K and its value group:
+    for each (V, weight) in the group:
+        writer.write1((V, weight))
+    writer.write0((K, ()))
+writer.close(metadata)
+\end{verbatim}
+      \par\bigskip\small
+      \textbf{Key 43: two value writes}\par\smallskip
+      Pending rows: $[2,2)\to[2,3)\to[2,4)$.\par\medskip
+      \texttt{write0((43, ()))} captures $[2,4)$\par
+      and resets pending rows to $[4,4)$.
+    \end{column}
+  \end{columns}
+  \note{Timing: 1.5 minutes. The callout describes the illustrated one-run case in the inspected input/join paths: there is no mutable memtable absorbing updates across transactions. An actual transaction can produce several runs. This simplified file writer constructs one immutable run across many write1 and write0 calls, completing it at close(metadata), not at each individual write. Native file ``columns'' mean nested file trees, not SQL attribute columns: key\_tree and value\_tree replace that terminology here. TreeWriter stands for ColumnWriter; leaf\_builder and index\_builders stand for its data\_block and index\_blocks. Serialization, factories, errors, buffering, and trailer details are omitted. Input has distinct sorted keys and nonempty value groups with distinct sorted values after consolidation. Row ordinals are file-wide within each tree, not leaf-local. A leaf flush does not reset the tree's counters. write1 has no position argument: it increments value\_tree.rows.end and appends the item. write0 takes the pending nonempty value-row range, resets it to [end,end), increments the key-tree counter, and appends (K, ()) with that row group. For key 43, two writes move pending rows from [2,2) through [2,3) to [2,4); the key write captures [2,4) and resets to [4,4). Sources: storage/file/writer.rs:224--246,1234--1255,1660--1737.}
+\end{frame}
+
+% 4
 \begin{frame}{Ex. predicate-free three-way join}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.53\textwidth}
@@ -108,7 +159,7 @@
   \note{Timing: 1.5 minutes. This SQL projection is the experiment's maintained view, not full TPC-H Q3. It has two equijoins and retains all nine projected fields. There are no Q3 filters, aggregate, ranking, or limit here. Customer 7 has segment BUILDING. Order 42 has customer 7, date 1995-03-01, and ship priority 0. Its line 1 has price 100, discount 0, and ship date 1995-03-10. Primary keys are Customer ID, Order ID, and (Order ID, line number). We will insert Order 43, dated 1995-03-02 with priority 0, and its line 1, priced 30 with discount 0 and ship date 1995-03-11, in the same transaction. The tables show the identifying fields. Appendix A defines complete payloads. The chosen explanatory join order changes no SQL result. R superscript minus and plus name states, not negative and positive row weights. Source: experiments/q3-ivm-baseline/query.sql:1--30.}
 \end{frame}
 
-% 4
+% 5
 \begin{frame}{The complete incremental program}
   \input{figures/ivm-program.tex}
   \vspace{-1em}
@@ -120,7 +171,7 @@
   $\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$
 \end{frame}
 
-% 5
+% 6
 \begin{frame}{Accumulated state and immutable runs}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.48\textwidth}
@@ -137,12 +188,11 @@
     \end{column}
     \begin{column}{.49\textwidth}
       \lead{$R^+$ and $R^-$ share one trace.}\par
-      \textbf{Native LSM storage insufficiency:} NO mutable memtable across transactions. Delta from ONE transaction become ONE IMMUTABLE run.
     \end{column}
   \end{columns}
 \end{frame}
 
-% 6
+% 7
 \begin{frame}{Record structure}
   \large Logically, $\text{record}=(\text{key},\text{value},\text{weight})$---``bag semantics''
   \par\medskip\normalsize
@@ -172,7 +222,7 @@
   \note{Timing: 1 minute. The native indexed run key is Customer ID. The subscript c,o describes grouping and value ordering, not a composite native key: Order ID then line number lead the value tuple. A row is identified explicitly, for example (7;43,1,...). Remaining value fields are Order date, priority, line price, discount, ship date. No segment is present until the Customer join. Distinct complete values share key 7. Equal complete key/value pairs consolidate into integer multiplicities; zero totals disappear. Neither weight nor visibility superscript is a record identity or transaction timestamp. The underlying representation supports weighted bags even when source primary-key map semantics impose uniqueness. Sources: VLDB 2023 Sections 4 and 7.3; indexed\_wset\_batch.rs.}
 \end{frame}
 
-% 9
+% 8
 \begin{frame}{Memory arrays and indexed file groups}
   \small
   One illustrative $OL_{c,o}$ run. Arrays preserve complete values and weights.
@@ -194,7 +244,7 @@
   \note{Timing: 1.5 minutes. The sorted key array and half-open group offsets identify contiguous value ranges. Each value carries the full OL payload. The immutable layer file contains the same concrete key/value groups, with tree indexes within the file. The diagram is a logical grouping, not a byte-level layout. The spine organizes runs separately from indexes within a file. A trace may retain both memory and file runs and expose compatible cursors. Extra Customer 9 and Order 44/line 1, price 50 and ship date 1995-03-12, illustrate a second group only. They do not change the running transaction. Sources: trace/ord/vec/indexed\_wset\_batch.rs:158--199; storage/file.rs:3--65.}
 \end{frame}
 
-% 10
+% 9
 \begin{frame}{A changed Customer reads retained intermediate rows}
   \centering\resizebox{.95\textwidth}{!}{\input{figures/matching-read.tex}}
   \par\medskip\raggedright
@@ -209,7 +259,7 @@
   \note{Timing: 1.5 minutes. This occurs after the insertion transaction. Customer overwrite emits negative (7,BUILDING) and positive (7,AUTOMOBILE). The first Orders--Lineitem join has no changed inputs, so delta OL is empty and OL remains unchanged. The second join's Customer-change branch reads OL before-state directly and finds both retained lines for Orders 42 and 43. Their dates/prices/ship dates are respectively 1995-03-01/100/1995-03-10 and 1995-03-02/30/1995-03-11. Priority and discount are zero. Each yields a negative old nine-field output and positive new output, changing only the segment. Matching values may span several runs. Trace cursors consolidate complete key/value weights across those runs. The example shows logical matches, not a mandatory delta-led scan. Optional fetch\_join prepares requested keys and is configuration-gated; ordinary joins can choose driving direction by estimated key counts. Sources: join.rs:705--749,1760--1788; trace/cursor.rs; cursor/cursor\_list.rs.}
 \end{frame}
 
-% 11
+% 10
 \begin{frame}{Small updates become separate immutable runs}
   \lead{Native storage shortcoming: no mutable memtable across transactions}
   \par\smallskip\small
@@ -225,7 +275,7 @@
   \note{Timing: 1.5 minutes. The OL example shows one-record memory runs: a inserts (7;42,1,...), b inserts (7;43,1,...), c retracts the first pair. Each seals before separate trace insertion. There is no mutable memtable across transactions in these paths. A later memory merge constructs a replacement; cancellation leaves only the second pair. Run sizes and merge timing are illustrative. Native scheduling uses levels/counts and pressure/compaction triggers, not this exact three-run schedule. Merging can also choose file output. One transaction may yield several runs; merged runs may combine several transactions. Neither size nor transaction count is fixed. The default 10,000-record join-output chunk target can overshoot when buffered output is submitted and seals final partial output. It does not cap input-map or merged runs. Placement thresholds choose where runs live. Root-circuit untimed runs carry no per-record transaction epoch; timed batches exist elsewhere. Performance consequences remain unmeasured. Sources: input\_upsert.rs:691; input\_upsert.rs:321; join.rs:1926--1957; dev\_tweaks.rs:332; spine\_async.rs:310--365,446--463; fallback/indexed\_wset.rs:546--560.}
 \end{frame}
 
-% 12
+% 11
 \begin{frame}{Before-state and after-state snapshots}
   \centering\input{figures/snapshot-visibility.tex}
   \par\bigskip
@@ -237,7 +287,7 @@
   \note{Timing: 1 minute. Return to the transaction inserting Order 43 and its line. Before-state OL references run a for Order 42/line 1. After-state references the same a plus newly inserted run b for Order 43/line 1. Snapshot creation clones strong references, not records. This is illustrative membership: actual transactions may supply several runs, and merged runs may combine contributions from several transactions. Superscripts identify visibility, not signed tuple weights or a homogeneous epoch for all records in a run. A delayed trace accessor selects before-state without another independent integrator. Sources: snapshot.rs:55--63,170--179; accumulate\_trace.rs delayed accessor and flush snapshot.}
 \end{frame}
 
-% 13
+% 12
 \begin{frame}{Merging referenced runs}
   \centering\resizebox{.95\textwidth}{!}{\input{figures/merge-ownership.tex}}
   \par\medskip
@@ -248,7 +298,7 @@
   \note{Timing: 1.5 minutes. Before the merge, the spine and old snapshot own a and b. During the merge, the merge machinery retains the inputs while building m, so source data and replacement data coexist. At completion the spine installs m and releases its source references. The snapshot still owns a and b until its consumers finish, so completion alone cannot reclaim their memory. The exact lifetime is the final strong owning reference, including any other readers. Spilling shared memory similarly writes a file-backed copy while readers retain the original. For newly created temporary file runs, reader ownership keeps the underlying file alive and DeleteOnDrop removes it when the last owner drops. Checkpoint-marked or reopened persistent files have different keep/delete behavior. That qualification is about retention, not a recovery-design claim. Sources: snapshot.rs:55--63; spine\_async.rs:527--575, 2457--2504; posixio\_impl.rs:615--635.}
 \end{frame}
 
-% 14
+% 13
 \begin{frame}{Where memory goes}
   \begin{tabular}{@{}p{.24\textwidth}p{.71\textwidth}@{}}
     \toprule Allocation & Examples\\\midrule
@@ -264,7 +314,7 @@
   \note{Timing: 1.5 minutes. Memory accounting must include primary-key input traces as well as join and output state. During maintenance there are transaction runs, exchange or other in-flight runs, merge-building allocations, and old sources pinned by snapshots. Disk state still needs a memory cache and resident lookup filters/metadata. The process also contains connector buffers, thread stacks, allocator overhead, and other allocations. Operator allocation estimates, run and merge metrics, cache occupancy, and filter memory are useful diagnostics, but they are not interchangeable with process RSS. Summing per-operator estimates blindly can count shared runs more than once. The on-disk file size is not its resident memory footprint. This slide classifies native allocations and makes no measured per-state or savings claim. Sources: circuit/runtime.rs:848--904; storage/buffer\_cache/cache.rs; docs.feldera.com/docs/operations/memory.md.}
 \end{frame}
 
-% 15
+% 14
 \begin{frame}{What memory pressure changes}
   \small
   \begin{tabular}{@{}lp{.75\textwidth}@{}}
@@ -282,7 +332,7 @@
   \note{Timing: 2 minutes. The target is runtime max\_rss\_bytes. Raw pressure is Low below 85 percent, Moderate at 85, High at 90, and Critical at 95. Actions use effective pressure with hysteresis: High persists until raw pressure becomes Low, and Critical persists until raw pressure becomes Moderate or Low. At Moderate, the inserted-run threshold is configured min\_storage\_bytes, or the default 10 MiB. At High the threshold is zero, and loose memory runs may cause merges below usual run-count thresholds. At Critical, transient nonempty step runs also target storage. The controller samples roughly once per second, so it is not a strict allocator quota or an instantaneous cap. The 128-loose-run limit controls merger backlog separately and excludes in-progress merging runs. Shared-memory spill writes a copy and may leave the original pinned. This pressure path does not resize the storage cache. Sources: runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs:455--463,680--691,882--908, 2457--2504.}
 \end{frame}
 
-% 16
+% 15
 \begin{frame}{Native mechanisms and reconstruction prototype}
   \begin{tabular}{@{}p{.20\textwidth}p{.74\textwidth}@{}}
     \toprule Status & State and reads\\\midrule
@@ -295,7 +345,7 @@
   Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$ (Appendix D).\par\smallskip
   Subsequent RF1 inserts / RF2 deletes require referential integrity.\par
   Base primary-key state and $V$ remain separately retained.
-  \source{Explanatory program: slides 4--7. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
+  \source{Explanatory program: slide 5. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
   \note{Timing: 1.5 minutes. The actual experiment joins Orders--Customer first, then Lineitem with B. Its reconstructed accesses are C after-state and O before-state keyed by Customer ID, B after-state and L before-state keyed by Order ID. It does not retain our explanatory OL-first intermediate. Reconstruction decodes/copies and may sort requested ranges into temporary native runs. Base primary-key state and materialized V stay native; the manual COL owner runs outside the Q3 graph. Supported work is subsequent complete Order/Lineitem RF1 insertion and RF2 deletion under referential integrity after setup. Customer updates, replacements, key moves, orphans, and independent Lineitem updates are excluded. General native signed examples do not expand prototype support. Direct cursors and broader updates remain deferred. The measurement qualification campaign is pending; this deck claims no measured savings, update costs, or comparative performance. Sources: experiment README; WORKFLOW.md; native-state-read-contracts.md:373--409; CIRCUIT.md:140.}
 \end{frame}
 
@@ -373,10 +423,20 @@
   $B_o$ pair for Order 43: $(43;7,\text{BUILDING},\text{1995-03-02},0)$.\par
   $B_o$ is keyed by Order ID. $O_c$ groups Orders by Customer ID.
   \par\medskip\normalsize
-  This circuit and the slides 4--7 program compute the same maintained $V$.\par
+  This circuit and the slide 5 program compute the same maintained $V$.\par
   The RF1/RF2 prototype reconstructs these actual reads.
   \source{CIRCUIT.md; native-state-read-contracts.md; experiment README. No experiment changes in this revision.}
   \note{The compiler's optimized grouping is Orders--Customer first, with Orders on the left. Its projected joined-orders B is then on the right of Lineitem. In the first join changed Orders read after-state Customers and changed Customers read before-state Orders. In the second changed Lineitem reads after-state B and changed B reads before-state Lineitem. The native key for B is Order ID and its value contains Customer ID, segment, Order date, priority. The prototype reconstructs exactly these four accesses; it is not OL-first. The standalone algebra checker verifies both groupings against the same full three-way join, including exact branch assertions for each order. Source: CIRCUIT.md:140; native-state-read-contracts.md:47--108; experiment generated src/lib.rs (ignored build artifact, not modified or regenerated here).}
+\end{frame}
+
+\begin{frame}<1-4>{Appendix E: key-to-value row traversal.}
+  \centering\input{figures/row-traversal.tex}
+  \source{storage/file/format.rs; writer.rs; reader.rs. Zero-based row and array indices.}
+  \note{This illustrates key lookup followed by value-group iteration, without a target V. Exactly three nodes are drawn: the matching key leaf, a value branch rooted at row 0, and the selected value leaf. Other children are omitted. Key items (K, ()) and the row-boundary array are separate metadata. Key-item offsets, most header fields, and the value branch's min/max value bounds and bound map are omitted; those value bounds are not used for this row-based descent. Branch offsets and sizes are in 512-byte units. Leaf offsets m, a, and b are symbolic byte offsets within the uncompressed block, not file offsets. The item-offset map is illustrated as an explicit array; the native format also supports a fixed-stride encoding. The selected leaf's first row, 2, is derived traversal context passed down from the branch, not an on-disk header field. Sources: storage/file/format.rs:15--62; writer.rs:662--680,994--1023; reader.rs:648--670,1124--1186.}
+  \note<1>{\par Advance 1: show all three nodes and all their contents, with no traversal arrows. The key leaf contains keys 42, 43, 44 and four boundaries [0,2,4,6]. The value branch contains cumulative row totals [2,4,6] and three corresponding offsets/sizes. The selected leaf contains two items and the map locating them.}
+  \note<2>{\par Advance 2: key 43 has item index 1, so row\_groups[1]=2 and row\_groups[2]=4 define [2,4). The pair (43, ()) itself contains no byte pointer.}
+  \note<3>{\par Advance 3: locate the first value row, 2. With this branch starting at row 0, cumulative totals [2,4,6] give child ranges [0,2), [2,4), [4,6). Row 2 is outside child 0 and inside child 1. Select array index 1: offset 16, size 1. The descriptor means file byte offset 8192 and block size 512 bytes.}
+  \note<4>{\par Advance 4: follow the child descriptor to the value leaf. Its first row is derived as 0+2=2, so row 2 gives local index 2-2=0. Header n\_values=2 and value\_map\_ofs=m locate the item-offset map [a,b]. Map entry 0 points to (8,+1) at a. Iterate row 3 using local index 1, map entry b, and tuple (15,+1). Stop before row 4, the exclusive end of this key's group; do not visit the next child.}
 \end{frame}
 
 \end{document}

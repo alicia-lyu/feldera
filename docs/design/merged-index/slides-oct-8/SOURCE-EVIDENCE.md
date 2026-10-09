@@ -170,15 +170,67 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 14 main topics, two advances each on slides 2 and 4, and four
-appendices: 20 rendered pages in each PDF. Slide 2 shows a schematic
-LSM-like trace and one enlarged immutable file run. Its two column trees
+It has 15 main topics, two advances each on slides 2 and 5, and five
+appendices, with four advances in Appendix E: 25 rendered pages in each PDF.
+Slide 2 shows six unconnected runs with independent rightward cursors and
+one enlarged immutable file run. Its key and value trees
 follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
 `trace/ord/file/indexed_wset_batch.rs:41–83`. Row-group metadata and index
 block offsets follow `storage/file/format.rs:15–62`. The notes distinguish
-per-key value ordering, overlapping runs, and illustrative merging from
-implementation scheduling. Final visual review and
-build results are recorded in [final-revision-handoff.md](final-revision-handoff.md).
+per-key value ordering and overlapping runs from implementation scheduling.
+Construction and traversal sources and qualifications are detailed below.
+Current visual review and build results are recorded in
+[immutable-run-traversal-handoff.md](immutable-run-traversal-handoff.md).
 The original [planning handoff](advisor-presentation-implementation-plan.md)
 remains unchanged. The deck claims no measured savings, update costs, or
 comparative performance results.
+
+## Immutable-run construction and row traversal, 2026-10-09
+
+This addition inspected the files below at checkout
+`9ec749f84665eb8ba48f4036152020afd9bbf45d`. Their hashes identify the source
+bytes used; the earlier source-map identity remains a historical record.
+
+| Source (repository-relative) | SHA-256 |
+| --- | --- |
+| `crates/dbsp/src/storage/file/writer.rs` | `d63377d0e771477423bfb5f3bb7943d86cd5dfb280e6843f4d207747b02c533f` |
+| `crates/dbsp/src/storage/file/reader.rs` | `780f4a969197d880d34af5e6a689d0203bf3b1472b69c7e13e26a95cf531502f` |
+| `crates/dbsp/src/storage/file/format.rs` | `9e97e5d3c7cc7130ed54f9ef13e0c1e3ad8f4d893367ec2797513af9ad09feb3` |
+
+Native “columns” describe nested file trees, not SQL attribute columns.
+For an untimed indexed weighted run, tree 0 stores `(K, ())` with separate
+row-group metadata selecting tree 1's `(V, weight)` items. Slide 3 calls these
+`key_tree` and `value_tree`; its `TreeWriter`, `leaf_builder`, and
+`index_builders` simplify native `ColumnWriter`, `data_block`, and `index_blocks`.
+This terminology prevents the file layout from being mistaken for a SQL
+column store.
+
+- `writer.rs:224–246` initializes the tree's row range and takes pending rows
+  by replacing the range with `[end,end)`. `writer.rs:1234–1255` takes a
+  nonempty child group before incrementing the parent counter and appending.
+  `writer.rs:1660–1737` exposes `write0`, `write1`, and `close`. `write1`
+  takes an item, with no position argument. Construction spans many calls
+  and completes at `close`; the callout's one-run case is illustrative.
+- The tree's counters survive data-leaf flushes: `ColumnWriter::add_item`
+  (`writer.rs:411–427`) writes a completed leaf after `DataBlockBuilder::add_item`
+  (`writer.rs:588–605`) builds the full leaf and retries the item. Neither
+  resets `ColumnWriter.rows`. Each tree's row ordinals are file-wide.
+- `reader.rs:648–670` reads adjacent row-boundary entries. Key 43's item
+  index 1 selects entries 1 and 2 of `[0,2,4,6]`, hence `[2,4)`.
+- `format.rs:50–62` and `reader.rs:1124–1186` establish cumulative row
+  totals and descriptor units. For the illustrated branch starting at row 0,
+  row 2 selects child 1 from `[2,4,6]`, with offset 16 and size 1: byte offset
+  8192 and size 512. Other children and unused value bounds are omitted.
+- `writer.rs:662–680` writes the leaf header/map;
+  `reader.rs:560–570,673–706` locates an item via the map and derives local
+  index from `row - first_row`. The leaf's first row 2 is traversal context
+  derived from the preceding cumulative total, not an on-disk header field.
+  Symbolic block offsets `m`, `a`, and `b` avoid invented serialization sizes.
+  The map illustration uses the supported explicit-array case; the native
+  format also supports fixed-stride encoding.
+
+Appendix E draws exactly the key leaf, value branch, and selected value leaf.
+It iterates rows 2 and 3 through the two map entries to `(8,+1)` and `(15,+1)`,
+then stops before row 4. It omits key-item offsets and unused branch value
+bounds. These numeric values are a compact layout example, not complete
+Orders payloads or a measurement of block packing.

@@ -1,0 +1,92 @@
+% Three fixed block outlines; only traversal marks and context are revealed.
+\begin{tikzpicture}[x=1cm,y=1cm,font=\small,
+  traversal/.style={-{Latex[length=1.8mm]},draw=teal,line width=1pt},
+  selected/.style={draw=teal,line width=1pt,rounded corners=1pt}]
+  \path[use as bounding box] (0,0) rectangle (14,5.6);
+
+  \draw[draw=ink,line width=.8pt,fill=ink!4] (0,1.6) rectangle (4.05,4.9);
+  \draw[draw=ink,line width=.8pt,fill=ink!4] (4.6,1.6) rectangle (9,4.9);
+  \draw[draw=ink,line width=.8pt,fill=ink!4] (9.55,1.6) rectangle (14,4.9);
+  \node[font=\normalsize\bfseries] at (2.025,4.55) {Key leaf};
+  \node[font=\normalsize\bfseries] at (6.8,4.55) {Value branch};
+  \node[font=\normalsize\bfseries] at (11.775,4.55) {Selected value leaf};
+
+  % Key items are separate from the four row-group boundaries.
+  \node at (.08,3.9) {$[$};
+  \node (key42) at (.8,3.9) {$(42,())$};
+  \node at (1.38,3.9) {$,$};
+  \node (key43) at (2.025,3.9) {$(43,())$};
+  \node at (2.65,3.9) {$,$};
+  \node (key44) at (3.25,3.9) {$(44,())$};
+  \node at (3.97,3.9) {$]$};
+  \node[text=quiet,font=\scriptsize,anchor=west,align=left]
+    at (.08,3.4) {Row\\boundaries};
+  \node at (.55,2.85) {$[$};
+  \foreach \x/\value/\name in {.9/0/bound0,1.65/2/bound1,2.4/4/bound2,3.15/6/bound3}
+    \node (\name) at (\x,2.85) {$\value$};
+  \foreach \x in {1.275,2.025,2.775}
+    \node at (\x,2.85) {$,$};
+  \node at (3.5,2.85) {$]$};
+
+  % All branch arrays share the same zero-based child indices.
+  \node[anchor=west,align=left] at (4.8,3.7) {Cumulative\\row totals};
+  \node[anchor=west] at (4.8,2.95) {Child offsets};
+  \node[anchor=west] at (4.8,2.2) {Child sizes};
+  \foreach \y in {3.7,2.95,2.2} {
+    \node at (6.9,\y) {$[$};
+    \node at (7.5,\y) {$,$};
+    \node at (8.2,\y) {$,$};
+    \node at (8.8,\y) {$]$};
+  }
+  \foreach \x/\total/\offset/\index in {7.15/2/8/0,7.85/4/16/1,8.55/6/24/2} {
+    \node (total\index) at (\x,3.7) {$\total$};
+    \node (offset\index) at (\x,2.95) {$\offset$};
+    \node (size\index) at (\x,2.2) {$1$};
+  }
+  \node[text=quiet,font=\scriptsize] at (6.8,1.8) {Offsets and sizes: units of 512 bytes};
+
+  % Leaf header, map, and individual items; all block offsets are symbolic.
+  \node at (11.775,4.05) {\texttt{n\_values=2}};
+  \node (mapheader) at (11.775,3.65) {\texttt{value\_map\_ofs=m}};
+  \node[text=quiet] at (11.775,3.05) {Item-offset map at $m$};
+  \node at (10.5,2.65) {$[$};
+  \node (map0) at (10.95,2.65) {$a$};
+  \node at (11.775,2.65) {$,$};
+  \node (map1) at (12.6,2.65) {$b$};
+  \node at (13.05,2.65) {$]$};
+  \node (tuple0) at (10.95,2.0) {$(8,+1)$};
+  \node (tuple1) at (12.6,2.0) {$(15,+1)$};
+
+  \only<2->{
+    \draw[selected] (1.42,3.68) rectangle (2.63,4.12);
+    \draw[traversal] (1.75,3.68) -- (1.65,3.5) -- (1.65,3.03);
+    \draw[traversal] (2.3,3.68) -- (2.4,3.5) -- (2.4,3.03);
+    \draw[selected] (1.43,2.63) rectangle (1.87,3.07);
+    \draw[selected] (2.18,2.63) rectangle (2.62,3.07);
+    \draw[traversal] (bound1.south) -- (1.65,2.4) -- (1.85,2.22);
+    \draw[traversal] (bound2.south) -- (2.4,2.4) -- (2.2,2.22);
+    \node[text=teal] (range) at (2.025,2.05) {$[2,4)$};
+  }
+  \only<3->{
+    \draw[traversal] (range.east) -- (4.3,2.05) -- (4.3,5.2)
+      -- (8.85,5.2) -- (8.85,4.2) -- (7.15,4.2) -- (7.15,3.92);
+    \node[text=teal,fill=white,inner sep=2pt] at (5.75,5.2) {Row 2};
+    \draw[selected] (6.95,3.48) rectangle (8.05,3.92);
+    \draw[traversal] (total1.south) -- (offset1.north);
+    \draw[selected] (7.55,2.73) rectangle (8.15,3.17);
+    \draw[traversal] (offset1.south) -- (size1.north);
+    \draw[selected] (7.63,1.98) rectangle (8.07,2.42);
+    \node[text=teal] at (6.8,1.1) {$2\le 2<4\ \Rightarrow\ \text{child index }1$};
+  }
+  \only<4->{
+    \draw[traversal] (8.15,3.1) -- (8.35,3.3) -- (9.3,3.3)
+      -- (9.3,4.05) -- (9.55,4.05);
+    \node[text=teal] at (11.775,5.3) {Local index: $2-2=0$};
+    \draw[traversal] (10.5,5.1) -- (9.8,5.1) -- (9.8,2.65) -- (map0.west);
+    \draw[traversal] (mapheader.south) -- (11.775,3.27);
+    \draw[traversal] (map0.south) -- (tuple0.north);
+    \draw[traversal] (map1.south) -- (tuple1.north);
+    \node[text=teal] at (11.775,.65) {Rows 2, 3: iterate both tuples};
+    \node[text=teal] at (11.775,.2) {Stop before row 4};
+  }
+\end{tikzpicture}
