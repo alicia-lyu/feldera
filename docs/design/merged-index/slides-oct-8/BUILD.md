@@ -35,15 +35,15 @@ pdfinfo build/dbsp-physical-design-notes.pdf
 ```
 
 Inspect all presentation and notes pages at readable size, including both slide-2
-advances and their notes. Check clipping, overlap, stable positions, readable
+advances. Check clipping, overlap, stable positions, readable
 tree/search connectors, fields/weights, grammar, and source labels.
-Speaker notes must include the common context and only the appropriate overlay's step.
+The deck currently has no speaker notes, so the notes pages are blank.
 On slide 2, check one independent rightward cursor inside each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
 first value row and iterates the group without a target value.
 On slide 3, check pseudocode indentation, file-wide counters, the pending
-row-range reset, and the two-column layout. The notes qualify the one-run case.
+row-range reset, and the two-column layout.
 On Appendix E, inspect all four cumulative advances: three fixed block
 outlines, separate key items/boundaries, zero-based array indices, 512-byte
 descriptor units, symbolic leaf offsets, and connectors clear of labels.

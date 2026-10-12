@@ -22,7 +22,7 @@ apart from updated slide numbers and explanatory-program references.
 The recovered opening slides simplify the introduction,
 base storage, and example notation; the circuit uses unsubscripted relations
 and delta-labeled integrators; the state table lists four indexed states.
-Existing speaker notes were retained because the reference has no notes.
+Speaker notes were removed on 2026-10-12 because agents wrote them without review.
 
 ## Build and deliverables
 
