@@ -1,28 +1,25 @@
 # Generated native state-read contracts (R2)
 
 Inspected on 2026-10-06 at Feldera revision
-`308950de73a28bb014c8ad002365d2aa64f1f152`. The source links below refer to the
-generated program and runtime inspected at that revision. The generated files
-were tracked at that revision; they are now Git-ignored. Run
+`308950de73a28bb014c8ad002365d2aa64f1f152`; symbol names were rechecked on
+2026-10-12. Code is cited by symbol and file path, not by line, because line
+anchors drift. Stream names such as `s3` to `s7` come from the generated
+`q3-ivm-baseline/src/lib.rs`, which is git-ignored and may change between
+compiler versions; run
 [generate.sh](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/generate.sh)
-before following their local source links. The
+and read the generator (`ToRustVisitor.java`) to confirm them. The
 [native circuit note](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md#reading-the-generated-program)
 records the generated topology; this document binds its accumulated-state reads.
-R1–R5 name the [README roadmap](README.md#next-steps). The older storage Step 2
-and its Phase numbering retain their meaning.
 
-R2 documents existing behavior and observed compatibility gaps. R3 owns
-reconstruction and runtime integration, including decisions about adapters,
-ordering strategies, memory policies, and recovery. The
-[RF1/RF2 implementation contract](r3-rf1-rf2-reconstruction-implementation-plan.md)
-narrows the current integration workload; the native behavior inspected here
-remains the comparison contract. Maintenance targets one DBSP worker; initial loading may use
-multiple workers under the [worker policy](README.md).
+R2 documents existing behavior and compatibility gaps. R3 owns reconstruction
+(see [reconstruction.md](reconstruction.md)); the native behavior inspected here
+remains the comparison contract. Maintenance and initial loading both use one
+DBSP worker ([decisions.md](decisions.md)).
 
 ## Relations and state notation
 
 `O`, `C`, and `L` denote logical Orders, Customer, and Lineitem. Following the
-[storage design notation](folded-key-layer-file-plan.md#compatibility-with-feldera-operators),
+[storage design notation](col-storage.md),
 for any relation `X`:
 
 - `X⁻` is accumulated state immediately before the current update set.
@@ -35,11 +32,11 @@ contribute through the signed relation `ΔX`; addition consolidates weights of
 identical complete tuples.
 
 `B` names the actual generated Orders–Customer intermediate, stream
-[s6](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487).
+s6.
 It is an order-keyed projection of `O ⋈ C`, retaining customer ID, segment,
 order date, and ship priority. It is not a named SQL view. `V` is the
 materialized nine-field Customer–Orders–Lineitem join generated as
-[s7](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L503).
+s7.
 Neither join applies Q3's residual filters or aggregation.
 
 ## Generated bindings and equations
@@ -51,10 +48,10 @@ accumulated operand read by a delta branch, rather than a separate input delta.
 
 | Delta input | Accumulated state read | Lookup key | Generated stream and runtime wiring |
 | --- | --- | --- | --- |
-| `ΔO` (`s3`) | `C⁺` (`s4` integral) | Customer ID | [s3/s4 join](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487); [left delta with current right trace](../../../crates/dbsp/src/operator/dynamic/join.rs#L714). |
-| `ΔC` (`s4`) | `O⁻` (`s3` integral) | Customer ID | [s3/s4 join](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487); [right delta with delayed left trace](../../../crates/dbsp/src/operator/dynamic/join.rs#L731). |
-| `ΔL` (`s5`) | `B⁺` (`s6` integral) | Order ID | [s5/s6 join](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L518); [left delta with current right trace](../../../crates/dbsp/src/operator/dynamic/join.rs#L714). |
-| `ΔB` (`s6`) | `L⁻` (`s5` integral) | Order ID | [s5/s6 join](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L518); [right delta with delayed left trace](../../../crates/dbsp/src/operator/dynamic/join.rs#L731). |
+| `ΔO` (`s3`) | `C⁺` (`s4` integral) | Customer ID | s3/s4 join; left delta with current right trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔC` (`s4`) | `O⁻` (`s3` integral) | Customer ID | s3/s4 join; right delta with delayed left trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔL` (`s5`) | `B⁺` (`s6` integral) | Order ID | s5/s6 join; left delta with current right trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔB` (`s6`) | `L⁻` (`s5` integral) | Order ID | s5/s6 join; right delta with delayed left trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
 
 These bindings give the generated equations:
 
@@ -66,21 +63,20 @@ V⁺ = V⁻ + ΔV
 
 The first equality expands to
 `ΔO ⋈ C⁻ + ΔO ⋈ ΔC + O⁻ ⋈ ΔC`; the simultaneous-change term occurs once.
-The same reasoning applies to the second join. The runtime
-[creates each input trace](../../../crates/dbsp/src/operator/dynamic/join.rs#L705),
-wires the two branches as cited above, and [adds their outputs](../../../crates/dbsp/src/operator/dynamic/join.rs#L748).
-The [delayed-trace accessor](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L773)
+The same reasoning applies to the second join. `dyn_join_generic` (`crates/dbsp/src/operator/dynamic/join.rs`)
+creates each input trace, wires the two branches as cited above, and adds their outputs.
+The delayed-trace accessor (`accumulate_delay_trace` in `crates/dbsp/src/operator/dynamic/accumulate_trace.rs`)
 uses the cached prior-cycle trace; its
-[snapshot operator](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L1416)
+snapshot operator (`AccumulateDelayTrace`, same file)
 captures that trace on initialization or on evaluation after the runtime's
 notification that transaction inputs are complete (`Operator::flush`). A delayed snapshot is a
 read of existing accumulation, not a second accumulation of the input.
 
 The generated `*_balanced` wrappers use ordinary joins when adaptive joins are
 disabled, as in the native baseline: see
-[join_balanced](../../../crates/dbsp/src/mono.rs#L181),
-[join_index_balanced](../../../crates/dbsp/src/mono.rs#L485), and the
-[default setting](../../../crates/feldera-types/src/config/dev_tweaks.rs#L335).
+join_balanced (`crates/dbsp/src/mono.rs`),
+join_index_balanced (`crates/dbsp/src/mono.rs`), and the
+default setting (`crates/feldera-types/src/config/dev_tweaks.rs`).
 This contract describes that configuration, without extending it to adaptive
 or multiworker maintenance.
 
@@ -88,25 +84,25 @@ or multiworker maintenance.
 
 The generated stream declarations and projection closures establish these
 types and field orders. Each indexed collection associates a signed
-[i64 weight](../../../crates/dbsp/src/algebra/zset.rs#L39) with a complete
+i64 weight (`crates/dbsp/src/algebra/zset.rs`) with a complete
 `(key, value)` pair; the superscript selects visibility, not the weight's sign.
 
 | Read | Concrete key type | Concrete value type | Value fields in order | Generated source |
 | --- | --- | --- | --- | --- |
-| `C⁺` | `Tup1<i64>` | `Tup1<SqlString>` | Market segment | [s4](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L456) |
-| `O⁻` | `Tup1<i64>` | `Tup3<i64, Date, i32>` | Order ID, order date, ship priority | [s3](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L442) |
-| `B⁺` | `Tup1<i64>` | `Tup4<i64, SqlString, Date, i32>` | Customer ID, market segment, order date, ship priority | [s6](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487) |
-| `L⁻` | `Tup1<i64>` | `Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>` | Line number, extended price, discount, ship date | [s5](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L465) |
+| `C⁺` | `Tup1<i64>` | `Tup1<SqlString>` | Market segment | s4 |
+| `O⁻` | `Tup1<i64>` | `Tup3<i64, Date, i32>` | Order ID, order date, ship priority | s3 |
+| `B⁺` | `Tup1<i64>` | `Tup4<i64, SqlString, Date, i32>` | Customer ID, market segment, order date, ship priority | s6 |
+| `L⁻` | `Tup1<i64>` | `Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>` | Line number, extended price, discount, ship date | s5 |
 
 The keys are customer ID for `C⁺` and `O⁻`, and order ID for `B⁺` and `L⁻`.
 The logical Lineitem identity is `(order ID, line number)`; its generated
 indexed value retains the line number. Its schema has no customer ID.
 
-The output [s7 declaration and closure](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L503)
+The output `s7` declaration and closure
 use `WSet<Tup9<i64, SqlString, i64, Date, i32, i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>`.
 The fields are customer ID, segment, order ID, order date, ship priority,
 line number, extended price, discount, and ship date, in that order. The
-[materialized output registration](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L630)
+materialized output registration
 exposes `V` through Catalog. Base input maps and materialized `V` are outside
 the four accumulated join-read bindings above.
 
@@ -127,14 +123,14 @@ types and current or delayed trace.
 
 `Operator::flush` means **finish processing the current transaction's inputs
 and emit the remaining outputs**. The
-[scheduler](../../../crates/dbsp/src/circuit/schedule.rs#L219)
+scheduler (`crates/dbsp/src/circuit/schedule.rs`)
 invokes it on an operator after all predecessors have finished producing their
 outputs for that transaction, then waits for the operator to finish before
 flushing downstream operators. It flushes pending computation downstream;
 it does not request a storage write or consolidation into one batch or file.
 
 For example, the
-[transaction delta collector](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303)
+transaction delta collector (`crates/dbsp/src/operator/dynamic/accumulator.rs`)
 inserts incoming batches into its transaction Spine. After its `flush`
 notification, the next evaluation returns that Spine and replaces it with an
 empty one. The returned delta is one logical collection, which may still
@@ -161,8 +157,8 @@ references.
 
 | Role | Native source | Logical output | Lifetime and reset |
 | --- | --- | --- | --- |
-| Transaction delta collector | [Accumulator](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303), used by `dyn_accumulate` and `dyn_shard_accumulate` | The current transaction's `ΔX`, collected from its input batches | Hands off its transaction Spine after `Operator::flush`, then starts with an empty Spine. |
-| Historical trace accumulation | [Trace construction and feedback](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L95) with [AccumulateTraceAppend](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L939) | Accumulated `X⁺`, including `X⁻` and the current `ΔX` | Retains relation state across transactions; transaction completion does not reset it. |
+| Transaction delta collector | Accumulator (`crates/dbsp/src/operator/dynamic/accumulator.rs`), used by `dyn_accumulate` and `dyn_shard_accumulate` | The current transaction's `ΔX`, collected from its input batches | Hands off its transaction Spine after `Operator::flush`, then starts with an empty Spine. |
+| Historical trace accumulation | Trace construction and feedback (`crates/dbsp/src/operator/dynamic/accumulate_trace.rs`) with AccumulateTraceAppend (`crates/dbsp/src/operator/dynamic/accumulate_trace.rs`) | Accumulated `X⁺`, including `X⁻` and the current `ΔX` | Retains relation state across transactions; transaction completion does not reset it. |
 
 The trace construction uses a transaction delta collector internally before
 appending its output to historical state. Both roles can use a Spine, so the
@@ -170,7 +166,7 @@ collection's representation does not distinguish their temporal scope.
 
 ### Why this join waits for complete inputs
 
-The [scheduler](../../../crates/dbsp/src/circuit/schedule.rs#L216) permits
+The scheduler (`crates/dbsp/src/circuit/schedule.rs`) permits
 operators to process inputs before transaction completion; some operators
 accumulate them for later processing. The wait described here belongs to the
 existing accumulated-trace join, not a requirement that every downstream
@@ -190,12 +186,12 @@ In this implementation, **transaction completion notifications and snapshot
 reads are coupled**: after predecessor outputs are complete, `JoinTrace`
 snapshots the trace supplied to its branch and uses it with the transaction
 delta. The
-[current branch](../../../crates/dbsp/src/operator/dynamic/join.rs#L714)
+current branch (`crates/dbsp/src/operator/dynamic/join.rs`)
 receives the accumulated trace including current updates; the
-[before-state branch](../../../crates/dbsp/src/operator/dynamic/join.rs#L731)
+before-state branch (`crates/dbsp/src/operator/dynamic/join.rs`)
 receives the delayed prior trace. `flush()` does not itself take a sequential
 pair of snapshots before and after appending the delta. The
-[delayed-trace wiring](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs#L773)
+delayed-trace wiring (`crates/dbsp/src/operator/dynamic/accumulate_trace.rs`)
 provides the before state. This coordination controls logical visibility,
 not batch placement, storage writes, or compaction.
 
@@ -209,24 +205,24 @@ the two underlying cursors to enumerate value pairs and multiply their weights.
 
 The following operations are confirmed in the inspected source:
 
-1. [JoinTrace::eval](../../../crates/dbsp/src/operator/dynamic/join.rs#L1633)
+1. JoinTrace::eval (`crates/dbsp/src/operator/dynamic/join.rs`)
    takes a read-only snapshot of an arriving delta and retains it until
-   [Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)
+   Operator::flush (`crates/dbsp/src/circuit/operator_traits.rs`)
    notifies the operator that all predecessors have produced their outputs
    for the current transaction. The
-   [join's notification handler](../../../crates/dbsp/src/operator/dynamic/join.rs#L1454)
+   join's notification handler (`crates/dbsp/src/operator/dynamic/join.rs`)
    sets a flag; the following evaluation snapshots the supplied accumulated
    trace and processes the retained delta. That trace's wiring determines
    whether it represents the before or after state. This scheduling ensures
    that the join consumes complete transaction inputs. Snapshot acquisition
    itself neither requires spilling nor consolidating the referenced batches.
-2. [WithSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L23)
+2. WithSnapshot (`crates/dbsp/src/trace/spine_async/snapshot.rs`)
    defines read-only, non-merging snapshots. A
-   [SpineSnapshot](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L55)
+   SpineSnapshot (`crates/dbsp/src/trace/spine_async/snapshot.rs`)
    owns `Vec<Arc<B>>`; acquisition from a
-   [Spine](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L170)
+   Spine (`crates/dbsp/src/trace/spine_async/snapshot.rs`)
    obtains batch references. Its
-   [cursor](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L213)
+   cursor (`crates/dbsp/src/trace/spine_async/snapshot.rs`)
    retains cloned batch references. Both memory-backed and file-backed batches
    can be retained; snapshot acquisition does not require spilling in-memory
    batches. The existing
@@ -236,26 +232,26 @@ The following operations are confirmed in the inspected source:
    Reading that view does not append updates or merge its batches. These
    snapshot and notification operations do not define a memory-limit policy.
    For a consolidated read, the
-   [CursorList](../../../crates/dbsp/src/trace/cursor/cursor_list.rs#L150)
+   CursorList (`crates/dbsp/src/trace/cursor/cursor_list.rs`)
    sums contributions for identical key/value pairs across batches and skips
    zero totals.
 3. When `fetch_join == Some(true)`, the join invokes
-   [trace.fetch(&delta)](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661).
-   [SpineSnapshot::fetch](../../../crates/dbsp/src/trace/spine_async/snapshot.rs#L252)
+   trace.fetch(&delta) (`crates/dbsp/src/operator/dynamic/join.rs`).
+   SpineSnapshot::fetch (`crates/dbsp/src/trace/spine_async/snapshot.rs`)
    delegates to `FetchList`, which concurrently fetches each batch and keeps
    batch cursors for batches without a specialized fetch result. The join
    uses the fetched cursor when present, otherwise the snapshot's full cursor.
 4. **Join traversal and output.** Each input cursor implements the
-   [Cursor interface](../../../crates/dbsp/src/trace/cursor.rs#L42): ordered
+   Cursor interface (`crates/dbsp/src/trace/cursor.rs`): ordered
    key/value navigation and borrowed key/value references.
-   [JointKeyCursor](../../../crates/dbsp/src/operator/dynamic/join.rs#L1572)
+   JointKeyCursor (`crates/dbsp/src/operator/dynamic/join.rs`)
    finds keys shared by the delta and accumulated-state snapshot: it visits
    keys on one side and seeks the same key on the other. For
    these inner joins, fetched state makes the delta drive; otherwise
-   [estimated key counts](../../../crates/dbsp/src/operator/dynamic/join.rs#L1667)
+   estimated key counts (`crates/dbsp/src/operator/dynamic/join.rs`)
    choose which side drives. Missing keys produce no joined rows. At each
    matching key, the
-   [JoinTrace loop for this circuit](../../../crates/dbsp/src/operator/dynamic/join.rs#L1809)
+   JoinTrace loop for this circuit (`crates/dbsp/src/operator/dynamic/join.rs`)
    takes each delta value in turn and pairs it with every accumulated-state
    value under that key. After each delta value, it resets the accumulated-state
    cursor to the first value under the same key, so the next delta value sees
@@ -274,7 +270,7 @@ state; records are not selected by a timestamp or a time-travel request. A
 snapshot can reference memory-backed or file-backed batches.
 
 In the source, the generic time parameter is Rust's unit type `()`, and its
-[batch specialization](../../../crates/dbsp/src/time.rs#L214) uses the ordinary
+batch specialization (`crates/dbsp/src/time.rs`) uses the ordinary
 batch directly. This is a type-level representation of the absence of
 per-record logical time, not a timestamp stored with each record.
 
@@ -286,7 +282,7 @@ does not imply that its delta always drives a selective lookup.
 **Validation status:** These are agent-authored algebraic illustrations, not
 executable test cases. They have not been executed as written or reviewed or
 validated by a human expert. R2 added no runtime code or executable tests.
-The native baseline has [tests for related scenarios](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs#L858),
+The native baseline has tests for related scenarios (`native_deltas_match_full_join_across_updates` and `simultaneous_three_source_changes_match_reference` in `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs`),
 but those do not establish validation of these exact examples. The examples
 illustrate the equations above; they are not correctness evidence for R3.
 
@@ -347,32 +343,33 @@ and price; no BUILDING filter runs in this circuit. The unchanged order
 belongs to both `O⁻` and `O⁺`. Projecting either replacement delta to its
 unchanged identity and summing would yield zero, although its payload changes.
 
-## Observed prototype gaps and R3 handoff
+## Compatibility gaps before R3 (historical, 2026-10-06)
 
-The [storage Step 2 implementation evidence](phase-4-implementation-note.md)
-establishes folded weighted batches and native snapshot reads. It does not
-establish these generated typed relations or their runtime substitution.
+This section records what R2 observed before R3 existed. R3 has since closed
+the runtime-integration gap for RF1/RF2 (see
+[R3 RF1/RF2 binding](#r3-rf1rf2-binding) and
+[reconstruction.md](reconstruction.md)). The other rows describe the storage
+design at that date; [col-storage.md](col-storage.md) is current.
 
-| Observed boundary | Native request | Current storage prototype evidence |
+| Boundary | Native request | Storage prototype at 2026-10-06 |
 | --- | --- | --- |
-| Key placement | `B⁺` and `L⁻` request order-ID keys; `O⁻` requests customer-ID keys. Logical equality uses native IDs; folded bytes encode physical placement. | The [reusable COL definition](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs) places Customer at `(c)`, Orders at `(c,o)`, and extended Lineitem at `(c,o,l)`. Prefix helpers require customer ID as well as order ID. |
-| Identity widths | Customer and order IDs are `i64`; line number is `i32`. | COL uses `SourceKey::Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`, with corresponding key-domain widths. |
-| Payload representation | Values use `SqlString`, `Date`, and fixed-precision `SqlDecimal` types as listed above. | COL stores segment as `SqlString`, order and ship dates as `Date`, ship priority as `i32`, extended price as `SqlDecimal<15, 2>`, and discount as `SqlDecimal<4, 2>`. |
-| Cursor representation | Each join reads its typed key/value relation, including the joined `B` projection. | DBSP's [general merged-index batch](../../../crates/dbsp/src/trace/merged_index/batch.rs) stores folded byte keys and serialized payload bytes and exposes consolidated byte rows. Concrete payload codecs live in COL; typed join projections remain deferred. |
-| Logical versus physical Lineitem | `s5` contains order ID and line number, with no customer ID; logical equality still uses native IDs. | [LineitemByCustomer](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs) folds the extended row under a customer-leading physical key. Its producer and related placement changes remain separate work under the [storage contract](folded-key-layer-file-plan.md#contract-and-references). |
-| Runtime integration | The generated joins build native retained traces and read current/delayed snapshots. | The [generated calls](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/lib.rs#L487) do not instantiate the merged-index prototype or redirect any accumulated read to it. |
+| Key placement | `B⁺` and `L⁻` request order-ID keys; `O⁻` requests customer-ID keys. Logical equality uses native IDs; folded bytes encode physical placement. | The reusable COL definition (`merged-index-col/src/lib.rs`) places Customer at `(c)`, Orders at `(c,o)`, and extended Lineitem at `(c,o,l)`. Prefix helpers require the customer ID as well as the order ID. |
+| Identity widths | Customer and order IDs are `i64`; line number is `i32`. | COL uses `SourceKey::Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`. |
+| Payload representation | `SqlString`, `Date`, and fixed-precision `SqlDecimal` types, as listed above. | COL stores segment as `SqlString`, dates as `Date`, ship priority as `i32`, price as `SqlDecimal<15, 2>`, and discount as `SqlDecimal<4, 2>`. |
+| Cursor representation | Each join reads its typed key/value relation, including the joined `B` projection. | The general merged-index batch (`crates/dbsp/src/trace/merged_index/batch.rs`, a public module) stores folded byte keys and serialized payload bytes and exposes consolidated byte rows. Payload codecs live in COL; the typed projections are the Q3 readers described below. |
+| Logical versus physical Lineitem | `s5` carries order ID and line number, with no customer ID. | The `LINEITEM` index, named `LineitemByCustomer` (`merged-index-col/src/lib.rs`), folds the extended row under a customer-leading key; the producer supplies the customer from the same transaction's Orders. |
+| Runtime integration | The default generated joins build native retained traces and read current and delayed snapshots. | Default generation still does. With `--q3-merged-index`, the compiler instead emits the supplied-snapshot joins that read the merged index (R3 below). |
 
-R3 must investigate these compatibility boundaries and implement the four
-bindings with the documented tuples, signed weights, key/value order, absence,
-and before/after visibility. It must identify the actual trace owners and
-consumers so redirecting selected reads also stops their independent
-accumulation. Base input storage, the secondary merged index, materialized `V`,
-and unreplaced state remain separately accounted for. R4 owns the broader correctness
-verification, and R5 owns maintenance measurements.
+R3 had to implement the four bindings with the documented tuples, signed
+weights, key and value order, absence, and before/after visibility, and to stop
+the independent accumulation of the replaced traces. Base input storage, the
+secondary merged index, materialized `V`, and unreplaced state remain separately
+accounted for. R4 owns the broader correctness verification and R5 the
+maintenance measurements.
 
 ### R3 RF1/RF2 binding
 
-The opt-in compiler emits calls to the COL library's
+The opt-in compiler (`--q3-merged-index`) emits calls to the COL library's
 [Q3 readers](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/q3.rs).
 The manually maintained index has already received its physical updates when Q3
 starts. Its immutable before/after snapshots and a temporary order/customer map

@@ -2,7 +2,7 @@
 
 This note describes the compiler-expanded logical graph and the actual runtime
 graphs captured for the native Q3 baseline. Artifacts and capture logs are stored under the repository’s
-`target/q3-circuit-exports/` directory. The graph files preserve the node
+`target/q3-circuit-exports/` directory. They are local-only: `target/` is git-ignored, so the links to them below work only after a local capture. The graph files preserve the node
 IDs, edges, ports, and clusters emitted by their source graph. The source code
 and runtime operator behavior referenced below explain how to read those
 graphs; they do not reconstruct the topology.
@@ -62,15 +62,16 @@ Node IDs and original operator names remain intact.
 
 ## Worker policy
 
-All future IVM maintenance runs use one worker. Initial loading may use
-multiple workers. The two-worker captures below are prior runtime inspection
-artifacts. `CircuitConfig::with_workers(N)` creates local worker threads with
+Maintenance and initial loading both use one worker (see
+[decisions.md](../../../docs/design/merged-index/decisions.md)). Reconstructed
+mode rejects any other count. The two-worker captures below are prior runtime
+inspection artifacts of the native circuit. `CircuitConfig::with_workers(N)` creates local worker threads with
 replicas of the circuit; input maps and join traces are partitioned by key.
 The generated `join_*_balanced` wrappers select adaptive balancing only when
 `adaptive_joins` is enabled, which is off in the default configuration used
 for these captures. See the
-[wrappers](../../../crates/dbsp/src/mono.rs) and
-[default settings](../../../crates/feldera-types/src/config/dev_tweaks.rs).
+wrappers in `crates/dbsp/src/mono.rs` and the default settings in
+`crates/feldera-types/src/config/dev_tweaks.rs`.
 
 ## Per-worker runtime graphs
 
@@ -93,7 +94,7 @@ current transaction's changes in a Spine. Historical trace accumulation retains
 relation state across transactions. The
 [naming distinction](../../../docs/design/merged-index/native-state-read-contracts.md#weird-feldera-naming-accumulation)
 records these separate roles.
-[Operator::flush](../../../crates/dbsp/src/circuit/operator_traits.rs#L349)
+`Operator::flush` (`crates/dbsp/src/circuit/operator_traits.rs`)
 asks an operator to finish processing that transaction and emit its remaining
 outputs. The collector's next evaluation returns its transaction Spine and
 replaces it with an empty one. The returned Spine can still contain multiple
@@ -113,7 +114,8 @@ applies to the named integration regions and `AccumulateDelayTrace`
 snapshots. The snapshot represents historical integrator state, although it
 does not itself append new deltas to that state. See the
 [trace builders](../../../crates/dbsp/src/operator/dynamic/accumulate_trace.rs)
-and [transaction delta collector](../../../crates/dbsp/src/operator/dynamic/accumulator.rs#L303).
+and the transaction delta collector `Accumulator` in
+`crates/dbsp/src/operator/dynamic/accumulator.rs`.
 
 The local one-worker capture is
 [`worker-0-styled.svg`](../../../target/q3-circuit-exports/runtime-1/run-1/worker-0-styled.svg). The
@@ -127,10 +129,9 @@ the source revision, command, configuration, run, and capture stage.
 It performs keyed cursor and range access inside the operator; the graph does
 not contain separate index-access nodes. The other-state category can include
 buffered join work and does not mean the operator accumulates a trace. Read the
-[join implementation](../../../crates/dbsp/src/operator/dynamic/join.rs#L651)
-and its [range fetch path](../../../crates/dbsp/src/operator/dynamic/join.rs#L1661),
-and see [generated Rust](src/lib.rs#L487) for the calls that instantiate the
-joins.
+`JoinTrace` and `JointKeyCursor` in `crates/dbsp/src/operator/dynamic/join.rs`.
+The generated `src/lib.rs` instantiates the joins; it is git-ignored, so read the
+generator (`ToRustVisitor.java`) or run [generate.sh](generate.sh).
 
 ## Reading the generated program
 
@@ -139,17 +140,19 @@ customer key, projects their needed fields, and joins the result with Lineitem
 on order key. The logical Lineitem input has `(l_orderkey, l_linenumber)`
 identity and no customer key. It then projects the nine fields of `V`. These
 are plan nodes 2, 3, 4, 5, 1, 6, 7, and 8 in [plan.json](plan.json). The SQL
-starts with `Customer JOIN Orders`; the optimized plan's first join has Orders
-on the left. The plan records the selected shape.
+starts with `Customer JOIN Orders`; in the plan generated locally, the first
+join has Orders on the left. Unverified in git: `plan.json` is git-ignored, so
+rerun [generate.sh](generate.sh) and read the plan to confirm the orientation.
 
-`B` below names the generated join output [s6](src/lib.rs#L487) for discussion;
-it is not a SQL view. The compiler rekeys Orders by customer key in
-[s3](src/lib.rs#L442), Customer by customer key in [s4](src/lib.rs#L456),
-and Lineitem by order key in [s5](src/lib.rs#L465). It computes `s6` with
-`s3.join_index_balanced(&s4)` and `s7` with `s5.join_balanced(&s6)`. The latter
-produces the nine-column delta of `V`. A [materialized output
-registration](src/lib.rs#L641) exposes both a signed delta handle and an
-integrated snapshot.
+`B = Orders ⋈ Customer` names the first generated join's output for
+discussion; it is not a SQL view. In the generated `src/lib.rs` (git-ignored;
+the generator is `ToRustVisitor.java`), the compiler rekeys Orders by customer
+key (`s3`), Customer by customer key (`s4`), and Lineitem by order key (`s5`).
+It computes `s6` (`B`) with `s3.join_index_balanced(&s4)` and `s7` with
+`s5.join_balanced(&s6)`. The latter produces the nine-column delta of `V`. The
+materialized output registration exposes both a signed delta handle and an
+integrated snapshot. Stream names such as `s6` may change between compiler
+versions.
 
 With `O₀`, `C₀`, `L₀`, and `B₀` denoting state before the transaction, the
 generated branch orientation is:
@@ -160,20 +163,21 @@ generated branch orientation is:
 V_after = V_before + ΔV
 ```
 
-In [`dyn_join_generic`](../../../crates/dbsp/src/operator/dynamic/join.rs#L700),
+In `dyn_join_generic` (`crates/dbsp/src/operator/dynamic/join.rs`),
 each input's retained trace supplies the opposite branch. The left delta joins
 the right trace after its current change; the right delta joins a delayed left
 trace, giving the before state. Signed weights multiply in the joins and add
 at the branch unions, so inserts, deletes, replacements, and concurrent
 changes use the same circuit. In the default solo layout, Catalog's
-[integration path](../../../crates/adapters/src/static_compile/catalog.rs#L130)
-uses `shard_accumulate_integrate_trace_legacy`; the
-[snapshot handle](../../../crates/adapters/src/static_compile/catalog.rs#L643)
-reads that integral. Primary-key input maps retain base storage too. Native
+integration path (`crates/adapters/src/static_compile/catalog.rs`) uses
+`shard_accumulate_integrate_trace_legacy`, and the snapshot handle reads
+that integral through `ro_snapshot()`. Primary-key input maps retain base storage too. Native
 trace sharing and extra indexes mean there is no universal one-index-per-
 integrator allocation count.
 
-The source program does not route trace reads through a merged index. The
+The native source program does not route trace reads through a merged index;
+the reconstructed program does, through the supplied-snapshot join (see
+[reconstruction.md](../../../docs/design/merged-index/reconstruction.md)). The
 initial load bootstraps the incremental circuit from empty before state; RF1
 and RF2 use that same circuit and materialized output. The independent full
 join in [main.rs](src/main.rs) is a checker outside the measured transaction
