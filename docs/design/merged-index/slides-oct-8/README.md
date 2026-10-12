@@ -114,6 +114,7 @@ for provenance, but this revision does not display it. Teal highlights the
 independent run cursors and key-search path on slide 3, and the cumulative
 traversal in Appendix E. Runs on slide 3 remain unconnected; the dashed
 connector enlarges one file. Amber identifies deferred work on slide 12.
+Plum marks integrators, integration text, and the Head they maintain.
 
 | Topics | Subject |
 | --- | --- |

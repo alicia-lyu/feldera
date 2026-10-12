@@ -17,6 +17,8 @@
 \definecolor{amber}{HTML}{B46A20}
 \definecolor{plum}{HTML}{6B4788}
 \definecolor{quiet}{HTML}{526473}
+% Integrators and the trace state they maintain, including its Head.
+\colorlet{integrator}{plum}
 \setbeamercolor{normal text}{fg=ink,bg=white}
 \setbeamercolor{frametitle}{fg=ink,bg=white}
 \setbeamercolor{structure}{fg=teal}
@@ -36,6 +38,7 @@
   stage proposed/.style={stage,draw=amber},
   diagram stage/.style={stage,minimum height=7mm,inner sep=3pt},
   diagram proposed/.style={diagram stage,draw=amber},
+  diagram integrator/.style={diagram stage,draw=integrator,text=integrator},
   small label/.style={font=\small,align=center,text=quiet},
   batch/.style={draw=ink,fill=ink!4,minimum width=1.1cm,
     minimum height=.7cm,align=center,inner sep=4pt},
@@ -147,7 +150,7 @@
     \uncover<2->{\Delta V} &\uncover<2->{= \Delta OL\join C^+ + OL^-\join\Delta C}
   \end{align*}
   \par\raggedright
-  $\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$
+  \textcolor{integrator}{$\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$}
 \end{frame}
 
 % 7
@@ -163,7 +166,7 @@
         $C_c$ & Customer ID\\\bottomrule
       \end{tabular}
       \smallskip\par
-      Created by ``integrating'' or accumulating all deltas in the history.
+      Created by \textcolor{integrator}{``integrating''} or accumulating all deltas in the history.
     \end{column}
     \begin{column}{.49\textwidth}
       \lead{$R^+$ and $R^-$ share one trace.}\par

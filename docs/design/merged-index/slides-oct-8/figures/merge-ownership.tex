@@ -7,7 +7,7 @@
   \newcommand{\refdot}[3]{\fill[#1] ($(#2.east)-(#3,0)$) circle (1.8pt)}
 
   % Referrers: before-state, after-state, and the head (newest version).
-  \foreach \name/\hue/\y in {$C^-$/ink/3.3,$C^+$/teal/2.8,Head/plum/2.3} {
+  \foreach \name/\hue/\y in {$C^-$/ink/3.3,$C^+$/teal/2.8,Head/integrator/2.3} {
     \fill[\hue] (9.0,\y) circle (2.2pt);
     \node[anchor=west,text=\hue] at (9.15,\y) {\name};
   }
@@ -26,13 +26,13 @@
   % Both snapshots keep their references across the merge.
   \foreach \run in {old,mid1,mid2,large} \refdot{ink}{\run}{.47};
   \foreach \run in {old,new,mid1,mid2,large} \refdot{teal}{\run}{.3};
-  \foreach \run in {mid1,mid2,large} \refdot{plum}{\run}{.13};
+  \foreach \run in {mid1,mid2,large} \refdot{integrator}{\run}{.13};
 
   % Before the merge the head holds L0; afterward it holds m instead.
-  \only<1>{\foreach \run in {old,new} \refdot{plum}{\run}{.13};}
+  \only<1>{\foreach \run in {old,new} \refdot{integrator}{\run}{.13};}
   \only<2>{
     \node[run,minimum width=1.4cm] (merged) at (7.6,1.9) {$m$};
-    \refdot{plum}{merged}{.13};
+    \refdot{integrator}{merged}{.13};
     \node[draw=ink,dashed,line width=.8pt,rounded corners=2pt,inner sep=4pt,
       fit=(old)(new)] (sources) {};
     \draw[link] (sources.east) -| (merged.north);

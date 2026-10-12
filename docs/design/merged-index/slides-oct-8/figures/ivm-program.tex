@@ -2,8 +2,8 @@
 \begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize]
   \node (dl) at (0,3.4) {$\Delta L$};
   \node (do) at (0,.8) {$\Delta O$};
-  \node[diagram stage] (il) at (1.8,3.4) {$\mathcal{I}_{\Delta L}$};
-  \node[diagram stage] (io) at (1.8,.8) {$\mathcal{I}_{\Delta O}$};
+  \node[diagram integrator] (il) at (1.8,3.4) {$\mathcal{I}_{\Delta L}$};
+  \node[diagram integrator] (io) at (1.8,.8) {$\mathcal{I}_{\Delta O}$};
   \node[diagram stage] (j1a) at (4,2.8) {$\Delta L\join O^+$};
   \node[diagram stage] (j1b) at (4,1.4) {$L^-\join\Delta O$};
   \node (dol) at (6.3,2.1) {$\Delta OL$};
@@ -18,9 +18,9 @@
   \draw[link] (j1b.east) -| (dol.south);
   \uncover<2->{%
   \coordinate (dol2) at (7.7,3.4);
-  \node[diagram stage] (iol) at (9.2,3.4) {$\mathcal{I}_{\Delta OL}$};
+  \node[diagram integrator] (iol) at (9.2,3.4) {$\mathcal{I}_{\Delta OL}$};
   \node (dc) at (7.7,.8) {$\Delta C$};
-  \node[diagram stage] (ic) at (9.2,.8) {$\mathcal{I}_{\Delta C}$};
+  \node[diagram integrator] (ic) at (9.2,.8) {$\mathcal{I}_{\Delta C}$};
   \node[diagram stage] (j2a) at (11.6,2.8) {$\Delta OL\join C^+$};
   \node[diagram stage] (j2b) at (11.6,1.4) {$OL^-\join\Delta C$};
   \node (dv) at (14.1,2.1) {$\Delta V$};
