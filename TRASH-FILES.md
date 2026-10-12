@@ -27,3 +27,19 @@ target/q3-ivm-runs/20261002T183104Z/README.md - moved to TRASH/ - retired non-in
 target/q3-ivm-runs/20261002T183104Z/generation-check.log - moved to TRASH/ - retired non-incremental circuit inspection and associated comparison logs; load uses the incremental circuit
 target/q3-ivm-runs/20261002T183104Z/rerun.py - moved to TRASH/ - retired non-incremental circuit inspection and associated comparison logs; load uses the incremental circuit
 target/q3-ivm-runs/20261002T183104Z/summarize.py - moved to TRASH/ - retired non-incremental circuit inspection and associated comparison logs; load uses the incremental circuit
+
+Merged-index docs tidy-up, 2026-10-12:
+
+docs/design/merged-index/phase-1-encoding-layer-file-implementation-plan.md - moved to TRASH/ - completed plan; content consolidated into col-storage.md
+docs/design/merged-index/phase-2-in-memory-batches-implementation-plan.md - moved to TRASH/ - completed plan; content consolidated into col-storage.md
+docs/design/merged-index/phase-4-file-backed-storage-implementation-plan.md - moved to TRASH/ - completed plan; content consolidated into col-storage.md
+docs/design/merged-index/generated-circuit-export-implementation-plan.md - moved to TRASH/ - completed plan
+docs/design/merged-index/direct-reconstruction-documentation-plan.md - moved to TRASH/ - completed plan
+docs/design/merged-index/range-aligned-ivm-native-q3-baseline-plan.md - moved to TRASH/ - completed plan
+docs/design/merged-index/history/architectural-note-rewrite.md - moved to TRASH/ - history; dated user directives extracted into decisions.md
+docs/design/merged-index/history/investigation-plan.md - moved to TRASH/ - history; dated user directives extracted into decisions.md
+docs/design/merged-index/history/orchestration.md - moved to TRASH/ - history; dated user directives extracted into decisions.md
+docs/design/merged-index/slides-oct-8/advisor-presentation-implementation-plan.md - moved to TRASH/ - completed slide plan; still-valid rules kept in the slides README
+docs/design/merged-index/slides-oct-8/immutable-run-traversal-handoff.md - moved to TRASH/ - completed handoff
+docs/design/merged-index/slides-oct-8/restore-user-pdf-plan.md - moved to TRASH/ - completed plan
+docs/design/merged-index/slides-oct-8/advisor-working-style-2026-10-08.md - moved to TRASH/ - directives extracted into decisions.md and the slides README

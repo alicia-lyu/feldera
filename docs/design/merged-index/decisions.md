@@ -1,0 +1,97 @@
+# Decisions
+
+This file records the user's confirmed decisions for the merged-index prototype. Each entry is dated. A "decision" that appears elsewhere in these docs without an entry here is unconfirmed.
+
+Entries come from two sources:
+
+- the user's answers during the documentation review of 2026-10-12;
+- dated user directives in the former `history/architectural-note-rewrite.md` and `slides-oct-8/advisor-working-style-2026-10-08.md`, both now archived under `TRASH/`.
+
+## Current decisions
+
+### 2026-10-12: One DBSP worker
+
+Maintenance and initial loading both use one DBSP worker. No multiworker extension is planned. `main.rs` in `q3-ivm-baseline` rejects any other worker count in reconstructed mode and in R5 runs.
+
+### 2026-10-12: Secondary storage only
+
+The merged index is secondary storage, maintained beside Feldera's own base-table state. Clustered primary storage, in which the merged index would replace the base tables, is deferred.
+
+### 2026-10-12: The compiler hook is the current approach
+
+The `--q3-merged-index` compiler option is endorsed for now. It pattern-matches the exact Q3 circuit and emits the reconstructed joins. This supersedes the 2026-09-28 preference for hand-composed circuits (see [Superseded](#superseded-and-withdrawn)).
+
+An open question remains; see [Open questions](#open-questions).
+
+### 2026-10-12: No folded-key uniqueness validator
+
+Folded keys are unique because the base tables have primary keys:
+
+- **Keys.** `query.sql` declares the primary keys `c_custkey`, `o_orderkey`, and `(l_orderkey, l_linenumber)`. The folded keys are `C(c)`, `O(c, o)`, and `L(c, o, l)`. An order's customer never changes inside the workload.
+- **Harness condition.** The merged index is fed the harness's own signed rows, not the base tables' net delta after upserts. Uniqueness therefore holds only because `BaseState::validate` in `q3-ivm-baseline/src/workload.rs` admits just the changes that the base tables apply as given: no duplicate, replacement, or key-moving deltas.
+- **Future workloads.** A workload with upserts must derive the merged-index rows from the base tables' net delta.
+
+This supersedes the 2026-09-28 requirement of a transaction-level uniqueness check (see [Superseded](#superseded-and-withdrawn)).
+
+### 2026-10-12: Drop the R1 measurement table
+
+The R1 table in `q3-ivm-baseline/RESULTS.md` has no raw artifact behind it, and its results are not actionable. It is removed.
+
+### 2026-10-12: "Residual execution" is an acceptable term
+
+An earlier slide plan banned the phrase. The ban is withdrawn and is not carried forward.
+
+### 2026-10-12: Placement limitation accepted
+
+The placement map (order → customer) comes only from Orders rows in the same transaction. Changes outside RF1 and RF2, such as a Lineitem added to an existing order, are therefore unsupported by design. This is an accepted limitation, not a defect. The harness's `prepare` rejects such changes.
+
+### 2026-10-12: Report only what was measured
+
+Never infer an unmeasured quantity from leftover arithmetic, such as assigning residual storage to the index; the user rejected this as circular. Make no performance or savings claim without a raw artifact.
+
+### 2026-09-28: Maintained views exclude selection predicates
+
+The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
+
+### 2026-09-28: Merged-index keys are folded byte strings in flat key-value storage
+
+Merged-index keys are opaque byte strings, folded differently for each record type. Each key ends in the record's own identifier. Each value holds one payload; a payload list is never packed into one value. Feldera's LSM machinery (spines of immutable sorted runs) remains the backend: the merged index changes representation and comparison rules, not run management.
+
+### 2026-09-28: Before/after read handles, not stored status bits
+
+The user chose Feldera's existing operator wiring and removed any old/new or base/pending bit from storage. The index appends the transaction delta before view maintenance. Operators hold separate handles to the delta and to the accumulated state before and after the append. Completion releases those handles and never appends the delta a second time. Storage adds no parent-lookup records, relational-consistency checks, or automatic child moves.
+
+### 2026-09-28: Reconstruction is interchangeable with retained state
+
+Reconstructed state must answer the same requested-key reads that an integrator's retained state answers. The IVM algorithm and output path stay shared. The only reconstruction target is an integrator's accumulated output state, never its input delta stream. No reconstructed relation is assumed to fit in memory.
+
+### 2026-09-28: No multi-versioning or expiration policies
+
+The prototype adds no multi-versioning and no record or file expiration policy. Snapshots are temporary read handles over existing immutable batches.
+
+### 2026-10-08: Slide-deck directions
+
+These directions apply to the 2026-10-08 advisor deck; they do not set research scope.
+
+- Introduce DBSP briefly, then derive physical behavior from code.
+- Explain an already-loaded primary-key table before IVM mechanics; call its spine an LSM-like trace.
+- Use Orders–Lineitem first for the explanatory program, but describe the experiment's Orders–Customer-first circuit as it actually is.
+- Make no measured-savings, update-cost, or comparative performance claims.
+
+## Superseded and withdrawn
+
+| Date | Earlier position | Replaced by |
+| --- | --- | --- |
+| 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. |
+| 2026-09-28 | Require a transaction-level folded-key uniqueness check before a delta is incorporated. | 2026-10-12: no validator; uniqueness follows from the base tables' primary keys. |
+| 2026-09-28 | A physical old/new bit, or base/pending bit, in each stored record. | 2026-09-28: before/after read handles. |
+| 2026-09-28 | Reuse Feldera's grouped key/value batches unchanged for the merged index. | 2026-09-28: flat folded keys with an adapter over the same LSM machinery. |
+| 2026-09-28 | A filtered, aggregate-first, five-state Q3 example. | 2026-09-28: the predicate-free join `V`. |
+| 2026-09-28 | Q3 and operator semantic checkers as evidence. | Excluded by the user as unvalidated agent byproducts. |
+| 2026-10-08 | A ban on the phrase "residual execution". | Withdrawn on 2026-10-12. |
+| 2026-10-08 | "Five advances per join" in the slide walkthrough. | Not carried forward. |
+
+## Open questions
+
+- **Is the interesting-ordering shape required?** Reconstructing state from a merged index may require the circuit to read state in the merged index's order (customer > order > line). If so, the compiler cannot always produce that shape, and some queries will need hand-written circuits.
+- **Clustered primary storage.** Deferred; see the secondary-storage decision.
