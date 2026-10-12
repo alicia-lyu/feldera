@@ -48,8 +48,9 @@ the teal callout from the smallest run with the key 43 → `[2,4)` and sorted
 value arrays. Panels stay fixed across advances and no L1 or L2 appears.
 On slide 5, check that the inserted run's arrow skips L0–L1 and that the
 merge output stays in L2 on advance 2. On advance 3, check the dashed 10 MiB
-line between L1 and L2, hatched file runs below it, and the teal inserted run
-left in memory. On slide 9, check two equal-size L0 runs and matching reference dots: ink for
+line between L1 and L2, stepping down around the small L2 run that stays
+under 10 MiB, hatched file runs below it, and the teal inserted run left in
+memory. On slide 9, check two equal-size L0 runs and matching reference dots: ink for
 C⁻, teal for C⁺. On slide 10, check that only the head's plum dots move on
 advance 2. The faded L0 runs keep their snapshot dots, and *m* has only a
 head dot.
