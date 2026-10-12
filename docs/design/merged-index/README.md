@@ -38,6 +38,16 @@ git-ignored `target/` directories and are local only.
 | R4 | RF1/RF2 verification | Complete. `verify.sh` compares native and reconstructed transcripts byte for byte. Replacements, key moves, independent line updates, and customer updates are deferred. | [reconstruction.md](reconstruction.md); [WORKFLOW.md](WORKFLOW.md) |
 | R5 | Maintenance measurement | Harness implemented (`measure.py`, `src/measurement.rs`). The qualifying Linux run is pending, so no comparison exists. | [measurement.md](measurement.md) |
 
+## Open code follow-ups
+
+These were found by the 2026-10-12 review and are tracked here, not yet scheduled:
+
+- Turn the reader `expect` calls in `merged-index-col/src/q3.rs` into errors.
+- Add a property test that compares the reconstructed join with the native join.
+- Remove the dead `ordersCustomers` branch in `ToRustVisitor.processJoinBase`.
+- Decide whether native runs should also reject `--workers` values other than 1.
+- Review the changes visible upstream: the single-batch spill in `spine_async`, the default `is_background_merge_idle() = true`, and `SerBatch::location`.
+
 ## Reading guide
 
 - [decisions.md](decisions.md): confirmed decisions, withdrawn ideas, open questions.
