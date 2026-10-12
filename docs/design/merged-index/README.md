@@ -56,6 +56,8 @@ These were found by the 2026-10-12 review and are tracked here, not yet schedule
 - [reconstruction.md](reconstruction.md): the transaction contract, the placement map, R3 and R4.
 - [measurement.md](measurement.md): R5 definitions and the pending Linux campaign.
 - [native-state-read-contracts.md](native-state-read-contracts.md): the four generated reads.
+- [native-run-placement.md](native-run-placement.md): how native runs are built,
+  leveled, placed in memory or files, and steered by memory pressure.
 - [support.md](support.md): the trace and cursor interface and acceptance criteria.
 - [deferred.md](deferred.md): designs not implemented, such as shared scan sessions.
 - [references.md](references.md): sibling-repository sources and their roles.

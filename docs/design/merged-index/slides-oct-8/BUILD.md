@@ -46,8 +46,9 @@ On slide 4, inspect all three advances: the memtable panel alone, then the
 DBSP L0 levels of shrinking runs with merge-sort labels inside the box, then
 the teal callout from the smallest run with the key 43 → `[2,4)` and sorted
 value arrays. Panels stay fixed across advances and no L1 or L2 appears.
-On slide 8, check two equal-size L0 runs and matching reference dots: ink for
-C⁻, teal for C⁺. On slide 9, check that only the head's plum dots move on
+On slide 5, check that the inserted run's arrow skips L0–L1 and that the
+merge output stays in L2 on advance 2. On slide 9, check two equal-size L0 runs and matching reference dots: ink for
+C⁻, teal for C⁺. On slide 10, check that only the head's plum dots move on
 advance 2. The faded L0 runs keep their snapshot dots, and *m* has only a
 head dot.
 On Appendix E, inspect all four cumulative advances: three fixed block
@@ -71,15 +72,17 @@ A successful TeX build alone does not establish visual correctness.
 | 2 | Main slide 2, record structure |
 | 3–4 | Slide 3, base storage, structure then lookup |
 | 5–7 | Slide 4, memtable vs. in-memory runs, advances 1–3 |
-| 8 | Main slide 5, example and notation |
-| 9–10 | Slide 6, complete program, advances 1–2 |
-| 11–12 | Main slides 7–8 |
-| 13–14 | Slide 9, merging the first level, advances 1–2 |
-| 15–17 | Main slides 10–12 |
-| 18–21 | Appendices A–D |
-| 22–25 | Appendix E, traversal, advances 1–4 |
+| 8–9 | Slide 5, run levels, advances 1–2 |
+| 10 | Main slide 6, example and notation |
+| 11–12 | Slide 7, complete program, advances 1–2 |
+| 13–14 | Main slides 8–9 |
+| 15–16 | Slide 10, merging the first level, advances 1–2 |
+| 17 | Main slide 11, memory pressure table |
+| 18 | Main slide 12, native mechanisms and prototype |
+| 19–22 | Appendices A–D |
+| 23–26 | Appendix E, traversal, advances 1–4 |
 
-Both PDFs have 25 pages. The main talk has 12 topics: advancing an
+Both PDFs have 26 pages. The main talk has 12 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 

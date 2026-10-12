@@ -5,17 +5,21 @@ appendix topics. Slide 2 defines a record as (key, value, weight). Slide 3
 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
 Each run has its own downward cursor above it on both advances. Slide 4
-contrasts a standard LSM's mutable L0 memtables with DBSP's L0 of in-memory
+contrasts a standard LSM's mutable L0 memtables with DBSP's in-memory
 immutable runs that merge-sort into larger runs, then shows how sorted (K, V)
-pairs build the smallest run. Slide 6 reveals the downstream
-Customer circuit and its delta equation on the second overlay. Slide 8 draws
+pairs build the smallest run. Slide 5 shows that record count sets a run's
+level: an inserted run lands directly in its level, and a merge output can
+stay in its input level. Slide 7 reveals the downstream
+Customer circuit and its delta equation on the second overlay. Slide 9 draws
 the before-state and after-state snapshots as reference arrows to shared runs;
-only the after-state references the new transaction's run. Slide 9 merges the
+only the after-state references the new transaction's run. Slide 10 merges the
 first level: the head's references move to the merged run, while both
-snapshots keep the faded L0 runs alive. Appendix E
+snapshots keep the faded L0 runs alive. Slide 11 tabulates how process RSS
+steers run location; [native-run-placement.md](../native-run-placement.md)
+records the verified details. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
-Each PDF has **25 rendered pages**: 17 main-talk pages and eight appendix pages.
+Each PDF has **26 rendered pages**: 18 main-talk pages and eight appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on

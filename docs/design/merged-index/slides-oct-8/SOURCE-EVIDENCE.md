@@ -122,7 +122,7 @@ the inspected committed source. Hashes are SHA-256 of current file bytes.
 
 ## Explanatory and actual programs
 
-Slides 2 and 5–7 use the equivalent explanatory Orders–Lineitem-first program:
+Slides 2 and 6–8 use the equivalent explanatory Orders–Lineitem-first program:
 
 ```text
 ΔOL_c,o = ΔL_o ⋈ O_o+ + L_o− ⋈ ΔO_o
@@ -179,8 +179,8 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 12 main topics, two advances each on slides 3, 6, and 9, three
-on slide 4, and five appendices, with four advances in Appendix E: 25 rendered
+It has 12 main topics, two advances each on slides 3, 5, 7, and 10,
+three on slide 4, and five appendices, with four advances in Appendix E: 26 rendered
 pages in each PDF.
 Slide 3 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees

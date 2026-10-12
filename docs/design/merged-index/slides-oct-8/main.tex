@@ -114,6 +114,12 @@
 \end{frame}
 
 % 5
+\begin{frame}<1-2>{Run levels}
+  \vfill\centering\input{figures/run-levels.tex}
+  \source{Spine::size\_to\_level, MERGE\_COUNTS, min\_batches\_to\_merge: trace/spine\_async.rs.}
+\end{frame}
+
+% 6
 \begin{frame}{Ex. predicate-free three-way join}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.53\textwidth}
@@ -141,7 +147,7 @@
   \par\smallskip
 \end{frame}
 
-% 6
+% 7
 \begin{frame}{The complete incremental program}
   \input{figures/ivm-program.tex}
   \vspace{-1em}
@@ -153,7 +159,7 @@
   \textcolor{integrator}{$\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$}
 \end{frame}
 
-% 7
+% 8
 \begin{frame}{Accumulated state and immutable runs}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.48\textwidth}
@@ -174,48 +180,29 @@
   \end{columns}
 \end{frame}
 
-% 8
+% 9
 \begin{frame}{Before-state and after-state snapshots}
   \vfill\centering\input{figures/snapshot-visibility.tex}
   \source{Snapshot strong references: trace/spine\_async/snapshot.rs:55--63,170--179.}
 \end{frame}
 
-% 9
+% 10
 \begin{frame}<1-2>{Merging referenced runs}
   \vfill\centering\input{figures/merge-ownership.tex}
   \source{Snapshot Arcs, merge slots, and merge\_complete: snapshot.rs and spine\_async.rs.}
 \end{frame}
 
-% 10
-\begin{frame}{Where memory goes}
-  \begin{tabular}{@{}p{.24\textwidth}p{.71\textwidth}@{}}
-    \toprule Allocation & Examples\\\midrule
-    Retained state & Base-input state, join traces, materialized $V$\\[.8em]
-    Temporary or pinned & Transaction runs, merge output under construction, obsolete runs held by snapshots\\[.8em]
-    Cache and lookup & Storage block cache, resident filters, index metadata\\[.8em]
-    Other allocations & Connector buffers, stacks, allocator overhead, other work\\\bottomrule
-  \end{tabular}
-  \par\bigskip
-  \large\lead{Process RSS measures resident memory across these allocations.}\par\medskip\normalsize
-  Count shared allocations once. File bytes do not equal resident bytes.
-  \source{runtime.rs RSS sampling; operator/run metrics; buffer\_cache/cache.rs; operations/memory.md.}
-\end{frame}
-
 % 11
-\begin{frame}{What memory pressure changes}
-  \small
-  \begin{tabular}{@{}lp{.75\textwidth}@{}}
-    \toprule Raw RSS / target & Response with storage configured\\\midrule
-    $<85\%$ & Inserted runs normally remain in memory. Merge output uses the configured size threshold.\\[.65em]
-    $\geq85\%$ & Merge outputs target storage. Large inserted runs spill.\\[.65em]
-    $\geq90\%$ & All nonempty inserted runs target storage. Loose memory runs can trigger earlier merges.\\[.65em]
-    $\geq95\%$ & Transient per-step runs also target storage.\\\bottomrule
+\begin{frame}{Memory pressure: process RSS decides run location}
+  \vfill\centering\small
+  \begin{tabular}{@{}lllll@{}}
+    \toprule RSS / max & Inserted run & Merge output & Early merge & New runs built\\\midrule
+    $<85\%$ & memory & memory if inputs $<10$ MiB & no & in memory\\[.4em]
+    $\geq85\%$ & file if $\geq10$ MiB & file & no & in memory\\[.4em]
+    $\geq90\%$ & file & file & yes & in memory\\[.4em]
+    $\geq95\%$ & file & file & yes & straight to file\\\bottomrule
   \end{tabular}
-  \par\medskip\normalsize
-  RSS sampling: about once per second, with hysteresis.\par\smallskip
-  Separate backpressure pauses insertion at \textbf{128 loose runs}.\par\medskip
-  \lead{Spilling may copy shared data. Readers can delay reclamation.}
-  \source{runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs. RSS target is not an allocator quota.}
+  \source{Runtime::raw\_memory\_pressure, min\_*\_storage\_bytes: circuit/runtime.rs. pick\_*\_destination: trace/ord/fallback/utils.rs. must\_relieve\_memory\_pressure: trace/spine\_async.rs.}
 \end{frame}
 
 % 12
@@ -231,7 +218,7 @@
   Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$ (Appendix D).\par\smallskip
   Subsequent RF1 inserts / RF2 deletes require referential integrity.\par
   Base primary-key state and $V$ remain separately retained.
-  \source{Explanatory program: slide 6. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
+  \source{Explanatory program: slide 7. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
 \end{frame}
 
 \pdfstringdefDisableCommands{\def\translate#1{#1}}
@@ -305,7 +292,7 @@
   $B_o$ pair for Order 43: $(43;7,\text{BUILDING},\text{1995-03-02},0)$.\par
   $B_o$ is keyed by Order ID. $O_c$ groups Orders by Customer ID.
   \par\medskip\normalsize
-  This circuit and the slide 6 program compute the same maintained $V$.\par
+  This circuit and the slide 7 program compute the same maintained $V$.\par
   The RF1/RF2 prototype reconstructs these actual reads.
   \source{CIRCUIT.md; native-state-read-contracts.md; experiment README. No experiment changes in this revision.}
 \end{frame}
