@@ -18,7 +18,7 @@ for name in ("dbsp-physical-design", "dbsp-physical-design-notes"):
     if "Overfull" in log:
         raise SystemExit(f"Overflow in build/{name}.log")
     pages = re.search(r"Output written on .*?\((\d+) pages", log, re.DOTALL)
-    if pages is None or int(pages.group(1)) != 27:
-        raise SystemExit(f"Expected 27 rendered pages in {name}")
-print("Both PDFs: 27 rendered pages, no TeX overflow")
+    if pages is None or int(pages.group(1)) != 24:
+        raise SystemExit(f"Expected 24 rendered pages in {name}")
+print("Both PDFs: 24 rendered pages, no TeX overflow")
 PYTHON

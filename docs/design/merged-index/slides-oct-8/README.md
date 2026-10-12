@@ -1,6 +1,6 @@
 # DBSP physical design: advisor presentation
 
-This editable 16:9 Beamer/TikZ deck has **15 main slide topics** and five
+This editable 16:9 Beamer/TikZ deck has **12 main slide topics** and five
 appendix topics. Slide 2 defines a record as (key, value, weight). Slide 3
 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
@@ -8,10 +8,12 @@ Each run has its own downward cursor above it on both advances. Slide 4
 contrasts a standard LSM's mutable L0 memtables with DBSP's L0 of in-memory
 immutable runs that merge-sort into larger runs, then shows how sorted (K, V)
 pairs build the smallest run. Slide 6 reveals the downstream
-Customer circuit and its delta equation on the second overlay. Appendix E
+Customer circuit and its delta equation on the second overlay. Slide 8 draws
+the before-state and after-state snapshots as reference arrows to shared runs;
+only the after-state references the new transaction's run. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
-Each PDF has **27 rendered pages**: 19 main-talk pages and eight appendix pages.
+Each PDF has **24 rendered pages**: 16 main-talk pages and eight appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on
@@ -52,7 +54,7 @@ joins; the current user edits omit the two step-by-step worked-join topics. The 
 all nine output fields remain unchanged.
 
 The actual experiment and restricted RF1/RF2 reconstruction prototype use
-**Orders–Customer first**, then Lineitem. Slide 15 and Appendix D retain their
+**Orders–Customer first**, then Lineitem. Slide 12 and Appendix D retain their
 actual accesses `C_c+`, `O_c−`, `B_o+`, and `L_o−`. The explanatory order is
 logically equivalent; this revision changes no runtime, compiler, API, or
 experiment code.
@@ -109,7 +111,7 @@ The former opening backdrop remains in `figures/query-update-backdrop.tex`
 for provenance, but this revision does not display it. Teal highlights the
 independent run cursors and key-search path on slide 3, and the cumulative
 traversal in Appendix E. Runs on slide 3 remain unconnected; the dashed
-connector enlarges one file. Amber identifies deferred work on slide 15.
+connector enlarges one file. Amber identifies deferred work on slide 12.
 
 | Topics | Subject |
 | --- | --- |

@@ -1,12 +1,27 @@
-\begin{tikzpicture}[x=1cm,y=.8cm,font=\normalsize]
-  \node[stage,minimum width=3cm] (old) at (1,2.3) {$OL_{c,o}^-$};
-  \node[stage,minimum width=3cm] (new) at (8,2.3) {$OL_{c,o}^+$};
-  \node[batch,minimum width=3.3cm] (a) at (3,0) {$a:(7;42,1,\ldots):+1$};
-  \node[batch,minimum width=3.3cm] (b) at (8,0) {$b:(7;43,1,\ldots):+1$};
-  \draw[ref] (old.south) -- (a.north west);
-  \draw[ref] (new.south west) -- (a.north east);
-  \draw[ref] (new.south) -- (b.north);
-  \node[font=\small,text=quiet] at (3,-.85) {Shared retained run};
-  \node[font=\small,text=quiet] at (8,-.85) {New insertion run};
-  \node[font=\small,text=quiet] at (4.5,3.3) {Dashed arrows are owning references.};
+% Each snapshot holds one reference per run; runs stack by level, the new one joins the top level.
+\begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize,
+  run/.style={draw=ink,fill=ink!4,line width=.8pt,minimum height=.32cm,
+    inner sep=0pt},
+  slot/.style={draw=#1,line width=.8pt,minimum width=.4cm,minimum height=.32cm,
+    inner sep=0pt},
+  pointer/.style={-{Latex[length=2mm]},draw=#1,line width=.8pt}]
+  % Levels: small runs plus the new transaction's smaller run, then medium and large.
+  \node[run,fill=teal!15,draw=teal,minimum width=.35cm] (run0) at (4,4.05) {};
+  \foreach \i/\y/\w in {1/3.6/.7,2/3.15/.7,3/2.7/.7,4/2.25/.7,
+                        5/1.55/1.7,6/1.1/1.7,7/.4/3.2}
+    \node[run,minimum width=\w cm] (run\i) at (4,\y) {};
+
+  % Before-state references every retained run; after-state also the new one.
+  \node[text=ink] at (.9,4.6) {$C^-$};
+  \node[text=teal] at (7.1,4.6) {$C^+$};
+  \foreach \i in {1,...,7} {
+    \node[slot=ink] (before\i) at (run\i -| .9,0) {};
+    \fill[ink] (before\i) circle (1.5pt);
+    \draw[pointer=ink] (before\i) -- (run\i.west);
+  }
+  \foreach \i in {0,...,7} {
+    \node[slot=teal] (after\i) at (run\i -| 7.1,0) {};
+    \fill[teal] (after\i) circle (1.5pt);
+    \draw[pointer=teal] (after\i) -- (run\i.east);
+  }
 \end{tikzpicture}

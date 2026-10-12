@@ -53,3 +53,6 @@ docs/design/merged-index/placement-lookup-multimap-plan.md - moved to TRASH/ - c
 docs/design/merged-index/r4-rf1-rf2-verification-implementation-plan.md - moved to TRASH/ - completed plan; folded into reconstruction.md
 docs/design/merged-index/r5-maintenance-measurement-implementation-plan.md - moved to TRASH/ - completed plan; folded into measurement.md
 docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md - moved to TRASH/ - completed plan; folded into measurement.md
+docs/design/merged-index/slides-oct-8/figures/nested-file.tex - moved to TRASH/ - figure of a deleted slide
+docs/design/merged-index/slides-oct-8/figures/matching-read.tex - moved to TRASH/ - figure of a deleted slide
+docs/design/merged-index/slides-oct-8/figures/trace-growth.tex - moved to TRASH/ - figure of a deleted slide

@@ -37,7 +37,7 @@ pdfinfo build/dbsp-physical-design-notes.pdf
 Inspect all presentation and notes pages at readable size, including both slide-3
 advances. Check clipping, overlap, stable positions, readable
 tree/search connectors, fields/weights, grammar, and source labels.
-The deck currently has no speaker notes, so the notes pages are blank.
+Only slide 4 has a speaker note; the other notes pages are blank.
 On slide 3, check one independent downward cursor above each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
@@ -69,11 +69,11 @@ A successful TeX build alone does not establish visual correctness.
 | 5–7 | Slide 4, memtable vs. in-memory runs, advances 1–3 |
 | 8 | Main slide 5, example and notation |
 | 9–10 | Slide 6, complete program, advances 1–2 |
-| 11–19 | Main slides 7–15 |
-| 20–23 | Appendices A–D |
-| 24–27 | Appendix E, traversal, advances 1–4 |
+| 11–16 | Main slides 7–12 |
+| 17–20 | Appendices A–D |
+| 21–24 | Appendix E, traversal, advances 1–4 |
 
-Both PDFs have 27 pages. The main talk has 15 topics: advancing an
+Both PDFs have 24 pages. The main talk has 12 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 

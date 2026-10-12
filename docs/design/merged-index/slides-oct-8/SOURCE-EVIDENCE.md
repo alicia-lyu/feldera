@@ -145,7 +145,7 @@ V+ = V− + ΔV
 ```
 
 Its actual accesses remain `C_c+`, `O_c−`, `B_o+`, and `L_o−`.
-Slide 14 and Appendix D explicitly identify that different order. Prototype
+Slide 12 and Appendix D explicitly identify that different order. Prototype
 support remains subsequent RF1 complete Order/Lineitem insertion and RF2
 deletion under referential integrity after setup. Customer updates, replacements,
 key moves, orphans, and independent Lineitem updates remain excluded.
@@ -179,8 +179,8 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 15 main topics, two advances each on slides 3 and 6, three on
-slide 4, and five appendices, with four advances in Appendix E: 27 rendered
+It has 12 main topics, two advances each on slides 3 and 6, three on
+slide 4, and five appendices, with four advances in Appendix E: 24 rendered
 pages in each PDF.
 Slide 3 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees

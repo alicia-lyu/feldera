@@ -5,7 +5,7 @@
 \usepackage{amsmath,booktabs,array,tikz,pgfpages}
 \usefonttheme{serif}
 \usefonttheme{professionalfonts}
-\usetikzlibrary{arrows.meta,calc,fit,positioning}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,fit,positioning}
 \ifdefined\PRESENTERNOTES
   \setbeameroption{show notes on second screen=right}
   \hypersetup{draft}
@@ -107,6 +107,7 @@
 \begin{frame}<1-3>{Creating an immutable run}
   \centering\input{figures/run-creation.tex}
   \source{trace/spine\_async.rs; trace/ord/vec/indexed\_wset\_batch.rs; storage/file/writer.rs.}
+  \note{1 transaction $\to$ 1+ runs. Currently, one run cannot contain several transactions.}
 \end{frame}
 
 % 5
@@ -171,67 +172,12 @@
 \end{frame}
 
 % 8
-\begin{frame}{Memory arrays and indexed file groups}
-  \small
-  One illustrative $OL_{c,o}$ run. Arrays preserve complete values and weights.
-  \par\medskip
-  \begin{tabular}{@{}ll@{}}
-    Keys & $[7,9]$\\[.3em]
-    Group offsets & $[0,2,3]$\\[.3em]
-    Values & $[(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10}),$\\
-      & $\phantom{[}(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11}),$\\
-      & $\phantom{[}(44,1,\text{1995-03-03},0,50,0,\text{1995-03-12})]$\\[.3em]
-    Weights & $[1,1,1]$\\
-  \end{tabular}
-  \par\smallskip\centering
-  \input{figures/nested-file.tex}
-  \par\smallskip\raggedright
-  Key 7 selects values $[0,2)$; key 9 selects $[2,3)$.\par
-  Compatible memory/file cursors seek keys and iterate values and weights.
-  \source{VecIndexedWSet::from\_parts; storage/file.rs. Customer 9 / Order 44 is a layout-only extension.}
-\end{frame}
-
-% 9
-\begin{frame}{A changed Customer reads retained intermediate rows}
-  \centering\resizebox{.95\textwidth}{!}{\input{figures/matching-read.tex}}
-  \par\medskip\raggedright
-  Customer 7 changes BUILDING to AUTOMOBILE. $OL_{c,o}$ stays unchanged.
-  \par\smallskip\small
-  For each retained row $r=(7;o,1,\ldots)$, where $o\in\{42,43\}$:\par
-  $-(7,\text{BUILDING},o,\text{date},0,1,\text{price},0,\text{shipdate})$\par
-  $+(7,\text{AUTOMOBILE},o,\text{date},0,1,\text{price},0,\text{shipdate})$
-  \par\smallskip\normalsize
-  Consolidate matching values across visible runs, then project signed outputs.
-  \source{Logical match on Customer ID. Cursor seeks/value iteration: trace/cursor.rs. Full payloads: Appendix A.}
-\end{frame}
-
-% 10
-\begin{frame}{Small updates become separate immutable runs}
-  \lead{Native storage shortcoming: no mutable memtable across transactions}
-  \par\smallskip\small
-  in the inspected input and join paths. Each output seals before trace insertion.
-  \par\medskip\centering
-  \resizebox{.98\textwidth}{!}{\input{figures/trace-growth.tex}}
-  \par\medskip\raggedright\normalsize
-  Larger runs grow through merging, including \textbf{merging in memory}.\par\smallskip
-  One transaction can produce several runs. A merged run can combine several\par
-  transactions, and cancellation can remove their contributions.\par\smallskip
-  There is no fixed number of transactions per run.
-  \source{Illustrative run sizes and merge timing. Structural limitation; performance consequences are unmeasured.}
-\end{frame}
-
-% 11
 \begin{frame}{Before-state and after-state snapshots}
-  \centering\input{figures/snapshot-visibility.tex}
-  \par\bigskip
-  \large
-  A snapshot copies references to complete immutable runs.\par\medskip\normalsize
-  $OL_{c,o}^-$ and $OL_{c,o}^+$ share unchanged runs.\par\smallskip
-  After-state includes the new run. Before-state excludes it.
+  \vfill\centering\input{figures/snapshot-visibility.tex}
   \source{Snapshot strong references: trace/spine\_async/snapshot.rs:55--63,170--179.}
 \end{frame}
 
-% 12
+% 9
 \begin{frame}{Merging referenced runs}
   \centering\resizebox{.95\textwidth}{!}{\input{figures/merge-ownership.tex}}
   \par\medskip
@@ -241,7 +187,7 @@
   \source{Snapshot Arcs, merge slots, and merge\_complete: snapshot.rs and spine\_async.rs.}
 \end{frame}
 
-% 13
+% 10
 \begin{frame}{Where memory goes}
   \begin{tabular}{@{}p{.24\textwidth}p{.71\textwidth}@{}}
     \toprule Allocation & Examples\\\midrule
@@ -256,7 +202,7 @@
   \source{runtime.rs RSS sampling; operator/run metrics; buffer\_cache/cache.rs; operations/memory.md.}
 \end{frame}
 
-% 14
+% 11
 \begin{frame}{What memory pressure changes}
   \small
   \begin{tabular}{@{}lp{.75\textwidth}@{}}
@@ -273,7 +219,7 @@
   \source{runtime.rs:675--694, 848--904, 1269--1356; spine\_async.rs. RSS target is not an allocator quota.}
 \end{frame}
 
-% 15
+% 12
 \begin{frame}{Native mechanisms and reconstruction prototype}
   \begin{tabular}{@{}p{.20\textwidth}p{.74\textwidth}@{}}
     \toprule Status & State and reads\\\midrule
