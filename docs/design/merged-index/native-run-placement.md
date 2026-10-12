@@ -131,6 +131,16 @@ the sections above.
   Operators sort in memory in chunks of about 10,000 records and emit one run
   per chunk; merges do the rest of the sorting. The builder's spill to a file
   is an emergency valve, off by default, not a sizing rule.
+- **The builder's spill is for output that never passes through a sort.**
+  Many operators stream already sorted inputs, possibly file runs, into a
+  builder. `filter_map` walks its input with a cursor
+  (`operator/dynamic/filter_map.rs`). `distinct` walks the delta and the
+  integral trace together (`operator/dynamic/distinct.rs`). Such output can
+  exceed memory, and the builder holds its only in-memory copy. Operators that
+  do sort, such as joins through a batcher (`trace/ord/merge_batcher.rs`),
+  sort in memory with no explicit budget. Only chunking bounds the sort; the
+  RSS controller reacts afterwards. Merges choose memory or file before they
+  start (`pick_merge_destination`) and do not use the threshold builder.
 - **"Building" and "inserting" are separate steps.** Building means appending
   sorted records to a builder. Inserting means handing the finished run to a
   trace, which may copy a memory run to a file.
