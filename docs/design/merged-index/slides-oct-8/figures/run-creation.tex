@@ -9,7 +9,7 @@
   tag/.style={font=\scriptsize,text=quiet}]
   \path[use as bounding box] (0,.7) rectangle (13.7,5.1);
 
-  % Standard LSM: L0 holds mutable memtables.
+  % Standard LSM: L0 is the in-memory memtables; L1 starts on disk.
   \node[font=\normalsize\bfseries] at (2.5,4.85) {Standard LSM};
   \draw[level] (.4,1.7) rectangle (4.6,4.55);
   \node[font=\scriptsize\bfseries,anchor=north west] at (.45,4.53) {L0};
@@ -18,11 +18,11 @@
   \node[tag,align=center] at (2.5,1.2)
     {mutable; in-place sorted insert\\(B-tree / skip list)};
 
-  % DBSP: L0 is itself several in-memory levels of immutable runs.
+  % DBSP: memory holds immutable runs that merge-sort into larger runs.
   \uncover<2->{
     \node[font=\normalsize\bfseries] at (7.1,4.85) {DBSP};
     \draw[level] (5.1,1.7) rectangle (9.1,4.55);
-    \node[font=\scriptsize\bfseries,anchor=north west] at (5.15,4.53) {L0};
+    \node[font=\scriptsize\bfseries,anchor=north west] at (5.15,4.53) {Memory};
     \foreach \i in {0,...,7}
       \node[run,minimum width=.22cm,minimum height=.2cm]
         (tiny\i) at (5.75+.45*\i,4.0) {};
@@ -42,12 +42,12 @@
     \draw[draw=teal,dashed,line width=.7pt] (tiny7.east) -- (9.75,4.75);
     \draw[draw=teal,line width=.8pt,rounded corners=2pt] (9.75,.9) rectangle (13.65,4.75);
     \node[font=\footnotesize\bfseries,text=teal,text width=3.6cm,align=left,anchor=north west]
-      at (9.9,4.65) {Creation inserts sorted (K, V) pairs sequentially};
+      at (9.9,4.65) {Creation inserts sorted records sequentially};
 
     \node[cell,minimum width=.8cm] (key) at (10.45,3.05) {$43$};
     \node[cell,minimum width=1.4cm,anchor=west] (range) at (key.east) {$[2,4)$};
     \node[tag,anchor=south] at (key.north) {key};
-    \node[tag,anchor=south] at (range.north) {value rows};
+    \node[tag, anchor=south] at (range.north east) {value row range};
 
     \node[cell,minimum width=2.2cm] (v2) at (11.9,2.15) {$(8,\ {+1})$};
     \node[cell,minimum width=2.2cm,anchor=north] (v3) at (v2.south) {$(15,\ {+1})$};

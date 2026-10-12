@@ -47,6 +47,8 @@
 }
 \newcommand{\source}[1]{\par\vfill{\color{quiet}\scriptsize #1}}
 \newcommand{\lead}[1]{{\color{teal}\bfseries #1}}
+% A symbolic byte offset within a block, read as "at byte".
+\newcommand{\at}[1]{\texttt{@}\ensuremath{#1}}
 % Two stacked cases inside one table cell.
 \newcommand{\twocase}[2]{\begin{tabular}[t]{@{}l@{}}#1\\#2\end{tabular}}
 
@@ -241,30 +243,18 @@
     $V$ & $(7,\text{BUILDING},42,\text{1995-03-01},0,1,100,0,\text{1995-03-10})$\\
      & $(7,\text{BUILDING},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11})$\\\bottomrule
   \end{tabular}
-  \par\medskip\normalsize
-  Subscripts name access ordering. Explicit fields identify individual rows.\par
-  $OL_{c,o}$ uses Customer ID as key. Order ID and line number lead its value.
   \source{Schema and output field order: query.sql. Semicolon separates indexed key and value.}
 \end{frame}
 
-\begin{frame}{Appendix B: overwrite and simultaneous deletion}
+\begin{frame}{Appendix B: Update = Delete + Insert}
   \small
-  \textbf{Overwrite Customer 7 after Order 43's insertion.}\par
-  $\Delta C_c=\{(7,\text{BUILDING}):-1,(7,\text{AUTOMOBILE}):+1\}$\par
-  $\Delta OL_{c,o}=0$. Retained $OL_{c,o}$ remains unchanged.
-  \par\smallskip
+  $\Delta C_c=\{(7,\text{BUILDING}):-1,(7,\text{AUTOMOBILE}):+1\}$\par\smallskip
   \begin{tabular}{@{}p{.24\textwidth}p{.32\textwidth}p{.379\textwidth}@{}}
     \toprule Changed rows & Matching accumulated rows & Signed output\\\midrule
     $\Delta OL_{c,o}$: none & no request to $C_c^+$ & none\\
     $\Delta C_c$: $-\text{old},+\text{new}$ & $OL_{c,o}^-$: $(7;42,1,\ldots)$ & $(7,\text{BUILDING},42,\ldots):-1$\newline $(7,\text{AUTOMOBILE},42,\ldots):+1$\\
       & $OL_{c,o}^-$: $(7;43,1,\ldots)$ & $(7,\text{BUILDING},43,\ldots):-1$\newline $(7,\text{AUTOMOBILE},43,\ldots):+1$\\\bottomrule
   \end{tabular}
-  \par\smallskip
-  All other output fields remain as in Appendix A.
-  \par\medskip
-  \textbf{Then delete Order 43 and Lineitem (43,1) together.}\par
-  $\Delta L_o\join O_o^+=0$; $L_o^-\join\Delta O_o=\{(7;43,1,\ldots):-1\}$.\par
-  $(7,\text{AUTOMOBILE},43,\text{1995-03-02},0,1,30,0,\text{1995-03-11}):-1$.
   \source{Native signed semantics. These Customer overwrites exceed the RF1/RF2 prototype scope.}
 \end{frame}
 
@@ -289,13 +279,6 @@
     \Delta V &= \Delta L_o\join B_o^+ + L_o^-\join\Delta B_o\\
     V^+ &= V^-+\Delta V
   \end{align*}
-  \small
-  Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$.\par\smallskip
-  $B_o$ pair for Order 43: $(43;7,\text{BUILDING},\text{1995-03-02},0)$.\par
-  $B_o$ is keyed by Order ID. $O_c$ groups Orders by Customer ID.
-  \par\medskip\normalsize
-  This circuit and the slide 7 program compute the same maintained $V$.\par
-  The RF1/RF2 prototype reconstructs these actual reads.
   \source{CIRCUIT.md; native-state-read-contracts.md; experiment README. No experiment changes in this revision.}
 \end{frame}
 

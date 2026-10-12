@@ -38,24 +38,28 @@
     \node at (8.2,\y) {$,$};
     \node at (8.8,\y) {$]$};
   }
-  \foreach \x/\total/\offset/\index in {7.15/2/8/0,7.85/4/16/1,8.55/6/24/2} {
+  % Sizes are compressed on-disk sizes; an 8 KiB block compresses to about
+  % 3-3.5 KiB, which fits the 4 KiB gaps between offsets.
+  \foreach \x/\total/\offset/\size/\index in
+      {7.15/2/8/7/0,7.85/4/16/6/1,8.55/6/24/7/2} {
     \node (total\index) at (\x,3.7) {$\total$};
     \node (offset\index) at (\x,2.95) {$\offset$};
-    \node (size\index) at (\x,2.2) {$1$};
+    \node (size\index) at (\x,2.2) {$\size$};
   }
-  \node[text=quiet,font=\scriptsize] at (6.8,1.8) {Offsets and sizes: units of 512 bytes};
+  \node[text=quiet,font=\scriptsize] at (6.8,1.8) {Units of 512 bytes; sizes compressed};
 
-  % Leaf header, map, and individual items; all block offsets are symbolic.
+  % Leaf header, map, and individual items. Byte offsets within the block are
+  % symbolic and marked with @, read as "at byte".
   \node at (11.775,4.05) {\texttt{n\_values=2}};
-  \node (mapheader) at (11.775,3.65) {\texttt{value\_map\_ofs=m}};
-  \node[text=quiet] at (11.775,3.05) {Item-offset map at $m$};
+  \node (mapheader) at (11.775,3.65) {\texttt{value\_map\_ofs=}\at{m}};
+  \node[text=quiet] at (11.775,3.05) {Item-offset map at \at{m}};
   \node at (10.5,2.65) {$[$};
-  \node (map0) at (10.95,2.65) {$a$};
+  \node (map0) at (10.95,2.65) {\at{a}};
   \node at (11.775,2.65) {$,$};
-  \node (map1) at (12.6,2.65) {$b$};
+  \node (map1) at (12.6,2.65) {\at{b}};
   \node at (13.05,2.65) {$]$};
-  \node (tuple0) at (10.95,2.0) {$(8,+1)$};
-  \node (tuple1) at (12.6,2.0) {$(15,+1)$};
+  \node (tuple0) at (10.95,2.0) {\at{a}: $(8,+1)$};
+  \node (tuple1) at (12.6,2.0) {\at{b}: $(15,+1)$};
 
   \only<2->{
     \draw[selected] (1.42,3.68) rectangle (2.63,4.12);
@@ -76,17 +80,13 @@
     \draw[selected] (7.55,2.73) rectangle (8.15,3.17);
     \draw[traversal] (offset1.south) -- (size1.north);
     \draw[selected] (7.63,1.98) rectangle (8.07,2.42);
-    \node[text=teal] at (6.8,1.1) {$2\le 2<4\ \Rightarrow\ \text{child index }1$};
   }
   \only<4->{
     \draw[traversal] (8.15,3.1) -- (8.35,3.3) -- (9.3,3.3)
       -- (9.3,4.05) -- (9.55,4.05);
-    \node[text=teal] at (11.775,5.3) {Local index: $2-2=0$};
-    \draw[traversal] (10.5,5.1) -- (9.8,5.1) -- (9.8,2.65) -- (map0.west);
+    \node[text=teal] at (11.775,5.3) {Searching for \#1 row};
     \draw[traversal] (mapheader.south) -- (11.775,3.27);
     \draw[traversal] (map0.south) -- (tuple0.north);
     \draw[traversal] (map1.south) -- (tuple1.north);
-    \node[text=teal] at (11.775,.65) {Rows 2, 3: iterate both tuples};
-    \node[text=teal] at (11.775,.2) {Stop before row 4};
   }
 \end{tikzpicture}

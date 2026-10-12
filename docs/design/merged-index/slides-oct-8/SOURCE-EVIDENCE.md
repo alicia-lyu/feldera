@@ -225,13 +225,15 @@ column store.
   index 1 selects entries 1 and 2 of `[0,2,4,6]`, hence `[2,4)`.
 - `format.rs:50–62` and `reader.rs:1124–1186` establish cumulative row
   totals and descriptor units. For the illustrated branch starting at row 0,
-  row 2 selects child 1 from `[2,4,6]`, with offset 16 and size 1: byte offset
-  8192 and size 512. Other children and unused value bounds are omitted.
+  row 2 selects child 1 from `[2,4,6]`, with offset 16 and size 6: byte offset
+  8192 and 3,072 compressed bytes. Data blocks default to at least 8 KiB
+  before Snappy compression (`Parameters::default`), so the figure's sizes of
+  6 and 7 units are plausible compressed sizes. Other children and unused value bounds are omitted.
 - `writer.rs:662–680` writes the leaf header/map;
   `reader.rs:560–570,673–706` locates an item via the map and derives local
   index from `row - first_row`. The leaf's first row 2 is traversal context
   derived from the preceding cumulative total, not an on-disk header field.
-  Symbolic block offsets `m`, `a`, and `b` avoid invented serialization sizes.
+  Symbolic block offsets `@m`, `@a`, and `@b` avoid invented serialization sizes.
   The map illustration uses the supported explicit-array case; the native
   format also supports fixed-stride encoding.
 

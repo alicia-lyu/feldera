@@ -129,8 +129,8 @@ Plum marks integrators, integration text, and the Head they maintain.
 | 10–12 | Separate small runs, snapshots, merge ownership |
 | 13–15 | Memory accounting/controls and prototype scope |
 
-Appendix A gives full payloads. Appendix B shows Customer overwrite and
-simultaneous Order/Lineitem deletion. Appendix C lists sources. Appendix D
+Appendix A gives full payloads. Appendix B shows a Customer update as a
+deletion plus an insertion. Appendix C lists sources. Appendix D
 shows the actual experiment program. Appendix E follows key 43 through
 boundaries `[2,4)`, branch child 1, and the selected leaf's item-offset map,
 iterating `(8,+1)` and `(15,+1)` and stopping before row 4.
