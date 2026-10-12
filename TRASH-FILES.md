@@ -48,3 +48,8 @@ docs/design/merged-index/phase-1-implementation-note.md - moved to TRASH/ - cont
 docs/design/merged-index/phase-2-implementation-note.md - moved to TRASH/ - content folded into col-storage.md
 docs/design/merged-index/phase-4-implementation-note.md - moved to TRASH/ - content folded into col-storage.md
 docs/design/merged-index/native-col-library-implementation-plan.md - moved to TRASH/ - completed plan; facts live in col-storage.md
+docs/design/merged-index/r3-rf1-rf2-reconstruction-implementation-plan.md - moved to TRASH/ - completed plan; folded into reconstruction.md
+docs/design/merged-index/placement-lookup-multimap-plan.md - moved to TRASH/ - completed plan; folded into reconstruction.md
+docs/design/merged-index/r4-rf1-rf2-verification-implementation-plan.md - moved to TRASH/ - completed plan; folded into reconstruction.md
+docs/design/merged-index/r5-maintenance-measurement-implementation-plan.md - moved to TRASH/ - completed plan; folded into measurement.md
+docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md - moved to TRASH/ - completed plan; folded into measurement.md
