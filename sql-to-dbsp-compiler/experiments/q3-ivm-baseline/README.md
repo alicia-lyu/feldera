@@ -1,272 +1,68 @@
 # Native Q3 join IVM baseline
 
-This standalone experiment maintains `V = Customer ⋈ Orders ⋈ Lineitem` with the
-SQL compiler's native incremental circuit. `V` includes the identities and
-payloads needed by Q3 before its residual filters, revenue aggregation,
-ranking, limit, and projection. The SQL in [query.sql](query.sql) has one
-predicate-free materialized view and no intermediate view or join hint.
+This standalone experiment maintains `V = Customer ⋈ Orders ⋈ Lineitem` with the SQL compiler's
+incremental circuit, and optionally with the reconstructed circuit that reads the
+Customer–Orders–Lineitem (COL) merged index instead of four integrator traces. `V` carries the
+identities and payloads Q3 needs before its residual filters, revenue aggregation, ranking, limit,
+and projection. [query.sql](query.sql) has one predicate-free materialized view and no intermediate
+view or join hint.
+
+All commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). The
+architecture and R1–R5 status are in the
+[design README](../../../docs/design/merged-index/README.md).
 
 ## Worker policy
 
-All future IVM maintenance runs use one DBSP worker (`--workers 1`), including
-RF1 and RF2. Initial loading may use multiple workers. The driver defaults to one worker. Keep this
-setting explicit in recorded run commands and configurations.
+Maintenance and initial loading both use one DBSP worker
+([decision of 2026-10-12](../../../docs/design/merged-index/decisions.md)). The driver defaults to
+`--workers 1`. Reconstructed mode and R5 runs reject any other count. Record the worker count in
+every run configuration.
 
-The IVM maintenance implementation targets single-worker execution. Partitioning,
-cross-worker exchange, distributed state placement, and migration are outside
-its current scope. No multiworker maintenance extension is planned.
+## Layout
 
-## Generate and run
+| Path | Role |
+| --- | --- |
+| `query.sql`, `generate.sh` | The SQL and the script that generates `src/lib.rs`, `src/stubs.rs`, and `plan.json` (git-ignored). `generate.sh --q3-merged-index` generates the reconstructed circuit. |
+| `src/main.rs`, `src/data.rs`, `src/udf.rs` | Handwritten driver, `.tbl` parser, and UDF scaffolding. |
+| `src/workload.rs` | `BaseState` and the workload checks, including `BaseState::validate`. |
+| `src/reconstruction.rs` | `ManualIndex` and the auxiliary-thread index maintenance (Cargo feature `merged-index`). |
+| `src/verification.rs` | Shared R4 tests for both modes. |
+| `src/measurement.rs`, `measure.py` | R5 reporting and the runner. |
+| `verify.sh` | The full verification gate. |
+| [CIRCUIT.md](CIRCUIT.md) | The generated circuit and its state reads. |
+| [RESULTS.md](RESULTS.md) | Dataset, correctness evidence, and historical measurements. |
 
-The [compilation and run workflow](../../../docs/design/merged-index/WORKFLOW.md)
-walks through compiler builds, incremental inspection artifacts,
-baseline comparisons, native execution, and the agent-added report formatting.
-The concrete Customer–Orders–Lineitem codecs and storage tests are also
-available as a reusable standalone library in
-[`merged-index-col`](../merged-index-col/src/lib.rs). This baseline does not
-instantiate that library on its default path. The opt-in `merged-index`
-feature runs the RF1/RF2 reconstruction prototype described below.
+## Modes
 
-Use the repository's pinned Calcite build and Java 21 as described in the
-[compiler README](../../README.md). From this directory, regenerate the Rust
-circuit with:
+The native path is the default: `./generate.sh` and Cargo without the `merged-index` feature. The
+reconstructed path needs the compiler option `--q3-merged-index` and the Cargo feature together.
+The concrete COL codecs and storage tests live in the standalone
+[`merged-index-col`](../merged-index-col/README.md) library, which the native path does not use.
 
-```sh
-./generate.sh
-```
+In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside the Q3
+circuit, on a DBSP auxiliary thread. Per transaction it appends the signed index rows, then
+publishes the before and after snapshots to Q3, which keeps them until its consumers finish.
+The placement map (order → customer) is built from the Orders rows of that transaction's delta,
+so only RF1 and RF2 are supported. The contract and its limits are in
+[reconstruction.md](../../../docs/design/merged-index/reconstruction.md).
 
-This is Catalog mode and the compiler's default optimization level 2. Run
-`./generate.sh` before building or testing a fresh checkout. It produces
-`src/lib.rs`, `src/stubs.rs`, and `plan.json`; these compiler artifacts are
-Git-ignored. The handwritten `src/main.rs` driver, `src/data.rs` parser,
-`src/udf.rs` scaffolding, SQL, and generator remain tracked. The generated
-circuit and plan are available locally for inspection after generation.
-Run the deterministic native transactions with:
+Reconstruction decodes the requested key ranges and copies them into temporary native batches for
+the existing joins. This copy is suboptimal; a direct reconstructed cursor is a future
+optimization. The prototype makes no performance-gain or hard-memory-cap claim.
 
-```sh
-cargo +1.96.1 test --offline --locked
-```
+## Verification
 
-The native path is the default: use `./generate.sh` and Cargo without the
-`merged-index` feature. To generate and build the reconstructed path, use:
+`Reference` is a measurement-harness checker, not DBSP state. With verification enabled it keeps
+independent Customer, Orders, and Lineitem maps and compares each transaction's emitted delta and
+materialized `V` with a full join; `--no-verify` allocates none of them. The shared tests in
+`src/verification.rs` run loading, then RF1 insertion and RF2 deletion, in both modes, and
+`verify.sh` compares the two modes' transcripts byte for byte. Details are in
+[reconstruction.md](../../../docs/design/merged-index/reconstruction.md). Replacements, key moves,
+orphan rows, independent Lineitem changes, and Customer updates are unsupported.
 
-```sh
-./generate.sh --q3-merged-index
-cargo +1.96.1 build --offline --locked --features merged-index
-cargo +1.96.1 test --offline --locked --features merged-index
-```
+## Measurement
 
-The generated compiler option and Cargo feature must be enabled together. Run
-the executable with the same input arguments as the native command. Initial
-loading prepares the base relations and merged index as setup for maintenance
-measurements. The R5 driver reads bounded batches, loading Customers first and
-then complete Order/Lineitem groups. It requires ascending Order keys and
-Lineitem rows grouped by Order, and reports unsupported ordering. Both modes use
-the same load transactions. Independent `Reference` validation is allocated
-only when verification is enabled; `--no-verify` retains no reference maps.
-The JSON configuration reports `driver_reference_bytes: 0` in this mode.
-`Reference` is a measurement-harness checker, not native DBSP state: with
-verification enabled it maintains independent Customer, Orders, and Lineitem
-hash maps and checks each transaction's emitted delta and materialized `V`
-against a full join. With `--no-verify`, neither mode allocates or updates those
-maps. Native RF2 discovery still reads the maintained Catalog Orders and
-Lineitem snapshots; both modes use the same logical refreshes. Earlier baseline
-results with verification enabled include the reference maps in their RSS.
-The measured workload is limited to RF1 insertion and RF2 deletion under
-referential integrity.
-Replacements, key moves, orphan rows, independent Lineitem changes, and Customer
-updates are unsupported.
-
-The harness maintains the merged index manually on a DBSP auxiliary thread
-outside the Q3 graph. Before each logical refresh, it captures the previous
-index snapshot, appends physical signed changes, waits for insertion, and
-publishes previous and current snapshots to Q3. The temporary placement map is
-built from complete Orders records in that refresh's delta, supplying one candidate
-customer per order. The readers' support for multiple candidates is documented
-in the [separate placement correction](../../../docs/design/merged-index/placement-lookup-multimap-plan.md)
-and does not extend the supported refresh workload. No persistent lookup is kept.
-Views remain published until Q3 finishes the transaction.
-
-Reconstruction reads only requested matching key ranges, decodes their rows,
-and copies them into temporary native batches for the existing joins. This
-copying path is suboptimal: decoding, copying, and possible sorting are charged
-to `q3_ms`. A direct reconstructed cursor is a future optimization. The temporary
-placement map currently uses `BTreeMap` and `BTreeSet`; container selection is also
-a future optimization, preserving its transaction-local contents. Report
-`index_ms`, `q3_ms`, and `combined_maintenance_ms` for each RF1/RF2 refresh;
-input preparation and RF2 discovery remain separate. The prototype makes no
-performance-gain or hard-memory-cap claim. Its checkpoint test covers save and
-restore at a completed transaction boundary; circuit stacking and coordinated
-cross-circuit checkpoints are deferred.
-
-## R5 maintenance measurements
-
-R5 keeps one `BaseState` backed by shared Catalog batch snapshots and refreshes
-it after each transaction for discovery and workload checks.
-`CatalogHandle::concat` consumes its input mailbox, so this state avoids
-retaining or rebuilding a second set of full relation maps. RF2 IDs are resolved
-from the current maintained Orders snapshot. Complete deletion rows come from
-native Lineitem primary-key ranges or the manual merged index's `(custkey,
-orderkey)` line range. Requested IDs are deduplicated; absent Orders are ignored
-and counted. Discovery uses maintained storage rather than rescanning base files
-or replaying refreshes. Operational checks enforce the supported workload
-against maintained state and the current delta.
-
-The R5 runner builds and preserves separate native and reconstructed release
-executables, then restores default native generation. It starts a fresh process
-and storage directory for each mode and repetition; three repetitions are the
-default. Run from this directory with Java 21, Rust 1.96.1, and the compiler
-already built:
-
-```sh
-python3 measure.py \
-  --customer "$TPCH_DATA/customer.tbl" \
-  --orders "$TPCH_DATA/orders.tbl" \
-  --lineitem "$TPCH_DATA/lineitem.tbl" \
-  --refresh-list "$TPCH_DATA/refreshes.json" \
-  --report target/r5-measurements/report.json \
-  --cache-bytes 1073741824 \
-  --memory-target-bytes 4294967296 \
-  --no-verify
-```
-
-The refresh list is a JSON array in execution order. Each item is either
-`{"rf1_orders":"orders.tbl.u1","rf1_lines":"lineitem.tbl.u1"}` or
-`{"rf2":"delete.1"}`; relative paths resolve against the list's directory.
-`--cache-bytes` must be a whole number of MiB. The R5 driver requires the
-file-backed storage configuration, one worker, native join fetch, no compression,
-and `min_storage_bytes=0`. It records the cache capacity, runtime memory-pressure
-target, and loading merge-wait timeout. Loading waits for naturally eligible
-background merges to become idle; it does not force full compaction and keeps
-multiple below-threshold runs. One empty loading transaction publishes the
-resulting snapshots. Batch locations are read from `SerBatch::location`, not
-inferred from a graph profile; below-threshold memory batches may remain. No
-final merge wait or extra transaction follows the refresh sequence. A complete
-refresh that cannot execute within its budget fails the run rather than being
-split.
-
-Maintenance compaction can continue across refresh transactions. In native
-mode, this includes all circuit traces. In reconstructed mode, it includes the
-remaining circuit traces and the auxiliary-thread manual merged index. The
-existing full-compaction API can merge eligible batches until at most one batch
-remains per trace, but R5 does not call it.
-
-Storage lookups by the driver and manual-index owner run inside
-`Runtime::with_buffer_cache`, bound to the already configured worker cache.
-This scopes lookups to the selected cache without creating another cache; when
-no binding is active, the runtime falls back to its global 256 MiB cache. The
-binding is restored during unwind.
-
-The JSON report records input and executable hashes, revision, configuration,
-per-phase measurements, and qualification status. It separates RF2 discovery,
-input preparation and operational checks, index maintenance, the Q3 transaction,
-publication/cleanup, and complete foreground latency. `index_ms + q3_ms` is a
-subtotal that excludes discovery and preparation. The sequence ends at the last
-refresh's publication/cleanup, with `completion_boundary` set to
-`last_refresh_complete` and `snapshot_publication_transactions` set to zero.
-`sequence.observed_storage_bytes` records storage after the last refresh without
-waiting for compaction; background merges can still be active. It is not a
-settled post-compaction size. `load.background_merge_wait_ms` and
-`load.observed_storage_bytes` describe the loading wait and its observed size.
-The configuration's `compaction_policy` value is `no forced compaction; loading
-waits for normal background merges only; no final wait`. Storage summaries
-report each Catalog relation's `snapshot_batch_count`, `memory_batch_count`,
-`storage_batch_count`, and `file_backed` state; `manual_index_storage` reports
-the auxiliary index separately. These fields permit memory batches and do not
-imply that every live batch is file-backed.
-Process CPU includes natural background merges that run during the measured
-interval. Backend operations and bytes are reported separately from OS physical
-I/O; OS physical byte counters are unavailable on macOS and appear as null.
-Reports include process RSS high-water mark, cache occupancy, affected
-customers/orders, and line fan-out; unavailable counters are marked explicitly.
-Independent correctness checking is excluded from measured runs.
-
-macOS reports are smoke tests and do not establish equal enforced total memory.
-Linux qualification requires equal cgroup v2 total-memory limits, swap disabled,
-and private copies of every input prepared inside each run's cgroup during
-loading. The current R5 v2 smoke comparisons completed 18 fresh processes without forced
-compaction; the qualifying Linux campaign remains pending. The tiny loaded base
-stayed in RAM and did not demonstrate memory pressure. Earlier forced-drain
-smoke results are historical R5 v1 evidence. Refresh
-completion has no durability guarantee. Periodic checkpoint measurement,
-broader updates, residual Q3, and Q5/Q10 remain deferred. See the
-[Linux pressure campaign plan](../../../docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md)
-for the pending workload and pressure instrumentation.
-
-## RF1/RF2 verification
-
-From this directory, run the complete verification workflow with Java 21 available
-through `JAVA_HOME` or `PATH` and the compiler already built:
-
-```sh
-./verify.sh
-```
-
-The script generates both circuit modes and runs each full experiment suite,
-plus the COL suite and Python runner tests, using Rust 1.96.1 and offline locked
-dependencies. It checks Rust formatting, Clippy with warnings denied, shell
-syntax, and whitespace. It restores default native generation on exit, including
-when a check fails. Logs and
-JSON result files are stored in a fresh ignored `target/r4-verification/`
-directory; `CARGO_TARGET_DIR` can select an existing compilation cache.
-
-The shared tests in `src/verification.rs` load Customers first, then complete
-Order/Lineitem groups, and repeat RF1 insertion and RF2 deletion. They cover
-multiple customers/orders, distinct lines with identical payloads, oversized
-groups crossing batch boundaries, empty transactions, and multiple runtime
-steps within a transaction. Every committed emitted delta and materialized `V`
-is compared with the full join computed by `Reference::evaluate` from logical
-input records.
-The reconstructed run also checks all four readers against expected rows computed
-directly from logical Customer, Orders, and Lineitem records for the requested keys.
-Each run writes a JSON file containing each transaction's name, sorted emitted rows
-and weights, and sorted materialized rows and weights. The script checks that the
-native and reconstructed JSON files are identical byte for byte. See
-[RESULTS.md](RESULTS.md) for executed evidence. These checks cover the supported
-loading and RF1/RF2 workload, where each order has one candidate customer.
-Broader updates, residual Q3, and performance comparisons are deferred.
-
-For a local dbgen run, supply exact paths to complete base files and one
-refresh batch. For example, after setting `TPCH_DATA` to a dbgen output
-directory:
-
-```sh
-cargo run -- \
-  --customer "$TPCH_DATA/customer.tbl" \
-  --orders "$TPCH_DATA/orders.tbl" \
-  --lineitem "$TPCH_DATA/lineitem.tbl" \
-  --rf1-orders "$TPCH_DATA/orders.tbl.u1" \
-  --rf1-lines "$TPCH_DATA/lineitem.tbl.u1" \
-  --rf2 "$TPCH_DATA/delete.1" \
-  --workers 1
-```
-
-The defaults are one worker, 10,000 input records per load transaction, three
-independent runs, full delta and materialized snapshot verification, and
-memory-backed DBSP state. `--batch` and `--runs` override these counts;
-retain `--workers 1` for IVM maintenance runs. `--storage-path DIR` enables native file-backed state in a distinct
-`run-N` subdirectory for each run. `--no-verify` excludes the independent
-full-join checks from measurement runs. RF1 submits related Orders
-and Lineitem inserts in one transaction. RF2 removes each present order and its
-lines in one transaction.
-The initial load is submitted through the same incremental circuit in batches.
-
-The original R1 driver buffered each entire base file, retained source maps for
-RF2 discovery even with `--no-verify`, and used memory-backed state unless
-`--storage-path` was supplied. Its phase reports and reference-byte counters
-describe those original measurements only. The R5 driver uses bounded loading,
-maintained-storage RF2 discovery, and file-backed state; see the R5 section
-above for its intervals and report fields.
-With verification enabled, `delta_plus`, `delta_minus`, and `view_rows` report
-signed output multiplicities and the materialized cardinality. With
-`--no-verify`, those counters are not computed and `verified=false` marks them
-as unavailable.
-
-## Generated circuit
-
-The compiler-expanded logical graph and per-worker runtime graph exports,
-including raw DOT/JSON and provenance, are documented in [CIRCUIT.md](CIRCUIT.md).
-The shared [workflow](../../../docs/design/merged-index/WORKFLOW.md) gives the
-capture commands and artifact layout.
-The pinned dataset, verification, and measured runs are in
-[RESULTS.md](RESULTS.md).
+R5 reports are defined in [measurement.md](../../../docs/design/merged-index/measurement.md). The
+qualifying Linux run is pending; macOS runs are smoke tests. The original R1 driver buffered
+whole base files and retained source maps even with `--no-verify`; only [RESULTS.md](RESULTS.md)
+describes it.

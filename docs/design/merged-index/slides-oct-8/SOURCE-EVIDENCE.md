@@ -1,11 +1,20 @@
 # Source and visual evidence
 
+> **Historical: pinned to `415bd4940a91e09eef4c2502c5195db00fd5806d`** (2026-10-08), with a
+> construction addendum pinned to `9ec749f84665eb8ba48f4036152020afd9bbf45d`. A diff against
+> the current branch shows `crates/dbsp/src/trace/spine_async.rs` and `crates/dbsp/src/trace.rs`
+> changed; the other cited DBSP sources are byte-identical, but their line anchors and hashes
+> were not re-derived. The hashes and anchors for the documentation files in the source map
+> (state-read contracts, `CIRCUIT.md`, the experiment README, `WORKFLOW.md`) describe
+> files that have since been rewritten. Use the pinned links, not the local ones, to check a
+> claim. Confirmed project decisions are in [decisions.md](../decisions.md).
+
 ## Inspection identity and configuration
 
 Final revision inspected on 2026-10-08 at checkout
 [`415bd4940a91e09eef4c2502c5195db00fd5806d`](https://github.com/feldera/feldera/tree/415bd4940a91e09eef4c2502c5195db00fd5806d),
 branch `feat/merged-index-storage`. The working tree was clean at the start.
-The earlier handoff inspected revision `7d3628513c390ba8053adf54f6c12e06fc901e37`
+An earlier inspection covered revision `7d3628513c390ba8053adf54f6c12e06fc901e37`
 with concurrent native/experiment edits; its working-tree qualifications are
 historical and do not identify this revision's bytes. The refreshed hashes
 below identify the exact source used for the current deck.
@@ -179,10 +188,7 @@ follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
 block offsets follow `storage/file/format.rs:15–62`. The notes distinguish
 per-key value ordering and overlapping runs from implementation scheduling.
 Construction and traversal sources and qualifications are detailed below.
-Current visual review and build results are recorded in
-[immutable-run-traversal-handoff.md](immutable-run-traversal-handoff.md).
-The original [planning handoff](advisor-presentation-implementation-plan.md)
-remains unchanged. The deck claims no measured savings, update costs, or
+The build and visual-review procedure is in [BUILD.md](BUILD.md). The deck claims no measured savings, update costs, or
 comparative performance results.
 
 ## Immutable-run construction and row traversal, 2026-10-09

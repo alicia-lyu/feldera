@@ -23,7 +23,6 @@ The recovered opening slides simplify the introduction,
 base storage, and example notation; the circuit uses unsubscripted relations
 and delta-labeled integrators; the state table lists four indexed states.
 Existing speaker notes were retained because the reference has no notes.
-See [the recovery record](restore-user-pdf-plan.md) for scope and verification.
 
 ## Build and deliverables
 
@@ -73,21 +72,30 @@ Leaf flushes do not reset those counters; the run completes at `close`.
 The callout illustrates a one-run transaction; actual transactions can
 produce several runs.
 
-- [SOURCE-EVIDENCE.md](SOURCE-EVIDENCE.md) records the inspected revision,
-  source hashes, configuration, construction/retention evidence, and provenance.
-- [Construction and traversal handoff](immutable-run-traversal-handoff.md)
-  records this revision's implementation and verification.
-- [Original handoff](advisor-presentation-implementation-plan.md) remains intact
-  as historical context. Its original join-order instructions are superseded
-  by the final revision handoff.
-- [Dated advisor guidance](advisor-working-style-2026-10-08.md) records the latest
-  task-specific guidance.
+- [SOURCE-EVIDENCE.md](SOURCE-EVIDENCE.md) records the inspected revisions, source
+  hashes, and construction and retention evidence. It is pinned to an earlier commit.
+- [decisions.md](../decisions.md) records the user's confirmed decisions, including the
+  slide-deck directions of 2026-10-08.
 
 `verify_examples.py` asserts exact branches for both programs, simultaneous
 insertion/deletion, Customer/Order/Lineitem overwrites, multiplicities, and
 cancellation. It compares both orders with full evaluation for the original
 729 nonnegative weighted cases and an additional 729 signed cases. It checks
 algebra and examples, not storage behavior or runtime performance.
+
+## Rules for editing the deck
+
+- The user's own edits to the deck are authoritative. Do not reapply earlier agent guidance over
+  them.
+- After `sh build.sh`, inspect the rendered pages ([BUILD.md](BUILD.md)). A clean TeX build does
+  not prove the slides look right. `build.sh` hard-codes the page count.
+- Notation:
+  - "transaction delta", not "batch", for a logical change set;
+  - "run" for an immutable sorted collection;
+  - subscripts for access order, superscripts for before/after state.
+- Make no measured-savings, update-cost, or comparative performance claim.
+- Describe the experiment's Orders–Customer-first circuit as it is, even though the explanatory
+  program joins Orders–Lineitem first.
 
 ## Style and talk structure
 

@@ -56,7 +56,7 @@ with the callout moved to the new page 4. Old pages 16 and 20 become pages 17
 and 21 with corrected explanatory-program references. Compare all other
 content and positions, reporting any subpixel TeX layout differences separately.
 Old pages 2–3 are the intentionally edited storage
-topic; new pages 22–25 are Appendix E. Preserve the historical PDF-recovery record.
+topic; new pages 22–25 are Appendix E.
 A successful TeX build alone does not establish visual correctness.
 
 | PDF pages | Topic / advance |
