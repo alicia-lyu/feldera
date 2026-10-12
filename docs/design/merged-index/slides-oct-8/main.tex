@@ -70,18 +70,46 @@
 \end{frame}
 
 % 2
+\begin{frame}{Record structure}
+  \large Logically, $\text{record}=(\text{key},\text{value},\text{weight})$---``bag semantics''
+  \par\medskip\normalsize
+  \begin{center}\small
+    \begin{tabular}{@{}lll@{}}
+      % Pending physical layout
+      % \toprule Key & Value & Weight\\\midrule
+      % 7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
+      % 7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
+    \end{tabular}
+  \end{center}
+  \par\medskip
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{.46\textwidth}
+      \textbf{Multiplicity}\par
+      $+2$: two equal complete rows.\par
+      A join multiplies matching weights.
+    \end{column}
+    \begin{column}{.49\textwidth}
+      \textbf{Signed transaction delta}\par
+      $-1$: retract one row.\par
+      Equal pairs cancel: $+1+(-1)=0$.
+    \end{column}
+  \end{columns}
+  \source{Weighted relations: VLDB 2023 \S4. Indexed/nested groups: \S7.3.}
+\end{frame}
+
+% 3
 \begin{frame}<1-2>{Storage for base relations}
   \centering\input{figures/base-storage.tex}
   \source{trace/spine\_async.rs; storage/file.rs; file/indexed\_wset\_batch.rs.}
 \end{frame}
 
-% 3
+% 4
 \begin{frame}<1-3>{Creating an immutable run}
   \centering\input{figures/run-creation.tex}
   \source{trace/spine\_async.rs; trace/ord/vec/indexed\_wset\_batch.rs; storage/file/writer.rs.}
 \end{frame}
 
-% 4
+% 5
 \begin{frame}{Ex. predicate-free three-way join}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.53\textwidth}
@@ -109,7 +137,7 @@
   \par\smallskip
 \end{frame}
 
-% 5
+% 6
 \begin{frame}{The complete incremental program}
   \input{figures/ivm-program.tex}
   \vspace{-1em}
@@ -121,7 +149,7 @@
   $\mathcal{I}_{\Delta R}$ ``integrates'' $\Delta R$
 \end{frame}
 
-% 6
+% 7
 \begin{frame}{Accumulated state and immutable runs}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.48\textwidth}
@@ -140,35 +168,6 @@
       \lead{$R^+$ and $R^-$ share one trace.}\par
     \end{column}
   \end{columns}
-\end{frame}
-
-% 7
-\begin{frame}{Record structure}
-  \large Logically, $\text{record}=(\text{key},\text{value},\text{weight})$---``bag semantics''
-  \par\medskip\normalsize
-  Physically, $OL_{c,o}$ is stored as
-  \begin{center}\small
-    \begin{tabular}{@{}lll@{}}
-      % Pending physical layout
-      % \toprule Key & Value & Weight\\\midrule
-      % 7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
-      % 7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
-    \end{tabular}
-  \end{center}
-  \par\medskip
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{.46\textwidth}
-      \textbf{Multiplicity}\par
-      $+2$: two equal complete rows.\par
-      A join multiplies matching weights.
-    \end{column}
-    \begin{column}{.49\textwidth}
-      \textbf{Signed transaction delta}\par
-      $-1$: retract one row.\par
-      Equal pairs cancel: $+1+(-1)=0$.
-    \end{column}
-  \end{columns}
-  \source{Weighted relations: VLDB 2023 \S4. Indexed/nested groups: \S7.3.}
 \end{frame}
 
 % 8
@@ -287,7 +286,7 @@
   Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$ (Appendix D).\par\smallskip
   Subsequent RF1 inserts / RF2 deletes require referential integrity.\par
   Base primary-key state and $V$ remain separately retained.
-  \source{Explanatory program: slide 5. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
+  \source{Explanatory program: slide 6. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
 \end{frame}
 
 \pdfstringdefDisableCommands{\def\translate#1{#1}}
@@ -361,7 +360,7 @@
   $B_o$ pair for Order 43: $(43;7,\text{BUILDING},\text{1995-03-02},0)$.\par
   $B_o$ is keyed by Order ID. $O_c$ groups Orders by Customer ID.
   \par\medskip\normalsize
-  This circuit and the slide 5 program compute the same maintained $V$.\par
+  This circuit and the slide 6 program compute the same maintained $V$.\par
   The RF1/RF2 prototype reconstructs these actual reads.
   \source{CIRCUIT.md; native-state-read-contracts.md; experiment README. No experiment changes in this revision.}
 \end{frame}

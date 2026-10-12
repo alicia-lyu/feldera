@@ -34,15 +34,15 @@ pdfinfo build/dbsp-physical-design.pdf
 pdfinfo build/dbsp-physical-design-notes.pdf
 ```
 
-Inspect all presentation and notes pages at readable size, including both slide-2
+Inspect all presentation and notes pages at readable size, including both slide-3
 advances. Check clipping, overlap, stable positions, readable
 tree/search connectors, fields/weights, grammar, and source labels.
 The deck currently has no speaker notes, so the notes pages are blank.
-On slide 2, check one independent downward cursor above each of the six
+On slide 3, check one independent downward cursor above each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
 first value row and iterates the group without a target value.
-On slide 3, inspect all three advances: the memtable panel alone, then the
+On slide 4, inspect all three advances: the memtable panel alone, then the
 DBSP L0 levels of shrinking runs with merge-sort labels inside the box, then
 the teal callout from the smallest run with the key 43 → `[2,4)` and sorted
 value arrays. Panels stay fixed across advances and no L1 or L2 appears.
@@ -64,11 +64,12 @@ A successful TeX build alone does not establish visual correctness.
 | PDF pages | Topic / advance |
 | --- | --- |
 | 1 | Main slide 1 |
-| 2–3 | Slide 2, base storage, structure then lookup |
-| 4–6 | Slide 3, memtable vs. in-memory runs, advances 1–3 |
-| 7 | Main slide 4, example and notation |
-| 8–9 | Slide 5, complete program, advances 1–2 |
-| 10–19 | Main slides 6–15 |
+| 2 | Main slide 2, record structure |
+| 3–4 | Slide 3, base storage, structure then lookup |
+| 5–7 | Slide 4, memtable vs. in-memory runs, advances 1–3 |
+| 8 | Main slide 5, example and notation |
+| 9–10 | Slide 6, complete program, advances 1–2 |
+| 11–19 | Main slides 7–15 |
 | 20–23 | Appendices A–D |
 | 24–27 | Appendix E, traversal, advances 1–4 |
 

@@ -122,7 +122,7 @@ the inspected committed source. Hashes are SHA-256 of current file bytes.
 
 ## Explanatory and actual programs
 
-Slides 4–7 use the equivalent explanatory Orders–Lineitem-first program:
+Slides 2 and 5–7 use the equivalent explanatory Orders–Lineitem-first program:
 
 ```text
 ΔOL_c,o = ΔL_o ⋈ O_o+ + L_o− ⋈ ΔO_o
@@ -179,9 +179,10 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 15 main topics, two advances each on slides 2 and 5, and five
-appendices, with four advances in Appendix E: 25 rendered pages in each PDF.
-Slide 2 shows six unconnected runs with independent downward cursors and
+It has 15 main topics, two advances each on slides 3 and 6, three on
+slide 4, and five appendices, with four advances in Appendix E: 27 rendered
+pages in each PDF.
+Slide 3 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees
 follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
 `trace/ord/file/indexed_wset_batch.rs:41–83`. Row-group metadata and index
@@ -205,7 +206,7 @@ bytes used; the earlier source-map identity remains a historical record.
 
 Native “columns” describe nested file trees, not SQL attribute columns.
 For an untimed indexed weighted run, tree 0 stores `(K, ())` with separate
-row-group metadata selecting tree 1's `(V, weight)` items. Slide 3's callout
+row-group metadata selecting tree 1's `(V, weight)` items. Slide 4's callout
 draws these as a key array and a value array.
 This terminology prevents the file layout from being mistaken for a SQL
 column store.
