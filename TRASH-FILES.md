@@ -43,3 +43,8 @@ docs/design/merged-index/slides-oct-8/advisor-presentation-implementation-plan.m
 docs/design/merged-index/slides-oct-8/immutable-run-traversal-handoff.md - moved to TRASH/ - completed handoff
 docs/design/merged-index/slides-oct-8/restore-user-pdf-plan.md - moved to TRASH/ - completed plan
 docs/design/merged-index/slides-oct-8/advisor-working-style-2026-10-08.md - moved to TRASH/ - directives extracted into decisions.md and the slides README
+docs/design/merged-index/folded-key-layer-file-plan.md - moved to TRASH/ - rewritten as the col-storage.md spec
+docs/design/merged-index/phase-1-implementation-note.md - moved to TRASH/ - content folded into col-storage.md
+docs/design/merged-index/phase-2-implementation-note.md - moved to TRASH/ - content folded into col-storage.md
+docs/design/merged-index/phase-4-implementation-note.md - moved to TRASH/ - content folded into col-storage.md
+docs/design/merged-index/native-col-library-implementation-plan.md - moved to TRASH/ - completed plan; facts live in col-storage.md
