@@ -209,22 +209,6 @@
   \source{Runtime::raw\_memory\_pressure, min\_*\_storage\_bytes: circuit/runtime.rs. pick\_*\_destination: trace/ord/fallback/utils.rs. must\_relieve\_memory\_pressure: trace/spine\_async.rs.}
 \end{frame}
 
-% 12
-\begin{frame}{Native mechanisms and reconstruction prototype}
-  \begin{tabular}{@{}p{.20\textwidth}p{.74\textwidth}@{}}
-    \toprule Status & State and reads\\\midrule
-    \textbf{Native} & Indexed traces retain immutable runs. Joins read accumulated state with the required visibility.\\[.8em]
-    \textbf{Prototype} & The restricted RF1/RF2 path reconstructs requested ranges into temporary native runs from one COL index.\\[.8em]
-    \textcolor{amber}{\textbf{Deferred}} & Broader updates, direct reconstructed cursors, and comparative memory/performance results.\\\bottomrule
-  \end{tabular}
-  \par\medskip
-  \lead{The existing prototype uses Orders--Customer first, then Lineitem.}\par\smallskip
-  Actual reads: $C_c^+,O_c^-,B_o^+,L_o^-$ (Appendix D).\par\smallskip
-  Subsequent RF1 inserts / RF2 deletes require referential integrity.\par
-  Base primary-key state and $V$ remain separately retained.
-  \source{Explanatory program: slide 7. Actual circuit: CIRCUIT.md and native-state-read-contracts.md.}
-\end{frame}
-
 \pdfstringdefDisableCommands{\def\translate#1{#1}}
 \appendix
 \setbeamertemplate{footline}{\hfill\color{quiet}Appendix\hspace{1em}\vspace{.6em}}

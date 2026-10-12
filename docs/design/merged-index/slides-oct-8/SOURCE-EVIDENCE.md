@@ -145,7 +145,7 @@ V+ = V− + ΔV
 ```
 
 Its actual accesses remain `C_c+`, `O_c−`, `B_o+`, and `L_o−`.
-Slide 12 and Appendix D explicitly identify that different order. Prototype
+Appendix D explicitly identifies that different order. Prototype
 support remains subsequent RF1 complete Order/Lineitem insertion and RF2
 deletion under referential integrity after setup. Customer updates, replacements,
 key moves, orphans, and independent Lineitem updates remain excluded.
@@ -167,7 +167,7 @@ preserve that style. The copied opening backdrop remains in
 `c29f087dbd7231793559c5388218bbe8a27e02b0d487920596be78e3f77e3f7d`)
 for provenance; the final revision does not display it. Worked joins use teal
 for active information and readable quiet ink for completed steps. Amber marks
-deferred work. All diagrams are editable and illustrative.
+the standard LSM's mutable memtables. All diagrams are editable and illustrative.
 
 ## Verification and delivery
 
@@ -179,8 +179,8 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 12 main topics, two advances each on slides 3, 7, and 10,
-three each on slides 4 and 5, and five appendices, with four advances in Appendix E: 27 rendered
+It has 11 main topics, two advances each on slides 3, 7, and 10,
+three each on slides 4 and 5, and five appendices, with four advances in Appendix E: 26 rendered
 pages in each PDF.
 Slide 3 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees

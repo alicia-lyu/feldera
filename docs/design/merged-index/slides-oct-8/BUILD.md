@@ -81,11 +81,10 @@ A successful TeX build alone does not establish visual correctness.
 | 14–15 | Main slides 8–9 |
 | 16–17 | Slide 10, merging the first level, advances 1–2 |
 | 18 | Main slide 11, memory pressure table |
-| 19 | Main slide 12, native mechanisms and prototype |
-| 20–23 | Appendices A–D |
-| 24–27 | Appendix E, traversal, advances 1–4 |
+| 19–22 | Appendices A–D |
+| 23–26 | Appendix E, traversal, advances 1–4 |
 
-Both PDFs have 27 pages. The main talk has 12 topics: advancing an
+Both PDFs have 26 pages. The main talk has 11 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 
