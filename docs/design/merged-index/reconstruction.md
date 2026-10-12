@@ -49,7 +49,7 @@ The test `published_views_cover_multiple_transaction_steps` (`q3-ivm-baseline/sr
 
 To batch more changes, use one larger transaction. Its full change set must be known before it starts, because the index is updated first.
 
-The index is maintained on an auxiliary thread, outside the circuit. It uses the native `Spine`. The harness saves it with the prepared checkpoint UUID before committing Q3, so checkpoint dependency collection includes its batch files (test `checkpoint_restores_q3_and_manual_index_at_completed_boundary`). Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
+The merged index is owned by `ManualIndex` on a DBSP auxiliary thread, outside the Q3 graph. `append` builds the transaction's index rows, adds them to the index, and returns the immutable before and after snapshots, which `publish` hands to the readers together with the placement map. The index uses the native `Spine`. The harness saves it with the prepared checkpoint UUID before committing Q3, so checkpoint dependency collection includes its batch files (test `checkpoint_restores_q3_and_manual_index_at_completed_boundary`). Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
 
 ## Placement map
 
