@@ -179,8 +179,8 @@ for 729 nonnegative and 729 signed cases. It does not simulate storage, retest
 runtime execution, or measure memory/performance.
 
 The current deck preserves the user's removal of the two worked-join topics.
-It has 12 main topics, two advances each on slides 3 and 6, three on
-slide 4, and five appendices, with four advances in Appendix E: 24 rendered
+It has 12 main topics, two advances each on slides 3, 6, and 9, three
+on slide 4, and five appendices, with four advances in Appendix E: 25 rendered
 pages in each PDF.
 Slide 3 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees

@@ -10,10 +10,12 @@ immutable runs that merge-sort into larger runs, then shows how sorted (K, V)
 pairs build the smallest run. Slide 6 reveals the downstream
 Customer circuit and its delta equation on the second overlay. Slide 8 draws
 the before-state and after-state snapshots as reference arrows to shared runs;
-only the after-state references the new transaction's run. Appendix E
+only the after-state references the new transaction's run. Slide 9 merges the
+first level: the spine's references move to the merged run, while both
+snapshots keep the faded L0 runs alive. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
-Each PDF has **24 rendered pages**: 16 main-talk pages and eight appendix pages.
+Each PDF has **25 rendered pages**: 17 main-talk pages and eight appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on

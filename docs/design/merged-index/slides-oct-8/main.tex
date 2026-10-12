@@ -178,12 +178,8 @@
 \end{frame}
 
 % 9
-\begin{frame}{Merging referenced runs}
-  \centering\resizebox{.95\textwidth}{!}{\input{figures/merge-ownership.tex}}
-  \par\medskip
-  \lead{Merge completion releases the spine's source references.}\par\smallskip
-  An old snapshot can still own the old runs.\par\medskip
-  Reclaim a memory run after its last strong owner releases it.
+\begin{frame}<1-2>{Merging referenced runs}
+  \vfill\centering\input{figures/merge-ownership.tex}
   \source{Snapshot Arcs, merge slots, and merge\_complete: snapshot.rs and spine\_async.rs.}
 \end{frame}
 

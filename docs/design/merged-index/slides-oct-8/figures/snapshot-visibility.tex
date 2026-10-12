@@ -1,27 +1,28 @@
-% Each snapshot holds one reference per run; runs stack by level, the new one joins the top level.
+% Each snapshot holds one reference per run; dots inside a run repeat who references it.
 \begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize,
   run/.style={draw=ink,fill=ink!4,line width=.8pt,minimum height=.32cm,
     inner sep=0pt},
   slot/.style={draw=#1,line width=.8pt,minimum width=.4cm,minimum height=.32cm,
     inner sep=0pt},
   pointer/.style={-{Latex[length=2mm]},draw=#1,line width=.8pt}]
-  % Levels: small runs plus the new transaction's smaller run, then medium and large.
-  \node[run,fill=teal!15,draw=teal,minimum width=.35cm] (run0) at (4,4.05) {};
-  \foreach \i/\y/\w in {1/3.6/.7,2/3.15/.7,3/2.7/.7,4/2.25/.7,
-                        5/1.55/1.7,6/1.1/1.7,7/.4/3.2}
+  % Levels: two equal small runs (the second is new), two medium, one large.
+  \node[run,fill=teal!15,draw=teal,minimum width=.7cm] (run0) at (4,3.6) {};
+  \foreach \i/\y/\w in {1/3.15/.7,2/2.45/1.7,3/2.0/1.7,4/1.3/3.2}
     \node[run,minimum width=\w cm] (run\i) at (4,\y) {};
 
   % Before-state references every retained run; after-state also the new one.
-  \node[text=ink] at (.9,4.6) {$C^-$};
-  \node[text=teal] at (7.1,4.6) {$C^+$};
-  \foreach \i in {1,...,7} {
+  \node[text=ink] at (.9,4.15) {$C^-$};
+  \node[text=teal] at (7.1,4.15) {$C^+$};
+  \foreach \i in {1,...,4} {
     \node[slot=ink] (before\i) at (run\i -| .9,0) {};
     \fill[ink] (before\i) circle (1.5pt);
     \draw[pointer=ink] (before\i) -- (run\i.west);
+    \fill[ink] ($(run\i.east)-(.3,0)$) circle (1.8pt);
   }
-  \foreach \i in {0,...,7} {
+  \foreach \i in {0,...,4} {
     \node[slot=teal] (after\i) at (run\i -| 7.1,0) {};
     \fill[teal] (after\i) circle (1.5pt);
     \draw[pointer=teal] (after\i) -- (run\i.east);
+    \fill[teal] ($(run\i.east)-(.13,0)$) circle (1.8pt);
   }
 \end{tikzpicture}
