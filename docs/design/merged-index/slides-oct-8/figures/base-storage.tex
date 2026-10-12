@@ -18,7 +18,7 @@
 
   % Each run owns an independent cursor; runs are not connected.
   \foreach \run in {r00,r01,r02,r10,r11,r20}
-    \draw[seek] ($(\run.west)+(.12,0)$) -- ($(\run.east)-(.12,0)$);
+    \draw[seek] ($(\run.north)+(0,.5)$) -- ($(\run.north)+(0,.05)$);
 
   % One retained file run is enlarged; this is not another trace level.
   \draw[draw=quiet,dashed,line width=.7pt]

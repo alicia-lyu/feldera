@@ -38,7 +38,7 @@ Inspect all presentation and notes pages at readable size, including both slide-
 advances. Check clipping, overlap, stable positions, readable
 tree/search connectors, fields/weights, grammar, and source labels.
 The deck currently has no speaker notes, so the notes pages are blank.
-On slide 2, check one independent rightward cursor inside each of the six
+On slide 2, check one independent downward cursor above each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
 first value row and iterates the group without a target value.
