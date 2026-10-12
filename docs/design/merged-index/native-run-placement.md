@@ -88,8 +88,8 @@ to the result before use.
 
 | RSS / `max_rss_bytes` | Pressure | Inserted run | Merge output | Early merge | New runs built |
 | --- | --- | --- | --- | --- | --- |
-| below 85% | Low | memory | memory if inputs below 10 MiB | no | in memory |
-| 85% or more | Moderate | file if 10 MiB or more | file | no | in memory |
+| below 85% | Low | memory | inputs below 10 MiB: memory; 10 MiB or more: file | no | in memory |
+| 85% or more | Moderate | below 10 MiB: memory; 10 MiB or more: file | file | no | in memory |
 | 90% or more | High | file | file | yes | in memory |
 | 95% or more | Critical | file | file | yes | straight to file |
 
