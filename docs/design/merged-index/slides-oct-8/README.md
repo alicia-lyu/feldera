@@ -9,7 +9,8 @@ contrasts a standard LSM's mutable L0 memtables with DBSP's in-memory
 immutable runs that merge-sort into larger runs, then shows how sorted (K, V)
 pairs build the smallest run. Slide 5 shows that record count sets a run's
 level: an inserted run lands directly in its level, and a merge output can
-stay in its input level. Slide 7 reveals the downstream
+stay in its input level. Its third step draws the 10 MiB memory/file line at
+Low pressure for about 100-byte records. Slide 7 reveals the downstream
 Customer circuit and its delta equation on the second overlay. Slide 9 draws
 the before-state and after-state snapshots as reference arrows to shared runs;
 only the after-state references the new transaction's run. Slide 10 merges the
@@ -19,7 +20,7 @@ steers run location; [native-run-placement.md](../native-run-placement.md)
 records the verified details. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
-Each PDF has **26 rendered pages**: 18 main-talk pages and eight appendix pages.
+Each PDF has **27 rendered pages**: 19 main-talk pages and eight appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on

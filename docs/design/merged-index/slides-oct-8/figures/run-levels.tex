@@ -1,9 +1,10 @@
-% A run's level depends only on its record count. Fixed bounds keep both
-% advances aligned.
+% A run's level depends only on its record count. Fixed bounds keep all
+% three advances aligned.
 \begin{tikzpicture}[x=1cm,y=1cm,font=\normalsize,
   run/.style={draw=ink,fill=ink!4,line width=.8pt,minimum height=.42cm,
     inner sep=0pt},
   new run/.style={run,fill=teal!15,draw=teal},
+  file run/.style={run,fill=white,pattern=north east lines,pattern color=ink!35},
   tag/.style={font=\small,text=quiet}]
   \path[use as bounding box] (0,.3) rectangle (13.7,4.7);
 
@@ -16,9 +17,21 @@
     \node[run,minimum width=.35cm] at (\x,3.8) {};
   \foreach \x in {3.1,4.2}
     \node[run,minimum width=.9cm] at (\x,2.8) {};
-  \node[run,minimum width=1.8cm] (l2a) at (3.5,1.8) {};
-  \node[run,minimum width=1.8cm] (l2b) at (5.5,1.8) {};
-  \node[run,minimum width=3.6cm] at (4.4,.8) {};
+  % On advance 3, runs past the byte threshold are drawn as files.
+  \alt<3>{\tikzset{deep run/.style={file run}}}{\tikzset{deep run/.style={run}}}
+  \node[deep run,minimum width=1.8cm] (l2a) at (3.5,1.8) {};
+  \node[deep run,minimum width=1.8cm] (l2b) at (5.5,1.8) {};
+  \node[deep run,minimum width=3.6cm] at (4.4,.8) {};
+
+  % At one moment and pressure, location splits by bytes, not by level. The
+  % inserted run stays in memory at Low pressure until a merge rewrites it.
+  \only<3>{
+    \draw[draw=quiet,dashed,line width=.9pt] (0,2.3) -- (13.6,2.3);
+    \node[tag,anchor=south east] at (13.6,2.35) {$\uparrow$ memory};
+    \node[tag,anchor=north east] at (13.6,2.25) {$\downarrow$ file};
+    \node[tag,anchor=north west,align=left] at (9.0,2.2)
+      {10 MiB threshold\\Low pressure, $\approx$100 B/record};
+  }
 
   % An inserted run goes straight to the level its size dictates.
   \node[new run,minimum width=1.8cm] (inserted) at (7.6,1.8) {};
@@ -33,4 +46,5 @@
     \draw[link] (inputs.east) -- (output.west);
     \node[tag,anchor=north] at ($(inputs.east)!.5!(output.west)$) {merge};
   }
+
 \end{tikzpicture}

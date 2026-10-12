@@ -5,7 +5,7 @@
 \usepackage{amsmath,booktabs,array,tikz,pgfpages}
 \usefonttheme{serif}
 \usefonttheme{professionalfonts}
-\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,fit,positioning}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,fit,patterns,positioning}
 \ifdefined\PRESENTERNOTES
   \setbeameroption{show notes on second screen=right}
   \hypersetup{draft}
@@ -116,7 +116,7 @@
 \end{frame}
 
 % 5
-\begin{frame}<1-2>{Run levels}
+\begin{frame}<1-3>{Run levels}
   \vfill\centering\input{figures/run-levels.tex}
   \source{Spine::size\_to\_level, MERGE\_COUNTS, min\_batches\_to\_merge: trace/spine\_async.rs.}
 \end{frame}

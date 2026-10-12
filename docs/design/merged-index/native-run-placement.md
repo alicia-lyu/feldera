@@ -106,6 +106,21 @@ A memory run moves to disk only by being rewritten, through a merge or an
 eager spill on insertion. Spilling writes a copy, so readers can keep the
 memory original alive.
 
+Recording location per run is deliberate. A run's location is its
+representation: memory arrays or a file, the two variants of one batch type
+(`FallbackIndexedWSet` in `trace/ord/fallback/indexed_wset.rs`). Runs are
+immutable, so a new location means a rewrite. Merges rewrite runs constantly
+as they move down the levels, and each rewrite applies the current policy.
+Early merges actively rewrite memory runs under High pressure. Placement is
+therefore lazy but converges.
+
+At a fixed moment and pressure, location does split the levels, but by bytes
+rather than by level. With records of about 100 bytes, 10 MiB is about 100k
+records, near the L1/L2 boundary, so L0–L1 runs sit in memory and deeper runs
+in files. Two kinds of run cross the line: a large inserted run stays in
+memory at Low pressure until a merge rewrites it, and snapshots can pin
+obsolete memory runs.
+
 ## Memory pressure
 
 A runtime thread samples the process resident set size (RSS) about once a
