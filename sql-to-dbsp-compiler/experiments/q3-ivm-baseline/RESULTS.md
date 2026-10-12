@@ -248,7 +248,7 @@ DBSP library Clippy passed. The broader DBSP test-code Clippy check found 56
 existing lint errors outside the modified files; its output is retained at
 `target/r5-dbsp-clippy-tests.log` in this experiment.
 
-### Workload definitions
+### v1 workload definitions
 
 All three workloads start with **64 Customers, 512 Orders, and 2,048 Lines**.
 The workload label describes the Orders and Lines added by each RF1:

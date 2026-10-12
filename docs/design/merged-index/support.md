@@ -204,7 +204,6 @@ into explicitly budgeted storage. The snapshot remains alive until its readers f
 the [cursor navigation contract](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L42-L109)
 and [seek methods](https://github.com/feldera/feldera/blob/f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c/crates/dbsp/src/trace/cursor.rs#L197-L245).
 
-
 A read exposes each complete `(K, V)` pair with its consolidated signed weight. Before/after visibility comes from the immutable runs that the selected snapshot references, not from filtering timestamped records.
 
 In R3 the supplied-snapshot join (`dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`) takes this read side from caller-supplied readers. Each reader (for example `Q3State::customers_after` in `sql-to-dbsp-compiler/experiments/merged-index-col/src/q3.rs`) seeks into a COL snapshot, stops at the end of the requested prefix, and returns a `SpineSnapshot` of the rows it decoded. The join consumes that snapshot through the cursor interface above. Only the harness-side `ManualIndex` writes source updates; reconstructed outputs are never inserted into a trace.

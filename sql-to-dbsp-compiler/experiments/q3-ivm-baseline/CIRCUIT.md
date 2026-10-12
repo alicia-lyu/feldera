@@ -9,8 +9,8 @@ graphs; they do not reconstruct the topology.
 
 Run [generate.sh](generate.sh) before following local `src/lib.rs` and
 `plan.json` links below. Those compiler outputs and `src/stubs.rs` are
-Git-ignored; the [experiment instructions](README.md#generate-and-run)
-describe their regeneration.
+Git-ignored; the [workflow](../../../docs/design/merged-index/WORKFLOW.md#generate-and-test)
+describes their regeneration.
 
 ## Compiler-expanded logical graph
 

@@ -251,4 +251,3 @@ physical EOF, close lagging readers, and hold borrowed values during pressure. A
 sealing, independent seeks, cross-step view lifetime, oversized records, dependency cycles, external-order
 changes, and failure during commit. Compare both state-provider results and the shared IVM output with the
 retained-state baseline; report high-water bytes and every spill, reread, sort, and access-path write.
-
