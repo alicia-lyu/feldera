@@ -30,7 +30,11 @@ use crate::{
     profile::{ParkReason, ParkingFor},
     storage::{
         buffer_cache::{BufferCache, CacheStats},
+        diagnostics::{
+            self, CompactionRecord, RunContents, RunWriteKind, SpineContents, now_micros,
+        },
         file::{FilterKind, FilterStats},
+        write_attribution::{WriteOwner, current_write_owner, scope_write_owner, with_write_owner},
     },
     time::Timestamp,
     trace::{
@@ -62,6 +66,7 @@ use rand::Rng;
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::{Context, HumanBytes, SizeOf};
 use std::{
+    any::TypeId,
     borrow::Cow,
     future::Future,
     sync::{
@@ -121,8 +126,15 @@ pub(crate) const MAX_LEVEL0_BATCH_SIZE_RECORDS: u16 = 14_999;
 /// something else asks it to, such as a compaction request or memory pressure.
 pub(crate) const MIN_LEVEL0_MERGE_BATCHES: usize = 8;
 
+/// Sets up the task-local variables of a tokio merger task.
+///
+/// `write_owner` is the owner of the spine that the task merges for. A task
+/// does not inherit the thread-local owner of the thread that spawned it, so
+/// the spine's owner is re-established here, and every file that the task
+/// writes belongs to the spine's owner.
 fn scope_tokio_merger_locals<F>(
     worker_index: usize,
+    write_owner: WriteOwner,
     buffer_cache: Arc<BufferCache>,
     slab_allocator: Arc<FBufSlabs>,
     future: F,
@@ -130,9 +142,12 @@ fn scope_tokio_merger_locals<F>(
 where
     F: Future,
 {
-    TOKIO_WORKER_INDEX.scope(
-        worker_index,
-        TOKIO_BUFFER_CACHE.scope(buffer_cache, TOKIO_FBUF_SLABS.scope(slab_allocator, future)),
+    scope_write_owner(
+        write_owner,
+        TOKIO_WORKER_INDEX.scope(
+            worker_index,
+            TOKIO_BUFFER_CACHE.scope(buffer_cache, TOKIO_FBUF_SLABS.scope(slab_allocator, future)),
+        ),
     )
 }
 
@@ -837,6 +852,9 @@ where
             role,
         )));
 
+        // The spine belongs to whichever owner is current where it is created.
+        let write_owner = current_write_owner();
+
         let max_level0_batch_size_records = max_level0_batch_size_records();
         assert!(
             max_level0_batch_size_records > 0,
@@ -855,12 +873,30 @@ where
                 runtime,
                 max_level0_batch_size_records,
                 worker_index,
+                write_owner,
             )),
             state,
             idle,
             no_backpressure,
             max_level0_batch_size_records,
         }
+    }
+
+    /// Who the files of this spine are counted for.
+    fn write_owner(&self) -> WriteOwner {
+        self.merge_workers.write_owner
+    }
+
+    /// Lets [diagnostics::spine_contents] report this spine until it is
+    /// dropped.
+    fn register_for_diagnostics(&self) {
+        let state = Arc::downgrade(&self.state);
+        let write_owner = self.write_owner();
+        diagnostics::register_spine(Box::new(move || {
+            state
+                .upgrade()
+                .map(|state| spine_contents(&state, write_owner))
+        }));
     }
 
     fn set_key_filter(&self, key_filter: &Filter<B::Key>) {
@@ -1347,6 +1383,10 @@ where
     runtime: Runtime,
     max_level0_batch_size_records: usize,
     worker_index: usize,
+
+    /// The owner of the spine, fixed when the spine is created. Mergers run
+    /// under it, so a compaction's files belong to the spine's owner.
+    write_owner: WriteOwner,
 }
 
 impl<B> MergeWorkers<B>
@@ -1360,6 +1400,7 @@ where
         runtime: Runtime,
         max_level0_batch_size_records: usize,
         worker_index: usize,
+        write_owner: WriteOwner,
     ) -> Self {
         Self {
             workers_started: AtomicU32::new(0),
@@ -1370,6 +1411,7 @@ where
             runtime,
             max_level0_batch_size_records,
             worker_index,
+            write_owner,
         }
     }
 
@@ -1402,6 +1444,7 @@ where
             // Setup task-local variables for the tokio merger runtime.
             scope_tokio_merger_locals(
                 self.worker_index,
+                self.write_owner,
                 buffer_cache,
                 slab_allocator,
                 async move {
@@ -1483,6 +1526,9 @@ where
                 return false;
             };
 
+            // `try_start_merge` marks the slot in progress when this merge is
+            // part of a requested full compaction.
+            let requested = state.slots[level].compaction_status == CompactionStatus::InProgress;
             let key_filter = state.key_filter.clone();
             let value_filter = state.value_filter.clone();
             let frontier = state.frontier.clone();
@@ -1503,6 +1549,8 @@ where
                 &value_filter,
                 snapshot,
                 frontier,
+                level,
+                requested,
             ))
         };
 
@@ -1526,7 +1574,13 @@ where
             let new_batch = merger.elapsed.record(|| Arc::new(merger.builder.done()));
             let new_level =
                 Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
-            self.state.lock().unwrap().merge_complete(
+            let mut state = self.state.lock().unwrap();
+            diagnostics::log_compaction(|| {
+                merger
+                    .log
+                    .record(self.write_owner, state.name.to_string(), &*new_batch)
+            });
+            state.merge_complete(
                 level,
                 new_batch,
                 new_level,
@@ -1534,6 +1588,7 @@ where
                 merger.elapsed,
                 merger.n_steps,
             );
+            drop(state);
             self.start(new_level);
         }
         true
@@ -1598,6 +1653,29 @@ where
 
     /// The merger itself.
     inner: MergeInner<B>,
+
+    /// What the compaction log says about this merge's inputs.
+    log: MergeLogInfo,
+}
+
+/// What is known about a merge when it starts, for the compaction log.
+#[derive(Clone, Copy)]
+struct MergeLogInfo {
+    /// Spine level whose runs are merged.
+    level: usize,
+
+    /// Whether this merge belongs to a requested full compaction, as opposed
+    /// to one the spine started on its own.
+    requested: bool,
+
+    /// Wall-clock start, in [now_micros].
+    start_micros: u64,
+
+    /// Number of runs consumed.
+    input_runs: usize,
+
+    /// Records in the consumed runs, before consolidation.
+    input_records: u64,
 }
 
 enum MergeInner<B>
@@ -1619,11 +1697,23 @@ where
         value_filter: &Option<GroupFilter<B::Val>>,
         snapshot: Option<Arc<SpineSnapshot<B>>>,
         frontier: B::Time,
+        level: usize,
+        requested: bool,
     ) -> Self {
         let factories = batches[0].factories();
         let batch_refs: Vec<&B> = batches.iter().map(|b| b.as_ref()).collect();
+        let start_micros = now_micros();
+        let input_runs = batches.len();
+        let input_records = batches.iter().map(|batch| batch.len() as u64).sum();
         let builder = B::Builder::for_merge(&factories, batch_refs, None);
         Self {
+            log: MergeLogInfo {
+                level,
+                requested,
+                start_micros,
+                input_runs,
+                input_records,
+            },
             builder,
             fuel: 0,
             start: Instant::now(),
@@ -1671,6 +1761,101 @@ where
         let consumed_fuel = supplied_fuel - fuel;
         self.fuel += consumed_fuel;
         consumed_fuel
+    }
+}
+
+/// Lists the runs of the spine behind `state`, for [diagnostics::spine_contents].
+fn spine_contents<B: Batch>(state: &Mutex<SharedState<B>>, owner: WriteOwner) -> SpineContents {
+    // Copy what is needed and release the lock: reading files can be slow, and
+    // the mergers need the lock.
+    let (name, role, factories, batches) = {
+        let state = state.lock().unwrap();
+        (
+            state.name.to_string(),
+            state.role,
+            state.factories.clone(),
+            state.get_batches(),
+        )
+    };
+    let runs = batches
+        .iter()
+        .map(|batch| {
+            let (file, file_bytes) = file_of(batch.as_ref());
+            RunContents {
+                location: location_name(batch.location()),
+                records: batch.len() as u64,
+                negative_weight_records: batch.negative_weight_count(),
+                file,
+                file_bytes,
+            }
+        })
+        .collect();
+    // Consolidating needs the weights of equal (key, value) pairs to be summed
+    // across runs, which the spine's cursor does for untimed batches.
+    let consolidated_rows = (TypeId::of::<B::Time>() == TypeId::of::<()>()).then(|| {
+        let snapshot = SpineSnapshot::with_batches(&factories, batches);
+        let mut cursor = snapshot.cursor();
+        let mut rows = 0u64;
+        while cursor.key_valid() {
+            while cursor.val_valid() {
+                rows += 1;
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        rows
+    });
+    SpineContents {
+        owner,
+        name,
+        role: match role {
+            TraceRole::Accumulator => "accumulator",
+            TraceRole::Integral => "integral",
+        },
+        runs,
+        consolidated_rows,
+    }
+}
+
+impl MergeLogInfo {
+    /// Describes this merge, now finished with `output`, for the compaction
+    /// log.
+    fn record<B: Batch>(&self, owner: WriteOwner, spine: String, output: &B) -> CompactionRecord {
+        let (output_file, output_file_bytes) = file_of(output);
+        CompactionRecord {
+            kind: if self.requested {
+                RunWriteKind::RequestedCompaction
+            } else {
+                RunWriteKind::BackgroundCompaction
+            },
+            owner,
+            spine,
+            level: self.level,
+            started_micros: self.start_micros,
+            finished_micros: now_micros(),
+            input_runs: self.input_runs,
+            input_records: self.input_records,
+            output_records: output.len() as u64,
+            output_location: location_name(output.location()),
+            output_file,
+            output_file_bytes,
+        }
+    }
+}
+
+/// `"memory"` or `"storage"`, for diagnostics.
+fn location_name(location: BatchLocation) -> &'static str {
+    match location {
+        BatchLocation::Memory => "memory",
+        BatchLocation::Storage => "storage",
+    }
+}
+
+/// The storage path and size of the file behind `batch`, if there is one.
+fn file_of<B: Batch>(batch: &B) -> (Option<String>, Option<u64>) {
+    match batch.file_reader() {
+        Some(reader) => (Some(reader.path().to_string()), reader.get_size().ok()),
+        None => (None, None),
     }
 }
 
@@ -2152,13 +2337,17 @@ where
             )
         };
 
-        let mut fork = Self::with_runtime(
-            Runtime::runtime().expect("Attempting to fork a spine outside of a DBSP runtime"),
-            Runtime::worker_index(),
-            &self.factories,
-            name,
-            role,
-        );
+        // The fork belongs to the same owner as the original, wherever the
+        // fork is made.
+        let mut fork = with_write_owner(self.merger.write_owner(), || {
+            Self::with_runtime(
+                Runtime::runtime().expect("Attempting to fork a spine outside of a DBSP runtime"),
+                Runtime::worker_index(),
+                &self.factories,
+                name,
+                role,
+            )
+        });
 
         if let Some(filter) = key_filter {
             fork.retain_keys(filter);
@@ -2194,12 +2383,14 @@ where
         // [`SpineSnapshot`] or a [`Trace::fork`] of this spine, in which case
         // `Arc::unwrap_or_clone` copies the batch instead of taking ownership.
         let batches = self.merger.pause().into_iter().map(Arc::unwrap_or_clone);
-        let result = merge_batches(
-            &self.factories,
-            batches,
-            &self.key_filter,
-            &self.value_filter,
-        );
+        let result = with_write_owner(self.merger.write_owner(), || {
+            merge_batches(
+                &self.factories,
+                batches,
+                &self.key_filter,
+                &self.value_filter,
+            )
+        });
         if result.is_empty() {
             None
         } else {
@@ -2208,9 +2399,7 @@ where
     }
 
     async fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) {
-        let batch = Self::maybe_flush_batch(batch, &self.factories, || {
-            self.merger.state.lock().unwrap().get_filters()
-        });
+        let batch = self.spill_if_due(batch.into());
         if !batch.is_empty() {
             self.dirty = true;
             if self
@@ -2306,9 +2495,10 @@ where
         // saving time then. On the other hand, we do have to read them back
         // from disk to use them: no free lunch.)
         let (not_merging, merging) = self.merger.pause_new_merges();
-        let not_merging = persist_batches(not_merging);
+        let owner = self.merger.write_owner();
+        let not_merging = with_write_owner(owner, || persist_batches(not_merging));
         self.merger.resume(not_merging.iter().cloned());
-        let merging = persist_batches(merging);
+        let merging = with_write_owner(owner, || persist_batches(merging));
 
         // Get the persistent IDs.
         let ids = not_merging
@@ -2457,13 +2647,51 @@ where
         name: Arc<String>,
         role: TraceRole,
     ) -> Self {
+        let merger = AsyncMerger::new(runtime, worker_index, factories, name, role);
+        if diagnostics::enabled() {
+            merger.register_for_diagnostics();
+        }
         Spine {
             factories: factories.clone(),
             dirty: false,
             key_filter: None,
             value_filter: None,
-            merger: AsyncMerger::new(runtime, worker_index, factories, name, role),
+            merger,
         }
+    }
+
+    /// Returns `batch`, first writing it to storage if the insertion policy
+    /// says so (see [Self::maybe_flush_batch]), under this spine's owner. The
+    /// spill is logged as a run write when diagnostics are on.
+    fn spill_if_due(&self, batch: Arc<B>) -> Arc<B> {
+        with_write_owner(self.merger.write_owner(), || {
+            let started_micros = now_micros();
+            let was_in_memory = batch.location() == BatchLocation::Memory;
+            let input_records = batch.len() as u64;
+            let batch = Self::maybe_flush_batch(batch, &self.factories, || {
+                self.merger.state.lock().unwrap().get_filters()
+            });
+            if was_in_memory && batch.location() == BatchLocation::Storage {
+                diagnostics::log_compaction(|| {
+                    let (output_file, output_file_bytes) = file_of(&*batch);
+                    CompactionRecord {
+                        kind: RunWriteKind::InsertSpill,
+                        owner: self.merger.write_owner(),
+                        spine: self.merger.state.lock().unwrap().name.to_string(),
+                        level: 0,
+                        started_micros,
+                        finished_micros: now_micros(),
+                        input_runs: 1,
+                        input_records,
+                        output_records: batch.len() as u64,
+                        output_location: location_name(batch.location()),
+                        output_file,
+                        output_file_bytes,
+                    }
+                });
+            }
+            batch
+        })
     }
 
     /// The role this spine was built with.
@@ -2473,12 +2701,14 @@ where
 
     pub fn complete_merges(&mut self) {
         let batches = self.merger.pause();
-        let batch = merge_batches(
-            &self.factories,
-            batches.into_iter().map(|b| Arc::unwrap_or_clone(b)),
-            &self.key_filter,
-            &self.value_filter,
-        );
+        let batch = with_write_owner(self.merger.write_owner(), || {
+            merge_batches(
+                &self.factories,
+                batches.into_iter().map(|b| Arc::unwrap_or_clone(b)),
+                &self.key_filter,
+                &self.value_filter,
+            )
+        });
         self.merger.resume(vec![Arc::new(batch)]);
     }
 

@@ -7,10 +7,13 @@ use super::{
 use crate::Runtime;
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED, FILES_SYNCED};
 use crate::profile::{BlockingFor, ParkReason};
+use crate::storage::diagnostics::{self, FlushRecord};
+use crate::storage::write_attribution::{
+    WriteOwner, current_write_owner, record_write_bytes, record_write_operation,
+};
 use crate::storage::{buffer_cache::FBuf, init};
 use feldera_storage::metrics::{
-    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES,
-    WRITE_LATENCY_MICROSECONDS,
+    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS,
 };
 use feldera_storage::tokio::TOKIO;
 use feldera_storage::{
@@ -667,6 +670,11 @@ struct PosixWriter {
     buffers: Vec<Arc<FBuf>>,
     len: u64,
 
+    /// Who the bytes of this file are counted for, fixed when the writer is
+    /// created. A flush may happen on any thread and long after the writer's
+    /// creator has moved on, so the owner is not looked up at flush time.
+    owner: WriteOwner,
+
     async_threads: bool,
     ioop_delay: Duration,
 }
@@ -734,46 +742,73 @@ impl PosixWriter {
             drop: DeleteOnDrop::new(path, false, 0, usage),
             buffers: Vec::new(),
             len: 0,
+            owner: current_write_owner(),
             async_threads,
             ioop_delay,
         }
     }
 
+    /// Writes the buffered blocks to the file and counts the flush.
+    ///
+    /// The flush is counted once, after it ends, whether or not it succeeded:
+    /// one operation for the backend's total and for the owner, and one record
+    /// in the flush log if diagnostics are on. Bytes are counted as they are
+    /// written, in [Self::write_buffers].
     fn flush(&mut self) -> Result<(), StorageError> {
-        WRITE_LATENCY_MICROSECONDS.record_callback(|| {
-            if let Some(storage_mb_max) = Runtime::with_dev_tweaks(|tweaks| tweaks.storage_mb_max) {
-                let usage_mb = (self.drop.usage.load(Ordering::Relaxed) / 1024 / 1024)
-                    .max(0)
-                    .cast_unsigned();
-                if usage_mb > storage_mb_max {
-                    return Err(StorageError::stdio(
-                        ErrorKind::StorageFull,
-                        "write",
-                        self.drop.path.display(),
-                    ));
-                }
-            }
+        let started = Instant::now();
+        let started_micros = diagnostics::enabled().then(diagnostics::now_micros);
+        let blocks = self.buffers.len();
+        let mut bytes = 0;
+        let result = self.write_buffers(&mut bytes);
+        record_write_operation(self.owner, started);
+        diagnostics::log_flush(|| FlushRecord {
+            file: self.name.to_string(),
+            bytes,
+            blocks,
+            started_micros: started_micros.unwrap_or_default(),
+            finished_micros: diagnostics::now_micros(),
+            owner: self.owner,
+            succeeded: result.is_ok(),
+        });
+        result
+    }
 
-            let mut bufs = self
-                .buffers
-                .iter()
-                .map(|buf| IoSlice::new(buf.as_slice()))
-                .collect::<Vec<_>>();
-            let mut cursor = bufs.as_mut_slice();
-            let _blocked = BlockingFor::new(ParkReason::StorageWrite);
-            sleep(self.ioop_delay);
-            while !cursor.is_empty() {
-                let n = self.file.write_vectored(cursor).map_err(|e| {
-                    StorageError::stdio(e.kind(), "write", self.drop.path.display())
-                })?;
-                WRITE_BLOCKS_BYTES.record(n);
-                self.drop.size += n as u64;
-                self.drop.usage.fetch_add(n as i64, Ordering::Relaxed);
-                IoSlice::advance_slices(&mut cursor, n);
+    /// Writes the buffered blocks, adding the bytes written to `bytes`.
+    fn write_buffers(&mut self, bytes: &mut u64) -> Result<(), StorageError> {
+        if let Some(storage_mb_max) = Runtime::with_dev_tweaks(|tweaks| tweaks.storage_mb_max) {
+            let usage_mb = (self.drop.usage.load(Ordering::Relaxed) / 1024 / 1024)
+                .max(0)
+                .cast_unsigned();
+            if usage_mb > storage_mb_max {
+                return Err(StorageError::stdio(
+                    ErrorKind::StorageFull,
+                    "write",
+                    self.drop.path.display(),
+                ));
             }
-            self.buffers.clear();
-            Ok(())
-        })
+        }
+
+        let mut bufs = self
+            .buffers
+            .iter()
+            .map(|buf| IoSlice::new(buf.as_slice()))
+            .collect::<Vec<_>>();
+        let mut cursor = bufs.as_mut_slice();
+        let _blocked = BlockingFor::new(ParkReason::StorageWrite);
+        sleep(self.ioop_delay);
+        while !cursor.is_empty() {
+            let n = self
+                .file
+                .write_vectored(cursor)
+                .map_err(|e| StorageError::stdio(e.kind(), "write", self.drop.path.display()))?;
+            record_write_bytes(self.owner, n);
+            *bytes += n as u64;
+            self.drop.size += n as u64;
+            self.drop.usage.fetch_add(n as i64, Ordering::Relaxed);
+            IoSlice::advance_slices(&mut cursor, n);
+        }
+        self.buffers.clear();
+        Ok(())
     }
 
     fn write(&mut self, buffer: &Arc<FBuf>) -> Result<(), StorageError> {
