@@ -1,69 +1,26 @@
 # Native Customer–Orders–Lineitem merged index
 
-This standalone library supplies a concrete three-source definition for DBSP's
-general merged-index implementation. Its folded keys place Customer first,
-followed by Orders and Lineitem rows for each customer and order. Source
-identities use `i64` customer and order IDs and an `i32` line ID. The complete
-folded keys occupy 11, 20, and 25 bytes, respectively.
+This standalone library supplies the concrete Customer–Orders–Lineitem (COL) definition for DBSP's general merged-index module, `dbsp::trace::merged_index`. It also holds the Q3 readers that the reconstructed circuit uses.
 
-The payloads use SQL runtime values: `SqlString` for customer segment, `Date`
-and `i32` for order date and ship priority, and `Date`,
-`SqlDecimal<15, 2>`, and `SqlDecimal<4, 2>` for line ship date, extended price,
-and discount. Payloads are serialized as checked `rkyv` bytes. The library
-exposes `CustomerOrdersLineitemIndex`, its definition and source types, and
-typed fold, prefix, batch, and payload codec operations. Batches remain
-byte-backed and support signed weights.
+The folded-key encoding (11, 20, and 25 bytes), the payload types, and the batch and file layout are specified in [col-storage.md](../../../docs/design/merged-index/col-storage.md). The library exposes `CustomerOrdersLineitemIndex`, its definition and source types, and typed fold, prefix, batch, and payload-codec operations.
 
-From this directory, run the full library suite with:
+Commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). The library's own suite runs with `cargo +1.96.1 test --offline --locked` from this directory. It covers encoding, payload validation, batch consolidation, cursor seeks, layer files, native spine compaction, snapshots, and reopened files. This experiment does not migrate files written with an earlier payload codec.
 
-```sh
-cargo +1.96.1 test --offline --locked
-```
+## Q3 readers
 
-The tests cover encoding, payload validation, batch consolidation, cursor
-seeks, layer files, native Spine compaction, snapshots, and reopened files.
-Prototype files created with the prior primitive payload codec must be
-regenerated; this experiment does not migrate persisted files.
+The `q3` module reconstructs the four native accumulated reads from COL snapshots that the harness maintains outside the circuit. The harness-side `ManualIndex` (in [`q3-ivm-baseline`](../q3-ivm-baseline/README.md)) appends to the index; this library never does. `q3.rs` contains no insertion call.
 
-## Q3 RF1/RF2 readers
+`Q3State::publish` supplies one transaction's before and after snapshots and its placement map (order to customer). The placement map comes only from the Orders rows of that transaction's delta. Call `Q3State::finish` after the transaction commits and before publishing another. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract and the supported workload: complete order-and-line groups under referential integrity. General replacements, key moves, orphan lines, and Customer updates are unsupported by design.
 
-The `q3` module reconstructs the four native accumulated reads from externally
-maintained COL snapshots. `Q3State::publish` supplies one transaction's before/after
-views and its temporary placement map of order keys to customer sets. The harness supplies
-one candidate customer for each order, obtained from complete Orders delta records. The
-[separate placement correction](../../../docs/design/merged-index/placement-lookup-multimap-plan.md)
-documents multiple-candidate reader checks; it does not extend the harness workload.
-Finish Q3 maintenance before calling `Q3State::finish` or publishing
-another transaction. Q3 never inserts into the secondary index.
+Each reader receives a transaction delta, takes the requested keys from it, and scans the matching snapshot:
 
-The supported harness loads Customers first and then complete order/line groups.
-Subsequent RF1/RF2 insert or delete complete groups under referential integrity.
-General replacements, key moves, orphan lines, and Customer updates are deferred.
-The [Q3 experiment](../q3-ivm-baseline/README.md) documents generation and execution.
+- `customers_after` seeks each requested customer in the after snapshot.
+- `orders_before` scans the customer prefix of each requested customer in the before snapshot, so it reads all of that customer's orders.
+- `lineitems_before` scans the line prefix of each requested order, for each customer the placement map lists, in the before snapshot.
+- `joined_orders_after` reconstructs `B⁺` for the distinct order keys in `ΔL`. It seeks the Customer and the Order at each placement in the after snapshot, then multiplies their signed weights.
 
-`joined_orders_after` reconstructs `B⁺` on the fly for distinct order keys in
-`ΔL`: it seeks the Customer and Order at each supplied candidate in the after
-snapshot, combines their payloads, and multiplies their signed weights. Placement comes from
-the current Orders delta. No accumulated `B` relation is stored.
+A scan seeks to the requested prefix and stops at the first key outside it (`scan` in `src/q3.rs`). Only the rows found are decoded and pushed into a transient native indexed batch, which the reader returns as a `SpineSnapshot`. The reader never builds an accumulated `B` relation. Decoding, copying, and sorting these rows are charged to Q3 maintenance. No hard memory bound is claimed.
 
-Readers copy only requested accumulated rows into transient native indexed batches.
-`SpineSnapshot` shares references to the original source batches, and native
-sorting/consolidated cursors preserve the generated key/value order and signed
-weights. This temporary row copying and possible sorting is suboptimal and included
-in Q3 maintenance time. Direct reconstructed cursors are a future optimization;
-neither a new cursor framework nor a hard memory bound is claimed here. The
-transaction-local placement map uses `BTreeMap` and `BTreeSet`; container selection
-is another future optimization, preserving the placement and publication contract.
+The join readers (`join_orders_customers`, `join_lineitems_orders`) call `expect` on reader errors. A change that violates the placement-map contract therefore panics the worker; the harness's `prepare` rejects such changes first.
 
-The Q3 experiment's `verify.sh` runs both generated circuit modes with identical
-loading and RF1/RF2 tests. It checks each reader's rows against expected rows computed
-directly from logical Customer, Orders, and Lineitem records for the requested keys.
-It also checks emitted deltas and materialized `V` against a full join recomputed
-from those records. Each run writes a JSON file of sorted emitted rows and
-materialized rows with their weights for every transaction; the script checks that
-the native and reconstructed files are identical byte for byte.
-The COL weighted-reader, storage, and compaction tests remain in this library's
-suite. Broader Customer updates and independent line changes remain deferred.
-
-An upstream maintenance circuit and coordination of its checkpoint with Q3 remain
-future work. The prototype manually maintains its index before logical Q3 deltas.
+`verify.sh` in the Q3 experiment runs both generated circuit modes over the same loading and RF1/RF2 transactions and checks reader rows, emitted deltas, and materialized `V` against a full join recomputed from the logical records. It also compares the two modes' per-transaction JSON output byte for byte. The COL weighted-reader, storage, and compaction tests stay in this library's suite.

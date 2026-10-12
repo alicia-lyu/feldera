@@ -25,6 +25,22 @@ is pending, and no batch group currently meets the merge policy. It can return
 true while several below-threshold batches remain. Full compaction retains its
 stronger at-most-one-batch completion condition.
 
+## Merged-index storage
+
+The public module `dbsp::trace::merged_index` provides schema-independent
+machinery for a merged index: folded byte keys, a `MergedIndexDefinition`
+trait that supplies key domains and byte tags, and `batch::build_batch` and
+`batch::batch_cursor` for immutable weighted batches and consolidated reads.
+Concrete definitions and payload codecs belong to client crates. See
+[`docs/design/merged-index/col-storage.md`](../../docs/design/merged-index/col-storage.md).
+
+`Stream::join_with_snapshot_readers` (and the indexed-output variant
+`join_index_with_snapshot_readers`) incrementally joins two delta streams using
+snapshots that the caller supplies for the opposite accumulated state. It keeps
+no integrate or delay trace of either input. The readers run once, at the
+commit flush, and the caller keeps the returned snapshots valid until the flush
+finishes.
+
 # Resources
 
 ## Learning Materials
