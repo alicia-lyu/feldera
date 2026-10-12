@@ -45,7 +45,8 @@
   link/.style={-{Latex[length=2mm]},draw=ink,line width=.8pt},
   ref/.style={link,dashed,draw=quiet}
 }
-\newcommand{\source}[1]{\par\vfill{\color{quiet}\scriptsize #1}}
+% Sources appear only in the notes rendering; the \vfill keeps slide layout.
+\newcommand{\source}[1]{\par\vfill\note{\par\raggedright\textbf{Source:} #1\par}}
 \newcommand{\lead}[1]{{\color{teal}\bfseries #1}}
 % A symbolic byte offset within a block, read as "at byte".
 \newcommand{\at}[1]{\texttt{@}\ensuremath{#1}}

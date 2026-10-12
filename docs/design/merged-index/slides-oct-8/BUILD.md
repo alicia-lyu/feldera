@@ -36,8 +36,10 @@ pdfinfo build/dbsp-physical-design-notes.pdf
 
 Inspect all presentation and notes pages at readable size, including both slide-3
 advances. Check clipping, overlap, stable positions, readable
-tree/search connectors, fields/weights, grammar, and source labels.
-Only slide 4 has a speaker note; the other notes pages are blank.
+tree/search connectors, fields/weights, and grammar. Source citations appear
+only in the notes PDF, as a "Source:" line beside each slide.
+Slide 4 has the only spoken note; other notes pages carry only their source
+citation, and pages without one are blank.
 On slide 3, check that advance 2 reveals one independent downward cursor above each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
