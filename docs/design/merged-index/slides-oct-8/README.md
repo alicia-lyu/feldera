@@ -11,7 +11,7 @@ pairs build the smallest run. Slide 6 reveals the downstream
 Customer circuit and its delta equation on the second overlay. Slide 8 draws
 the before-state and after-state snapshots as reference arrows to shared runs;
 only the after-state references the new transaction's run. Slide 9 merges the
-first level: the spine's references move to the merged run, while both
+first level: the head's references move to the merged run, while both
 snapshots keep the faded L0 runs alive. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.

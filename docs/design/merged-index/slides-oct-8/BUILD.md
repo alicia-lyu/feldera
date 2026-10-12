@@ -47,9 +47,9 @@ DBSP L0 levels of shrinking runs with merge-sort labels inside the box, then
 the teal callout from the smallest run with the key 43 → `[2,4)` and sorted
 value arrays. Panels stay fixed across advances and no L1 or L2 appears.
 On slide 8, check two equal-size L0 runs and matching reference dots: ink for
-C⁻, teal for C⁺. On slide 9, check that only the spine's plum dots move on
+C⁻, teal for C⁺. On slide 9, check that only the head's plum dots move on
 advance 2. The faded L0 runs keep their snapshot dots, and *m* has only a
-spine dot.
+head dot.
 On Appendix E, inspect all four cumulative advances: three fixed block
 outlines, separate key items/boundaries, zero-based array indices, 512-byte
 descriptor units, symbolic leaf offsets, and connectors clear of labels.

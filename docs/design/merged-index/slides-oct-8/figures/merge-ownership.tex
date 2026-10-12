@@ -6,15 +6,15 @@
   \path[use as bounding box] (1.6,.3) rectangle (10.4,3.8);
   \newcommand{\refdot}[3]{\fill[#1] ($(#2.east)-(#3,0)$) circle (1.8pt)}
 
-  % Referrers: before-state, after-state, and the spine itself.
-  \foreach \name/\hue/\y in {$C^-$/ink/3.3,$C^+$/teal/2.8,Spine/plum/2.3} {
+  % Referrers: before-state, after-state, and the head (newest version).
+  \foreach \name/\hue/\y in {$C^-$/ink/3.3,$C^+$/teal/2.8,Head/plum/2.3} {
     \fill[\hue] (9.0,\y) circle (2.2pt);
     \node[anchor=west,text=\hue] at (9.15,\y) {\name};
   }
 
   \foreach \level/\y in {0/3.0,1/1.9,2/.8}
     \node[text=quiet] at (2.1,\y) {L\level};
-  % After the merge, L0 runs leave the spine but stay alive, drawn faded.
+  % After the merge, L0 runs leave the head but stay alive, drawn faded.
   \alt<2>{\tikzset{old run/.style={faded},new run/.style={faded,draw=teal!45}}}
     {\tikzset{old run/.style={},new run/.style={fill=teal!15,draw=teal}}}
   \node[run,minimum width=.7cm,old run] (old) at (3.0,3.0) {};
@@ -28,7 +28,7 @@
   \foreach \run in {old,new,mid1,mid2,large} \refdot{teal}{\run}{.3};
   \foreach \run in {mid1,mid2,large} \refdot{plum}{\run}{.13};
 
-  % Before the merge the spine holds L0; afterward it holds m instead.
+  % Before the merge the head holds L0; afterward it holds m instead.
   \only<1>{\foreach \run in {old,new} \refdot{plum}{\run}{.13};}
   \only<2>{
     \node[run,minimum width=1.4cm] (merged) at (7.6,1.9) {$m$};
