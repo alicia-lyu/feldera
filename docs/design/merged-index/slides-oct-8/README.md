@@ -3,12 +3,13 @@
 This editable 16:9 Beamer/TikZ deck has **15 main slide topics** and five
 appendix topics. Slide 2 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
-Each run has its own downward cursor above it on both advances. Slide 3 shows how
-the writer constructs an immutable run. Slide 5 reveals the downstream
+Each run has its own downward cursor above it on both advances. Slide 3 contrasts a standard
+LSM's mutable L0 memtables with DBSP's L0 of in-memory immutable runs that
+merge-sort into larger runs, then shows how sorted (K, V) pairs build the smallest run. Slide 5 reveals the downstream
 Customer circuit and its delta equation on the second overlay. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
-Each PDF has **25 rendered pages**: 17 main-talk pages and eight appendix pages.
+Each PDF has **27 rendered pages**: 19 main-talk pages and eight appendix pages.
 `notes.tex` places each overlay beside its corresponding speaker notes.
 
 The user's edits were recovered from `/Users/alicialyu/Desktop/main.pdf` on

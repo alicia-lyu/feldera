@@ -76,53 +76,9 @@
 \end{frame}
 
 % 3
-\begin{frame}[fragile]{Creating an immutable run}
-  \small
-  \textbf{Native LSM storage insufficiency:} NO mutable memtable across transactions.
-  Delta from ONE transaction becomes ONE IMMUTABLE run.
-  \par\smallskip
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{.56\textwidth}
-      \fontsize{8}{8}\selectfont
-\begin{verbatim}
-struct Writer:
-    key_tree: TreeWriter
-    value_tree: TreeWriter
-struct TreeWriter:
-    rows = [0, 0)
-    leaf_builder
-    index_builders
-
-write1(item):
-    value_tree.rows.end += 1
-    value_tree.append(item)
-
-write0(item):
-    r = value_tree.rows
-    assert r.start < r.end
-    value_tree.rows = [r.end, r.end)
-    key_tree.rows.end += 1
-    key_tree.append(item, row_group=r)
-\end{verbatim}
-    \end{column}
-    \begin{column}{.42\textwidth}
-      \fontsize{8}{8}\selectfont
-\begin{verbatim}
-// Input sorted lexicographically
-// by (K, V)
-for each K and its value group:
-    for each (V, weight) in the group:
-        writer.write1((V, weight))
-    writer.write0((K, ()))
-writer.close(metadata)
-\end{verbatim}
-      \par\bigskip\small
-      \textbf{Key 43: two value writes}\par\smallskip
-      Pending rows: $[2,2)\to[2,3)\to[2,4)$.\par\medskip
-      \texttt{write0((43, ()))} captures $[2,4)$\par
-      and resets pending rows to $[4,4)$.
-    \end{column}
-  \end{columns}
+\begin{frame}<1-3>{Creating an immutable run}
+  \centering\input{figures/run-creation.tex}
+  \source{trace/spine\_async.rs; trace/ord/vec/indexed\_wset\_batch.rs; storage/file/writer.rs.}
 \end{frame}
 
 % 4

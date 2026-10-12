@@ -42,8 +42,10 @@ On slide 2, check one independent downward cursor above each of the six
 unconnected runs, the dashed enlargement connector, the `K → [start,end)`
 caption, and identical geometry on both advances. The lookup locates the
 first value row and iterates the group without a target value.
-On slide 3, check pseudocode indentation, file-wide counters, the pending
-row-range reset, and the two-column layout.
+On slide 3, inspect all three advances: the memtable panel alone, then the
+DBSP L0 levels of shrinking runs with merge-sort labels inside the box, then
+the teal callout from the smallest run with the key 43 → `[2,4)` and sorted
+value arrays. Panels stay fixed across advances and no L1 or L2 appears.
 On Appendix E, inspect all four cumulative advances: three fixed block
 outlines, separate key items/boundaries, zero-based array indices, 512-byte
 descriptor units, symbolic leaf offsets, and connectors clear of labels.
@@ -63,14 +65,14 @@ A successful TeX build alone does not establish visual correctness.
 | --- | --- |
 | 1 | Main slide 1 |
 | 2–3 | Slide 2, base storage, structure then lookup |
-| 4 | Slide 3, immutable-run construction |
-| 5 | Main slide 4, example and notation |
-| 6–7 | Slide 5, complete program, advances 1–2 |
-| 8–17 | Main slides 6–15 |
-| 18–21 | Appendices A–D |
-| 22–25 | Appendix E, traversal, advances 1–4 |
+| 4–6 | Slide 3, memtable vs. in-memory runs, advances 1–3 |
+| 7 | Main slide 4, example and notation |
+| 8–9 | Slide 5, complete program, advances 1–2 |
+| 10–19 | Main slides 6–15 |
+| 20–23 | Appendices A–D |
+| 24–27 | Appendix E, traversal, advances 1–4 |
 
-Both PDFs have 25 pages. The main talk has 15 topics: advancing an
+Both PDFs have 27 pages. The main talk has 15 topics: advancing an
 overlay does not advance its slide number. The notes PDF uses one wide page
 per rendered overlay, with slide and notes side by side.
 

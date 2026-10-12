@@ -205,9 +205,8 @@ bytes used; the earlier source-map identity remains a historical record.
 
 Native “columns” describe nested file trees, not SQL attribute columns.
 For an untimed indexed weighted run, tree 0 stores `(K, ())` with separate
-row-group metadata selecting tree 1's `(V, weight)` items. Slide 3 calls these
-`key_tree` and `value_tree`; its `TreeWriter`, `leaf_builder`, and
-`index_builders` simplify native `ColumnWriter`, `data_block`, and `index_blocks`.
+row-group metadata selecting tree 1's `(V, weight)` items. Slide 3's callout
+draws these as a key array and a value array.
 This terminology prevents the file layout from being mistaken for a SQL
 column store.
 

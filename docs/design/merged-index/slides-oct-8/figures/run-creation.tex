@@ -1,0 +1,59 @@
+% Fixed bounds keep all three advances aligned.
+\begin{tikzpicture}[x=1cm,y=1cm,font=\small,
+  run/.style={draw=ink,fill=ink!4,line width=.8pt,inner sep=0pt},
+  memtable/.style={draw=amber,fill=amber!8,line width=.8pt,
+    minimum width=1.6cm,minimum height=.8cm,inner sep=0pt,font=\scriptsize},
+  level/.style={draw=ink,line width=.8pt,rounded corners=2pt},
+  cell/.style={draw=ink,fill=white,line width=.8pt,minimum height=.45cm,
+    inner sep=0pt,font=\small},
+  tag/.style={font=\scriptsize,text=quiet}]
+  \path[use as bounding box] (0,.7) rectangle (13.7,5.1);
+
+  % Standard LSM: L0 holds mutable memtables.
+  \node[font=\normalsize\bfseries] at (2.5,4.85) {Standard LSM};
+  \draw[level] (.4,1.7) rectangle (4.6,4.55);
+  \node[font=\scriptsize\bfseries,anchor=north west] at (.45,4.53) {L0};
+  \node[memtable] at (1.55,3.1) {memtable};
+  \node[memtable] at (3.45,3.1) {memtable};
+  \node[tag,align=center] at (2.5,1.2)
+    {mutable; in-place sorted insert\\(B-tree / skip list)};
+
+  % DBSP: L0 is itself several in-memory levels of immutable runs.
+  \uncover<2->{
+    \node[font=\normalsize\bfseries] at (7.1,4.85) {DBSP};
+    \draw[level] (5.1,1.7) rectangle (9.1,4.55);
+    \node[font=\scriptsize\bfseries,anchor=north west] at (5.15,4.53) {L0};
+    \foreach \i in {0,...,7}
+      \node[run,minimum width=.22cm,minimum height=.2cm]
+        (tiny\i) at (5.75+.45*\i,4.0) {};
+    \foreach \i in {0,...,3}
+      \node[run,minimum width=.6cm,minimum height=.3cm] at (5.95+.9*\i,3.15) {};
+    \foreach \i in {0,1}
+      \node[run,minimum width=1.4cm,minimum height=.4cm] at (6.4+1.8*\i,2.25) {};
+    \node[tag] at (7.1,3.58) {$\downarrow$ merge-sort $\downarrow$};
+    \node[tag] at (7.1,2.7) {$\downarrow$ merge-sort $\downarrow$};
+    \node[tag,align=center] at (7.1,1.2)
+      {immutable runs in memory; merge-sorts\\replace in-place inserts};
+  }
+
+  % Smallest run: built by appending sorted (K, V) pairs in order.
+  \only<3>{
+    \draw[draw=teal,line width=1.3pt] (tiny7.north west) rectangle (tiny7.south east);
+    \draw[draw=teal,dashed,line width=.7pt] (tiny7.east) -- (9.75,4.75);
+    \draw[draw=teal,line width=.8pt,rounded corners=2pt] (9.75,.9) rectangle (13.65,4.75);
+    \node[font=\footnotesize\bfseries,text=teal,text width=3.6cm,align=left,anchor=north west]
+      at (9.9,4.65) {Creation inserts sorted (K, V) pairs sequentially};
+
+    \node[cell,minimum width=.8cm] (key) at (10.45,3.05) {$43$};
+    \node[cell,minimum width=1.4cm,anchor=west] (range) at (key.east) {$[2,4)$};
+    \node[tag,anchor=south] at (key.north) {key};
+    \node[tag,anchor=south] at (range.north) {value rows};
+
+    \node[cell,minimum width=2.2cm] (v2) at (11.9,2.15) {$(8,\ {+1})$};
+    \node[cell,minimum width=2.2cm,anchor=north] (v3) at (v2.south) {$(15,\ {+1})$};
+    \node[tag,anchor=north] at (v3.south) {value array, sorted by $V$};
+    \node[tag,anchor=east] at (v2.west) {row 2};
+    \node[tag,anchor=east] at (v3.west) {row 3};
+    \draw[link,draw=teal] (range.south) -- (range.south |- v2.north);
+  }
+\end{tikzpicture}
