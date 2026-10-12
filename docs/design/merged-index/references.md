@@ -70,3 +70,21 @@ Prefer the current files and their symbol names.
 - [SQL view grammar](https://docs.feldera.com/sql/grammar/), including `CREATE LOCAL VIEW` and index rules
 - [Materialized views](https://docs.feldera.com/sql/materialized/)
 - [DBSP paper (VLDB 2023)](https://docs.feldera.com/vldb23.pdf)
+
+## Provenance of pinned sources
+
+Inspected on 2026-09-28 unless noted. Local manuscript links assume sibling checkouts under the same
+parent as Feldera; their `#L` fragments are source-viewer line locators only.
+
+| Source | Pin |
+| --- | --- |
+| Feldera links above | `f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c` |
+| LeanStore | `305ad0a98b147d048a37a1eba3787b35b1181b85` |
+| DBSP lecture note (`DBSP_w_merged_index`) | `ac8380511fe4463b81651a3f6d6991b849577ff7`; cited files clean |
+| Interesting-orderings manuscript, experiments file | `6c4c3a5d851c9044352da2aead6b419c45c77237`; clean |
+| Interesting-orderings manuscript, `main.tex` | Modified working-tree content, SHA-256 `44bf60963e6b94f6aaad04cdacea3ecc31e248a95cb10dd1118ff2e6fa17a9c2` |
+| Multi-pipeline manuscript (`query_execution_using_MI`) | `e485dd5b5775cabf9cfbf0aa44a0e5bd64a8f925`; clean |
+| `mi_db` architecture document | Revision and SHA-256 given in the table above; also at the top of the scan-session section of [deferred.md](deferred.md) |
+
+The interesting-orderings manuscript is the primary architectural reference; LeanStore supplies
+working storage and query evidence.
