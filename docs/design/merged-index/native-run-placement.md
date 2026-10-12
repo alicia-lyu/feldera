@@ -36,11 +36,15 @@ A file builder (`FileIndexedWSetBuilder` over `Writer2` in
 - It keeps a key tree and a value tree. `push_val` appends a (value, weight)
   row to the value tree (`write1`). The key's `push_key` follows its values
   and appends (key, ()) with the range of value rows just written (`write0`).
-- Each tree keeps one open data block (`DataBlockBuilder`, at least
-  `min_data_block` = 4 KiB). A full block is compressed and written, and its
+- Each tree keeps one open data block (`DataBlockBuilder`; `min_data_block`
+  defaults to 8 KiB before compression and must be at least 4 KiB). A full
+  block is compressed (Snappy by default), padded to a multiple of 512 bytes,
+  and written, and its
   summary goes into the open index block one level up (`index_blocks`). Index
   blocks fill and propagate upward the same way. Nothing is revisited, so
   memory stays at about one block per tree level, whatever the run size.
+- Index blocks record each child's file offset and on-disk (compressed)
+  size in 512-byte units (`get_child_location` in `storage/file/reader.rs`).
 - `close` flushes partial blocks, writes the index roots, the key filter
   (Bloom or roaring bitmap, the one structure that grows with the run), and
   the trailer. Each data block also enters the buffer cache as it is written
