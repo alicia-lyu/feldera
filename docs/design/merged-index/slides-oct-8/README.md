@@ -3,7 +3,7 @@
 This editable 16:9 Beamer/TikZ deck has **15 main slide topics** and five
 appendix topics. Slide 2 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
-Each run has its own rightward cursor on both advances. Slide 3 shows how
+Each run has its own downward cursor above it on both advances. Slide 3 shows how
 the writer constructs an immutable run. Slide 5 reveals the downstream
 Customer circuit and its delta equation on the second overlay. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its

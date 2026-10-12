@@ -181,7 +181,7 @@ runtime execution, or measure memory/performance.
 The current deck preserves the user's removal of the two worked-join topics.
 It has 15 main topics, two advances each on slides 2 and 5, and five
 appendices, with four advances in Appendix E: 25 rendered pages in each PDF.
-Slide 2 shows six unconnected runs with independent rightward cursors and
+Slide 2 shows six unconnected runs with independent downward cursors and
 one enlarged immutable file run. Its key and value trees
 follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
 `trace/ord/file/indexed_wset_batch.rs:41–83`. Row-group metadata and index
