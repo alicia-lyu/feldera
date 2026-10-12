@@ -60,6 +60,33 @@ A run's level depends only on its record count (`Spine::size_to_level` in
   records. Runs with many retractions therefore move down sooner and meet the
   insertions they cancel.
 
+## Merging
+
+Each level has its own background merger task, started on demand
+(`MergeWorkers` in `trace/spine_async.rs`). A merger wakes when a run is added
+to its level or when memory pressure changes (`memory_pressure_notify`).
+
+- **Regular merge.** A level starts a merge when it has no merge in flight
+  and holds at least its minimum number of loose runs (`Slot::try_start_merge`,
+  `MERGE_COUNTS`): 8 at L0 and L1, 3 at L2–L5, 2 at L6–L8. A merge takes the
+  oldest loose runs, at most 128 at L0 and 64 elsewhere.
+- **Early merge.** From High pressure up, `must_relieve_memory_pressure` lets
+  a level start as soon as it holds any memory run, even one. Merge outputs
+  go to files at that pressure, so an early merge mainly moves memory runs to
+  disk.
+- **Requested compaction.** A level asked to compact
+  (`CompactionStatus::Requested`) merges all its runs regardless of count. The
+  request then passes to the next level down. This file does not trace who
+  issues these requests.
+
+An L0 merge runs to completion at once. Deeper merges run in slices sized
+like an average L0 merge and yield between slices. Inputs stay readable until
+the merge completes. `merge_complete` derives the output's level again and
+adds it as a loose run there, which can start the next merge.
+
+The 128-loose-run backpressure does not start merges; it pauses foreground
+insertion until the mergers catch up.
+
 ## Location: memory or file
 
 Location is a separate, per-run decision made when a run is created. Level
