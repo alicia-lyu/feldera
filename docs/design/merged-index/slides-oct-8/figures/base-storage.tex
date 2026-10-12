@@ -16,9 +16,12 @@
   \node[run,minimum width=1.2cm] (r11) at (3.1,1.9) {};
   \node[run,minimum width=2.3cm] (r20) at (2.3,.6) {};
 
-  % Each run owns an independent cursor; runs are not connected.
-  \foreach \run in {r00,r01,r02,r10,r11,r20}
-    \draw[seek] ($(\run.north)+(0,.5)$) -- ($(\run.north)+(0,.05)$);
+  % Each run owns an independent cursor; runs are not connected. The cursors
+  % appear with the lookup on advance 2.
+  \only<2>{
+    \foreach \run in {r00,r01,r02,r10,r11,r20}
+      \draw[seek] ($(\run.north)+(0,.5)$) -- ($(\run.north)+(0,.05)$);
+  }
 
   % One retained file run is enlarged; this is not another trace level.
   \draw[draw=quiet,dashed,line width=.7pt]

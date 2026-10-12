@@ -182,7 +182,7 @@ The current deck preserves the user's removal of the two worked-join topics.
 It has 11 main topics, two advances each on slides 3, 7, and 10,
 three each on slides 4 and 5, and five appendices, with four advances in Appendix E: 26 rendered
 pages in each PDF.
-Slide 3 shows six unconnected runs with independent downward cursors and
+Slide 3 shows six unconnected runs, revealing independent downward cursors with the lookup, and
 one enlarged immutable file run. Its key and value trees
 follow `storage/file.rs:3–65`; `(K, ())` and `(V, weight)` follow
 `trace/ord/file/indexed_wset_batch.rs:41–83`. Row-group metadata and index

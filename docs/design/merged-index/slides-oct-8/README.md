@@ -4,7 +4,7 @@ This editable 16:9 Beamer/TikZ deck has **11 main slide topics** and five
 appendix topics. Slide 2 defines a record as (key, value, weight). Slide 3
 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
-Each run has its own downward cursor above it on both advances. Slide 4
+The second step also reveals each run's own downward cursor. Slide 4
 contrasts a standard LSM's mutable L0 memtables with DBSP's in-memory
 immutable runs that merge-sort into larger runs, then shows how sorted (K, V)
 pairs build the smallest run. Slide 5 shows that record count sets a run's
