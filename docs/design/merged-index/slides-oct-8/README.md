@@ -121,6 +121,8 @@ traversal in Appendix E. Runs on slide 3 remain unconnected; the dashed
 connector enlarges one file. Amber marks the standard LSM's mutable memtables on
 slide 4.
 Plum marks integrators, integration text, and the Head they maintain.
+Source citations, shown in the notes PDF and Appendix C, use brick red for the
+VLDB paper, blue for Feldera code, and olive for project artifacts.
 
 | Topics | Subject |
 | --- | --- |
@@ -131,7 +133,8 @@ Plum marks integrators, integration text, and the Head they maintain.
 | 13–15 | Memory accounting/controls and prototype scope |
 
 Appendix A gives full payloads. Appendix B shows a Customer update as a
-deletion plus an insertion. Appendix C lists sources. Appendix D
+deletion plus an insertion. Appendix C groups every slide's sources by category and names the slides
+each supports. Appendix D
 shows the actual experiment program. Appendix E follows key 43 through
 boundaries `[2,4)`, branch child 1, and the selected leaf's item-offset map,
 iterating `(8,+1)` and `(15,+1)` and stopping before row 4.

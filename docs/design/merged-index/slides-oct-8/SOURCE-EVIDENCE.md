@@ -33,6 +33,12 @@ Placement does not establish checkpoint durability or optimal update I/O.
 
 ## Current source map
 
+The deck cites three source categories, color-coded in its notes and in
+Appendix C: the VLDB 2023 paper (brick red), Feldera code under
+`crates/dbsp/src/` (blue), and this project's own artifacts (olive), such as
+`query.sql`, `CIRCUIT.md`, and `../native-run-placement.md`. The Feldera
+memory documentation is no longer cited; it backed a deleted slide.
+
 All paths below are relative to the repository root. The pinned links identify
 the inspected committed source. Hashes are SHA-256 of current file bytes.
 
@@ -58,7 +64,6 @@ the inspected committed source. Hashes are SHA-256 of current file bytes.
 | RSS sampling, hysteresis and placement | [local](../../../../crates/dbsp/src/circuit/runtime.rs#L848), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/crates/dbsp/src/circuit/runtime.rs#L848) | `fa336bffb66b8447b59f7450aa7eb3b345bcd9067dea1e45e47fbc2e8982c5c3` |
 | Raw 85/90/95 percent thresholds | [local](../../../../crates/feldera-types/src/memory_pressure.rs#L6), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/crates/feldera-types/src/memory_pressure.rs#L6) | `4192301884a40296c439e361036d1461e18387d91642dfec3d959a2627485c35` |
 | Cache allocation context | [local](../../../../crates/dbsp/src/storage/buffer_cache/cache.rs#L1), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/crates/dbsp/src/storage/buffer_cache/cache.rs#L1) | `5daf84ed1c6a3f8a47e35a6bd9655816e9c6d55bff9070520e12b9ad6e281bed` |
-| Native memory accounting documentation | [local](../../../../docs.feldera.com/docs/operations/memory.md#L1), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/docs.feldera.com/docs/operations/memory.md#L1) | `549fe82b9949565fa5f40e3f5c379fa79bd4ec913442fbe5090c3dd60c84543c` |
 | Actual experiment state-read contracts and B payload | [local](../../../../docs/design/merged-index/native-state-read-contracts.md#L47), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/docs/design/merged-index/native-state-read-contracts.md#L47) | `159c60eaae538a91ce29bd768566d4eccb9146287d272df1a18de5f22a7601da` |
 | Actual optimized experiment order | [local](../../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md#L140), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md#L140) | `18e4881d7a269e94da142418d9c34ed73a3f0f6ddb0045bc99b0ac161900db73` |
 | Restricted RF1/RF2 workload and qualification | [local](../../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#L50), [pinned](https://github.com/feldera/feldera/blob/415bd4940a91e09eef4c2502c5195db00fd5806d/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md#L50) | `47fc8a47a741aba3916e5d873d212fbc1ed574c3254410e884c044a262ad9a05` |
