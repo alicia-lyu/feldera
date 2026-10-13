@@ -199,7 +199,10 @@
 
 % 11
 \begin{frame}{Memory pressure: process RSS decides run location}
-  \vfill\centering\small
+  \vfill\centering
+  \textbf{RSS} (resident set size): physical memory the OS maps to the process,\\
+  sampled about once per second against the configured maximum.
+  \par\bigskip\small
   \begin{tabular}{@{}lllll@{}}
     \toprule RSS / max & Inserted run & Merge output & Early merge & New runs built\\\midrule
     $<85\%$ & memory & \twocase{inputs $<10$ MiB: memory}{inputs $\geq10$ MiB: file} & no & in memory\\[.4em]
