@@ -69,7 +69,7 @@ pub fn block_bytes(
     read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> Result<BlockBytes> {
     ensure!(
-        size >= TRAILER_BYTES && size % 512 == 0,
+        size >= TRAILER_BYTES && size.is_multiple_of(512),
         "a layer file is a whole number of 512-byte blocks and holds a trailer; this one has {size} bytes"
     );
     let trailer_bytes = read(size - TRAILER_BYTES, TRAILER_BYTES as usize)?;

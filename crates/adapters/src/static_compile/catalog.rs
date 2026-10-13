@@ -5,6 +5,7 @@ use dbsp::circuit::Layout;
 use dbsp::circuit::circuit_builder::CircuitBase;
 use dbsp::dynamic::DynData;
 use dbsp::operator::dynamic::accumulator::EnableCount;
+use dbsp::storage::write_attribution::{WriteOwner, with_write_owner};
 use dbsp::trace::spine_async::WithSnapshot;
 use dbsp::typed_batch::{Spine, TypedBatch};
 use dbsp::utils::Tup1;
@@ -187,12 +188,16 @@ impl Catalog {
         circuit.region(
             &format!("create table {}", relation_schema.name.name()),
             move || {
-                // Inputs are also outputs.
-                self.register_output_zset_persistent_inner(
-                    Self::output_persistent_id(&stream).as_deref(),
-                    stream,
-                    &relation_schema,
-                );
+                // The relation's own state and its delta accumulators belong to the
+                // base relation, not to the queries that read it.
+                with_write_owner(WriteOwner::BaseRelation, || {
+                    // Inputs are also outputs.
+                    self.register_output_zset_persistent_inner(
+                        Self::output_persistent_id(&stream).as_deref(),
+                        stream,
+                        &relation_schema,
+                    );
+                });
             },
         );
     }
@@ -230,13 +235,17 @@ impl Catalog {
         circuit.region(
             &format!("create materialized table {}", relation_schema.name.name()),
             move || {
-                // Inputs are also outputs.
-                self.register_materialized_output_zset_persistent_inner(
-                    Self::output_persistent_id(&stream).as_deref(),
-                    stream,
-                    &relation_schema,
-                    false,
-                );
+                // The relation's own state and its delta accumulators belong to the
+                // base relation, not to the queries that read it.
+                with_write_owner(WriteOwner::BaseRelation, || {
+                    // Inputs are also outputs.
+                    self.register_materialized_output_zset_persistent_inner(
+                        Self::output_persistent_id(&stream).as_deref(),
+                        stream,
+                        &relation_schema,
+                        false,
+                    );
+                });
             },
         );
     }
@@ -317,23 +326,27 @@ impl Catalog {
         circuit.region(
             &format!("create table {}", relation_schema.name.name()),
             move || {
-                // Inputs are also outputs.
-                let handles = self
-                    .register_output_map_persistent_inner(
-                        Self::output_persistent_id(&stream).as_deref(),
-                        stream,
-                        None,
-                        None,
-                        &relation_schema,
-                        &key_schema_name,
-                        false,
-                        false,
-                        primary_key.as_slice(),
-                    )
-                    .unwrap();
+                // The relation's own state and its delta accumulators belong to the
+                // base relation, not to the queries that read it.
+                with_write_owner(WriteOwner::BaseRelation, || {
+                    // Inputs are also outputs.
+                    let handles = self
+                        .register_output_map_persistent_inner(
+                            Self::output_persistent_id(&stream).as_deref(),
+                            stream,
+                            None,
+                            None,
+                            &relation_schema,
+                            &key_schema_name,
+                            false,
+                            false,
+                            primary_key.as_slice(),
+                        )
+                        .unwrap();
 
-                self.register_output_batch_handles(&relation_schema.name, handles)
-                    .unwrap();
+                    self.register_output_batch_handles(&relation_schema.name, handles)
+                        .unwrap();
+                });
             },
         );
     }
@@ -399,23 +412,27 @@ impl Catalog {
         circuit.region(
             &format!("create materialized table {}", relation_schema.name.name()),
             move || {
-                // Inputs are also outputs.
-                let handles = self
-                    .register_output_map_persistent_inner(
-                        Self::output_persistent_id(&stream).as_deref(),
-                        stream,
-                        None,
-                        None,
-                        &relation_schema,
-                        &key_schema_name,
-                        true,
-                        false,
-                        primary_key.as_slice(),
-                    )
-                    .unwrap();
+                // The relation's own state and its delta accumulators belong to the
+                // base relation, not to the queries that read it.
+                with_write_owner(WriteOwner::BaseRelation, || {
+                    // Inputs are also outputs.
+                    let handles = self
+                        .register_output_map_persistent_inner(
+                            Self::output_persistent_id(&stream).as_deref(),
+                            stream,
+                            None,
+                            None,
+                            &relation_schema,
+                            &key_schema_name,
+                            true,
+                            false,
+                            primary_key.as_slice(),
+                        )
+                        .unwrap();
 
-                self.register_output_batch_handles(&relation_schema.name, handles)
-                    .unwrap();
+                    self.register_output_batch_handles(&relation_schema.name, handles)
+                        .unwrap();
+                });
             },
         );
     }

@@ -1549,8 +1549,7 @@ where
                 &value_filter,
                 snapshot,
                 frontier,
-                level,
-                requested,
+                MergeOrigin { level, requested },
             ))
         };
 
@@ -1658,6 +1657,16 @@ where
     log: MergeLogInfo,
 }
 
+/// Which slot a merge works on, and why it started.
+#[derive(Clone, Copy)]
+struct MergeOrigin {
+    /// Spine level whose runs are merged.
+    level: usize,
+
+    /// Whether the merge belongs to a requested full compaction.
+    requested: bool,
+}
+
 /// What is known about a merge when it starts, for the compaction log.
 #[derive(Clone, Copy)]
 struct MergeLogInfo {
@@ -1697,8 +1706,7 @@ where
         value_filter: &Option<GroupFilter<B::Val>>,
         snapshot: Option<Arc<SpineSnapshot<B>>>,
         frontier: B::Time,
-        level: usize,
-        requested: bool,
+        origin: MergeOrigin,
     ) -> Self {
         let factories = batches[0].factories();
         let batch_refs: Vec<&B> = batches.iter().map(|b| b.as_ref()).collect();
@@ -1708,8 +1716,8 @@ where
         let builder = B::Builder::for_merge(&factories, batch_refs, None);
         Self {
             log: MergeLogInfo {
-                level,
-                requested,
+                level: origin.level,
+                requested: origin.requested,
                 start_micros,
                 input_runs,
                 input_records,

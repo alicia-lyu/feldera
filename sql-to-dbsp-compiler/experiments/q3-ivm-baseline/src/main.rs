@@ -1,4 +1,5 @@
 mod data;
+mod diagnostics;
 mod measurement;
 #[cfg(feature = "merged-index")]
 mod reconstruction;
@@ -569,6 +570,7 @@ struct Config {
     compaction_timeout_secs: f64,
     r5: bool,
     dump_runtime_circuit: Option<PathBuf>,
+    diagnostics: Option<PathBuf>,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -616,6 +618,13 @@ impl Config {
                     config.dump_runtime_circuit = Some(
                         args.next()
                             .context("--dump-runtime-circuit needs path")?
+                            .into(),
+                    )
+                }
+                "--diagnostics" => {
+                    config.diagnostics = Some(
+                        args.next()
+                            .context("--diagnostics needs a new directory")?
                             .into(),
                     )
                 }
@@ -692,6 +701,9 @@ impl Config {
         }
         if config.report.is_some() && config.runs != 1 {
             bail!("--report requires one run per process");
+        }
+        if config.diagnostics.is_some() && (config.runs != 1 || config.storage_path.is_none()) {
+            bail!("--diagnostics requires file storage and one run per process");
         }
         Ok(config)
     }
@@ -1023,6 +1035,21 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
         )?));
     }
+    // Diagnostics must be on before any spine exists, so that all are registered.
+    let diagnostics = config
+        .diagnostics
+        .as_deref()
+        .map(|directory| {
+            diagnostics::Diagnostics::start(
+                directory,
+                if cfg!(feature = "merged-index") {
+                    "reconstructed"
+                } else {
+                    "native"
+                },
+            )
+        })
+        .transpose()?;
     #[cfg(feature = "merged-index")]
     let q3_state = Q3State::default();
     #[cfg(feature = "merged-index")]
@@ -1088,9 +1115,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         .map(measurement::StorageSampler::start)
         .transpose()?;
     let sequence_resources = measurement::ResourceSnapshot::capture()?;
+    let window_started_micros = dbsp::storage::diagnostics::now_micros();
     let sequence_started = Instant::now();
     let mut sequence_finished = sequence_started;
     let mut resources_after = sequence_resources;
+    let mut window_finished_micros = window_started_micros;
     let mut reports = Vec::new();
     let mut verification_time = Duration::ZERO;
     let mut foreground_total = Duration::ZERO;
@@ -1181,6 +1210,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         foreground_total += measurement.foreground;
         sequence_finished = phase_finished;
         resources_after = measurement::ResourceSnapshot::capture()?;
+        window_finished_micros = dbsp::storage::diagnostics::now_micros();
         let resource_delta = resources_before.delta(&resources_after);
         let mut report = phase_json(&measurement);
         report["refresh"] = json!(number + 1);
@@ -1237,6 +1267,15 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     } else {
         storage_evidence(&base, &catalog)?
     };
+    // The scan reads storage but writes none. It runs after the window's
+    // counters, the disk usage and the cache occupancy have been read.
+    if let Some(diagnostics) = &diagnostics {
+        diagnostics.write_run_contents(
+            storage_path
+                .as_deref()
+                .context("--diagnostics requires file storage")?,
+        )?;
+    }
     let report = json!({
         "status": "complete",
         "measurement_version": 2,
@@ -1252,6 +1291,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
             "compaction_policy": "no forced compaction; loading waits for normal background merges only; no final wait",
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
+            "diagnostics": config.diagnostics,
         },
         "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
             "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
@@ -1264,6 +1304,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "end_to_end_ms": milliseconds(sequence_elapsed), "observed_storage_bytes": observed_storage_bytes,
             "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
             "cache_occupancy_bytes": cache_occupancy, "snapshot_publication_transactions": 0, "cache_capacity_bytes": cache_capacity,
+            "window_started_micros": window_started_micros, "window_finished_micros": window_finished_micros,
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
             "manual_index_storage": manual_storage,
@@ -1275,6 +1316,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     });
     if let Some(path) = &config.report {
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+    }
+    if let Some(diagnostics) = &diagnostics {
+        diagnostics.finish(diagnostics::Window {
+            started_micros: window_started_micros,
+            finished_micros: window_finished_micros,
+        })?;
     }
     if let Some(root) = &config.dump_runtime_circuit {
         let directory = root.join(format!("run-{run_number}"));
