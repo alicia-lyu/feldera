@@ -49,6 +49,10 @@ The placement map (order → customer) comes only from Orders rows in the same t
 
 Never infer an unmeasured quantity from leftover arithmetic, such as assigning residual storage to the index; the user rejected this as circular. Make no performance or savings claim without a raw artifact.
 
+### 2026-10-14: Leave the record-size gap open
+
+After the POSIX fix and setup full compaction, the merged index still stores 1.68 times the bytes of the four native join traces it replaces, because each record is about twice as large. The investigation stops there: no encoding measurement or redesign is scheduled. Evidence is in [measurement.md](measurement.md#write-and-storage-investigation-2026-10-14).
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
