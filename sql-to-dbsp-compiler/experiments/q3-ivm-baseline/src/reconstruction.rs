@@ -34,6 +34,9 @@ enum Request {
     Append(Vec<SourceRow>, mpsc::SyncSender<Result<Snapshot, String>>),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
     Restore(StoragePath, mpsc::SyncSender<Result<(), String>>),
+    /// Request full compaction of the index's spine.
+    StartCompaction(mpsc::SyncSender<()>),
+    CompactionComplete(mpsc::SyncSender<bool>),
 }
 
 pub(crate) struct ManualIndex {
@@ -67,6 +70,13 @@ impl ManualIndex {
                         match incoming.try_recv() {
                             Ok(Request::BackgroundIdle(reply)) => {
                                 let _ = reply.send(trace.is_background_merge_idle());
+                            }
+                            Ok(Request::StartCompaction(reply)) => {
+                                trace.initiate_compaction();
+                                let _ = reply.send(());
+                            }
+                            Ok(Request::CompactionComplete(reply)) => {
+                                let _ = reply.send(trace.is_compaction_complete());
                             }
                             Ok(Request::StorageEvidence(reply)) => {
                                 let batches = trace.get_batches();
@@ -151,6 +161,16 @@ impl ManualIndex {
 
     pub(crate) fn is_background_merge_idle(&self) -> Result<bool> {
         self.request(Request::BackgroundIdle)
+    }
+
+    /// Requests full compaction; it runs in the background.
+    pub(crate) fn start_compaction(&self) -> Result<()> {
+        self.request(Request::StartCompaction)
+    }
+
+    /// Whether the spine has compacted to at most one run with no merge pending.
+    pub(crate) fn is_compaction_complete(&self) -> Result<bool> {
+        self.request(Request::CompactionComplete)
     }
 
     pub(crate) fn storage_evidence(&self) -> Result<serde_json::Value> {

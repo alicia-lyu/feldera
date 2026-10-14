@@ -571,6 +571,9 @@ struct Config {
     r5: bool,
     dump_runtime_circuit: Option<PathBuf>,
     diagnostics: Option<PathBuf>,
+    /// Fully compact the circuit and the merged index after loading, before
+    /// the measured refreshes, so both modes start from one run per spine.
+    setup_full_compaction: bool,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -634,6 +637,7 @@ impl Config {
                 "--batch" => config.batch = args.next().context("--batch needs number")?.parse()?,
                 "--runs" => config.runs = args.next().context("--runs needs number")?.parse()?,
                 "--no-verify" => config.verify = false,
+                "--setup-full-compaction" => config.setup_full_compaction = true,
                 "--r5" => config.r5 = true,
                 "--refresh-list" => {
                     config.refresh_list =
@@ -918,15 +922,46 @@ fn wait_for_loading_merges(
     Ok(started.elapsed())
 }
 
+/// Requests full compaction of the circuit and the merged index, waits for
+/// compaction to finish, and reports what that setup cost.
+fn setup_full_compaction(
+    circuit: &mut dbsp::DBSPHandle,
+    timeout: Duration,
+    #[cfg(feature = "merged-index")] index: &ManualIndex,
+) -> Result<Value> {
+    let before = measurement::ResourceSnapshot::capture()?;
+    let started = Instant::now();
+    circuit.start_compaction()?;
+    #[cfg(feature = "merged-index")]
+    index.start_compaction()?;
+    let wait = measurement::drain_until(timeout, || {
+        let complete = circuit.is_compaction_complete()?;
+        #[cfg(feature = "merged-index")]
+        let complete = complete && index.is_compaction_complete()?;
+        Ok(complete)
+    })?;
+    let elapsed = started.elapsed();
+    let after = measurement::ResourceSnapshot::capture()?;
+    Ok(json!({
+        "wait_for_compaction_ms": milliseconds(wait),
+        "elapsed_ms": milliseconds(elapsed),
+        "resources": before.delta(&after),
+    }))
+}
+
 /// Publish current batches to Catalog without changing logical input.
-/// Loading alone waits for normally scheduled merges; it never requests compaction.
+/// Loading waits for normally scheduled merges. It requests full compaction
+/// only when `full_compaction` is set, and then before publication, so the
+/// published snapshots hold the compacted runs. Returns the time spent
+/// outside setup compaction and the setup compaction's cost, if any.
 fn finish_loading(
     circuit: &mut dbsp::DBSPHandle,
     catalog: &impl CircuitCatalog,
     base: &mut workload::BaseState,
     timeout: Duration,
+    full_compaction: bool,
     #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
-) -> Result<Duration> {
+) -> Result<(Duration, Option<Value>)> {
     let started = Instant::now();
     #[cfg(feature = "merged-index")]
     let (index, q3_state) = reconstruction;
@@ -936,6 +971,18 @@ fn finish_loading(
         #[cfg(feature = "merged-index")]
         index,
     )?;
+    let setup_compaction_started = Instant::now();
+    let setup_compaction = full_compaction
+        .then(|| {
+            setup_full_compaction(
+                circuit,
+                timeout.saturating_sub(started.elapsed()),
+                #[cfg(feature = "merged-index")]
+                index,
+            )
+        })
+        .transpose()?;
+    let setup_compaction_elapsed = setup_compaction_started.elapsed();
     for name in ["CUSTOMER", "ORDERS", "LINEITEM", "V"] {
         let output = catalog
             .output_handles(&SqlIdentifier::from(name))
@@ -974,7 +1021,11 @@ fn finish_loading(
         #[cfg(feature = "merged-index")]
         index,
     )?;
-    Ok(started.elapsed())
+    // Setup compaction is reported on its own, not as background merge wait.
+    Ok((
+        started.elapsed().saturating_sub(setup_compaction_elapsed),
+        setup_compaction,
+    ))
 }
 
 fn phase_json(stats: &Measurements) -> Value {
@@ -1089,11 +1140,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             Ok(())
         },
     )?;
-    let load_drain = finish_loading(
+    let (load_drain, setup_compaction) = finish_loading(
         &mut circuit,
         &catalog,
         &mut base,
         timeout,
+        config.setup_full_compaction,
         #[cfg(feature = "merged-index")]
         (&index, &q3_state),
     )?;
@@ -1289,7 +1341,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
             "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
-            "compaction_policy": "no forced compaction; loading waits for normal background merges only; no final wait",
+            "compaction_policy": if config.setup_full_compaction {
+                "setup full compaction after loading, before the refreshes; no compaction requested after any refresh; no final wait"
+            } else {
+                "no forced compaction; loading waits for normal background merges only; no final wait"
+            },
+            "setup_full_compaction": config.setup_full_compaction,
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
         },
@@ -1297,7 +1354,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
             "sampled_peak_storage_bytes": load_peak_storage_bytes,
             "observed_storage_bytes": load_observed_storage_bytes,
-            "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed)},
+            "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed),
+            "setup_full_compaction": setup_compaction},
         "refreshes": reports,
         "sequence": {
             "foreground_ms": milliseconds(foreground_total),
@@ -2250,6 +2308,39 @@ mod measurement_tests {
         assert_eq!(empty["sequence"]["end_to_end_ms"], 0.0);
         assert_eq!(empty["sequence"]["resources"]["cpu_microseconds"], 0);
         assert_eq!(empty["sequence"]["snapshot_publication_transactions"], 0);
+        assert!(empty["load"]["setup_full_compaction"].is_null());
+
+        // Setup full compaction leaves each relation in at most one run before
+        // the refreshes, and reports its cost apart from the sequence.
+        let config = Config {
+            refresh_list: Some(directory.join("refreshes.json")),
+            storage_path: Some(directory.join("setup-compaction-storage")),
+            report: Some(directory.join("setup-compaction-report.json")),
+            setup_full_compaction: true,
+            ..config
+        };
+        run(&config, 1)?;
+        let compacted: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        assert_eq!(compacted["configuration"]["setup_full_compaction"], true);
+        for (name, relation) in compacted["load"]["catalog_storage"].as_object().unwrap() {
+            let runs = relation["memory_batch_count"].as_u64().unwrap()
+                + relation["storage_batch_count"].as_u64().unwrap();
+            assert!(runs <= 1, "{name} has {runs} runs after setup compaction");
+        }
+        let setup = &compacted["load"]["setup_full_compaction"];
+        assert!(setup["wait_for_compaction_ms"].as_f64().unwrap() >= 0.0);
+        let resources = &setup["resources"];
+        let owner_bytes: u64 = resources["backend_write_by_owner"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|owner| owner["bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            owner_bytes,
+            resources["backend_write_bytes"].as_u64().unwrap()
+        );
+        assert_eq!(compacted["refreshes"].as_array().unwrap().len(), 6);
         Ok(())
     }
 }

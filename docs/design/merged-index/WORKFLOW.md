@@ -117,7 +117,13 @@ python3 measure.py \
 ```
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
-`--runs`, `--storage-path`, `--diagnostics`, `--cgroup-root`, `--total-memory-bytes`).
+`--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--cgroup-root`,
+`--total-memory-bytes`).
+
+`--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests
+full compaction for the circuit and the merged index and waits for compaction to finish, then
+publishes and starts the measured refreshes. Nothing is compacted on request after any refresh.
+The report's `load.setup_full_compaction` holds the setup's cost.
 
 `--diagnostics` turns on the opt-in storage diagnostics. Each run directory then gains a
 `diagnostics/` directory (the driver's own `--diagnostics DIR`, which needs file storage and one run

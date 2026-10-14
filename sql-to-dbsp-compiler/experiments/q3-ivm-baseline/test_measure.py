@@ -293,6 +293,19 @@ class MeasureTest(unittest.TestCase):
         self.assertTrue(measure.parse_args([*self.args, "--diagnostics"]).diagnostics)
         self.assertFalse(measure.parse_args(self.args).diagnostics)
 
+    def test_setup_full_compaction_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "setup_full_compaction": True}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        self.assertIn("--setup-full-compaction", measure.driver_command(spec, inputs))
+        spec["args"]["setup_full_compaction"] = False
+        self.assertNotIn("--setup-full-compaction", measure.driver_command(spec, inputs))
+        self.assertTrue(
+            measure.parse_args([*self.args, "--setup-full-compaction"]).setup_full_compaction)
+        self.assertFalse(measure.parse_args(self.args).setup_full_compaction)
+
     def test_cli_rejects_invalid_cache_and_timeout(self) -> None:
         with self.assertRaises(SystemExit):
             measure.parse_args([*self.args, "--cache-bytes", "1024"])

@@ -201,6 +201,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         # Opt-in flush log, compaction log and run contents, written beside the
         # run's driver report.
         command.extend(["--diagnostics", str(Path(spec["run_dir"]) / "diagnostics")])
+    if args.get("setup_full_compaction"):
+        command.append("--setup-full-compaction")
     return command
 
 
@@ -279,6 +281,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--diagnostics", action="store_true",
                         help="record the flush log, the compaction log and the run contents "
                              "of each run in a diagnostics directory beside its driver report")
+    parser.add_argument("--setup-full-compaction", action="store_true",
+                        help="fully compact the circuit and the merged index after loading, "
+                             "before the refreshes; its cost is reported in the load section")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
@@ -312,6 +317,7 @@ def run(argv: list[str]) -> int:
                           "compaction_timeout_secs": args.compaction_timeout_secs,
                           "verify": not args.no_verify,
                           "diagnostics": args.diagnostics,
+                          "setup_full_compaction": args.setup_full_compaction,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
         "inputs": {}, "executables": {}, "runs": [], "errors": [],
@@ -353,7 +359,8 @@ def run(argv: list[str]) -> int:
                                  "memory_target_bytes": args.memory_target_bytes,
                                  "compaction_timeout_secs": args.compaction_timeout_secs,
                                  "no_verify": args.no_verify,
-                                 "diagnostics": args.diagnostics}}
+                                 "diagnostics": args.diagnostics,
+                                 "setup_full_compaction": args.setup_full_compaction}}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",
