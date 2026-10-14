@@ -668,6 +668,7 @@ struct PosixWriter {
     name: StoragePath,
 
     buffers: Vec<Arc<FBuf>>,
+    /// Total bytes in `buffers`, which are flushed once this reaches 1 MiB.
     len: u64,
 
     /// Who the bytes of this file are counted for, fixed when the writer is
@@ -808,6 +809,7 @@ impl PosixWriter {
             IoSlice::advance_slices(&mut cursor, n);
         }
         self.buffers.clear();
+        self.len = 0;
         Ok(())
     }
 
