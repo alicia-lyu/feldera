@@ -8,6 +8,7 @@ This file defines what is measured and what remains pending. Commands (the runne
 
 - Harness, runner, and macOS smoke runs (measurement version 2) are done.
 - macOS runs are smoke tests only. Their highest RSS (43.2 MiB) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
+- The smoke runs' write and storage gap is explained down to record size; see [the investigation](#write-and-storage-investigation-2026-10-14). The merged index still stores more bytes than the four join traces it replaces.
 - Pending: the Linux pilot, pressure instrumentation, and the three-repetition campaign, all below. No input-preparation helper exists for the campaign.
 
 ## Definitions
@@ -73,6 +74,59 @@ The runner records cgroup limits, peak, events, and I/O. It does not sample runt
 - As a probe, repeat a pilot with a 192 MiB runtime target and check that the samples show the intended levels. An optional delta stress case concatenates eight complete RF1 sets in RAM; a run that exceeds its budget must fail as one complete refresh.
 
 Until these are recorded in RESULTS.md, with raw artifacts, make no memory-pressure, reclaim, or beyond-memory claim.
+
+## Write and storage investigation (2026-10-14)
+
+In the macOS smoke runs, reconstructed mode wrote more and stored more than native mode, although it drops four join traces. This section records why, from direct evidence. Raw artifacts are local and git-ignored: `target/r5-diagnostics/` (before the fixes), `target/r5-posix-fix/`, and `target/r5-posix-fix-setup-compaction/`. Each holds the three workloads, three repetitions per mode, with `--diagnostics`.
+
+### Terms
+
+- **Batch:** the delta of one transaction. **Run:** an immutable sorted collection in a Spine, in memory or on disk; `memory_batch_count` and similar code fields count runs.
+- **Compaction:** LSM compaction. Background compaction starts when a Spine level reaches 8 runs (`MIN_LEVEL0_MERGE_BATCHES`). A requested full compaction is `DBSPHandle::start_compaction`, or `initiate_compaction` on the merged index's Spine.
+- **Base-relation state:** the base tables stored by primary key (Feldera's "input map").
+- **Operations**, named separately: finish a transaction, request full compaction, wait for compaction to finish, publish snapshots, release snapshots.
+
+### State kept by each mode
+
+Only the joins differ. Both modes keep base-relation state (`add_input_map_persistent`), the delta accumulators (`dyn_shard_accumulate`), and V (`register_materialized_output_zset_persistent`). Native `dyn_join_generic` builds four join traces with `dyn_shard_accumulate_trace`. Reconstructed `dyn_join_generic_with_snapshot_readers` builds none; it reads the merged index, one Spine that `ManualIndex::new` creates on its auxiliary thread.
+
+### Instruments
+
+- **Writes by owner.** Each file writer records an owner when it is created: `query` (join traces, V, query execution), `base_relation`, or `merged_index`. A Spine's owner is set at creation and carried into its background compaction. The owners always sum to the backend totals (tests in `crates/dbsp/tests/write_attribution_*.rs`, check in `measure.py`).
+- **`--diagnostics`.** A flush log, a compaction log, and each Spine's run contents at the end of the window (see [WORKFLOW.md](WORKFLOW.md)). In all runs the flush log matches the counters, and every run's block bytes sum to its file size. Turning diagnostics on leaves large-group's totals unchanged.
+
+The logs name Spines by circuit node. Matching record counts and block bytes identifies them: in native mode, `AccumulateZ1Trace nn42`, `nn37`, `nn56`, and `nn51` are the Customer, Orders, Orders ⋈ Customer, and Lineitem join traces, and `nn65` is V. In reconstructed mode, `nn51` is V.
+
+### Cause 1: the POSIX writer flushed every block after the first MiB (fixed)
+
+- **Evidence.** `VectoredWrite::flush` (`posixio_impl.rs`) cleared its buffers but not its byte count, so once a file had buffered 1 MiB, every later block flushed on its own. In large-group, the merged index's 1,590,272-byte compaction output took one 1 MiB flush plus 68 small ones; every other file took one flush.
+- **Fix.** Reset the count on flush (`f7fec2391`, an upstream DBSP change). Regression test: `crates/dbsp/tests/posix_flush_threshold.rs` (385 flushes before, 3 after).
+- **Effect.** Large-group reconstructed writes fall from 72 operations to 5; the merged index's from 69 to 2. Bytes are unchanged (2,171,392 B). Native is unchanged (6 operations, 765,952 B).
+
+### Cause 2: the merged index reached the compaction threshold one refresh earlier
+
+- **Evidence.** Loading is one Customer transaction and six Order and Lineitem transactions. The merged index takes a run from all 7; each native trace from at most 6. At the first refresh, the merged index reaches 8 runs and compacts: in large-group, 12,625 records in and 12,625 out, all written to disk, including the 10,000 RF1 Lines that RF2 then deletes. Native traces reach 8 runs one refresh later, so their compaction cancels RF1 against RF2 (22,048 records in, 2,048 out).
+- **Consequence.** Writes inside the window depend on where each Spine stands against the threshold when the window opens, not on how much state it keeps. In clustered and scattered, native compactions sometimes finish after the window closes, which is why those results varied between repetitions.
+- **Treatment.** `--setup-full-compaction` (`035eeab8e`) starts both modes from one run per Spine: after loading, request full compaction, wait for compaction to finish, then publish and start the refreshes. No compaction is requested after any refresh. The loading itself is unchanged: the merged index takes a run from every transaction that touches any of its tables, so it reaches the threshold sooner by design.
+
+### Results after both changes (observations; all repetitions identical)
+
+| | Native | Reconstructed |
+| --- | --- | --- |
+| Setup compaction writes, base relation | 3 ops, 206,848 B | 3 ops, 206,848 B |
+| Setup compaction writes, query | 5 ops, 471,552 B | 1 op, 282,624 B (V) |
+| Setup compaction writes, merged index | 0 | 1 op, 317,440 B |
+| Join state on disk (four join traces, or the merged index) | 188,928 B for 3,136 rows | 317,440 B for 2,624 rows |
+| Writes inside the window, all owners | 0 | 0 |
+| Disk usage at window end | 678,400 B | 806,912 B |
+
+The six refreshes stay in memory in both modes, so the window shows no writes. That is not evidence of a disk saving.
+
+### Remaining gap: record size (unresolved)
+
+With equal compaction and the POSIX fix, the merged index holds fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but takes 1.68 times the bytes. Data blocks dominate in both. Per record, the merged index costs about 121 B; in large-group, each additional Lineitem record costs about 123 B. The native Lineitem join trace costs 69 B per row (141,312 B for 2,048 rows).
+
+Deduction, not measured: the merged index's Spine stores keys and values as `Vec<u8>` (`OrdIndexedWSetFactories<DynData, DynData, DynZWeight>` over `Vec<u8>`, in `ManualIndex::new`). Each record therefore carries a 25-byte folded key and an `rkyv`-encoded payload (`PayloadBytes`), each inside a byte vector with its own length and alignment, where native traces store typed tuples. Attributing the 54-byte difference to these parts needs a measurement that varies the encoding.
 
 ## Deferred
 

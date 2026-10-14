@@ -56,3 +56,4 @@ docs/design/merged-index/r5-pressure-and-linux-campaign-documentation-plan.md - 
 docs/design/merged-index/slides-oct-8/figures/nested-file.tex - moved to TRASH/ - figure of a deleted slide
 docs/design/merged-index/slides-oct-8/figures/matching-read.tex - moved to TRASH/ - figure of a deleted slide
 docs/design/merged-index/slides-oct-8/figures/trace-growth.tex - moved to TRASH/ - figure of a deleted slide
+docs/design/merged-index/q3-write-storage-investigation.md - moved to TRASH/ - staging notes, consolidated into the measurement.md investigation section
