@@ -19,6 +19,7 @@ from typing import Any
 
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
+WRITE_OWNERS = ("query", "base_relation", "merged_index")
 
 
 def sha256(path: Path) -> str:
@@ -51,6 +52,36 @@ def refresh_inputs(path: Path) -> tuple[list[dict[str, str]], dict[str, Path]]:
             inputs[f"refresh_{number}_{field}"] = source
         resolved.append(item)
     return resolved, inputs
+
+
+def owner_write_problems(report: dict[str, Any]) -> list[str]:
+    """List where a driver report's per-owner writes disagree with its totals.
+
+    Every resource block that carries backend write totals (the sequence and
+    each refresh) must also split them by owner, and the owners must add up to
+    the totals. A native report must show no merged-index writes: the native
+    circuit has no merged index.
+    """
+    blocks = [("sequence", report.get("sequence", {}).get("resources"))]
+    blocks += [(f"refresh {item.get('refresh')}", item.get("resources"))
+               for item in report.get("refreshes", [])]
+    problems: list[str] = []
+    for place, resources in blocks:
+        if not isinstance(resources, dict) or "backend_write_operations" not in resources:
+            continue  # Validation runs omit counters.
+        owners = resources.get("backend_write_by_owner")
+        if not isinstance(owners, dict) or set(owners) != set(WRITE_OWNERS):
+            problems.append(f"{place}: backend_write_by_owner is missing or incomplete")
+            continue
+        for field, total_name in (("operations", "backend_write_operations"),
+                                  ("bytes", "backend_write_bytes")):
+            by_owner = sum(owners[owner][field] for owner in WRITE_OWNERS)
+            if by_owner != resources[total_name]:
+                problems.append(f"{place}: owners write {by_owner} {field}, "
+                                f"total is {resources[total_name]}")
+        if report.get("mode") == "native" and any(owners["merged_index"].values()):
+            problems.append(f"{place}: a native run reports merged-index writes")
+    return problems
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -166,6 +197,10 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
     ]
     if args["no_verify"]:
         command.append("--no-verify")
+    if args.get("diagnostics"):
+        # Opt-in flush log, compaction log and run contents, written beside the
+        # run's driver report.
+        command.extend(["--diagnostics", str(Path(spec["run_dir"]) / "diagnostics")])
     return command
 
 
@@ -241,6 +276,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--storage-path", type=Path)
     parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="record the flush log, the compaction log and the run contents "
+                             "of each run in a diagnostics directory beside its driver report")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
@@ -273,6 +311,7 @@ def run(argv: list[str]) -> int:
                           "memory_target_bytes": args.memory_target_bytes,
                           "compaction_timeout_secs": args.compaction_timeout_secs,
                           "verify": not args.no_verify,
+                          "diagnostics": args.diagnostics,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
         "inputs": {}, "executables": {}, "runs": [], "errors": [],
@@ -313,7 +352,8 @@ def run(argv: list[str]) -> int:
                                  "batch": args.batch,
                                  "memory_target_bytes": args.memory_target_bytes,
                                  "compaction_timeout_secs": args.compaction_timeout_secs,
-                                 "no_verify": args.no_verify}}
+                                 "no_verify": args.no_verify,
+                                 "diagnostics": args.diagnostics}}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",
@@ -342,6 +382,10 @@ def run(argv: list[str]) -> int:
                 record["driver"] = raw
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
+                problems = owner_write_problems(raw)
+                if problems:
+                    raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
+                                       + "; ".join(problems))
                 record["qualification"] = qualification(platform.system(),
                     args.total_memory_bytes, raw, verify=not args.no_verify,
                     enforced=record.get("cgroup", {}).get("enforced", False))

@@ -100,6 +100,7 @@ use std::{
 use std::{any::Any, sync::Arc};
 use std::{fmt::Debug, ptr::NonNull};
 
+pub mod block_stats;
 mod filter;
 pub mod format;
 mod item;

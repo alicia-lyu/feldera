@@ -11,11 +11,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use dbsp::storage::write_attribution::{write_snapshot, WriteOwner, WriteSnapshot};
 use feldera_storage::histogram::ExponentialHistogram;
-use feldera_storage::metrics::{
-    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES, WRITE_LATENCY_MICROSECONDS,
-};
-use serde_json::{json, Value};
+use feldera_storage::metrics::{READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS};
+use serde_json::{json, Map, Value};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResourceSnapshot {
@@ -23,6 +22,9 @@ pub struct ResourceSnapshot {
     backend_write_operations: u64,
     backend_read_bytes: u64,
     backend_write_bytes: u64,
+    /// The write totals above, split by owner. Read together with them so the
+    /// owners always sum to the totals.
+    writes: WriteSnapshot,
     cpu_microseconds: u64,
     peak_rss_bytes: u64,
     os_physical_read_bytes: Option<u64>,
@@ -50,11 +52,13 @@ impl ResourceSnapshot {
         #[cfg(not(target_os = "linux"))]
         let (os_physical_read_bytes, os_physical_write_bytes) = (None, None);
 
+        let writes = write_snapshot();
         Ok(Self {
             backend_read_operations: histogram_count(&READ_LATENCY_MICROSECONDS),
-            backend_write_operations: histogram_count(&WRITE_LATENCY_MICROSECONDS),
+            backend_write_operations: writes.total.operations,
             backend_read_bytes: READ_BLOCKS_BYTES.sum(),
-            backend_write_bytes: WRITE_BLOCKS_BYTES.sum(),
+            backend_write_bytes: writes.total.bytes,
+            writes,
             cpu_microseconds,
             peak_rss_bytes,
             os_physical_read_bytes,
@@ -66,6 +70,7 @@ impl ResourceSnapshot {
     /// end of the interval, not an additive interval counter.
     pub fn delta(&self, after: &Self) -> Value {
         json!({
+            "backend_write_by_owner": self.write_delta_by_owner(after),
             "backend_read_operations": after.backend_read_operations.saturating_sub(self.backend_read_operations),
             "backend_write_operations": after.backend_write_operations.saturating_sub(self.backend_write_operations),
             "backend_read_bytes": after.backend_read_bytes.saturating_sub(self.backend_read_bytes),
@@ -75,12 +80,32 @@ impl ResourceSnapshot {
             "os_physical_read_bytes": optional_delta(self.os_physical_read_bytes, after.os_physical_read_bytes),
             "os_physical_write_bytes": optional_delta(self.os_physical_write_bytes, after.os_physical_write_bytes),
             "notes": {
+                "backend_write_by_owner": "The write operations and bytes above, split by the owner (query, base_relation, merged_index) that each file writer captured when its file was created; the owners sum to the totals.",
                 "backend_operations": "Counts from storage read/write latency histograms; process-global.",
                 "backend_bytes": "Exact sums of storage read/write block-size histograms; process-global.",
                 "os_physical_bytes": "Linux /proc/self/io read_bytes/write_bytes; unavailable on other platforms. These differ from rchar/wchar syscall bytes.",
                 "peak_rss_bytes": "getrusage process high-water mark since process start, including driver and runtime."
             }
         })
+    }
+}
+
+impl ResourceSnapshot {
+    /// Per-owner increments of the write counters, keyed by owner name.
+    fn write_delta_by_owner(&self, after: &Self) -> Value {
+        let mut owners = Map::new();
+        for owner in WriteOwner::ALL {
+            let before = self.writes.owner(owner);
+            let after = after.writes.owner(owner);
+            owners.insert(
+                owner.name().to_owned(),
+                json!({
+                    "operations": after.operations.saturating_sub(before.operations),
+                    "bytes": after.bytes.saturating_sub(before.bytes),
+                }),
+            );
+        }
+        Value::Object(owners)
     }
 }
 
@@ -215,6 +240,7 @@ pub fn drain_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbsp::storage::write_attribution::WriteCounts;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -229,6 +255,70 @@ mod tests {
         root
     }
 
+    /// A write snapshot whose owners, in `WriteOwner::ALL` order, wrote the
+    /// given (operations, bytes), and whose totals are their sums.
+    fn snapshot_of(by_owner: [(u64, u64); 3]) -> WriteSnapshot {
+        let by_owner = by_owner.map(|(operations, bytes)| WriteCounts { operations, bytes });
+        WriteSnapshot {
+            total: WriteCounts {
+                operations: by_owner.iter().map(|c| c.operations).sum(),
+                bytes: by_owner.iter().map(|c| c.bytes).sum(),
+            },
+            by_owner,
+        }
+    }
+
+    #[test]
+    fn owner_deltas_sum_to_the_total_deltas() {
+        let before = ResourceSnapshot {
+            backend_write_operations: 3,
+            backend_write_bytes: 30,
+            writes: snapshot_of([(1, 10), (1, 10), (1, 10)]),
+            ..zero_snapshot()
+        };
+        let after = ResourceSnapshot {
+            backend_write_operations: 7,
+            backend_write_bytes: 300,
+            writes: snapshot_of([(2, 100), (2, 100), (3, 100)]),
+            ..zero_snapshot()
+        };
+        let delta = before.delta(&after);
+        let owners = &delta["backend_write_by_owner"];
+        assert_eq!(owners["query"], json!({"operations": 1, "bytes": 90}));
+        assert_eq!(
+            owners["base_relation"],
+            json!({"operations": 1, "bytes": 90})
+        );
+        assert_eq!(
+            owners["merged_index"],
+            json!({"operations": 2, "bytes": 90})
+        );
+        for (field, total) in [
+            ("operations", "backend_write_operations"),
+            ("bytes", "backend_write_bytes"),
+        ] {
+            let by_owner: u64 = WriteOwner::ALL
+                .iter()
+                .map(|owner| owners[owner.name()][field].as_u64().unwrap())
+                .sum();
+            assert_eq!(Value::from(by_owner), delta[total]);
+        }
+    }
+
+    fn zero_snapshot() -> ResourceSnapshot {
+        ResourceSnapshot {
+            backend_read_operations: 0,
+            backend_write_operations: 0,
+            backend_read_bytes: 0,
+            backend_write_bytes: 0,
+            writes: WriteSnapshot::default(),
+            cpu_microseconds: 0,
+            peak_rss_bytes: 0,
+            os_physical_read_bytes: None,
+            os_physical_write_bytes: None,
+        }
+    }
+
     #[test]
     fn counters_are_interval_deltas_with_explicit_unavailable_io() {
         let before = ResourceSnapshot {
@@ -236,6 +326,7 @@ mod tests {
             backend_write_operations: 3,
             backend_read_bytes: 20,
             backend_write_bytes: 30,
+            writes: snapshot_of([(1, 10), (1, 10), (1, 10)]),
             cpu_microseconds: 100,
             peak_rss_bytes: 1_000,
             os_physical_read_bytes: None,
@@ -246,6 +337,7 @@ mod tests {
             backend_write_operations: 7,
             backend_read_bytes: 200,
             backend_write_bytes: 300,
+            writes: snapshot_of([(2, 100), (2, 100), (3, 100)]),
             cpu_microseconds: 150,
             peak_rss_bytes: 2_000,
             os_physical_read_bytes: None,

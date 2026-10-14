@@ -19,6 +19,7 @@ use crate::{
             trace::{DelayedTraceId, TraceBounds, TraceId, UntimedTraceAppend, Z1Trace},
         },
     },
+    storage::write_attribution::{WriteOwner, with_write_owner},
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Rkyv, Spine,
         cursor::Cursor,
@@ -287,13 +288,17 @@ where
 
             let sharded = self.dyn_shard_pairs(factories.pairs_factory);
 
-            let z1 = Z1Trace::new(
-                &factories.batch_factories,
-                &factories.batch_factories,
-                false,
-                circuit.root_scope(),
-                bounds.clone(),
-            );
+            // The trace holds the base relation's state, so its files are
+            // counted for the base relation, not for the query.
+            let z1 = with_write_owner(WriteOwner::BaseRelation, || {
+                Z1Trace::new(
+                    &factories.batch_factories,
+                    &factories.batch_factories,
+                    false,
+                    circuit.root_scope(),
+                    bounds.clone(),
+                )
+            });
 
             let (delayed_trace, z1feedback) = circuit.add_feedback_persistent(
                 persistent_id
@@ -391,13 +396,17 @@ where
 
             let sharded = self.dyn_shard_pairs(factories.pairs_factory);
 
-            let z1 = Z1Trace::new(
-                &factories.batch_factories,
-                &factories.batch_factories,
-                false,
-                circuit.root_scope(),
-                bounds.clone(),
-            );
+            // The trace holds the base relation's state, so its files are
+            // counted for the base relation, not for the query.
+            let z1 = with_write_owner(WriteOwner::BaseRelation, || {
+                Z1Trace::new(
+                    &factories.batch_factories,
+                    &factories.batch_factories,
+                    false,
+                    circuit.root_scope(),
+                    bounds.clone(),
+                )
+            });
 
             let (delayed_trace, z1feedback) = circuit.add_feedback_persistent(
                 persistent_id

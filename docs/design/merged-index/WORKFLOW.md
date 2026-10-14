@@ -117,7 +117,24 @@ python3 measure.py \
 ```
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
-`--runs`, `--storage-path`, `--cgroup-root`, `--total-memory-bytes`).
+`--runs`, `--storage-path`, `--diagnostics`, `--cgroup-root`, `--total-memory-bytes`).
+
+`--diagnostics` turns on the opt-in storage diagnostics. Each run directory then gains a
+`diagnostics/` directory (the driver's own `--diagnostics DIR`, which needs file storage and one run
+per process) with four files:
+
+- `flush-log.jsonl`: one line per backend flush, with file, bytes, owner and times.
+- `compaction-log.jsonl`: one line per run that a spine wrote outside the circuit's steps, with
+  kind (background compaction, requested compaction, or insert spill), owner, spine, input runs, and
+  output file and size.
+- `run-contents.json`: for every spine alive at the end of the window, each run's location,
+  records, negative-weight records, file size and bytes per block type, plus the consolidated row
+  count, labelled with the run's mode.
+- `summary.json`: the window, the flush log split before, in and after the window, and whether the
+  flush log matches the backend's counters.
+
+The scans run outside the timed window. The runner also rejects any driver report whose per-owner
+writes do not add up to its totals.
 
 The refresh list is a JSON array in execution order. Each item is
 `{"rf1_orders": "orders.tbl.u1", "rf1_lines": "lineitem.tbl.u1"}` or `{"rf2": "delete.1"}`;

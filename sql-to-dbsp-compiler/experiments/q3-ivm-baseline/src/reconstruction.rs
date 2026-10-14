@@ -6,6 +6,7 @@ use std::sync::{mpsc, Arc};
 use anyhow::{bail, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::dynamic::{DowncastTrait, DynData, Erase};
+use dbsp::storage::write_attribution::{with_write_owner, WriteOwner};
 use dbsp::trace::{
     BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSetFactories, Spine,
     SpineSnapshot, Trace, TraceRole, WithSnapshot,
@@ -47,77 +48,83 @@ impl ManualIndex {
         let unparker = parker.unparker().clone();
         let cache_runtime = runtime.clone();
         runtime.spawn_aux_thread("q3-manual-merged-index", parker, move |parker| {
-            cache_runtime.with_buffer_cache(0, || {
-                let index = CustomerOrdersLineitemIndex::default();
-                let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
-                    Vec<u8>,
-                    Vec<u8>,
-                    ZWeight,
-                >();
-                let mut trace = Spine::<IndexBatch>::new(
-                    &factories,
-                    Arc::new("q3_manual_merged_index".to_owned()),
-                    TraceRole::Integral,
-                );
-                while !Runtime::kill_in_progress() {
-                    match incoming.try_recv() {
-                        Ok(Request::BackgroundIdle(reply)) => {
-                            let _ = reply.send(trace.is_background_merge_idle());
+            // Every file this thread creates, and every spine it owns and that
+            // spine's background compaction, belongs to the merged index.
+            with_write_owner(WriteOwner::MergedIndex, || {
+                cache_runtime.with_buffer_cache(0, || {
+                    let index = CustomerOrdersLineitemIndex::default();
+                    let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+                        Vec<u8>,
+                        Vec<u8>,
+                        ZWeight,
+                    >();
+                    let mut trace = Spine::<IndexBatch>::new(
+                        &factories,
+                        Arc::new("q3_manual_merged_index".to_owned()),
+                        TraceRole::Integral,
+                    );
+                    while !Runtime::kill_in_progress() {
+                        match incoming.try_recv() {
+                            Ok(Request::BackgroundIdle(reply)) => {
+                                let _ = reply.send(trace.is_background_merge_idle());
+                            }
+                            Ok(Request::StorageEvidence(reply)) => {
+                                let batches = trace.get_batches();
+                                let memory_batches = batches
+                                    .iter()
+                                    .filter(|batch| {
+                                        !batch.is_empty()
+                                            && batch.location() != BatchLocation::Storage
+                                    })
+                                    .count();
+                                let storage_batches = batches
+                                    .iter()
+                                    .filter(|batch| {
+                                        !batch.is_empty()
+                                            && batch.location() == BatchLocation::Storage
+                                    })
+                                    .count();
+                                let _ = reply.send(serde_json::json!({
+                                    "snapshot_batch_count": batches.len(),
+                                    "memory_batch_count": memory_batches,
+                                    "storage_batch_count": storage_batches,
+                                    "file_backed": memory_batches == 0,
+                                }));
+                            }
+                            Ok(Request::Snapshot(reply)) => {
+                                let _ = reply.send(trace.ro_snapshot());
+                            }
+                            Ok(Request::Append(rows, reply)) => {
+                                let result = index.build_batch(rows).map(|batch| {
+                                    feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
+                                    trace.ro_snapshot()
+                                });
+                                let _ = reply.send(result);
+                            }
+                            Ok(Request::Save(path, reply)) => {
+                                let result = (|| {
+                                    let mut files = Vec::new();
+                                    trace
+                                        .save(&path, "q3_manual_merged_index", &mut files)
+                                        .map_err(|error| error.to_string())?;
+                                    Runtime::storage_backend()
+                                        .map_err(|error| error.to_string())?
+                                        .commit_all(&files)
+                                        .map_err(|error| error.to_string())
+                                })();
+                                let _ = reply.send(result);
+                            }
+                            Ok(Request::Restore(path, reply)) => {
+                                let result = trace
+                                    .restore(&path, "q3_manual_merged_index")
+                                    .map_err(|error| error.to_string());
+                                let _ = reply.send(result);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => parker.park(),
+                            Err(mpsc::TryRecvError::Disconnected) => break,
                         }
-                        Ok(Request::StorageEvidence(reply)) => {
-                            let batches = trace.get_batches();
-                            let memory_batches = batches
-                                .iter()
-                                .filter(|batch| {
-                                    !batch.is_empty() && batch.location() != BatchLocation::Storage
-                                })
-                                .count();
-                            let storage_batches = batches
-                                .iter()
-                                .filter(|batch| {
-                                    !batch.is_empty() && batch.location() == BatchLocation::Storage
-                                })
-                                .count();
-                            let _ = reply.send(serde_json::json!({
-                                "snapshot_batch_count": batches.len(),
-                                "memory_batch_count": memory_batches,
-                                "storage_batch_count": storage_batches,
-                                "file_backed": memory_batches == 0,
-                            }));
-                        }
-                        Ok(Request::Snapshot(reply)) => {
-                            let _ = reply.send(trace.ro_snapshot());
-                        }
-                        Ok(Request::Append(rows, reply)) => {
-                            let result = index.build_batch(rows).map(|batch| {
-                                feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
-                                trace.ro_snapshot()
-                            });
-                            let _ = reply.send(result);
-                        }
-                        Ok(Request::Save(path, reply)) => {
-                            let result = (|| {
-                                let mut files = Vec::new();
-                                trace
-                                    .save(&path, "q3_manual_merged_index", &mut files)
-                                    .map_err(|error| error.to_string())?;
-                                Runtime::storage_backend()
-                                    .map_err(|error| error.to_string())?
-                                    .commit_all(&files)
-                                    .map_err(|error| error.to_string())
-                            })();
-                            let _ = reply.send(result);
-                        }
-                        Ok(Request::Restore(path, reply)) => {
-                            let result = trace
-                                .restore(&path, "q3_manual_merged_index")
-                                .map_err(|error| error.to_string());
-                            let _ = reply.send(result);
-                        }
-                        Err(mpsc::TryRecvError::Empty) => parker.park(),
-                        Err(mpsc::TryRecvError::Disconnected) => break,
                     }
-                }
+                });
             });
         });
         Self { requests, unparker }

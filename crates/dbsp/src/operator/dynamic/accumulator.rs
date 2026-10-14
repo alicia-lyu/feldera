@@ -23,6 +23,7 @@ use crate::{
         operator_traits::{Operator, OperatorName, UnaryOperator},
     },
     circuit_cache_key,
+    storage::write_attribution::{WriteOwner, current_write_owner, with_write_owner},
     trace::{Batch, BatchReader, Spine, Trace, TraceRole},
 };
 
@@ -178,6 +179,11 @@ where
     // Output batch sizes.
     output_batch_stats: BatchSizeStats,
 
+    /// The owner that is current where this accumulator is created. Each
+    /// transaction accumulates into a fresh spine, so the owner is kept to
+    /// give every one of them the same owner.
+    write_owner: WriteOwner,
+
     /// Used to enable/disable an accumulator during a transaction.
     enable_count: EnableCount,
 
@@ -209,9 +215,13 @@ where
         };
 
         let name = OperatorName::new("Accumulator");
+        let write_owner = current_write_owner();
         Self {
             factories: factories.clone(),
-            state: Spine::new(factories, name.get(), TraceRole::Accumulator),
+            state: with_write_owner(write_owner, || {
+                Spine::new(factories, name.get(), TraceRole::Accumulator)
+            }),
+            write_owner,
             name,
             flush: false,
             location,
@@ -224,7 +234,9 @@ where
 
     /// An empty spine to accumulate the next transaction into.
     fn new_spine(&self) -> Spine<B> {
-        Spine::new(&self.factories, self.name.get(), TraceRole::Accumulator)
+        with_write_owner(self.write_owner, || {
+            Spine::new(&self.factories, self.name.get(), TraceRole::Accumulator)
+        })
     }
 }
 

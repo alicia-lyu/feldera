@@ -217,6 +217,82 @@ class MeasureTest(unittest.TestCase):
             "memory.peak": "12345", "memory.events": "oom 0",
             "io.stat": "8:0 rbytes=9 wbytes=10"})
 
+    @staticmethod
+    def owner_report(mode: str = "reconstructed", **changes: object) -> dict:
+        """A report whose per-owner writes add up to its totals."""
+        resources = {
+            "backend_write_operations": 10, "backend_write_bytes": 1000,
+            "backend_write_by_owner": {
+                "query": {"operations": 2, "bytes": 200},
+                "base_relation": {"operations": 3, "bytes": 300},
+                "merged_index": {"operations": 5, "bytes": 500}}}
+        if mode == "native":
+            resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
+            resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
+        resources.update(changes)
+        return {"mode": mode, "sequence": {"resources": resources},
+                "refreshes": [{"refresh": 1, "resources": resources}]}
+
+    def test_owner_writes_must_sum_to_totals_in_every_report_block(self) -> None:
+        self.assertEqual(measure.owner_write_problems(self.owner_report()), [])
+        self.assertEqual(measure.owner_write_problems(self.owner_report("native")), [])
+        # Validation runs omit counters and are not checked.
+        validation = {"mode": "native", "sequence": {"resources": {"unavailable": "x"}}}
+        self.assertEqual(measure.owner_write_problems(validation), [])
+
+        wrong_total = measure.owner_write_problems(
+            self.owner_report(backend_write_bytes=1001))
+        self.assertEqual(len(wrong_total), 2)  # the sequence and the refresh
+        self.assertIn("owners write 1000 bytes", wrong_total[0])
+
+        no_owners = self.owner_report()
+        del no_owners["refreshes"][0]["resources"]["backend_write_by_owner"]
+        self.assertIn("missing", measure.owner_write_problems(no_owners)[0])
+
+    def test_native_runs_report_no_merged_index_writes(self) -> None:
+        report = self.owner_report("native")
+        owners = report["sequence"]["resources"]["backend_write_by_owner"]
+        owners["query"] = {"operations": 5, "bytes": 500}
+        owners["merged_index"] = {"operations": 2, "bytes": 200}
+        problems = measure.owner_write_problems(report)
+        # The sequence and the refresh share the changed counters in this fixture.
+        self.assertEqual(len(problems), 2)
+        for problem in problems:
+            self.assertIn("native run reports merged-index writes", problem)
+
+    def test_inconsistent_owner_report_fails_the_campaign(self) -> None:
+        def process(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            if command[0] in map(str, binaries.values()):
+                report = self.owner_report("native", backend_write_bytes=1)
+                Path(command[command.index("--report") + 1]).write_text(json.dumps(report))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / mode for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            self.assertEqual(measure.run(self.args), 1)
+        manifest = json.loads(self.report.read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("report is inconsistent", manifest["errors"][0])
+
+    def test_diagnostics_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "diagnostics": True}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        command = measure.driver_command(spec, inputs)
+        self.assertEqual(command[command.index("--diagnostics") + 1],
+                         str(self.root / "run" / "diagnostics"))
+        spec["args"]["diagnostics"] = False
+        self.assertNotIn("--diagnostics", measure.driver_command(spec, inputs))
+        self.assertTrue(measure.parse_args([*self.args, "--diagnostics"]).diagnostics)
+        self.assertFalse(measure.parse_args(self.args).diagnostics)
+
     def test_cli_rejects_invalid_cache_and_timeout(self) -> None:
         with self.assertRaises(SystemExit):
             measure.parse_args([*self.args, "--cache-bytes", "1024"])
