@@ -109,3 +109,73 @@ buffer's length to `self.len`. `VectoredWrite::flush` clears `self.buffers` but 
 `self.len`. Once a file's writer has buffered 1 MiB, every later `write` flushes the buffers queued
 since the previous call. This confirms the mechanism behind H2. Whether it explains the 69
 operations still needs the flush log of Step 2.
+
+## Steps 2 and 3: diagnostics and writes by owner
+
+Commits `4fe5cc655` (DBSP: owners, flush and compaction logs) and `ed974b7e9` (harness:
+`--diagnostics`, per-owner report fields). Raw artifacts are in `target/r5-diagnostics/` (local,
+git-ignored): three workloads, three repetitions per mode, measurement version 2.
+
+### Checks (observations)
+
+- **Diagnostics do not perturb the totals.** Large-group with and without `--diagnostics` gives
+  identical write operations, bytes, and disk usage in every repetition. They also equal the
+  earlier smoke results (native 6 ops and 765,952 B; reconstructed 72 ops and 2,171,392 B).
+- **The flush log sums to the counters** in all 18 diagnostic runs (`matches_counters`), and the
+  three owners sum to the totals.
+
+### Naming the traces
+
+The logs name Spines by circuit node. Owners come from the code; the table names are
+deductions from record counts (64 Customers, 512 Orders, 2,048 Lines) and from block bytes. The
+native trace whose blocks match the reconstructed V exactly is taken to be V.
+
+| Spine | Owner | Native | Reconstructed |
+| --- | --- | --- | --- |
+| `Z1Trace nn13`, `nn24` | base relation | Orders, Lineitem state | same |
+| `AccumulateZ1Trace nn42`, `nn37`, `nn56`, `nn51` | query | join traces: Customer, Orders, Orders ⋈ Customer, Lineitem | absent |
+| `AccumulateZ1Trace nn65` (native), `nn51` (reconstructed) | query | V | V |
+| `q3_manual_merged_index` | merged index | absent | merged index |
+
+### Large-group (observations; all repetitions identical)
+
+| | Native | Reconstructed |
+| --- | --- | --- |
+| Writes, base relation | 2 ops, 250,368 B | 2 ops, 250,368 B |
+| Writes, query | 4 ops, 515,584 B | 1 op, 330,752 B (V) |
+| Writes, merged index | 0 | 69 ops, 1,590,272 B |
+| Join state on disk at window end | 184,832 B (Customer trace in memory) | 1,590,272 B |
+| V on disk | 330,752 B | 330,752 B |
+
+- **H2 confirmed.** The merged-index compaction output is written as one 1,048,576-byte flush
+  followed by 68 small ones (60 of 8,192 B, 4 of 512 B, 1 of 4,608 B). Every other file in every
+  run is written in a single flush. The bug inflates operations, not bytes.
+- **H1 confirmed.** The merged index compacts its 8 runs during the first RF1: 12,625 records in,
+  12,625 out, written to disk. Every native trace compacts at 8 runs too, but one refresh later,
+  so its compaction sees RF1 and RF2 together: 22,048 records in, 2,048 out.
+- **Window-end contents.** The merged index holds 42,628 records in 4 runs, 20,002 of them with
+  negative weight, against 2,624 consolidated rows. Its one on-disk run is the 12,625 records
+  written during the first RF1, including the 10,000 RF1 Lines that RF2 later deleted.
+
+### Clustered and scattered (observations)
+
+Results vary between repetitions, as before, because native compactions sometimes finish after
+the window closes ("late"). The merged index writes the same 327,168 B in all six reconstructed
+runs.
+
+| | Native (3 reps each) | Reconstructed (3 reps each) |
+| --- | --- | --- |
+| Merged index on disk | — | 327,168 B: 2,704 records, 2,624 consolidated rows |
+| Join traces on disk | 184,832 or 188,928 B | — |
+| V on disk | 283,136 B | 291,840 B |
+
+### Record size (observation, then deduction)
+
+In clustered, where the on-disk merged-index run is nearly consolidated, data blocks take
+314,880 B for 2,704 records, about 116 B per record. The native join traces' data blocks take
+178,688 B for 3,072 rows: Lineitem 67.5 B, Orders 27 B, and Orders ⋈ Customer 52 B per row. So
+the merged index is about 1.75 times the size of the native join state on disk here, although it
+holds fewer rows. This contradicts the expected saving.
+
+Deduction: once H1 and H2 are fixed, record size is the remaining gap. Its cause is under
+investigation.
