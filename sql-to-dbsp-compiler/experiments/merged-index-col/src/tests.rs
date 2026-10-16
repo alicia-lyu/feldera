@@ -39,12 +39,8 @@ fn cursor_row(
 ) -> (SourceKey, SourcePayload, ZWeight) {
     let weight = *cursor.weight().downcast_checked::<ZWeight>();
     let key = cursor.key().downcast_checked::<Vec<u8>>();
-    let payload = cursor.val().downcast_checked::<Vec<u8>>();
-    (
-        index.unfold(key).unwrap(),
-        index.decode_payload(key, payload).unwrap(),
-        weight,
-    )
+    let payload = cursor.val().downcast_checked::<SourcePayload>();
+    (index.unfold(key).unwrap(), payload.clone(), weight)
 }
 
 fn read_cursor(
@@ -80,7 +76,7 @@ fn memory_batch_sorts_and_consolidates_within_batch() {
     assert_eq!(batch.key_count(), 2);
     assert_eq!(batch.len(), 3);
     assert_eq!(
-        read_cursor(&index, &mut batch_cursor(&[batch])),
+        read_cursor(&index, &mut batch_cursor::<SourcePayload>(&[batch])),
         vec![
             customer_row(1, "A", 2),
             customer_row(2, "A", 4),
@@ -128,7 +124,7 @@ fn cursor_consolidates_batches_without_changing_stored_rows() {
         customer_row(4, "B", 2),
         customer_row(5, "negative", -3),
     ];
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<SourcePayload>(&batches);
     assert_eq!(read_cursor(&index, &mut cursor), expected);
     cursor.rewind_keys();
     assert_eq!(read_cursor(&index, &mut cursor), expected);
@@ -154,7 +150,7 @@ fn cursor_exact_and_lower_bound_seeks_after_rewind() {
             ])
             .unwrap(),
     ];
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<SourcePayload>(&batches);
     let first = index.fold(&SourceKey::Customer(1)).unwrap();
     assert!(cursor.seek_key_exact(first.as_bytes().to_vec().erase(), None));
     assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
@@ -207,7 +203,7 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
             .unwrap(),
     ];
     let prefix = index.customer_prefix(5);
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<SourcePayload>(&batches);
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
     while cursor.key_valid()
@@ -229,14 +225,14 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
 #[test]
 fn empty_batches_and_cancelled_rows_are_skipped() {
     let index = index();
-    assert!(!batch_cursor(&[]).key_valid());
+    assert!(!batch_cursor::<SourcePayload>(&[]).key_valid());
     let empty = [index.build_batch([]).unwrap()];
-    assert!(!batch_cursor(&empty).key_valid());
+    assert!(!batch_cursor::<SourcePayload>(&empty).key_valid());
     let cancelled = [
         index.build_batch([customer_row(1, "A", 1)]).unwrap(),
         index.build_batch([customer_row(1, "A", -1)]).unwrap(),
     ];
-    assert!(!batch_cursor(&cancelled).key_valid());
+    assert!(!batch_cursor::<SourcePayload>(&cancelled).key_valid());
     let batches = [
         index.build_batch([]).unwrap(),
         index
@@ -246,7 +242,7 @@ fn empty_batches_and_cancelled_rows_are_skipped() {
     ];
     assert_eq!(batches[0].len(), 0);
     assert_eq!(batches[1].key_count(), 0);
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<SourcePayload>(&batches);
     assert_eq!(
         read_cursor(&index, &mut cursor),
         vec![customer_row(2, "B", -3)]
@@ -347,81 +343,58 @@ fn malformed_folded_keys_are_rejected() {
 }
 
 #[test]
-fn payload_round_trip_and_corruption() {
+fn typed_payloads_round_trip_and_must_match_their_keys() {
     let index = index();
-    let pairs = [
+    let rows = [
         (
-            SourceKey::Customer(4),
+            SourceKey::Customer(i64::MAX),
             SourcePayload::Customer(CustomerPayload {
-                segment: "BUILDING".into(),
+                segment: ("東京 café ".repeat(80)).into(),
             }),
         ),
         (
-            SourceKey::Orders(4, 5),
+            SourceKey::Orders(i64::MIN, i64::MAX),
             SourcePayload::Orders(OrdersPayload {
-                order_date: Date::from_days(-1),
-                ship_priority: 7,
+                order_date: Date::from_days(i32::MIN),
+                ship_priority: i32::MAX,
             }),
         ),
         (
-            SourceKey::Lineitem(4, 5, 6),
+            SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
             SourcePayload::Lineitem(LineitemPayload {
-                ship_date: Date::from_days(9),
-                extended_price: SqlDecimal::<15, 2>::new(12345, 2).unwrap(),
-                discount: SqlDecimal::<4, 2>::new(12, 2).unwrap(),
+                ship_date: Date::from_days(i32::MAX),
+                extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
+                discount: SqlDecimal::<4, 2>::new(-99, 2).unwrap(),
             }),
         ),
     ];
-    for (key, payload) in pairs {
-        let folded = index.fold(&key).unwrap();
-        let encoded = index.encode_payload(&payload).unwrap();
-        assert_eq!(encoded, index.encode_payload(&payload).unwrap());
-        assert_eq!(
-            index.decode_payload(folded.as_bytes(), encoded.as_bytes()),
-            Ok(payload)
-        );
-        assert!(index.decode_payload(folded.as_bytes(), &[1, 2, 3]).is_err());
-        assert!(index.decode_payload(&[0], encoded.as_bytes()).is_err());
-    }
-
-    let customer_key = index.fold(&SourceKey::Customer(i64::MAX)).unwrap();
-    let customer = SourcePayload::Customer(CustomerPayload {
-        segment: ("東京 café ".repeat(80)).into(),
-    });
-    let encoded = index.encode_payload(&customer).unwrap();
-    assert_eq!(
-        index.decode_payload(customer_key.as_bytes(), encoded.as_bytes()),
-        Ok(customer)
-    );
-    let mut corrupt = encoded.as_bytes().to_vec();
-    corrupt.fill(0xff);
-    assert!(index
-        .decode_payload(customer_key.as_bytes(), &corrupt)
-        .is_err());
-
-    let order_key = index.fold(&SourceKey::Orders(i64::MIN, i64::MAX)).unwrap();
-    let order = SourcePayload::Orders(OrdersPayload {
-        order_date: Date::from_days(i32::MIN),
-        ship_priority: i32::MAX,
-    });
-    let encoded = index.encode_payload(&order).unwrap();
-    assert_eq!(
-        index.decode_payload(order_key.as_bytes(), encoded.as_bytes()),
-        Ok(order)
-    );
-    let line_key = index
-        .fold(&SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN))
+    let batch = index
+        .build_batch(rows.iter().cloned().map(|(key, payload)| (key, payload, 1)))
         .unwrap();
-    let line = SourcePayload::Lineitem(LineitemPayload {
-        ship_date: Date::from_days(i32::MAX),
-        extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
-        discount: SqlDecimal::<4, 2>::new(-99, 2).unwrap(),
-    });
-    let encoded = index.encode_payload(&line).unwrap();
-    assert_eq!(
-        index.decode_payload(line_key.as_bytes(), encoded.as_bytes()),
-        Ok(line)
-    );
+    let mut stored = read_cursor(&index, &mut batch_cursor::<SourcePayload>(&[batch]));
+    stored.sort_by_key(|(key, ..)| index.fold(key).unwrap());
+    let mut expected: Vec<_> = rows
+        .iter()
+        .cloned()
+        .map(|(key, payload)| (key, payload, 1))
+        .collect();
+    expected.sort_by_key(|(key, ..)| index.fold(key).unwrap());
+    assert_eq!(stored, expected);
+
+    // Each payload variant belongs to exactly one source index.
+    for (i, (key, _)) in rows.iter().enumerate() {
+        for (j, (_, payload)) in rows.iter().enumerate() {
+            let matches = i == j;
+            assert_eq!(payload.matches(key), matches, "{key:?} with {payload:?}");
+            assert_eq!(
+                index
+                    .build_batch([(key.clone(), payload.clone(), 1)])
+                    .is_ok(),
+                matches,
+                "{key:?} with {payload:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -540,7 +513,7 @@ type LayerReader = Reader<(
 )>;
 
 /// Reads only the file produced by `Writer2` in this fixture. That file's
-/// rkyv rows have the concrete `Vec<u8>` and `ZWeight` types in `LayerReader`.
+/// rkyv rows have the concrete `Vec<u8>`, `SourcePayload`, and `ZWeight` types in `LayerReader`.
 fn read_from(
     reader: &LayerReader,
     index: &CustomerOrdersLineitemIndex,
@@ -563,10 +536,10 @@ fn read_from(
         let mut child = unsafe { cursor.next_column().unwrap().first().unwrap() };
         let mut children = Vec::new();
         while child.has_value() {
-            let payload = child.key().unwrap().downcast_checked::<Vec<u8>>();
+            let payload = child.key().unwrap().downcast_checked::<SourcePayload>();
             let mut weight = 0_i64;
             unsafe { child.aux(weight.erase_mut()).unwrap() };
-            children.push((index.decode_payload(&key, payload).unwrap(), weight));
+            children.push((payload.clone(), weight));
             unsafe { child.move_next().unwrap() };
         }
         result.push((index.unfold(&key).unwrap(), children));
@@ -588,7 +561,7 @@ fn layer_file_weighted_children_and_seeks() {
     )
     .unwrap();
     let factory0 = Factories::<DynData, DynUnit>::new::<Vec<u8>, ()>();
-    let factory1 = Factories::<DynData, DynWeight>::new::<Vec<u8>, ZWeight>();
+    let factory1 = Factories::<DynData, DynWeight>::new::<SourcePayload, ZWeight>();
     let mut writer = Writer2::new(
         &factory0,
         &factory1,
@@ -675,12 +648,12 @@ fn layer_file_weighted_children_and_seeks() {
         let folded = index.fold(&key).unwrap();
         let children: Vec<_> = payloads
             .into_iter()
-            .map(|(payload, weight)| (index.encode_payload(&payload).unwrap(), weight, payload))
+            .map(|(payload, weight)| (payload.clone(), weight, payload))
             .collect();
         assert!(children.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let stored: Vec<_> = children
             .iter()
-            .map(|(bytes, weight, _)| (bytes.clone(), *weight))
+            .map(|(stored, weight, _)| (stored.clone(), *weight))
             .collect();
         index
             .base

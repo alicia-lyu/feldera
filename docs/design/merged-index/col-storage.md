@@ -9,7 +9,7 @@ The merged index is secondary storage, kept beside Feldera's own base-table stat
 - **Trace.** Feldera's name for an indexed collection of accumulated weighted updates. It implies no transaction log and no stored timepoints.
 - **Transaction delta.** The signed change set of one transaction.
 - **Run.** An immutable sorted collection of weighted records (a batch). A run is in memory or in a layer file.
-- **Layer file.** Feldera's immutable file format for nested sorted groups. Each nesting level is a *column*; it is not a SQL attribute.
+- **Layer file.** Feldera's immutable file format for nested sorted groups. An indexed batch has two levels: the *key level* holds each distinct key once, and the *value level* holds the values grouped under their key.
 - **Spine.** The collection of runs that merges them in the background.
 
 ## Folded keys
@@ -57,19 +57,19 @@ COL fills in the definition as `CustomerOrdersLineitemDefinition`, with `SourceK
 | `OrdersByCustomer` | customer, order | `OrdersPayload { order_date: Date, ship_priority: i32 }` |
 | `LineitemByCustomer` | customer, order, line | `LineitemPayload { ship_date: Date, extended_price: SqlDecimal<15, 2>, discount: SqlDecimal<4, 2> }` |
 
-`CustomerOrdersLineitemIndex` wraps `MergedIndex<CustomerOrdersLineitemDefinition>` with typed `fold`, `unfold`, prefix helpers (`customer_prefix`, `order_prefix`, `line_prefix`), `encode_payload`, `decode_payload`, and `build_batch`.
+`CustomerOrdersLineitemIndex` wraps `MergedIndex<CustomerOrdersLineitemDefinition>` with typed `fold`, `unfold`, prefix helpers (`customer_prefix`, `order_prefix`, `line_prefix`), and `build_batch`.
 
 Payload rules:
 
-- Payloads are serialized as checked `rkyv` bytes (`PayloadBytes`). Decoding validates the folded key first to choose the payload type, then checks the archived bytes before deserializing.
-- Only K needs an order-preserving encoding. The file merger orders payload bytes for equality and merging, not as a query-visible order.
-- Prototype files written with an earlier payload codec must be regenerated; there is no migration.
+- The stored value is the typed enum `SourcePayload`, a DBSP `DBData` type. Its variant must match the source index that the folded key names (`SourcePayload::matches`). `build_batch` rejects a mismatch, and the Q3 readers report one as an error.
+- Only K needs an order-preserving encoding. The value order is `SourcePayload`'s derived order. It serves equality and merging, not queries.
+- Values were byte strings (`PayloadBytes`) until 2026-10-16. Files from that time must be regenerated; there is no migration.
 
-A future SQL compiler extension could emit these static definitions. That is not implemented. Any generator must reproduce the exact folded bytes and payload serialization before it replaces the handwritten definition.
+A future SQL compiler extension could emit these static definitions. That is not implemented. Any generator must reproduce the exact folded bytes and payload types before it replaces the handwritten definition.
 
 ## Batch layout
 
-`batch::build_batch` in DBSP turns `(FoldedKey, PayloadBytes, ZWeight)` rows into one immutable `MergedIndexBatch`, an `OrdIndexedWSet` over byte keys and byte values:
+`batch::build_batch::<P>` in DBSP turns `(FoldedKey, P, ZWeight)` rows into one immutable `MergedIndexBatch`, an `OrdIndexedWSet` over byte keys and values of the payload type `P` (`SourcePayload` for COL):
 
 - It sorts by `(K, payload)`, adds the weights of equal pairs, reports overflow as an error, and omits zero totals.
 - It requests `BatchLocation::Memory` for the initial run. Feldera's generic builders can choose a file during construction; this explicit request keeps the initial run in memory (test `initial_col_run_stays_in_memory_when_runtime_selects_files`).
@@ -93,16 +93,16 @@ Summing by K alone would hide the replacement, whose net weight at K is zero.
 
 ## Layer-file layout
 
-A file-backed run has two columns, written by `Writer2` (`crates/dbsp/src/storage/file/writer.rs`):
+A file-backed run has two levels, written by `Writer2` (`crates/dbsp/src/storage/file/writer.rs`):
 
 ```text
-column 0: search key = FoldedKey;    data = ()
-column 1: search key = PayloadBytes; data = weight (ZWeight)
+key level:   FoldedKey (bytes), nothing else
+value level: SourcePayload, then weight (ZWeight)
 ```
 
-`MergedIndex::write_parent` writes all children of one K (`write1`), then the parent (`write0`). The caller supplies strictly increasing keys, because the file format requires unique keys within each group. Test `native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots` in `merged-index-col/src/storage_tests.rs` reopens a compacted file run and compares its keys, payloads, and weights with the original run.
+`MergedIndex::write_parent` writes all values of one K, then K itself. The caller supplies strictly increasing keys, because the file format requires unique keys within each group. Test `native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots` in `merged-index-col/src/storage_tests.rs` reopens a compacted file run and compares its keys, payloads, and weights with the original run.
 
-The second column exists even for a key with a single payload. Its file-size, cache, and read costs are unmeasured; make no performance claim about it.
+Because every K is unique, the key level stores one entry per row and shares nothing between rows. A native join trace instead stores one key per join-key value; its Lineitem trace, for example, stores one order key for all of that order's lines. On 2026-10-16, with byte-string values and setup full compaction, the merged index's key level took 132,096 bytes of data blocks for 2,624 keys, and its value level 173,056 bytes. The four native join traces' key levels took 13,312 bytes together (`target/r5-level-baseline/`, local; see [measurement.md](measurement.md)).
 
 ## Uniqueness of folded keys
 

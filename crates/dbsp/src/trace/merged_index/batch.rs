@@ -1,7 +1,7 @@
 //! Folded-key batches and consolidated reads across batches.
 
 use crate::{
-    DynZWeight,
+    DBData, DynZWeight,
     algebra::ZWeight,
     dynamic::{DynData, Erase},
     trace::{
@@ -11,20 +11,22 @@ use crate::{
     },
 };
 
-use super::{FoldedKey, PayloadBytes};
+use super::FoldedKey;
 
+/// Folded byte keys with typed payloads. The payload type is erased here;
+/// [`build_batch`] and [`batch_cursor`] name it.
 pub type MergedIndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
 type BatchCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 
 /// Sorts and consolidates contributions within one immutable initial batch.
 /// A zero net weight has no stored row.
-pub fn build_batch(
-    rows: impl IntoIterator<Item = (FoldedKey, PayloadBytes, ZWeight)>,
+pub fn build_batch<P: DBData>(
+    rows: impl IntoIterator<Item = (FoldedKey, P, ZWeight)>,
 ) -> Result<MergedIndexBatch, String> {
     let mut rows: Vec<_> = rows.into_iter().collect();
     rows.sort_unstable_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
 
-    let mut consolidated: Vec<(FoldedKey, PayloadBytes, ZWeight)> = Vec::with_capacity(rows.len());
+    let mut consolidated: Vec<(FoldedKey, P, ZWeight)> = Vec::with_capacity(rows.len());
     for (key, payload, weight) in rows {
         if let Some((last_key, last_payload, last_weight)) = consolidated.last_mut()
             && *last_key == key
@@ -38,7 +40,7 @@ pub fn build_batch(
         consolidated.push((key, payload, weight));
     }
 
-    let factories = OrdIndexedWSetFactories::new::<Vec<u8>, Vec<u8>, ZWeight>();
+    let factories = OrdIndexedWSetFactories::new::<Vec<u8>, P, ZWeight>();
     // Generic builders may select file storage during construction. L0 runs start in memory.
     let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity_in_location(
         &factories,
@@ -57,7 +59,7 @@ pub fn build_batch(
         {
             builder.push_key(pending_key.take().unwrap().0.erase());
         }
-        builder.push_val_diff(payload.0.erase(), weight.erase());
+        builder.push_val_diff(payload.erase(), weight.erase());
         pending_key = Some(key);
     }
     if let Some(key) = pending_key {
@@ -66,12 +68,13 @@ pub fn build_batch(
     Ok(builder.done())
 }
 
-/// Consolidates matching pairs without changing or copying the underlying batches.
-pub fn batch_cursor(
+/// Consolidates matching pairs without changing or copying the underlying
+/// batches, whose payloads are of type `P`.
+pub fn batch_cursor<P: DBData>(
     batches: &[MergedIndexBatch],
 ) -> CursorList<DynData, DynData, (), DynZWeight, BatchCursor<'_>> {
     let factories =
-        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, Vec<u8>, ZWeight>();
+        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, P, ZWeight>();
     CursorList::new(
         factories.weight_factory(),
         batches.iter().map(BatchReader::cursor).collect(),

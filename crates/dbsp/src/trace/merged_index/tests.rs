@@ -189,14 +189,15 @@ fn ambiguous_domain_tags_are_rejected() {
     assert!(index.unfold(valid.as_bytes()).is_err());
 }
 
-type Row = (Vec<u8>, Vec<u8>, ZWeight);
+/// A stored row: folded key bytes, typed payload, weight.
+type Row = (Vec<u8>, u8, ZWeight);
 
-fn row(root: i64, payload: u8, weight: ZWeight) -> (FoldedKey, PayloadBytes, ZWeight) {
+fn row(root: i64, payload: u8, weight: ZWeight) -> (FoldedKey, u8, ZWeight) {
     (
         MergedIndex::<Definition>::default()
             .fold(&(root, 0))
             .unwrap(),
-        vec![payload].into(),
+        payload,
         weight,
     )
 }
@@ -207,7 +208,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
         while cursor.val_valid() {
             rows.push((
                 cursor.key().downcast_checked::<Vec<u8>>().clone(),
-                cursor.val().downcast_checked::<Vec<u8>>().clone(),
+                *cursor.val().downcast_checked::<u8>(),
                 *cursor.weight().downcast_checked::<ZWeight>(),
             ));
             cursor.step_val();
@@ -219,7 +220,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
 
 fn bytes_row(root: i64, payload: u8, weight: ZWeight) -> Row {
     let (key, payload, weight) = row(root, payload, weight);
-    (key.as_bytes().to_vec(), payload.as_bytes().to_vec(), weight)
+    (key.as_bytes().to_vec(), payload, weight)
 }
 
 #[test]
@@ -262,7 +263,7 @@ fn consolidated_cursor_preserves_batches_and_handles_replacements() {
         .map(|batch| read_cursor(&mut batch.cursor()))
         .collect();
     let expected = vec![bytes_row(1, 1, 4), bytes_row(3, 4, 1), bytes_row(5, 5, -3)];
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<u8>(&batches);
     assert_eq!(read_cursor(&mut cursor), expected);
     cursor.rewind_keys();
     assert_eq!(read_cursor(&mut cursor), expected);
@@ -279,7 +280,7 @@ fn consolidated_cursor_seeks_and_stops_at_prefix_boundary() {
         batch::build_batch([row(1, 1, 1), row(2, 2, 1), row(3, 3, 1)]).unwrap(),
         batch::build_batch([row(1, 1, 2), row(2, 2, -1)]).unwrap(),
     ];
-    let mut cursor = batch_cursor(&batches);
+    let mut cursor = batch_cursor::<u8>(&batches);
     let first = bytes_row(1, 1, 3);
     assert!(cursor.seek_key_exact(first.0.erase(), None));
     assert_eq!(*cursor.weight().downcast_checked::<ZWeight>(), 3);
@@ -321,16 +322,16 @@ fn consolidated_cursor_seeks_and_stops_at_prefix_boundary() {
 
 #[test]
 fn empty_and_cancelled_batches_have_no_cursor_rows() {
-    assert!(!batch_cursor(&[]).key_valid());
+    assert!(!batch_cursor::<u8>(&[]).key_valid());
     let batches = [
-        batch::build_batch([]).unwrap(),
+        batch::build_batch::<u8>([]).unwrap(),
         batch::build_batch([row(0, 0, 1), row(0, 0, -1)]).unwrap(),
     ];
     assert!(batches.iter().all(|batch| batch.len() == 0));
-    assert!(!batch_cursor(&batches).key_valid());
+    assert!(!batch_cursor::<u8>(&batches).key_valid());
     let cancelled = [
         batch::build_batch([row(0, 0, 1)]).unwrap(),
         batch::build_batch([row(0, 0, -1)]).unwrap(),
     ];
-    assert!(!batch_cursor(&cancelled).key_valid());
+    assert!(!batch_cursor::<u8>(&cancelled).key_valid());
 }

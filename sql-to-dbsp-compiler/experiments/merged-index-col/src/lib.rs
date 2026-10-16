@@ -2,14 +2,14 @@
 
 pub mod q3;
 
+use feldera_macros::{IsNone, OrdRepr};
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
-use rkyv::{bytecheck, Archive, Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
+use size_of::SizeOf;
 
-use dbsp::storage::file::{to_bytes, Deserializer};
 use dbsp::trace::merged_index::{
     BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
-    MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
-    SourceIndexSpec,
+    MergedIndex, MergedIndexDefinition, SourceByteTag, SourceIndexId, SourceIndexSpec,
 };
 
 pub const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
@@ -145,32 +145,113 @@ impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive_attr(derive(rkyv::CheckBytes))]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Eq, Ord, PartialEq, PartialOrd))]
 pub struct CustomerPayload {
     pub segment: SqlString,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive_attr(derive(rkyv::CheckBytes))]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Eq, Ord, PartialEq, PartialOrd))]
 pub struct OrdersPayload {
     pub order_date: Date,
     pub ship_priority: i32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive_attr(derive(rkyv::CheckBytes))]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Eq, Ord, PartialEq, PartialOrd))]
 pub struct LineitemPayload {
     pub ship_date: Date,
     pub extended_price: SqlDecimal<15, 2>,
     pub discount: SqlDecimal<4, 2>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Eq, Ord, PartialEq, PartialOrd))]
+/// The stored value of a merged-index row. Its variant must match the source
+/// index named by the row's folded key.
 pub enum SourcePayload {
     Customer(CustomerPayload),
     Orders(OrdersPayload),
     Lineitem(LineitemPayload),
+}
+
+/// DBSP needs a default value; it is never stored.
+impl Default for SourcePayload {
+    fn default() -> Self {
+        Self::Customer(CustomerPayload::default())
+    }
+}
+
+impl SourcePayload {
+    /// Whether this payload belongs to the source index that `key` names.
+    pub fn matches(&self, key: &SourceKey) -> bool {
+        matches!(
+            (key, self),
+            (SourceKey::Customer(..), SourcePayload::Customer(_))
+                | (SourceKey::Orders(..), SourcePayload::Orders(_))
+                | (SourceKey::Lineitem(..), SourcePayload::Lineitem(_))
+        )
+    }
 }
 
 #[derive(Default)]
@@ -183,18 +264,16 @@ impl CustomerOrdersLineitemIndex {
         &self,
         rows: impl IntoIterator<Item = (SourceKey, SourcePayload, i64)>,
     ) -> Result<dbsp::trace::merged_index::MergedIndexBatch, String> {
-        let encoded = rows
+        let folded = rows
             .into_iter()
             .map(|(key, payload, weight)| {
-                let folded = self.fold(&key)?;
-                let bytes = self.encode_payload(&payload)?;
-                if self.decode_payload(folded.as_bytes(), bytes.as_bytes())? != payload {
+                if !payload.matches(&key) {
                     return Err("payload does not match source key".into());
                 }
-                Ok((folded, bytes, weight))
+                Ok((self.fold(&key)?, payload, weight))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        dbsp::trace::merged_index::batch::build_batch(encoded)
+        dbsp::trace::merged_index::batch::build_batch(folded)
     }
 
     pub fn fold(&self, key: &SourceKey) -> Result<FoldedKey, String> {
@@ -218,41 +297,6 @@ impl CustomerOrdersLineitemIndex {
             .prefix_with_next_tag(LINEITEM, &[customer_id, order_id])
             .unwrap()
     }
-
-    pub fn encode_payload(&self, payload: &SourcePayload) -> Result<PayloadBytes, String> {
-        let bytes = match payload {
-            SourcePayload::Customer(value) => to_bytes(value),
-            SourcePayload::Orders(value) => to_bytes(value),
-            SourcePayload::Lineitem(value) => to_bytes(value),
-        }
-        .map_err(|error| format!("payload serialization failed: {error:?}"))?;
-        Ok(PayloadBytes::from(bytes.as_slice().to_vec()))
-    }
-
-    pub fn decode_payload(&self, key: &[u8], bytes: &[u8]) -> Result<SourcePayload, String> {
-        let (source_index, _) = CustomerOrdersLineitemDefinition::project(&self.unfold(key)?);
-        match source_index {
-            CUSTOMER => decode::<CustomerPayload>(bytes).map(SourcePayload::Customer),
-            ORDERS => decode::<OrdersPayload>(bytes).map(SourcePayload::Orders),
-            LINEITEM => decode::<LineitemPayload>(bytes).map(SourcePayload::Lineitem),
-            _ => unreachable!("unfold returned a declared source index"),
-        }
-    }
-}
-
-fn decode<T>(bytes: &[u8]) -> Result<T, String>
-where
-    T: Archive,
-    T::Archived: for<'a> bytecheck::CheckBytes<rkyv::validation::validators::DefaultValidator<'a>>
-        + Deserialize<T, Deserializer>,
-{
-    let mut aligned = dbsp::storage::buffer_cache::FBuf::new();
-    aligned.extend_from_slice(bytes);
-    let archived = rkyv::check_archived_root::<T>(&aligned)
-        .map_err(|error| format!("corrupt payload: {error}"))?;
-    archived
-        .deserialize(&mut Deserializer::default())
-        .map_err(|error| format!("corrupt payload: {error}"))
 }
 
 #[cfg(test)]

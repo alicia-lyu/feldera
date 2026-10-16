@@ -4,6 +4,7 @@
 use std::marker::PhantomData;
 
 use crate::{
+    DBData,
     algebra::ZWeight,
     dynamic::{DynData, DynUnit, DynWeight, Erase},
     storage::{backend::StorageError, file::writer::Writer2},
@@ -96,24 +97,6 @@ pub trait MergedIndexDefinition {
 pub struct FoldedKey(Vec<u8>);
 
 impl FoldedKey {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-/// Encoded payload bytes are ordered only for file equality and merging.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PayloadBytes(Vec<u8>);
-
-/// Wraps bytes produced by a client-owned payload codec.
-/// Validation and source-schema selection remain the codec's responsibility.
-impl From<Vec<u8>> for PayloadBytes {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-}
-
-impl PayloadBytes {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -226,19 +209,20 @@ impl<D: MergedIndexDefinition> MergedIndex<D> {
     }
 
     /// Adds all children for one parent, then writes the parent exactly once.
-    /// The caller supplies strictly increasing parent and child byte keys.
-    pub fn write_parent(
+    /// The caller supplies a strictly increasing parent key and strictly
+    /// increasing payloads.
+    pub fn write_parent<P: DBData>(
         &self,
         writer: &mut Writer2<DynData, DynUnit, DynData, DynWeight>,
         key: &FoldedKey,
-        children: &[(PayloadBytes, ZWeight)],
+        children: &[(P, ZWeight)],
     ) -> Result<(), StorageError> {
         assert!(
             !children.is_empty(),
             "a layer-file parent requires children"
         );
         for (payload, weight) in children {
-            writer.write1((payload.0.erase(), weight.erase()))?;
+            writer.write1((payload.erase(), weight.erase()))?;
         }
         writer.write0((key.0.erase(), ().erase()))
     }

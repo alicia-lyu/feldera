@@ -56,9 +56,10 @@ impl ManualIndex {
             with_write_owner(WriteOwner::MergedIndex, || {
                 cache_runtime.with_buffer_cache(0, || {
                     let index = CustomerOrdersLineitemIndex::default();
+                    // Folded byte keys; typed payloads.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
-                        Vec<u8>,
+                        SourcePayload,
                         ZWeight,
                     >();
                     let mut trace = Spine::<IndexBatch>::new(
@@ -291,9 +292,7 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
             if **cursor.weight() != 1 {
                 bail!("current Lineitem does not have unit multiplicity");
             }
-            let SourcePayload::Lineitem(payload) = index
-                .decode_payload(&key, cursor.val().downcast_checked::<Vec<u8>>())
-                .map_err(anyhow::Error::msg)?
+            let SourcePayload::Lineitem(payload) = cursor.val().downcast_checked::<SourcePayload>()
             else {
                 bail!("Lineitem payload has unexpected type");
             };

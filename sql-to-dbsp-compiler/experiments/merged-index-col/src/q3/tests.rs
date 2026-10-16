@@ -43,8 +43,11 @@ fn line(c: i64, o: i64, l: i32, price: i128, weight: i64) -> SourceRow {
 
 fn source(batches: Vec<Vec<SourceRow>>) -> SourceSnapshot {
     let index = CustomerOrdersLineitemIndex::default();
-    let factories =
-        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, Vec<u8>, i64>();
+    let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+        Vec<u8>,
+        SourcePayload,
+        i64,
+    >();
     SourceSnapshot::with_batches(
         &factories,
         batches

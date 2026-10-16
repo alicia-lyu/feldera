@@ -26,7 +26,7 @@ use dbsp::{
 };
 
 type IndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
-type Row = (Vec<u8>, Vec<u8>, ZWeight);
+type Row = (Vec<u8>, SourcePayload, ZWeight);
 
 const BATCHES: usize = 16;
 const CUSTOMERS_PER_BATCH: usize = 10_000;
@@ -87,21 +87,17 @@ fn customer_group(c: i64) -> Vec<SourceRow> {
     rows
 }
 
-// The signed oracle encodes source rows independently of batch construction.
+// The signed oracle folds source rows independently of batch construction.
 fn encoded_row(index: &CustomerOrdersLineitemIndex, row: &SourceRow) -> Row {
     (
         index.fold(&row.0).unwrap().as_bytes().to_vec(),
-        index.encode_payload(&row.1).unwrap().as_bytes().to_vec(),
+        row.1.clone(),
         row.2,
     )
 }
 
 fn typed_row(index: &CustomerOrdersLineitemIndex, row: &Row) -> SourceRow {
-    (
-        index.unfold(&row.0).unwrap(),
-        index.decode_payload(&row.0, &row.1).unwrap(),
-        row.2,
-    )
+    (index.unfold(&row.0).unwrap(), row.1.clone(), row.2)
 }
 
 fn read_rows(
@@ -118,7 +114,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
         while cursor.val_valid() {
             rows.push((
                 key.clone(),
-                cursor.val().downcast_checked::<Vec<u8>>().clone(),
+                cursor.val().downcast_checked::<SourcePayload>().clone(),
                 *cursor.weight().downcast_checked::<ZWeight>(),
             ));
             cursor.step_val();
@@ -128,7 +124,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
     rows
 }
 
-fn apply(oracle: &mut BTreeMap<(Vec<u8>, Vec<u8>), ZWeight>, row: &Row) {
+fn apply(oracle: &mut BTreeMap<(Vec<u8>, SourcePayload), ZWeight>, row: &Row) {
     let entry = oracle.entry((row.0.clone(), row.1.clone())).or_default();
     *entry += row.2;
     if *entry == 0 {
@@ -153,7 +149,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let index = CustomerOrdersLineitemIndex::default();
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
-            Vec<u8>,
+            SourcePayload,
             ZWeight,
         >();
         let mut trace = Spine::<IndexBatch>::new(
@@ -388,7 +384,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
                     while cursor.val_valid() {
                         observed.push((
                             key.clone(),
-                            cursor.val().downcast_checked::<Vec<u8>>().clone(),
+                            cursor.val().downcast_checked::<SourcePayload>().clone(),
                             *cursor.weight().downcast_checked::<ZWeight>(),
                         ));
                         cursor.step_val();
@@ -436,9 +432,9 @@ fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
             assert_eq!(read_rows(&batch), expected);
         }
         // Confirm this runtime would place a generic nonempty builder on disk.
-        let factories = OrdIndexedWSetFactories::new::<Vec<u8>, Vec<u8>, ZWeight>();
+        let factories = OrdIndexedWSetFactories::new::<Vec<u8>, SourcePayload, ZWeight>();
         let mut generic = <IndexBatch as Batch>::Builder::with_capacity(&factories, 1, 1);
-        generic.push_val_diff(vec![1_u8].erase(), 1_i64.erase());
+        generic.push_val_diff(SourcePayload::default().erase(), 1_i64.erase());
         generic.push_key(vec![1_u8].erase());
         assert_eq!(generic.done().location(), BatchLocation::Storage);
     });

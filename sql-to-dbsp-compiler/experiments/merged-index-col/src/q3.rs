@@ -105,14 +105,11 @@ impl Q3State {
                 &index,
                 &views.after,
                 key.as_bytes(),
-                |key, bytes, weight| {
-                    if let SourceKey::Customer(id) = key {
-                        if let SourcePayload::Customer(payload) = index.decode_payload(
-                            index.fold(&SourceKey::Customer(id))?.as_bytes(),
-                            bytes,
-                        )? {
-                            output.push(Tup1(id), Tup1(payload.segment), weight);
-                        }
+                |key, payload, weight| {
+                    if let (SourceKey::Customer(id), SourcePayload::Customer(payload)) =
+                        (key, payload)
+                    {
+                        output.push(Tup1(id), Tup1(payload.segment.clone()), weight);
                     }
                     Ok(())
                 },
@@ -133,18 +130,15 @@ impl Q3State {
                 &index,
                 &views.before,
                 &index.customer_prefix(customer),
-                |key, bytes, weight| {
-                    if let SourceKey::Orders(c, order) = key {
-                        if let SourcePayload::Orders(payload) = index.decode_payload(
-                            index.fold(&SourceKey::Orders(c, order))?.as_bytes(),
-                            bytes,
-                        )? {
-                            output.push(
-                                Tup1(c),
-                                Tup3(order, payload.order_date, payload.ship_priority),
-                                weight,
-                            );
-                        }
+                |key, payload, weight| {
+                    if let (SourceKey::Orders(c, order), SourcePayload::Orders(payload)) =
+                        (key, payload)
+                    {
+                        output.push(
+                            Tup1(c),
+                            Tup3(order, payload.order_date, payload.ship_priority),
+                            weight,
+                        );
                     }
                     Ok(())
                 },
@@ -168,13 +162,11 @@ impl Q3State {
                     &index,
                     &views.after,
                     customer_key.as_bytes(),
-                    |key, bytes, weight| {
-                        if matches!(key, SourceKey::Customer(_)) {
-                            if let SourcePayload::Customer(payload) =
-                                index.decode_payload(customer_key.as_bytes(), bytes)?
-                            {
-                                customers.push((payload.segment, weight));
-                            }
+                    |key, payload, weight| {
+                        if let (SourceKey::Customer(_), SourcePayload::Customer(payload)) =
+                            (key, payload)
+                        {
+                            customers.push((payload.segment.clone(), weight));
                         }
                         Ok(())
                     },
@@ -184,26 +176,24 @@ impl Q3State {
                     &index,
                     &views.after,
                     order_key.as_bytes(),
-                    |key, bytes, order_weight| {
-                        if matches!(key, SourceKey::Orders(_, _)) {
-                            if let SourcePayload::Orders(payload) =
-                                index.decode_payload(order_key.as_bytes(), bytes)?
-                            {
-                                for (segment, customer_weight) in &customers {
-                                    let weight = order_weight
-                                        .checked_mul(*customer_weight)
-                                        .ok_or("Q3 reconstructed join weight overflow")?;
-                                    output.push(
-                                        Tup1(order),
-                                        Tup4(
-                                            customer,
-                                            segment.clone(),
-                                            payload.order_date,
-                                            payload.ship_priority,
-                                        ),
-                                        weight,
-                                    );
-                                }
+                    |key, payload, order_weight| {
+                        if let (SourceKey::Orders(_, _), SourcePayload::Orders(payload)) =
+                            (key, payload)
+                        {
+                            for (segment, customer_weight) in &customers {
+                                let weight = order_weight
+                                    .checked_mul(*customer_weight)
+                                    .ok_or("Q3 reconstructed join weight overflow")?;
+                                output.push(
+                                    Tup1(order),
+                                    Tup4(
+                                        customer,
+                                        segment.clone(),
+                                        payload.order_date,
+                                        payload.ship_priority,
+                                    ),
+                                    weight,
+                                );
                             }
                         }
                         Ok(())
@@ -227,23 +217,20 @@ impl Q3State {
                     &index,
                     &views.before,
                     &index.line_prefix(customer, order),
-                    |key, bytes, weight| {
-                        if let SourceKey::Lineitem(c, o, line) = key {
-                            if let SourcePayload::Lineitem(payload) = index.decode_payload(
-                                index.fold(&SourceKey::Lineitem(c, o, line))?.as_bytes(),
-                                bytes,
-                            )? {
-                                output.push(
-                                    Tup1(o),
-                                    Tup4(
-                                        line,
-                                        payload.extended_price,
-                                        payload.discount,
-                                        payload.ship_date,
-                                    ),
-                                    weight,
-                                );
-                            }
+                    |key, payload, weight| {
+                        if let (SourceKey::Lineitem(_, o, line), SourcePayload::Lineitem(payload)) =
+                            (key, payload)
+                        {
+                            output.push(
+                                Tup1(o),
+                                Tup4(
+                                    line,
+                                    payload.extended_price,
+                                    payload.discount,
+                                    payload.ship_date,
+                                ),
+                                weight,
+                            );
                         }
                         Ok(())
                     },
@@ -276,7 +263,7 @@ fn scan(
     index: &CustomerOrdersLineitemIndex,
     snapshot: &SourceSnapshot,
     prefix: &[u8],
-    mut visit: impl FnMut(SourceKey, &[u8], i64) -> Result<(), String>,
+    mut visit: impl FnMut(SourceKey, &SourcePayload, i64) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut cursor = snapshot.cursor();
     let seek = prefix.to_vec();
@@ -289,11 +276,11 @@ fn scan(
         let key = index.unfold(bytes)?;
         while cursor.val_valid() {
             let weight = **cursor.weight();
-            visit(
-                key.clone(),
-                cursor.val().downcast_checked::<Vec<u8>>(),
-                weight,
-            )?;
+            let payload = cursor.val().downcast_checked::<SourcePayload>();
+            if !payload.matches(&key) {
+                return Err(format!("stored payload does not match key {key:?}"));
+            }
+            visit(key.clone(), payload, weight)?;
             cursor.step_val();
         }
         cursor.step_key();
