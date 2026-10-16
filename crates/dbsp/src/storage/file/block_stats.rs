@@ -21,11 +21,27 @@ const TRAILER_BYTES: u64 = 512;
 /// Offsets and sizes of child blocks are stored in units of this many bytes.
 const BLOCK_UNIT_SHIFT: u32 = 9;
 
+/// Bytes of the blocks in one level of a layer file's nested rows.
+///
+/// Level 0 holds the keys; each later level holds the rows grouped under the
+/// level before it (for an indexed batch, level 1 holds the values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct LevelBlockBytes {
+    /// Data blocks of this level.
+    pub data: u64,
+    /// Index blocks of this level's tree.
+    pub index: u64,
+    /// Number of data blocks of this level.
+    pub data_blocks: u64,
+    /// Rows stored in this level.
+    pub rows: u64,
+}
+
 /// Bytes of a layer file by block type.
 ///
-/// The fields sum to the file size. Blocks are whole multiples of 512 bytes,
-/// so each figure includes the padding of its blocks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+/// The scalar fields sum to the file size. Blocks are whole multiples of 512
+/// bytes, so each figure includes the padding of its blocks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct BlockBytes {
     /// Data blocks.
     pub data: u64,
@@ -38,6 +54,9 @@ pub struct BlockBytes {
     /// Bytes that no block of the file's trees, filter, or trailer covers.
     /// Zero in a well-formed file.
     pub unreferenced: u64,
+    /// The data and index bytes split by level; they sum to `data` and
+    /// `index`.
+    pub levels: Vec<LevelBlockBytes>,
 }
 
 impl BlockBytes {
@@ -82,16 +101,29 @@ pub fn block_bytes(
 
     let mut bytes = BlockBytes {
         trailer: TRAILER_BYTES,
+        levels: trailer
+            .columns
+            .iter()
+            .map(|column| LevelBlockBytes {
+                rows: column.n_rows,
+                ..LevelBlockBytes::default()
+            })
+            .collect(),
         ..BlockBytes::default()
     };
     let mut visited = HashSet::new();
     let mut pending = Vec::new();
-    for column in &trailer.columns {
+    for (level, column) in trailer.columns.iter().enumerate() {
         if column.n_rows > 0 {
-            pending.push((column.node_offset, column.node_size, column.node_type));
+            pending.push((
+                level,
+                column.node_offset,
+                column.node_size,
+                column.node_type,
+            ));
         }
     }
-    while let Some((offset, node_size, node_type)) = pending.pop() {
+    while let Some((level, offset, node_size, node_type)) = pending.pop() {
         ensure!(
             offset
                 .checked_add(u64::from(node_size))
@@ -102,14 +134,22 @@ pub fn block_bytes(
             visited.insert(offset),
             "block at {offset} is referenced twice"
         );
+        let level_bytes = &mut bytes.levels[level];
         match node_type {
-            NodeType::Data => bytes.data += u64::from(node_size),
+            NodeType::Data => {
+                bytes.data += u64::from(node_size);
+                level_bytes.data += u64::from(node_size);
+                level_bytes.data_blocks += 1;
+            }
             NodeType::Index => {
                 bytes.index += u64::from(node_size);
+                level_bytes.index += u64::from(node_size);
                 let block = read(offset, node_size as usize)?;
                 pending.extend(
                     index_block_children(&block)
-                        .with_context(|| format!("parse the index block at {offset}"))?,
+                        .with_context(|| format!("parse the index block at {offset}"))?
+                        .into_iter()
+                        .map(|(offset, size, node_type)| (level, offset, size, node_type)),
                 );
             }
         }
@@ -194,7 +234,7 @@ mod tests {
             file::{
                 Factories, FilterPlan,
                 format::{BatchMetadata, Compression},
-                writer::{Parameters, Writer1},
+                writer::{Parameters, Writer1, Writer2},
             },
         },
     };
@@ -247,11 +287,62 @@ mod tests {
             assert_eq!(bytes.trailer, 512);
             assert!(bytes.data > 0, "{rows} rows");
             assert!(bytes.filter > 0, "{rows} rows");
+            assert_eq!(bytes.levels.len(), 1);
+            assert_eq!(bytes.levels[0].data, bytes.data, "{rows} rows");
+            assert_eq!(bytes.levels[0].index, bytes.index, "{rows} rows");
+            assert_eq!(bytes.levels[0].rows, rows as u64);
         }
         let (bytes, _) = write_and_analyze(20_000, parameters);
         assert!(
             bytes.index > 0,
             "a file with many data blocks has index blocks"
+        );
+    }
+
+    #[test]
+    fn levels_split_a_two_level_file_and_sum_to_the_totals() {
+        const KEYS: i64 = 2_000;
+        const VALUES_PER_KEY: i64 = 4;
+        let directory = tempdir().unwrap();
+        let backend = <dyn StorageBackend>::new(
+            &StorageConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+                cache: Default::default(),
+            },
+            &StorageOptions::default(),
+        )
+        .unwrap();
+        let keys = Factories::<DynData, DynData>::new::<i64, ()>();
+        let values = Factories::<DynData, DynData>::new::<i64, i64>();
+        let mut writer = Writer2::new(
+            &keys,
+            &values,
+            buffer_cache,
+            &*backend,
+            Parameters::default().with_compression(None),
+            None,
+        )
+        .unwrap();
+        for key in 0..KEYS {
+            for value in 0..VALUES_PER_KEY {
+                writer.write1((value.erase(), 1i64.erase())).unwrap();
+            }
+            writer.write0((key.erase(), ().erase())).unwrap();
+        }
+        let (file, _, _) = writer.close(BatchMetadata::default()).unwrap();
+        let path = directory.path().join(file.path().as_ref());
+
+        let bytes = layer_file_block_bytes(&path).unwrap();
+        assert_eq!(bytes.total(), std::fs::metadata(&path).unwrap().len());
+        assert_eq!(bytes.levels.len(), 2);
+        let [keys_level, values_level] = [bytes.levels[0], bytes.levels[1]];
+        assert_eq!(keys_level.rows, KEYS as u64);
+        assert_eq!(values_level.rows, (KEYS * VALUES_PER_KEY) as u64);
+        assert_eq!(keys_level.data + values_level.data, bytes.data);
+        assert_eq!(keys_level.index + values_level.index, bytes.index);
+        assert!(
+            values_level.data > keys_level.data,
+            "four values per key take more room than the keys"
         );
     }
 

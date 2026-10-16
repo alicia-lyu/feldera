@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use dbsp::storage::diagnostics::{self as dbsp_diagnostics, FlushRecord};
-use dbsp::storage::file::block_stats::layer_file_block_bytes;
+use dbsp::storage::file::block_stats::{layer_file_block_bytes, LevelBlockBytes};
 use dbsp::storage::write_attribution::{write_snapshot, WriteOwner};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -66,6 +66,9 @@ impl Diagnostics {
         let mut spines = Vec::new();
         for spine in dbsp_diagnostics::spine_contents() {
             let mut runs = Vec::new();
+            // On-disk bytes of the key level (level 0) and the value level
+            // (level 1), summed over the spine's files.
+            let mut levels = [LevelBlockBytes::default(); 2];
             for run in &spine.runs {
                 let mut value = serde_json::to_value(run)?;
                 if let Some(file) = &run.file {
@@ -76,6 +79,12 @@ impl Diagnostics {
                         blocks.total(),
                         run.file_bytes
                     );
+                    for (sum, level) in levels.iter_mut().zip(&blocks.levels) {
+                        sum.data += level.data;
+                        sum.index += level.index;
+                        sum.data_blocks += level.data_blocks;
+                        sum.rows += level.rows;
+                    }
                     value["blocks"] = serde_json::to_value(blocks)?;
                 }
                 runs.push(value);
@@ -95,6 +104,8 @@ impl Diagnostics {
                 "negative_weight_records_in_runs":
                     spine.runs.iter().filter_map(|r| r.negative_weight_records).sum::<u64>(),
                 "file_bytes": sum(|r| r.file_bytes.unwrap_or(0)),
+                "key_level": levels[0],
+                "value_level": levels[1],
                 "runs": runs,
             }));
         }
