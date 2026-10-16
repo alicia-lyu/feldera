@@ -39,14 +39,12 @@ pub struct LevelBlockBytes {
 
 /// Bytes of a layer file by block type.
 ///
-/// The scalar fields sum to the file size. Blocks are whole multiples of 512
-/// bytes, so each figure includes the padding of its blocks.
+/// Together they make up the file. Blocks are whole multiples of 512 bytes,
+/// so each figure includes the padding of its blocks.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct BlockBytes {
-    /// Data blocks.
-    pub data: u64,
-    /// Index blocks.
-    pub index: u64,
+    /// Data and index blocks, by level.
+    pub levels: Vec<LevelBlockBytes>,
     /// The membership filter block, if any.
     pub filter: u64,
     /// The trailer block.
@@ -54,15 +52,22 @@ pub struct BlockBytes {
     /// Bytes that no block of the file's trees, filter, or trailer covers.
     /// Zero in a well-formed file.
     pub unreferenced: u64,
-    /// The data and index bytes split by level; they sum to `data` and
-    /// `index`.
-    pub levels: Vec<LevelBlockBytes>,
 }
 
 impl BlockBytes {
-    /// The sum of all fields, which is the file size.
+    /// Bytes of data blocks, over all levels.
+    pub fn data(&self) -> u64 {
+        self.levels.iter().map(|level| level.data).sum()
+    }
+
+    /// Bytes of index blocks, over all levels.
+    pub fn index(&self) -> u64 {
+        self.levels.iter().map(|level| level.index).sum()
+    }
+
+    /// The file size.
     pub fn total(&self) -> u64 {
-        self.data + self.index + self.filter + self.trailer + self.unreferenced
+        self.data() + self.index() + self.filter + self.trailer + self.unreferenced
     }
 }
 
@@ -137,12 +142,10 @@ pub fn block_bytes(
         let level_bytes = &mut bytes.levels[level];
         match node_type {
             NodeType::Data => {
-                bytes.data += u64::from(node_size);
                 level_bytes.data += u64::from(node_size);
                 level_bytes.data_blocks += 1;
             }
             NodeType::Index => {
-                bytes.index += u64::from(node_size);
                 level_bytes.index += u64::from(node_size);
                 let block = read(offset, node_size as usize)?;
                 pending.extend(
@@ -164,7 +167,7 @@ pub fn block_bytes(
     };
     bytes.filter = filter;
 
-    let accounted = bytes.data + bytes.index + bytes.filter + bytes.trailer;
+    let accounted = bytes.data() + bytes.index() + bytes.filter + bytes.trailer;
     match size.checked_sub(accounted) {
         Some(unreferenced) => bytes.unreferenced = unreferenced,
         None => bail!("blocks cover {accounted} bytes of a {size}-byte file"),
@@ -285,16 +288,14 @@ mod tests {
             assert_eq!(bytes.total(), size, "{rows} rows");
             assert_eq!(bytes.unreferenced, 0, "{rows} rows");
             assert_eq!(bytes.trailer, 512);
-            assert!(bytes.data > 0, "{rows} rows");
+            assert!(bytes.data() > 0, "{rows} rows");
             assert!(bytes.filter > 0, "{rows} rows");
             assert_eq!(bytes.levels.len(), 1);
-            assert_eq!(bytes.levels[0].data, bytes.data, "{rows} rows");
-            assert_eq!(bytes.levels[0].index, bytes.index, "{rows} rows");
             assert_eq!(bytes.levels[0].rows, rows as u64);
         }
         let (bytes, _) = write_and_analyze(20_000, parameters);
         assert!(
-            bytes.index > 0,
+            bytes.index() > 0,
             "a file with many data blocks has index blocks"
         );
     }
@@ -338,8 +339,6 @@ mod tests {
         let [keys_level, values_level] = [bytes.levels[0], bytes.levels[1]];
         assert_eq!(keys_level.rows, KEYS as u64);
         assert_eq!(values_level.rows, (KEYS * VALUES_PER_KEY) as u64);
-        assert_eq!(keys_level.data + values_level.data, bytes.data);
-        assert_eq!(keys_level.index + values_level.index, bytes.index);
         assert!(
             values_level.data > keys_level.data,
             "four values per key take more room than the keys"
