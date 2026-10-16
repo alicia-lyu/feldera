@@ -1,7 +1,5 @@
 //! Schema-independent folded keys, byte-backed batches, and weighted layer-file rows.
-//! Concrete source definitions and payload codecs belong to client crates.
-
-use std::marker::PhantomData;
+//! Concrete index definitions and payload codecs belong to client crates.
 
 use crate::{
     algebra::ZWeight,
@@ -11,86 +9,33 @@ use crate::{
 
 pub mod batch;
 pub mod ordered;
+pub mod testing;
+pub mod trie;
 
 pub use batch::MergedIndexBatch;
 pub use ordered::OrderedKey;
+pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement, Via};
 
+/// Terminates the key fields of a folded key. No domain may use it as a tag.
 const INDEX_TAG: u8 = 0;
 
-/// A logical base relation, independent of how this index stores its rows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BaseRelationId(pub &'static str);
-
-/// A selected access path for a base relation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceIndexId(pub &'static str);
-
-/// A shared logical domain for an ordered key field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyDomainId(pub &'static str);
-
-/// The signed integer width used by a key domain in folded bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyPrimitive {
-    I32,
-    I64,
-}
-
-impl KeyPrimitive {
-    fn width(self) -> usize {
-        match self {
-            Self::I32 => 4,
-            Self::I64 => 8,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyDomain {
-    pub id: KeyDomainId,
-    pub primitive: KeyPrimitive,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyField {
-    pub name: &'static str,
-    pub domain: KeyDomainId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceIndexSpec {
-    pub id: SourceIndexId,
-    pub base_relation: BaseRelationId,
-    pub key_fields: &'static [KeyField],
-    pub payload_fields: &'static [&'static str],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DomainByteTag {
-    pub domain: KeyDomainId,
-    pub tag: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceByteTag {
-    pub source_index: SourceIndexId,
-    pub tag: u8,
-}
-
-/// Static source metadata and typed projection for one merged index.
-/// Domain and source tags must be unique within their respective namespaces; zero
-/// is reserved for the terminal index tag. Field values use `i64` at this API
-/// boundary, and folding checks that values in `I32` domains fit without truncation.
+/// A static merged-index definition: a key trie plus typed folding.
+///
+/// A folded key is `[tag value]* 0 id`. It has one tag and one value per
+/// domain on the path to its placement, then the terminator and the placement
+/// id. Tags and ids are derived from `TRIE` (see [`KeyTrie`]). The functions
+/// below hard-code them as constants, and tests check them against the trie.
 pub trait MergedIndexDefinition {
     type Key: Clone + Eq + std::fmt::Debug;
 
-    const KEY_DOMAINS: &'static [KeyDomain];
-    const SOURCE_INDEX_SPECS: &'static [SourceIndexSpec];
-    const DOMAIN_BYTE_TAGS: &'static [DomainByteTag];
-    const SOURCE_BYTE_TAGS: &'static [SourceByteTag];
+    const TRIE: KeyTrie;
 
-    fn project(key: &Self::Key) -> (SourceIndexId, Vec<i64>);
-    fn construct(source_index: SourceIndexId, fields: &[i64]) -> Option<Self::Key>;
+    /// Folds a key. Typed fields make this infallible.
+    fn fold(key: &Self::Key) -> FoldedKey;
+
+    /// The inverse of [`fold`](Self::fold). Rejects bytes that `fold` could not
+    /// have produced.
+    fn unfold(bytes: &[u8]) -> Result<Self::Key, String>;
 }
 
 /// A complete folded key. Its byte ordering is its query ordering.
@@ -121,197 +66,112 @@ impl PayloadBytes {
     }
 }
 
-/// Folding and prefix operations governed by a static index definition.
-pub struct MergedIndex<D>(PhantomData<D>);
+/// Writes the `[tag value]*` part of a folded key. A definition lists its
+/// `(tag, value)` pairs in path order and picks one of the three endings.
+#[derive(Debug, Default)]
+pub struct KeyEncoder {
+    bytes: Vec<u8>,
+}
 
-impl<D> Default for MergedIndex<D> {
-    fn default() -> Self {
-        Self(PhantomData)
+impl KeyEncoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends the tag of a domain, then the ordered encoding of the value.
+    pub fn field<T: OrderedKey>(mut self, tag: u8, value: &T) -> Self {
+        self.bytes.push(tag);
+        value.encode_ordered(&mut self.bytes);
+        self
+    }
+
+    /// Ends a complete key with the terminator and the placement id.
+    pub fn finish(mut self, placement_id: u8) -> FoldedKey {
+        self.bytes.push(INDEX_TAG);
+        self.bytes.push(placement_id);
+        FoldedKey(self.bytes)
+    }
+
+    /// The bytes shared by every key below the fields written so far.
+    pub fn prefix(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// A prefix that ends after the tag of the next field, before its value.
+    pub fn then_tag(mut self, tag: u8) -> Vec<u8> {
+        self.bytes.push(tag);
+        self.bytes
     }
 }
 
-impl<D: MergedIndexDefinition> MergedIndex<D> {
-    pub fn fold(&self, key: &D::Key) -> Result<FoldedKey, String> {
-        let (source_index, values) = D::project(key);
-        let source = Self::source(source_index)?;
-        if values.len() != source.key_fields.len() {
-            return Err("source key has the wrong number of fields".into());
-        }
-        let mut bytes = self.prefix(source_index, &values)?;
-        bytes.push(INDEX_TAG);
-        bytes.push(Self::source_tag(source_index)?);
-        Ok(FoldedKey(bytes))
-    }
+/// Reads a folded key written by [`KeyEncoder`].
+#[derive(Debug)]
+pub struct KeyDecoder<'a> {
+    fields: &'a [u8],
+}
 
-    pub fn unfold(&self, key: &[u8]) -> Result<D::Key, String> {
-        let (&source_tag, body) = key
+impl<'a> KeyDecoder<'a> {
+    /// Checks the terminator and splits off the placement id. The decoder then
+    /// reads the fields that precede the terminator.
+    pub fn new(bytes: &'a [u8]) -> Result<(u8, Self), String> {
+        let (&placement_id, body) = bytes
             .split_last()
             .ok_or_else(|| "empty folded key".to_string())?;
-        let source_index = Self::source_index_for_tag(source_tag)?;
-        let source = Self::source(source_index)?;
-        let primitives = source
-            .key_fields
-            .iter()
-            .map(|field| Self::primitive(field.domain))
-            .collect::<Result<Vec<_>, _>>()?;
-        let expected_length = primitives
-            .iter()
-            .map(|primitive| 1 + primitive.width())
-            .sum::<usize>()
-            + 1;
-        if body.len() != expected_length || body.last() != Some(&INDEX_TAG) {
-            return Err("folded key has an invalid length or index tag".into());
+        let (&terminator, fields) = body
+            .split_last()
+            .ok_or_else(|| "folded key has no terminator".to_string())?;
+        if terminator != INDEX_TAG {
+            return Err("folded key has an invalid terminator".into());
         }
-        let mut values = Vec::with_capacity(source.key_fields.len());
-        let mut offset = 0;
-        for (field, primitive) in source.key_fields.iter().zip(primitives) {
-            if body[offset] != Self::domain_tag(field.domain)? {
-                return Err("folded key has an invalid domain tag".into());
-            }
-            offset += 1;
-            let value = match primitive {
-                KeyPrimitive::I32 => {
-                    let encoded = u32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
-                    i64::from((encoded ^ 0x8000_0000) as i32)
-                }
-                KeyPrimitive::I64 => {
-                    let encoded = u64::from_be_bytes(body[offset..offset + 8].try_into().unwrap());
-                    (encoded ^ 0x8000_0000_0000_0000) as i64
-                }
-            };
-            values.push(value);
-            offset += primitive.width();
-        }
-        D::construct(source_index, &values)
-            .ok_or_else(|| "source definition could not construct folded key".into())
+        Ok((placement_id, Self { fields }))
     }
 
-    /// Returns a leading field prefix without the index tag or source id.
-    pub fn prefix(&self, source_index: SourceIndexId, values: &[i64]) -> Result<Vec<u8>, String> {
-        let source = Self::source(source_index)?;
-        if values.len() > source.key_fields.len() {
-            return Err("prefix has too many fields".into());
+    /// Reads the next field, which must carry `tag`.
+    pub fn field<T: OrderedKey>(&mut self, tag: u8) -> Result<T, String> {
+        let (&found_tag, after_tag) = self
+            .fields
+            .split_first()
+            .ok_or_else(|| "folded key ends before the expected field".to_string())?;
+        if found_tag != tag {
+            return Err(format!(
+                "folded key has domain tag {found_tag}, expected {tag}"
+            ));
         }
-        let mut bytes = Vec::new();
-        for (field, value) in source.key_fields.iter().zip(values) {
-            bytes.push(Self::domain_tag(field.domain)?);
-            match Self::primitive(field.domain)? {
-                KeyPrimitive::I32 => {
-                    let value = i32::try_from(*value)
-                        .map_err(|_| "key field is outside its I32 domain".to_string())?;
-                    bytes.extend_from_slice(&((value as u32) ^ 0x8000_0000).to_be_bytes());
-                }
-                KeyPrimitive::I64 => {
-                    bytes.extend_from_slice(
-                        &((*value as u64) ^ 0x8000_0000_0000_0000).to_be_bytes(),
-                    );
-                }
-            }
+        if after_tag.len() < T::WIDTH {
+            return Err("folded key has a truncated field".into());
         }
-        Ok(bytes)
+        let (value_bytes, rest) = after_tag.split_at(T::WIDTH);
+        let value = T::decode_ordered(value_bytes)
+            .ok_or_else(|| "folded key has a non-canonical field".to_string())?;
+        self.fields = rest;
+        Ok(value)
     }
 
-    /// A prefix ending after the tag of the next field, but before its value.
-    pub fn prefix_with_next_tag(
-        &self,
-        source_index: SourceIndexId,
-        values: &[i64],
-    ) -> Result<Vec<u8>, String> {
-        let source = Self::source(source_index)?;
-        let next_field = source
-            .key_fields
-            .get(values.len())
-            .ok_or_else(|| "prefix has no next field".to_string())?;
-        let mut bytes = self.prefix(source_index, values)?;
-        bytes.push(Self::domain_tag(next_field.domain)?);
-        Ok(bytes)
-    }
-
-    /// Adds all children for one parent, then writes the parent exactly once.
-    /// The caller supplies strictly increasing parent and child byte keys.
-    pub fn write_parent(
-        &self,
-        writer: &mut Writer2<DynData, DynUnit, DynData, DynWeight>,
-        key: &FoldedKey,
-        children: &[(PayloadBytes, ZWeight)],
-    ) -> Result<(), StorageError> {
-        assert!(
-            !children.is_empty(),
-            "a layer-file parent requires children"
-        );
-        for (payload, weight) in children {
-            writer.write1((payload.0.erase(), weight.erase()))?;
+    /// Checks that every field byte was consumed.
+    pub fn finish(self) -> Result<(), String> {
+        if self.fields.is_empty() {
+            Ok(())
+        } else {
+            Err("folded key has trailing bytes".into())
         }
-        writer.write0((key.0.erase(), ().erase()))
     }
+}
 
-    fn source(id: SourceIndexId) -> Result<&'static SourceIndexSpec, String> {
-        D::SOURCE_INDEX_SPECS
-            .iter()
-            .find(|source| source.id == id)
-            .ok_or_else(|| "unknown source-index identifier".into())
+/// Adds all children for one parent, then writes the parent exactly once.
+/// The caller supplies strictly increasing parent and child byte keys.
+pub fn write_parent(
+    writer: &mut Writer2<DynData, DynUnit, DynData, DynWeight>,
+    key: &FoldedKey,
+    children: &[(PayloadBytes, ZWeight)],
+) -> Result<(), StorageError> {
+    assert!(
+        !children.is_empty(),
+        "a layer-file parent requires children"
+    );
+    for (payload, weight) in children {
+        writer.write1((payload.0.erase(), weight.erase()))?;
     }
-
-    fn source_tag(source_index: SourceIndexId) -> Result<u8, String> {
-        let mut bindings = D::SOURCE_BYTE_TAGS
-            .iter()
-            .filter(|binding| binding.source_index == source_index);
-        let tag = bindings
-            .next()
-            .ok_or_else(|| "source index has no byte tag".to_string())?
-            .tag;
-        if tag == INDEX_TAG
-            || bindings.next().is_some()
-            || D::SOURCE_BYTE_TAGS
-                .iter()
-                .any(|binding| binding.tag == tag && binding.source_index != source_index)
-        {
-            return Err("source index has an invalid byte-tag binding".into());
-        }
-        Ok(tag)
-    }
-
-    fn source_index_for_tag(tag: u8) -> Result<SourceIndexId, String> {
-        let mut bindings = D::SOURCE_BYTE_TAGS
-            .iter()
-            .filter(|binding| binding.tag == tag);
-        let source_index = bindings
-            .next()
-            .ok_or_else(|| "unknown terminal source tag".to_string())?
-            .source_index;
-        if tag == INDEX_TAG || bindings.next().is_some() {
-            return Err("ambiguous terminal source tag".into());
-        }
-        Ok(source_index)
-    }
-
-    fn primitive(id: KeyDomainId) -> Result<KeyPrimitive, String> {
-        D::KEY_DOMAINS
-            .iter()
-            .find(|domain| domain.id == id)
-            .map(|domain| domain.primitive)
-            .ok_or_else(|| "source references an unknown key domain".to_string())
-    }
-
-    fn domain_tag(id: KeyDomainId) -> Result<u8, String> {
-        Self::primitive(id)?;
-        let mut bindings = D::DOMAIN_BYTE_TAGS
-            .iter()
-            .filter(|binding| binding.domain == id);
-        let tag = bindings
-            .next()
-            .ok_or_else(|| "key domain has no byte tag".to_string())?
-            .tag;
-        if tag == INDEX_TAG
-            || bindings.next().is_some()
-            || D::DOMAIN_BYTE_TAGS
-                .iter()
-                .any(|binding| binding.tag == tag && binding.domain != id)
-        {
-            return Err("key domain has an invalid byte-tag binding".into());
-        }
-        Ok(tag)
-    }
+    writer.write0((key.0.erase(), ().erase()))
 }
 
 #[cfg(test)]
