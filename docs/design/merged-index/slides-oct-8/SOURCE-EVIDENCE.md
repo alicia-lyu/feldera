@@ -247,3 +247,29 @@ It iterates rows 2 and 3 through the two map entries to `(8,+1)` and `(15,+1)`,
 then stops before row 4. It omits key-item offsets and unused branch value
 bounds. These numeric values are a compact layout example, not complete
 Orders payloads or a measurement of block packing.
+
+## Ordered initial runs: completion on 2026-10-15
+
+The current `docs/merged-index-tidy-up` deck supersedes the earlier 22-page
+consolidation plan with the user's subsequent diagram, source, and appendix
+edits. It retains 11 main topics and 26 pages per PDF. The completion renames
+slide 2 to “Z-sets and Bag Semantics,” removes its empty physical-layout table,
+and corrects the construction note without restoring removed spoken notes.
+
+`Writer2::write0` requires strictly increasing keys; `Writer2::write1`
+requires strictly increasing values within the current key group
+(`crates/dbsp/src/storage/file/writer.rs`). A closed key cannot reappear.
+The writer appends ordered input rather than sorting it or inserting into
+existing positions. For example, concatenating `(42,2),(44,1)` and `(43,8)`
+fails the contract even though each stream is sorted. A producer can sort and
+consolidate combined unordered output, merge sorted streams with consolidation,
+or build separate runs for trace reads and subsequent merging.
+
+The input/join paths' initial unmerged runs contain one transaction's output
+or part of it. L0 is a size class; a later merge can combine transactions and
+still return an L0 run (`Spine::size_to_level`, `merge_complete`). The user
+chooses small transaction deltas as the target low-latency workload assumption,
+so very small initial runs are expected. This does not assert a measured
+production transaction-size distribution. The canonical explanation now lives
+in [native-run-placement.md](../native-run-placement.md#building-a-run), with
+the workload assumption recorded in [decisions.md](../decisions.md).

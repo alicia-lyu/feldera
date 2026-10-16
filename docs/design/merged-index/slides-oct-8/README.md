@@ -1,7 +1,7 @@
 # DBSP physical design: advisor presentation
 
 This editable 16:9 Beamer/TikZ deck has **11 main slide topics** and five
-appendix topics. Slide 2 defines a record as (key, value, weight). Slide 3
+appendix topics. Slide 2, “Z-sets and Bag Semantics,” defines a record as (key, value, weight). Slide 3
 first shows the LSM-like trace and the key/value trees
 inside one immutable file run, then reveals the teal search for Order ID 43.
 The second step also reveals each run's own downward cursor. Slide 4
@@ -76,13 +76,18 @@ are illustrative. The deck claims no measured savings, update costs, or
 comparative performance.
 
 Native file “columns” describe nested file trees, not SQL attribute columns.
-The construction pseudocode therefore uses `key_tree` and `value_tree`:
-the first stores `(K, ())` with separate value-row boundaries; the second
-stores `(V, weight)`. `write1` advances a file-wide value-row counter, and
-`write0` captures the pending nonempty group and resets it to `[end,end)`.
-Leaf flushes do not reset those counters; the run completes at `close`.
-The callout illustrates a one-run transaction; actual transactions can
-produce several runs.
+The construction diagram shows key 43 selecting value rows `[2,4)`, ordered
+by value. Builders consume globally ordered, consolidated `(K,V)` pairs;
+they cannot insert out of order or reopen a closed key group. The parent
+[native run guide](../native-run-placement.md#building-a-run) explains the
+interleaving-loop example and the choice between sorting unordered output,
+merging sorted streams, and constructing separate runs.
+
+In the inspected input/join paths, an initial, unmerged run contains one
+transaction's output or part of it. For the target low-latency workload,
+assume small transaction deltas and expect very small initial runs. This
+is a workload assumption, not measured transaction-size data. Later merges
+can combine transactions and remain in L0, which names a size class.
 
 - [SOURCE-EVIDENCE.md](SOURCE-EVIDENCE.md) records the inspected revisions, source
   hashes, and construction and retention evidence. It is pinned to an earlier commit.
@@ -126,11 +131,11 @@ VLDB paper, blue for Feldera code, and olive for project artifacts.
 
 | Topics | Subject |
 | --- | --- |
-| 1–3 | DBSP context, base storage, immutable-run construction |
-| 4–6 | Example/notation, complete program, accumulated state/runs |
-| 7–9 | Records, representations, changed-Customer reads |
-| 10–12 | Separate small runs, snapshots, merge ownership |
-| 13–15 | Memory accounting/controls and prototype scope |
+| 1–3 | DBSP context, Z-sets and bag semantics, base storage |
+| 4–5 | Immutable-run construction and run levels |
+| 6–8 | Example/notation, complete program, accumulated state |
+| 9–10 | Before/after snapshots and merge ownership |
+| 11 | RSS-driven run placement |
 
 Appendix A gives full payloads. Appendix B shows a Customer update as a
 deletion plus an insertion. Appendix C groups every slide's sources by category and names the slides

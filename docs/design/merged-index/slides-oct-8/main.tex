@@ -86,18 +86,9 @@
 \end{frame}
 
 % 2
-\begin{frame}{Record structure}
+\begin{frame}{Z-sets and Bag Semantics}
   \large Logically, $\text{record}=(\text{key},\text{value},\text{weight})$---``bag semantics''
   \par\medskip\normalsize
-  \begin{center}\small
-    \begin{tabular}{@{}lll@{}}
-      % Pending physical layout
-      % \toprule Key & Value & Weight\\\midrule
-      % 7 & $(42,1,\text{1995-03-01},0,100,0,\text{1995-03-10})$ & $+1$\\
-      % 7 & $(43,1,\text{1995-03-02},0,30,0,\text{1995-03-11})$ & $+1$\\\bottomrule
-    \end{tabular}
-  \end{center}
-  \par\medskip
   \begin{columns}[T,onlytextwidth]
     \begin{column}{.46\textwidth}
       \textbf{Multiplicity}\par
@@ -123,7 +114,7 @@
 \begin{frame}<1-3>{Creating an immutable run}
   \centering\input{figures/run-creation.tex}
   \source{\srccode{trace/spine\_async.rs; trace/ord/vec/indexed\_wset\_batch.rs; storage/file/writer.rs.} \srcproject{Verified summary: native-run-placement.md.}}
-  \note{1 transaction $\to$ 1+ runs. Currently, one run cannot contain several transactions.}
+  \note{In the inspected input/join paths, each initial, unmerged run contains one transaction's output or part of it. For the target low-latency workload, assume small transaction deltas and expect very small initial runs. Later merges can combine transactions, including in memory; their output can still be in L0.}
 \end{frame}
 
 % 5

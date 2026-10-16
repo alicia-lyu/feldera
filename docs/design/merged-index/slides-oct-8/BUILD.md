@@ -61,20 +61,19 @@ outlines, separate key items/boundaries, zero-based array indices, 512-byte
 descriptor units, symbolic leaf offsets, and connectors clear of labels.
 The leaf's first row is traversal context, not a header field.
 
-For this revision, use the freshly built 20-page baseline captured before edits:
-old page 1 stays page 1; old pages 4–20 become pages 5–21. Exclude only the
-renumbered main-slide footer in pixel comparisons. Old page 7 becomes page 8
-with the callout moved to the new page 4. Old pages 16 and 20 become pages 17
-and 21 with corrected explanatory-program references. Compare all other
-content and positions, reporting any subpixel TeX layout differences separately.
-Old pages 2–3 are the intentionally edited storage
-topic; new pages 22–25 are Appendix E.
+For the 2026-10-15 completion, the baseline is the current 26-page deck,
+saved before edits under ignored `build/consolidation-2026-10-15/baseline/`.
+Compare every retained page at the same resolution: only slide 2's title
+and empty-table spacing change in the presentation. The notes for slide 4
+now distinguish initial runs from merged runs and state the small-transaction
+workload assumption. Preserve the newer three-advance construction and level
+diagrams, the source-only notes elsewhere, and the 26-page count.
 A successful TeX build alone does not establish visual correctness.
 
 | PDF pages | Topic / advance |
 | --- | --- |
 | 1 | Main slide 1 |
-| 2 | Main slide 2, record structure |
+| 2 | Main slide 2, Z-sets and Bag Semantics |
 | 3–4 | Slide 3, base storage, structure then lookup |
 | 5–7 | Slide 4, memtable vs. in-memory runs, advances 1–3 |
 | 8–10 | Slide 5, run levels, advances 1–3 |
