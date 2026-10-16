@@ -1,0 +1,123 @@
+# AGENTS.md
+
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+
+- To gather more context beyond README.md:
+  - Look at the outstanding changes in the tree
+  - If on a branch check the last 2-3 to commits
+  - Look at relevant README.md in sub-folders
+
+- Write production quality code.
+  - Adhere to rules in "Code Complete" by Steve McConnell.
+  - Adhere to rules in "The Art of Readable Code" by Dustin Boswell & Trevor Foucher.
+- Make sure the code compiles.
+- When adding code always ensure that tests cover the newly added code:
+  - Unit tests that validate for regular and exceptional inputs
+  - Use property based testing/model based testing/fuzzing when appropriate
+  - Integration tests for big platform-level features (in @python/tests)
+
+- Add/update documenation and comments.
+  - Adhere to rules in "Bugs in Writing: A Guide to Debugging Your Prose" by Lyn Dupre.
+  - Adhere to rules in "The Elements of Style, Fourth Edition" by William Strunk Jr. & E. B. White
+
+On this fork, commit `AGENTS.md` files in the same commits and branch as the code and docs they describe. Do not use a separate `Codex-context` branch or `scripts/Codex.sh push`.
+
+## Architecture
+
+SQL flows through four layers:
+
+1. `sql-to-dbsp-compiler/` (Java, Calcite) compiles tables and views into a Rust DBSP circuit. Flags are documented in `sql-to-dbsp-compiler/using.md`.
+2. The generated crate depends on `crates/sqllib` (SQL runtime functions) and `crates/dbsp` (the incremental engine: circuits, operators, Z-set batches, `Spine` traces, file-backed storage).
+3. `crates/adapters` (with `adapterlib`, `feldera-types`) connects circuits to input and output connectors.
+4. `crates/pipeline-manager` is the REST server that compiles and runs pipelines. `python/` holds the SDK and integration tests; `js-packages/web-console` is the SvelteKit UI, whose API client is generated from `openapi.json`.
+
+## Commands
+
+Toolchain: Rust 1.96.1 (`rust-version` in `Cargo.toml`; no toolchain file, so pass `+1.96.1`). The SQL compiler needs JDK 19–21; the default JDK on this machine is 17, so export `JAVA_HOME=/opt/homebrew/opt/openjdk@21`.
+
+```bash
+# Rust: one crate, one test filter
+cargo +1.96.1 test -p dbsp --lib <test_name_substring>
+
+# Lint, as scripts/pre-push runs it
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+
+# SQL compiler: full build (also builds Calcite), or the compiler alone
+cd sql-to-dbsp-compiler && ./build.sh
+cd sql-to-dbsp-compiler/SQL-compiler && mvn package -DskipTests
+# One JUnit test (generated Rust lands in sql-to-dbsp-compiler/temp/)
+mvn test -pl SQL-compiler -Dtest=<TestClass> -Dsurefire.failIfNoSpecifiedTests=false
+
+# Pipeline manager (needs the compiler built first)
+cargo run --bin=pipeline-manager
+
+# Python tests (from python/, need a running manager)
+uv run python -m pytest tests/platform/test_pipeline_crud.py::test_pipeline_post
+```
+
+## Merged-index research: range-aligned IVM
+
+Active branch: `docs/merged-index-tidy-up`. The former `feat/merged-index-storage` is archived as `archive/q3-investigation-abandoned`; do not build on it.
+
+This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Customer ⋈ Orders ⋈ Lineitem`. Two modes exist:
+
+- **Native:** ordinary Feldera state. The two joins keep four integrator traces.
+- **Reconstructed:** those four traces are not built. The join reads requested key ranges from a secondary "COL" merged index (folded keys: customer > order > line). The index is maintained outside the circuit on an auxiliary thread, and its before/after snapshots are published before each transaction.
+
+### Where the code lives
+
+| Piece | Location |
+| --- | --- |
+| Folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
+| Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
+| Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
+| COL keys, payloads, Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
+| Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
+
+### Experiment commands
+
+Run these from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline` with JDK 21. `src/lib.rs` is generated and git-ignored.
+
+```bash
+./generate.sh                       # native circuit
+cargo +1.96.1 test --offline --locked
+./generate.sh --q3-merged-index     # reconstructed circuit
+cargo +1.96.1 test --offline --locked --features merged-index
+./verify.sh                         # full gate: fmt, both modes, clippy, transcript cmp, COL suite, Python tests; restores native generation
+python3 measure.py --help           # R5 measurement runner
+```
+
+The COL library tests with `cargo +1.96.1 test --offline --locked` in its own directory. The DBSP side tests with `cargo +1.96.1 test --offline -p dbsp --lib merged_index` (also `supplied_snapshot_join`).
+
+### Contracts that the code enforces but the docs omit
+
+- **One worker.** Maintenance and initial loading both use one DBSP worker; this is the user's decision of 2026-10-12. Reconstructed mode and R5 runs reject any other count in `main.rs`.
+- **Transactions.** A DBSP transaction is `start_transaction`, any number of `step()` calls, then `commit_transaction`. It is not an OLTP commit: outputs appear at commit and the logical clock advances once.
+  - Wrap each transaction in `Q3State::publish(before, after, placements)` and `finish()`.
+  - The join readers run once, at the commit flush. Steps inside one transaction share one publish, but separate transactions cannot share one.
+- **Placements and supported changes.** The placement map (order → customer) comes only from Orders rows in the same transaction. Changes outside RF1/RF2 are therefore unsupported by design, an accepted limitation.
+  - The harness's `prepare` rejects such changes.
+  - Reaching the circuit any other way hits `expect` in `merged-index-col/src/q3.rs` and panics the worker.
+- **Uniqueness.** Folded keys are unique because of the base tables' primary keys; no separate validator is needed. The merged index is fed the harness's own signed rows, so this holds only while `BaseState::validate` admits just the changes the base tables apply as given. A future workload with upserts must feed the index from the base tables' net delta.
+
+### Trusting the docs
+
+The docs in `docs/design/merged-index/` were consolidated on 2026-10-12. Each file owns one topic; `README.md` is the entry point and `WORKFLOW.md` is the only home for commands.
+
+- Prefer code and tests. Docs cite code by symbol name; line anchors drift.
+- The user's confirmed decisions live in `docs/design/merged-index/decisions.md`, dated. A "decision" elsewhere without an entry there is unconfirmed. Record new user decisions there.
+- R1–R5 is the only numbering scheme. Completed plans and history are archived under `TRASH/` and are not authoritative.
+- Never infer an unmeasured quantity from leftover arithmetic, such as assigning residual storage to the index. The user rejected this as circular. Report only what was measured.
+- Make no performance or savings claim without a raw artifact. Raw artifacts live in git-ignored `target/` and are local-only.
+- "Residual execution" is an acceptable term.
+
+### Slides (`docs/design/merged-index/slides-oct-8/`)
+
+- Build with `sh build.sh`, then inspect the rendered pages. A clean TeX build does not prove the slides look right.
+- `build.sh` hard-codes the page count.
+- The user's own edits to the deck are authoritative. Do not reapply earlier agent guidance over them.
+- Notation:
+  - "transaction delta", not "batch"
+  - "run" for an immutable sorted collection
+  - subscripts for access order, superscripts for before/after state
