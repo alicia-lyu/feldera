@@ -1,6 +1,6 @@
 # General merged-index definition
 
-This document is a design and a roadmap. Nothing in it is implemented yet.
+This document is a design and a roadmap. Only the first roadmap step, the key encoders, is implemented.
 
 It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
@@ -94,7 +94,7 @@ Each failure is a compiler error that names the spec line.
    - Every `Relation.column` exists.
    - A column belongs to at most one domain.
    - A relation has at most one column per domain.
-2. **Types agree.** All columns of a domain have the same SQL type, ignoring nullability. A nullable column makes the domain's encoding nullable.
+2. **Types agree, and keys are NOT NULL.** All columns of a domain have the same SQL type, and every key column is NOT NULL. Primary keys already are; a nullable foreign-key column must be declared NOT NULL to serve as a key.
 3. **Fixed width.** Domain types are integers, BOOLEAN, DATE, TIME, TIMESTAMP, or DECIMAL. Other types are rejected as variable-width.
 4. **Every path domain resolves.**
    - Each domain on a placement's path has either the relation's own column or a `via` that passes both checks above.
@@ -180,14 +180,15 @@ This replaces the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN
 
 ### Order-preserving key encoders
 
-Folding needs, for each key type, a fixed-width byte encoding whose `memcmp` order equals the type's `Ord`. This is the note's unique-parsing lemma. A trait such as `OrderedKey`, with a `WIDTH` constant and encode and decode functions, would provide it for these types:
+Folding needs, for each key type, a fixed-width byte encoding whose `memcmp` order equals the type's `Ord`. Decoding accepts only canonical bytes, so a folded key parses into exactly one sequence of values, as the note's unique-parsing lemma requires. The trait `OrderedKey` in `merged_index/ordered.rs` provides this, with a `WIDTH` constant, `encode_ordered`, and `decode_ordered`. It is implemented for these types:
 
 - **Signed integers:** big-endian with the sign bit flipped. This is byte-identical to today's `I32` and `I64` encoding.
 - **Unsigned integers:** big-endian.
-- **`bool`.**
-- **`Option<T>`:** a marker byte, then the value or zero padding. NULL sorts first, as in `Option`'s `Ord`.
-- **`Date`, `Time`, and `Timestamp`** in `crates/sqllib`, each delegating to its inner integer.
-- **`SqlDecimal`.** This is fxp's `Fixed`, so its implementation goes in `crates/fxp` behind that crate's existing `dbsp` feature, as the orphan rule requires. It delegates to the i128 mantissa.
+- **`bool`:** one byte, 0 or 1.
+- **`Date`, `Time`, and `Timestamp`,** in `crates/sqllib/src/ordered_key.rs`. Each delegates to its inner integer: days, nanoseconds, or microseconds.
+- **`SqlDecimal`.** This is fxp's `Fixed`, so its implementation is in `crates/fxp/src/dbsp_impl.rs`, behind that crate's existing `dbsp` feature, as the orphan rule requires. It delegates to the i128 mantissa, which is correct because all columns of a domain share one precision and scale. Decoding rejects a mantissa outside the type's range.
+
+There is no encoding for NULL, because key columns are NOT NULL (see Validation). Floats are not key types.
 
 ## Decisions from this session
 
@@ -200,13 +201,14 @@ These are user decisions of 2026-10-16. They are recorded here until they are en
 - The parsed trie is a static data structure that mirrors the spec. Everything else is computed from it.
 - The first scope is the definition and typed fold, unfold, and prefix. Readers and joins stay hand-written.
 - Key types are fixed-width only.
+- Key columns must be NOT NULL, so there is no NULL key encoding for now.
 
 ## Roadmap
 
 These steps are ordered. Each ends with an exit check and lands with its own doc updates. The steps are not numbered stages, because R1–R5 is the only numbering scheme in these docs.
 
-1. **Key encoders.** Add the order-preserving encoders and their implementations.
-   - Exit check: proptests that byte order equals `Ord`, that decoding round-trips, and that widths are exact, including boundary values and NULL.
+1. **Key encoders.** Implemented: `OrderedKey`, with its implementations in dbsp, sqllib, and fxp.
+   - Exit check: proptests that byte order equals `Ord`, that decoding round-trips, and that widths are exact, including boundary values.
    - Exit check: the i32 and i64 bytes are unchanged.
 2. **Static trie and reshaped trait.** Add `KeyTrie` and the new `MergedIndexDefinition`, and port the hand-written COL to them, including a hand-written `TRIE`.
    - Exit check: the COL tests and `verify.sh` pass with unchanged transcripts.
@@ -225,6 +227,7 @@ Later work, outside this roadmap:
 - Variable-width keys such as VARCHAR. These need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
 - Generated readers and joins, replacing the exact-shape matching in `Q3MergedIndexBinding`.
 - Inferring the trie from foreign-key and primary-key metadata.
+- Nullable key columns. Two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 
 ## Pending doc integration
 

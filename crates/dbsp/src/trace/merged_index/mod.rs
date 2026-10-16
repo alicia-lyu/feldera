@@ -10,8 +10,10 @@ use crate::{
 };
 
 pub mod batch;
+pub mod ordered;
 
 pub use batch::MergedIndexBatch;
+pub use ordered::OrderedKey;
 
 const INDEX_TAG: u8 = 0;
 
