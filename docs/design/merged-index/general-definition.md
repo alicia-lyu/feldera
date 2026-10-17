@@ -1,6 +1,6 @@
 # General merged-index definition
 
-This document is a design and a roadmap. Only the first roadmap step, the key encoders, is implemented.
+This document is a design and a roadmap. Roadmap Steps 1 and 2 are implemented: the key encoders, and the static trie with the reshaped `MergedIndexDefinition`. The spec parser, the emitter, and the switch to generated code are not.
 
 It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
@@ -10,11 +10,11 @@ The trie spec supersedes the flat `key_domain` / `source_index` / `merged_index`
 
 COL is defined by hand. `merged-index-col/src/lib.rs` spells out domains, sources, tags, a key enum, and its `project` and `construct` arms. A second merged index would need all of it written again.
 
-The generic layer in `crates/dbsp/src/trace/merged_index/` has three limits:
+Before Steps 1 and 2, the generic layer in `crates/dbsp/src/trace/merged_index/` had three limits:
 
-- **Every key value crosses its API as an `i64`.** `MergedIndexDefinition::project` and `construct` take and return them.
-- **Only `KeyPrimitive::I32` and `I64` can be encoded.** DATE, DECIMAL, and the other key types have no encoding.
-- **Tags are looked up at run time,** by linear scans of four flat constant tables.
+- **Every key value crossed its API as an `i64`.** `MergedIndexDefinition::project` and `construct` took and returned them.
+- **Only `KeyPrimitive::I32` and `I64` could be encoded.** DATE, DECIMAL, and the other key types had no encoding.
+- **Tags were looked up at run time,** by linear scans of four flat constant tables.
 
 The companion note `merged_index_vldb2026_slides/docs/key-trie-laminar-ranges.tex` frames a merged index as a **key trie**:
 
@@ -111,42 +111,40 @@ Each failure is a compiler error that names the spec line.
 
 ## The static trie
 
-The parsed trie becomes a static Rust value that mirrors the spec and stores nothing that can be derived:
+The parsed trie becomes a static Rust value, `KeyTrie` in `merged_index/trie.rs`. It is a nested tree that mirrors the spec and stores nothing that can be derived:
 
 ```rust
 pub struct KeyTrie {
     pub name: &'static str,
-    pub domains: &'static [Domain],       // tag = position + 1
-    pub nodes: &'static [Node],           // pre-order; the root is implicit
-    pub placements: &'static [Placement], // id = position + 1
-}
-
-pub struct Domain {
-    pub name: &'static str,
-    pub columns: &'static [(&'static str, &'static str)], // (relation, column)
+    pub domains: &'static [Domain],   // the spec's `domains` block: column membership only
+    pub children: &'static [Node],    // the root's children; the root is implicit
 }
 
 pub struct Node {
-    pub parent: Option<usize>, // None for a child of the root
-    pub domain: usize,
+    pub domain: &'static str,         // the edge into this node, by domain name
+    pub placements: &'static [Placement],
+    pub children: &'static [Node],
 }
 
 pub struct Placement {
-    pub node: usize,
     pub relation: &'static str,
-    pub via: &'static [(usize, &'static str)], // (domain, relation)
-    pub payload: Payload,
-}
-
-pub enum Payload {
-    All,
-    Columns(&'static [&'static str]),
+    pub via: &'static [Via],          // Via { domain, relation }
+    pub payload: Payload,             // All, or Columns(names); metadata only
 }
 ```
 
-Everything else is computed by methods: a domain's tag, a placement's id and name, a node's path, a placement's key columns, and whether it is a primary index.
+`Domain` is a name with its `(relation, column)` members, so a domain's columns are looked up by name.
 
-The compiler's Java model has the same shape, and the emitter prints it as this Rust value. COL's trie has three domains, three nodes (`custkey`, then `orderkey` below it, then `linenumber` below that), and three placements.
+The tree stores no indices, parent links, tags, ids, or paths. Each query walks the tree in pre-order and recomputes what it needs:
+
+- `placements()` returns each placement with its id (visit position + 1) and its path of domain names;
+- `domain_tag(name)` returns the position of the domain's first appearance in the walk, + 1;
+- `PlacedIndex` derives `name()`, `is_primary()`, and `key_columns(&trie)`;
+- `validate()` checks the schema-free rules of the Validation section: declared and distinct domains, no repeat on a path, one placement per relation per node, at most 255 domains and 255 placements, and that every path domain resolves through an own column or a valid `via`. Type, NOT NULL, and primary-key checks need the schema, so they stay in the compiler.
+
+Tries are three or four levels deep, so this favors clean code over speed. Folding does not walk the tree: it uses constants, which `testing::check_against_trie` ties to the trie.
+
+The compiler's Java model has the same shape, and the emitter prints it as this Rust value. COL's `TRIE` in `merged-index-col/src/lib.rs` reads like its spec: `custkey { Customer; orderkey { Orders; linenumber { Lineitem [custkey via Orders] } } }`.
 
 ## Generated code
 
@@ -169,14 +167,17 @@ The generated module needs two things from `crates/dbsp/src/trace/merged_index/`
 
 ### A reshaped `MergedIndexDefinition`
 
-It assumes the typed-payload change is merged, which adds `type Payload: DBData` and removes `PayloadBytes`. On top of that, the trait would have these items:
+Implemented, for keys only. The trait now has these items:
 
-- `type Key` and `type Payload`;
+- `type Key`;
 - `const TRIE: KeyTrie`;
-- typed `fold` and `unfold`;
-- a function giving the placement of a key, and one giving the placement of a payload. `build_batch` uses them to reject a payload of the wrong variant.
+- typed `fold` and `unfold`. `fold` cannot fail, because the key's fields are typed.
 
-This replaces the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
+Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` writes `(tag, value)` pairs in path order and ends a key with `finish(id)`, `prefix()`, or `then_tag(tag)`. `KeyDecoder` checks the terminator, splits off the id, and reads one tagged field at a time. A definition, hand-written now and generated in Step 4, is straight-line code over them.
+
+This replaced the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
+
+`type Payload` and a function giving the placement of a key or payload are not part of this step. They arrive with the typed-payload change, which also removes `PayloadBytes`. `build_batch` will use them to reject a payload of the wrong variant.
 
 ### Order-preserving key encoders
 
@@ -202,6 +203,10 @@ These are user decisions of 2026-10-16. They are recorded here until they are en
 - The first scope is the definition and typed fold, unfold, and prefix. Readers and joins stay hand-written.
 - Key types are fixed-width only.
 - Key columns must be NOT NULL, so there is no NULL key encoding for now.
+- The static trie is a nested tree literal that mirrors the spec. It stores no indices, parent links, tags, ids, or paths. A pre-order walk recomputes them on each request, and clean code wins over speed.
+- Tags are the first appearance in the pre-order walk + 1, and placement ids are the visit position + 1.
+- Step 2 covers keys only. `PayloadBytes`, `encode_payload`, and `decode_payload` stay as they are. `type Payload` and the placement functions move to the typed-payload change.
+- The hand-written COL prefix functions are named the way the emitter will name them: `prefix_custkey`, `prefix_custkey_orderkey`, and `prefix_custkey_orderkey_then_linenumber`.
 
 ## Roadmap
 
@@ -210,8 +215,9 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
 1. **Key encoders.** Implemented: `OrderedKey`, with its implementations in dbsp, sqllib, and fxp.
    - Exit check: proptests that byte order equals `Ord`, that decoding round-trips, and that widths are exact, including boundary values.
    - Exit check: the i32 and i64 bytes are unchanged.
-2. **Static trie and reshaped trait.** Add `KeyTrie` and the new `MergedIndexDefinition`, and port the hand-written COL to them, including a hand-written `TRIE`.
-   - Exit check: the COL tests and `verify.sh` pass with unchanged transcripts.
+2. **Static trie and reshaped trait.** Implemented, for keys only: `KeyTrie`, the new `MergedIndexDefinition`, `KeyEncoder` and `KeyDecoder`, and the hand-written COL ported to them with a hand-written `TRIE`.
+   - Exit check: the COL tests and `verify.sh` pass with unchanged transcripts. The golden-byte tests are unchanged.
+   - Exit check: `check_against_trie` and a proptest tie COL's hard-coded tags and ids to its trie.
 3. **Parser and validator** in the SQL compiler, with no emission yet.
    - Exit check: JUnit tests of the derivation. COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
    - Exit check: one failing case per validation rule.

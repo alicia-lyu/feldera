@@ -17,8 +17,8 @@ The merged index is secondary storage, kept beside Feldera's own base-table stat
 A folded key (K) is a byte string that sorts a customer before its orders, and an order before its lines. The storage layer compares K as opaque lexicographic bytes.
 
 ```text
-domain tags:        INDEX = 0x00, customer = 0x01, order = 0x02, line = 0x03
-source-index tags:  CustomerPrimary = 0x01, OrdersByCustomer = 0x02, LineitemByCustomer = 0x03
+domain tags:    INDEX = 0x00, custkey = 0x01, orderkey = 0x02, linenumber = 0x03
+placement ids:  CustomerByCustkey = 0x01, OrdersByCustkeyOrderkey = 0x02, LineitemByCustkeyOrderkeyLinenumber = 0x03
 
 fold_iN(x) = big_endian_N_bits((x as unsigned_N_bits) XOR sign_bit_N)
 
@@ -30,34 +30,34 @@ L(c,o,l): 0x01 fold_i64(c) | 0x02 fold_i64(o) | 0x03 fold_i32(l) | INDEX | 0x03 
 Rules:
 
 - **Field widths.** Customer and order IDs are `i64`; line numbers are `i32`. The sign-bit flip preserves signed order within a domain.
-- **Terminal tag.** The key ends with `INDEX` and the source-index tag. `INDEX` is not an extra end marker: its value sorts below every child-domain tag, so a customer precedes its orders.
+- **Terminal tag.** The key ends with `INDEX` and the placement id. `INDEX` is not an extra end marker: its value sorts below every child-domain tag, so a customer precedes its orders.
 - **Nothing else in K.** Payload, weight, and occurrence counters never extend K.
-- **Checked conversion.** Generic field values are `i64`. A value for an `I32` domain is converted with a range check; `fold` and `prefix` return an error outside the range.
-- **Validation.** `unfold` rejects wrong lengths, wrong domain tags, a missing `INDEX` tag, and unknown or ambiguous source tags. Tag bindings that reuse `0x00` or collide are rejected.
-- **Prefixes.** `MergedIndex::prefix` returns the leading fields without `INDEX` or the source tag. A customer prefix ends after `c`; an order prefix ends after `o`; a line prefix also includes the line domain tag.
+- **Typed fields.** Key fields keep their Rust types. A line number is an `i32`, so no range check is needed and `fold` cannot fail.
+- **Validation.** `unfold` rejects wrong lengths, wrong domain tags, a missing `INDEX` tag, trailing bytes, and unknown placement ids. `KeyDecoder` implements the checks that do not depend on the definition.
+- **Prefixes.** `KeyEncoder::prefix` returns the leading fields without `INDEX` or the placement id. A customer prefix ends after `c`; an order prefix ends after `o`; a line prefix also includes the line domain tag, through `KeyEncoder::then_tag`.
 - **Scans.** A prefix scan seeks the prefix and steps until the key no longer starts with it. No successor function is needed.
 
-Fixture tests: `mixed_width_folding_uses_definition_metadata`, `signed_boundaries_round_trip_and_sort_in_both_domains`, `i32_fields_reject_out_of_range_projection_and_prefix_values`, `malformed_keys_are_rejected_without_panics`, and `ambiguous_domain_tags_are_rejected` in `crates/dbsp/src/trace/merged_index/tests.rs`.
+Fixture tests: `mixed_width_folding_writes_tags_values_terminator_and_id`, `signed_boundaries_round_trip_and_sort`, `malformed_keys_are_rejected_without_panics`, `decoder_reports_each_kind_of_malformed_key`, and the `validate_rejects_*` tests in `crates/dbsp/src/trace/merged_index/tests.rs`.
 
 ## Definition and source types
 
-The definition separates three things:
+The definition is a static key trie plus typed folding. It separates three things:
 
-- **Key domains** name a logical identity (`customer`, `order`, `line`) and its primitive type (`KeyPrimitive::I64` or `I32`). Shared domain identity, not field-name similarity, establishes shared ordering.
-- **Source indexes** (`SourceIndexSpec`) select ordered key fields and payload fields from one base relation. The base-relation ID is symbolic.
-- **Byte tags** (`DomainByteTag`, `SourceByteTag`) belong to one merged-index definition. Another merged index can assign different tags to the same source index.
+- **Domains** name a logical identity (`custkey`, `orderkey`, `linenumber`) and list the columns that join on equal values. Shared domain identity, not field-name similarity, establishes shared ordering. The key field types are Rust types (`i64`, `i32`) with an `OrderedKey` encoding.
+- **Placements** put an index on one relation at a trie node. The path from the root to the node lists the key's domains. A placement may take a key value from another relation (`custkey via Orders`).
+- **Byte tags and placement ids** are derived from the trie by a pre-order walk: tags are the first appearance of a domain, and ids are the visit order of placements. Another merged index can assign different tags to the same relation.
 
-In Rust, `MergedIndexDefinition` supplies these constants plus `project` (typed key to source index and field values) and `construct` (the inverse). `MergedIndex<D>` folds, unfolds, and builds prefixes from any such definition. Source row types have no global folding operation.
+In Rust, `MergedIndexDefinition` supplies `type Key`, `const TRIE: KeyTrie`, and typed `fold` and `unfold`. The design of the trie is in [general-definition.md](general-definition.md). Source row types have no global folding operation.
 
 COL fills in the definition as `CustomerOrdersLineitemDefinition`, with `SourceKey` variants `Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`:
 
-| Source index | Key fields | Payload |
+| Placement (id) | Key fields | Payload |
 | --- | --- | --- |
-| `CustomerPrimary` | customer | `CustomerPayload { segment: SqlString }` |
-| `OrdersByCustomer` | customer, order | `OrdersPayload { order_date: Date, ship_priority: i32 }` |
-| `LineitemByCustomer` | customer, order, line | `LineitemPayload { ship_date: Date, extended_price: SqlDecimal<15, 2>, discount: SqlDecimal<4, 2> }` |
+| `CustomerByCustkey` (1) | custkey | `CustomerPayload { segment: SqlString }` |
+| `OrdersByCustkeyOrderkey` (2) | custkey, orderkey | `OrdersPayload { order_date: Date, ship_priority: i32 }` |
+| `LineitemByCustkeyOrderkeyLinenumber` (3) | custkey, orderkey, linenumber | `LineitemPayload { ship_date: Date, extended_price: SqlDecimal<15, 2>, discount: SqlDecimal<4, 2> }` |
 
-`CustomerOrdersLineitemIndex` wraps `MergedIndex<CustomerOrdersLineitemDefinition>` with typed `fold`, `unfold`, prefix helpers (`customer_prefix`, `order_prefix`, `line_prefix`), `encode_payload`, `decode_payload`, and `build_batch`.
+`CustomerOrdersLineitemIndex` delegates `fold` and `unfold` to the definition. It adds prefix helpers (`prefix_custkey`, `prefix_custkey_orderkey`, `prefix_custkey_orderkey_then_linenumber`), `encode_payload`, `decode_payload`, and `build_batch`. The definition's tags and ids are constants. The tests tie them to the trie with `check_against_trie`.
 
 Payload rules:
 
@@ -65,7 +65,7 @@ Payload rules:
 - Only K needs an order-preserving encoding. The file merger orders payload bytes for equality and merging, not as a query-visible order.
 - Prototype files written with an earlier payload codec must be regenerated; there is no migration.
 
-A future SQL compiler extension could emit these static definitions. That is not implemented. Any generator must reproduce the exact folded bytes and payload serialization before it replaces the handwritten definition.
+A future SQL compiler extension could emit these static definitions; see [general-definition.md](general-definition.md). That is not implemented. Any generator must reproduce the exact folded bytes and payload serialization before it replaces the handwritten definition.
 
 ## Batch layout
 
@@ -73,7 +73,7 @@ A future SQL compiler extension could emit these static definitions. That is not
 
 - It sorts by `(K, payload)`, adds the weights of equal pairs, reports overflow as an error, and omits zero totals.
 - It requests `BatchLocation::Memory` for the initial run. Feldera's generic builders can choose a file during construction; this explicit request keeps the initial run in memory (test `initial_col_run_stays_in_memory_when_runtime_selects_files`).
-- The typed `CustomerOrdersLineitemIndex::build_batch` also checks that each payload matches its key's source index.
+- The typed `CustomerOrdersLineitemIndex::build_batch` also checks that each payload matches its key's placement.
 
 The batch is inserted once into a native `Spine` created with `TraceRole::Integral`. Persistence and compaction then follow Feldera's native placement policy. There is no custom merger, cursor framework, or staging area.
 
