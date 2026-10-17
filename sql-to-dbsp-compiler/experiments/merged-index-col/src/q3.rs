@@ -100,7 +100,7 @@ impl Q3State {
         let index = CustomerOrdersLineitemIndex::default();
         let mut output = RequestedRows::new();
         for customer in requested_keys(delta) {
-            let key = index.fold(&SourceKey::Customer(customer))?;
+            let key = index.fold(&SourceKey::Customer(customer));
             scan(
                 &index,
                 &views.after,
@@ -108,7 +108,7 @@ impl Q3State {
                 |key, bytes, weight| {
                     if let SourceKey::Customer(id) = key {
                         if let SourcePayload::Customer(payload) = index.decode_payload(
-                            index.fold(&SourceKey::Customer(id))?.as_bytes(),
+                            index.fold(&SourceKey::Customer(id)).as_bytes(),
                             bytes,
                         )? {
                             output.push(Tup1(id), Tup1(payload.segment), weight);
@@ -132,11 +132,11 @@ impl Q3State {
             scan(
                 &index,
                 &views.before,
-                &index.customer_prefix(customer),
+                &index.prefix_custkey(customer),
                 |key, bytes, weight| {
                     if let SourceKey::Orders(c, order) = key {
                         if let SourcePayload::Orders(payload) = index.decode_payload(
-                            index.fold(&SourceKey::Orders(c, order))?.as_bytes(),
+                            index.fold(&SourceKey::Orders(c, order)).as_bytes(),
                             bytes,
                         )? {
                             output.push(
@@ -163,7 +163,7 @@ impl Q3State {
         for order in requested_keys(delta) {
             for &customer in placements(&views, order)? {
                 let mut customers = Vec::new();
-                let customer_key = index.fold(&SourceKey::Customer(customer))?;
+                let customer_key = index.fold(&SourceKey::Customer(customer));
                 scan(
                     &index,
                     &views.after,
@@ -179,7 +179,7 @@ impl Q3State {
                         Ok(())
                     },
                 )?;
-                let order_key = index.fold(&SourceKey::Orders(customer, order))?;
+                let order_key = index.fold(&SourceKey::Orders(customer, order));
                 scan(
                     &index,
                     &views.after,
@@ -226,11 +226,11 @@ impl Q3State {
                 scan(
                     &index,
                     &views.before,
-                    &index.line_prefix(customer, order),
+                    &index.prefix_custkey_orderkey_then_linenumber(customer, order),
                     |key, bytes, weight| {
                         if let SourceKey::Lineitem(c, o, line) = key {
                             if let SourcePayload::Lineitem(payload) = index.decode_payload(
-                                index.fold(&SourceKey::Lineitem(c, o, line))?.as_bytes(),
+                                index.fold(&SourceKey::Lineitem(c, o, line)).as_bytes(),
                                 bytes,
                             )? {
                                 output.push(

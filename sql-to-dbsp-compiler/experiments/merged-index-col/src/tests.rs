@@ -1,6 +1,7 @@
 use super::*;
 use dbsp::trace::merged_index::batch::batch_cursor;
-use dbsp::trace::merged_index::{KeyPrimitive, MergedIndexDefinition};
+use dbsp::trace::merged_index::testing::check_against_trie;
+use dbsp::trace::merged_index::{write_parent, ColumnRef, MergedIndexDefinition, PlacedIndex};
 use dbsp::{
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
     storage::{
@@ -17,6 +18,7 @@ use dbsp::{
 };
 use feldera_sqllib::{Date, SqlDecimal};
 use feldera_types::config::{StorageConfig, StorageOptions};
+use proptest::prelude::*;
 use tempfile::tempdir;
 
 fn index() -> CustomerOrdersLineitemIndex {
@@ -155,12 +157,12 @@ fn cursor_exact_and_lower_bound_seeks_after_rewind() {
             .unwrap(),
     ];
     let mut cursor = batch_cursor(&batches);
-    let first = index.fold(&SourceKey::Customer(1)).unwrap();
+    let first = index.fold(&SourceKey::Customer(1));
     assert!(cursor.seek_key_exact(first.as_bytes().to_vec().erase(), None));
     assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
-    let cancelled = index.fold(&SourceKey::Customer(2)).unwrap();
+    let cancelled = index.fold(&SourceKey::Customer(2));
     assert!(!cursor.seek_key_exact(cancelled.as_bytes().to_vec().erase(), None));
-    let after = index.fold(&SourceKey::Customer(4)).unwrap();
+    let after = index.fold(&SourceKey::Customer(4));
     assert!(!cursor.seek_key_exact(after.as_bytes().to_vec().erase(), None));
     cursor.rewind_keys();
     cursor.seek_key(cancelled.as_bytes().to_vec().erase());
@@ -206,7 +208,7 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
             .build_batch([order.clone(), customer_row(5, "A", -1)])
             .unwrap(),
     ];
-    let prefix = index.customer_prefix(5);
+    let prefix = index.prefix_custkey(5);
     let mut cursor = batch_cursor(&batches);
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
@@ -252,7 +254,7 @@ fn empty_batches_and_cancelled_rows_are_skipped() {
         vec![customer_row(2, "B", -3)]
     );
     cursor.rewind_keys();
-    let first = index.fold(&SourceKey::Customer(1)).unwrap();
+    let first = index.fold(&SourceKey::Customer(1));
     cursor.seek_key(first.as_bytes().to_vec().erase());
     assert_eq!(cursor_row(&index, &mut cursor), customer_row(2, "B", -3));
 }
@@ -278,9 +280,9 @@ fn batch_rejects_weight_overflow_and_mismatched_payload() {
 #[test]
 fn exact_folded_keys_and_order() {
     let index = index();
-    let customer = index.fold(&SourceKey::Customer(-1)).unwrap();
-    let order = index.fold(&SourceKey::Orders(-1, 0)).unwrap();
-    let line = index.fold(&SourceKey::Lineitem(-1, 0, 1)).unwrap();
+    let customer = index.fold(&SourceKey::Customer(-1));
+    let order = index.fold(&SourceKey::Orders(-1, 0));
+    let line = index.fold(&SourceKey::Lineitem(-1, 0, 1));
     assert_eq!(
         customer.as_bytes(),
         &[1, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1]
@@ -297,23 +299,21 @@ fn exact_folded_keys_and_order() {
         ]
     );
     assert!(customer < order && order < line);
-    assert_eq!(index.customer_prefix(-1), customer.as_bytes()[..9]);
-    assert_eq!(index.order_prefix(-1, 0), order.as_bytes()[..18]);
-    assert_eq!(index.line_prefix(-1, 0), line.as_bytes()[..19]);
+    assert_eq!(index.prefix_custkey(-1), customer.as_bytes()[..9]);
+    assert_eq!(index.prefix_custkey_orderkey(-1, 0), order.as_bytes()[..18]);
+    assert_eq!(
+        index.prefix_custkey_orderkey_then_linenumber(-1, 0),
+        line.as_bytes()[..19]
+    );
     for key in [
         SourceKey::Customer(i64::MIN),
         SourceKey::Orders(i64::MAX, i64::MIN),
         SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MAX),
     ] {
-        assert_eq!(index.unfold(index.fold(&key).unwrap().as_bytes()), Ok(key));
+        assert_eq!(index.unfold(index.fold(&key).as_bytes()), Ok(key));
     }
-    assert!(
-        index.fold(&SourceKey::Customer(-1)).unwrap()
-            < index.fold(&SourceKey::Customer(0)).unwrap()
-    );
-    assert!(
-        index.fold(&SourceKey::Customer(0)).unwrap() < index.fold(&SourceKey::Customer(1)).unwrap()
-    );
+    assert!(index.fold(&SourceKey::Customer(-1)) < index.fold(&SourceKey::Customer(0)));
+    assert!(index.fold(&SourceKey::Customer(0)) < index.fold(&SourceKey::Customer(1)));
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn malformed_folded_keys_are_rejected() {
         SourceKey::Orders(1, 2),
         SourceKey::Lineitem(1, 2, 3),
     ] {
-        let bytes = index.fold(&key).unwrap().as_bytes().to_vec();
+        let bytes = index.fold(&key).as_bytes().to_vec();
         assert!(index.unfold(&bytes[..bytes.len() - 1]).is_err());
         let mut extra = bytes.clone();
         extra.push(0);
@@ -373,7 +373,7 @@ fn payload_round_trip_and_corruption() {
         ),
     ];
     for (key, payload) in pairs {
-        let folded = index.fold(&key).unwrap();
+        let folded = index.fold(&key);
         let encoded = index.encode_payload(&payload).unwrap();
         assert_eq!(encoded, index.encode_payload(&payload).unwrap());
         assert_eq!(
@@ -384,7 +384,7 @@ fn payload_round_trip_and_corruption() {
         assert!(index.decode_payload(&[0], encoded.as_bytes()).is_err());
     }
 
-    let customer_key = index.fold(&SourceKey::Customer(i64::MAX)).unwrap();
+    let customer_key = index.fold(&SourceKey::Customer(i64::MAX));
     let customer = SourcePayload::Customer(CustomerPayload {
         segment: ("東京 café ".repeat(80)).into(),
     });
@@ -399,7 +399,7 @@ fn payload_round_trip_and_corruption() {
         .decode_payload(customer_key.as_bytes(), &corrupt)
         .is_err());
 
-    let order_key = index.fold(&SourceKey::Orders(i64::MIN, i64::MAX)).unwrap();
+    let order_key = index.fold(&SourceKey::Orders(i64::MIN, i64::MAX));
     let order = SourcePayload::Orders(OrdersPayload {
         order_date: Date::from_days(i32::MIN),
         ship_priority: i32::MAX,
@@ -409,9 +409,7 @@ fn payload_round_trip_and_corruption() {
         index.decode_payload(order_key.as_bytes(), encoded.as_bytes()),
         Ok(order)
     );
-    let line_key = index
-        .fold(&SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN))
-        .unwrap();
+    let line_key = index.fold(&SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN));
     let line = SourcePayload::Lineitem(LineitemPayload {
         ship_date: Date::from_days(i32::MAX),
         extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
@@ -424,103 +422,126 @@ fn payload_round_trip_and_corruption() {
     );
 }
 
-#[test]
-fn line_number_conversion_is_checked() {
-    assert_eq!(
-        CustomerOrdersLineitemDefinition::construct(LINEITEM, &[1, 2, i32::MAX as i64 + 1]),
-        None
-    );
-    assert_eq!(
-        CustomerOrdersLineitemDefinition::construct(LINEITEM, &[1, 2, i32::MIN as i64 - 1]),
-        None
-    );
-    let index = index();
-    assert!(index
-        .base
-        .prefix(LINEITEM, &[1, 2, i32::MAX as i64 + 1])
-        .is_err());
+fn column(relation: &'static str, column: &'static str) -> ColumnRef {
+    ColumnRef { relation, column }
 }
 
 #[test]
-fn q3_descriptors_keep_logical_fields_separate_from_tags() {
-    let specs = CustomerOrdersLineitemDefinition::SOURCE_INDEX_SPECS;
+fn trie_is_valid_and_derives_the_spec() {
+    TRIE.validate().unwrap();
     assert_eq!(
-        specs.iter().map(|spec| spec.id.0).collect::<Vec<_>>(),
-        ["CustomerPrimary", "OrdersByCustomer", "LineitemByCustomer"]
-    );
-    assert_eq!(
-        specs
-            .iter()
-            .map(|spec| spec.base_relation.0)
-            .collect::<Vec<_>>(),
-        ["Customer", "Orders", "ExtendedLineitem"]
-    );
-    assert_eq!(
-        CustomerOrdersLineitemDefinition::KEY_DOMAINS
-            .iter()
-            .map(|domain| (domain.id.0, domain.primitive))
-            .collect::<Vec<_>>(),
-        [
-            ("customer", KeyPrimitive::I64),
-            ("order", KeyPrimitive::I64),
-            ("line", KeyPrimitive::I32)
-        ]
-    );
-    for spec in specs {
-        for field in spec.key_fields {
-            assert!(CustomerOrdersLineitemDefinition::KEY_DOMAINS
-                .iter()
-                .any(|domain| domain.id == field.domain));
-            assert!(!spec.payload_fields.contains(&field.name));
-        }
-        assert!(spec
-            .payload_fields
-            .iter()
-            .all(|field| !spec.key_fields.iter().any(|key| key.name == *field)));
-    }
-    assert_eq!(
-        specs[0]
-            .key_fields
-            .iter()
-            .map(|field| field.domain.0)
-            .collect::<Vec<_>>(),
-        ["customer"]
-    );
-    assert_eq!(
-        specs[1]
-            .key_fields
-            .iter()
-            .map(|field| field.domain.0)
-            .collect::<Vec<_>>(),
-        ["customer", "order"]
-    );
-    assert_eq!(
-        specs[2]
-            .key_fields
-            .iter()
-            .map(|field| field.domain.0)
-            .collect::<Vec<_>>(),
-        ["customer", "order", "line"]
-    );
-    assert_eq!(specs[0].payload_fields, ["segment"]);
-    assert_eq!(specs[1].payload_fields, ["order_date", "ship_priority"]);
-    assert_eq!(
-        specs[2].payload_fields,
-        ["ship_date", "extended_price", "discount"]
+        ["custkey", "orderkey", "linenumber"].map(|domain| TRIE.domain_tag(domain)),
+        [Some(1), Some(2), Some(3)]
     );
 
+    let placements = TRIE.placements();
+    assert_eq!(
+        placements
+            .iter()
+            .map(|placed| placed.id)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        placements.iter().map(PlacedIndex::name).collect::<Vec<_>>(),
+        [
+            "CustomerByCustkey",
+            "OrdersByCustkeyOrderkey",
+            "LineitemByCustkeyOrderkeyLinenumber"
+        ]
+    );
+    assert_eq!(
+        placements
+            .iter()
+            .map(PlacedIndex::is_primary)
+            .collect::<Vec<_>>(),
+        [true, false, false]
+    );
+    assert_eq!(
+        placements[0].key_columns(&TRIE),
+        [column("Customer", "c_custkey")]
+    );
+    assert_eq!(
+        placements[1].key_columns(&TRIE),
+        [
+            column("Orders", "o_custkey"),
+            column("Orders", "o_orderkey")
+        ]
+    );
+    // `custkey via Orders` takes the customer key from `Orders.o_custkey`.
+    assert_eq!(
+        placements[2].key_columns(&TRIE),
+        [
+            column("Orders", "o_custkey"),
+            column("Lineitem", "l_orderkey"),
+            column("Lineitem", "l_linenumber")
+        ]
+    );
+}
+
+#[test]
+fn hard_coded_tags_and_ids_agree_with_the_trie_at_the_extremes() {
+    check_against_trie::<CustomerOrdersLineitemDefinition>([
+        SourceKey::Customer(i64::MIN),
+        SourceKey::Customer(i64::MAX),
+        SourceKey::Orders(i64::MIN, i64::MAX),
+        SourceKey::Orders(i64::MAX, i64::MIN),
+        SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
+        SourceKey::Lineitem(i64::MAX, i64::MIN, i32::MAX),
+        SourceKey::Lineitem(0, 0, 0),
+    ]);
+}
+
+proptest! {
+    #[test]
+    fn folding_round_trips_and_agrees_with_the_trie(customer: i64, order: i64, line: i32) {
+        check_against_trie::<CustomerOrdersLineitemDefinition>([
+            SourceKey::Customer(customer),
+            SourceKey::Orders(customer, order),
+            SourceKey::Lineitem(customer, order, line),
+        ]);
+    }
+
+    /// Within one placement, byte order is the order of the key fields.
+    #[test]
+    fn folded_lineitem_order_is_field_order(
+        left: (i64, i64, i32),
+        right: (i64, i64, i32),
+    ) {
+        let fold = |(c, o, l): (i64, i64, i32)| {
+            CustomerOrdersLineitemDefinition::fold(&SourceKey::Lineitem(c, o, l))
+        };
+        prop_assert_eq!(fold(left).cmp(&fold(right)), left.cmp(&right));
+    }
+
+    /// Every key of a customer, order, or line range starts with that range's prefix.
+    #[test]
+    fn prefixes_cover_exactly_their_ranges(customer: i64, order: i64, line: i32) {
+        let index = index();
+        let customer_prefix = index.prefix_custkey(customer);
+        let order_prefix = index.prefix_custkey_orderkey(customer, order);
+        let line_prefix = index.prefix_custkey_orderkey_then_linenumber(customer, order);
+        let order_key = index.fold(&SourceKey::Orders(customer, order));
+        let line_key = index.fold(&SourceKey::Lineitem(customer, order, line));
+        prop_assert!(order_key.as_bytes().starts_with(&customer_prefix));
+        prop_assert!(order_key.as_bytes().starts_with(&order_prefix));
+        prop_assert!(line_key.as_bytes().starts_with(&order_prefix));
+        prop_assert!(line_key.as_bytes().starts_with(&line_prefix));
+        prop_assert!(!order_key.as_bytes().starts_with(&line_prefix));
+    }
+}
+
+#[test]
+fn prefixes_nest_and_end_at_the_expected_tags() {
     let index = index();
-    let customer = index.customer_prefix(12);
-    let order = index.order_prefix(12, -4);
-    let line = index.line_prefix(12, -4);
+    let customer = index.prefix_custkey(12);
+    let order = index.prefix_custkey_orderkey(12, -4);
+    let line = index.prefix_custkey_orderkey_then_linenumber(12, -4);
     assert!(order.starts_with(&customer));
     assert!(line.starts_with(&order));
     assert_eq!(line.last(), Some(&3));
     assert_eq!(
-        index
-            .fold(&SourceKey::Lineitem(12, -4, 7))
-            .unwrap()
-            .as_bytes()[..line.len()],
+        index.fold(&SourceKey::Lineitem(12, -4, 7)).as_bytes()[..line.len()],
         line
     );
 }
@@ -672,7 +693,7 @@ fn layer_file_weighted_children_and_seeks() {
     ];
     let mut expected = Vec::new();
     for (key, payloads) in fixtures {
-        let folded = index.fold(&key).unwrap();
+        let folded = index.fold(&key);
         let children: Vec<_> = payloads
             .into_iter()
             .map(|(payload, weight)| (index.encode_payload(&payload).unwrap(), weight, payload))
@@ -682,10 +703,7 @@ fn layer_file_weighted_children_and_seeks() {
             .iter()
             .map(|(bytes, weight, _)| (bytes.clone(), *weight))
             .collect();
-        index
-            .base
-            .write_parent(&mut writer, &folded, &stored)
-            .unwrap();
+        write_parent(&mut writer, &folded, &stored).unwrap();
         expected.push((key, folded, children));
     }
     assert_eq!(writer.n_rows(), 6);
@@ -701,13 +719,13 @@ fn layer_file_weighted_children_and_seeks() {
         vec![(SourceKey::Orders(1, 20), expected_children)]
     );
 
-    let between = index.fold(&SourceKey::Orders(1, 15)).unwrap();
+    let between = index.fold(&SourceKey::Orders(1, 15));
     assert_eq!(
         read_from(&reader, &index, between.as_bytes(), None, 1),
         observed
     );
 
-    let prefix = index.customer_prefix(1);
+    let prefix = index.prefix_custkey(1);
     let scanned = read_from(&reader, &index, &prefix, Some(&prefix), usize::MAX);
     assert_eq!(
         scanned.iter().map(|(key, _)| key).collect::<Vec<_>>(),
@@ -725,6 +743,6 @@ fn layer_file_weighted_children_and_seeks() {
                 .collect::<Vec<_>>()
         );
     }
-    let after = index.fold(&SourceKey::Customer(3)).unwrap();
+    let after = index.fold(&SourceKey::Customer(3));
     assert!(read_from(&reader, &index, after.as_bytes(), None, 1).is_empty());
 }

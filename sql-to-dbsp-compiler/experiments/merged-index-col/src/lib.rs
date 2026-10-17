@@ -7,77 +7,89 @@ use rkyv::{bytecheck, Archive, Deserialize, Serialize};
 
 use dbsp::storage::file::{to_bytes, Deserializer};
 use dbsp::trace::merged_index::{
-    BaseRelationId, DomainByteTag, FoldedKey, KeyDomain, KeyDomainId, KeyField, KeyPrimitive,
-    MergedIndex, MergedIndexDefinition, PayloadBytes, SourceByteTag, SourceIndexId,
-    SourceIndexSpec,
+    ColumnRef, Domain, FoldedKey, KeyDecoder, KeyEncoder, KeyTrie, MergedIndexDefinition, Node,
+    Payload, PayloadBytes, Placement, Via,
 };
 
-pub const CUSTOMER: SourceIndexId = SourceIndexId("CustomerPrimary");
-pub const ORDERS: SourceIndexId = SourceIndexId("OrdersByCustomer");
-pub const LINEITEM: SourceIndexId = SourceIndexId("LineitemByCustomer");
-pub const CUSTOMER_DOMAIN: KeyDomainId = KeyDomainId("customer");
-pub const ORDER_DOMAIN: KeyDomainId = KeyDomainId("order");
-pub const LINE_DOMAIN: KeyDomainId = KeyDomainId("line");
+/// The domain tags and placement ids that the trie below derives.
+/// `check_against_trie` in the tests ties these constants to the trie.
+const CUSTKEY: u8 = 1;
+const ORDERKEY: u8 = 2;
+const LINENUMBER: u8 = 3;
+const CUSTOMER_ID: u8 = 1;
+const ORDERS_ID: u8 = 2;
+const LINEITEM_ID: u8 = 3;
 
-const CUSTOMER_FIELDS: &[KeyField] = &[KeyField {
-    name: "customer_id",
-    domain: CUSTOMER_DOMAIN,
-}];
-const ORDERS_FIELDS: &[KeyField] = &[
-    KeyField {
-        name: "customer_id",
-        domain: CUSTOMER_DOMAIN,
-    },
-    KeyField {
-        name: "order_id",
-        domain: ORDER_DOMAIN,
-    },
-];
-const LINEITEM_FIELDS: &[KeyField] = &[
-    KeyField {
-        name: "customer_id",
-        domain: CUSTOMER_DOMAIN,
-    },
-    KeyField {
-        name: "order_id",
-        domain: ORDER_DOMAIN,
-    },
-    KeyField {
-        name: "line_id",
-        domain: LINE_DOMAIN,
-    },
-];
-
-pub const CUSTOMER_KEY_DOMAIN: KeyDomain = KeyDomain {
-    id: CUSTOMER_DOMAIN,
-    primitive: KeyPrimitive::I64,
-};
-pub const ORDER_KEY_DOMAIN: KeyDomain = KeyDomain {
-    id: ORDER_DOMAIN,
-    primitive: KeyPrimitive::I64,
-};
-pub const LINE_KEY_DOMAIN: KeyDomain = KeyDomain {
-    id: LINE_DOMAIN,
-    primitive: KeyPrimitive::I32,
-};
-
-pub const CUSTOMER_PRIMARY: SourceIndexSpec = SourceIndexSpec {
-    id: CUSTOMER,
-    base_relation: BaseRelationId("Customer"),
-    key_fields: CUSTOMER_FIELDS,
-    payload_fields: &["segment"],
-};
-pub const ORDERS_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
-    id: ORDERS,
-    base_relation: BaseRelationId("Orders"),
-    key_fields: ORDERS_FIELDS,
-    payload_fields: &["order_date", "ship_priority"],
-};
-pub const LINEITEM_BY_CUSTOMER: SourceIndexSpec = SourceIndexSpec {
-    id: LINEITEM,
-    base_relation: BaseRelationId("ExtendedLineitem"),
-    key_fields: LINEITEM_FIELDS,
-    payload_fields: &["ship_date", "extended_price", "discount"],
+/// The trie of the design doc's spec for this index:
+///
+/// ```text
+/// custkey { Customer; orderkey { Orders; linenumber { Lineitem [custkey via Orders] } } }
+/// ```
+pub const TRIE: KeyTrie = KeyTrie {
+    name: "CustomerOrdersLineitem",
+    domains: &[
+        Domain {
+            name: "custkey",
+            columns: &[
+                ColumnRef {
+                    relation: "Customer",
+                    column: "c_custkey",
+                },
+                ColumnRef {
+                    relation: "Orders",
+                    column: "o_custkey",
+                },
+            ],
+        },
+        Domain {
+            name: "orderkey",
+            columns: &[
+                ColumnRef {
+                    relation: "Orders",
+                    column: "o_orderkey",
+                },
+                ColumnRef {
+                    relation: "Lineitem",
+                    column: "l_orderkey",
+                },
+            ],
+        },
+        Domain {
+            name: "linenumber",
+            columns: &[ColumnRef {
+                relation: "Lineitem",
+                column: "l_linenumber",
+            }],
+        },
+    ],
+    children: &[Node {
+        domain: "custkey",
+        placements: &[Placement {
+            relation: "Customer",
+            via: &[],
+            payload: Payload::All,
+        }],
+        children: &[Node {
+            domain: "orderkey",
+            placements: &[Placement {
+                relation: "Orders",
+                via: &[],
+                payload: Payload::Columns(&["o_orderdate", "o_shippriority"]),
+            }],
+            children: &[Node {
+                domain: "linenumber",
+                placements: &[Placement {
+                    relation: "Lineitem",
+                    via: &[Via {
+                        domain: "custkey",
+                        relation: "Orders",
+                    }],
+                    payload: Payload::Columns(&["l_shipdate", "l_extendedprice", "l_discount"]),
+                }],
+                children: &[],
+            }],
+        }],
+    }],
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,56 +104,37 @@ pub struct CustomerOrdersLineitemDefinition;
 impl MergedIndexDefinition for CustomerOrdersLineitemDefinition {
     type Key = SourceKey;
 
-    const KEY_DOMAINS: &'static [KeyDomain] =
-        &[CUSTOMER_KEY_DOMAIN, ORDER_KEY_DOMAIN, LINE_KEY_DOMAIN];
-    const SOURCE_INDEX_SPECS: &'static [SourceIndexSpec] =
-        &[CUSTOMER_PRIMARY, ORDERS_BY_CUSTOMER, LINEITEM_BY_CUSTOMER];
+    const TRIE: KeyTrie = TRIE;
 
-    const DOMAIN_BYTE_TAGS: &'static [DomainByteTag] = &[
-        DomainByteTag {
-            domain: CUSTOMER_DOMAIN,
-            tag: 1,
-        },
-        DomainByteTag {
-            domain: ORDER_DOMAIN,
-            tag: 2,
-        },
-        DomainByteTag {
-            domain: LINE_DOMAIN,
-            tag: 3,
-        },
-    ];
-
-    const SOURCE_BYTE_TAGS: &'static [SourceByteTag] = &[
-        SourceByteTag {
-            source_index: CUSTOMER,
-            tag: 1,
-        },
-        SourceByteTag {
-            source_index: ORDERS,
-            tag: 2,
-        },
-        SourceByteTag {
-            source_index: LINEITEM,
-            tag: 3,
-        },
-    ];
-
-    fn project(key: &SourceKey) -> (SourceIndexId, Vec<i64>) {
+    fn fold(key: &SourceKey) -> FoldedKey {
         match *key {
-            SourceKey::Customer(c) => (CUSTOMER, vec![c]),
-            SourceKey::Orders(c, o) => (ORDERS, vec![c, o]),
-            SourceKey::Lineitem(c, o, l) => (LINEITEM, vec![c, o, i64::from(l)]),
+            SourceKey::Customer(c) => KeyEncoder::new().field(CUSTKEY, &c).finish(CUSTOMER_ID),
+            SourceKey::Orders(c, o) => KeyEncoder::new()
+                .field(CUSTKEY, &c)
+                .field(ORDERKEY, &o)
+                .finish(ORDERS_ID),
+            SourceKey::Lineitem(c, o, l) => KeyEncoder::new()
+                .field(CUSTKEY, &c)
+                .field(ORDERKEY, &o)
+                .field(LINENUMBER, &l)
+                .finish(LINEITEM_ID),
         }
     }
 
-    fn construct(source_index: SourceIndexId, fields: &[i64]) -> Option<SourceKey> {
-        match (source_index, fields) {
-            (CUSTOMER, [c]) => Some(SourceKey::Customer(*c)),
-            (ORDERS, [c, o]) => Some(SourceKey::Orders(*c, *o)),
-            (LINEITEM, [c, o, l]) => Some(SourceKey::Lineitem(*c, *o, (*l).try_into().ok()?)),
-            _ => None,
-        }
+    fn unfold(bytes: &[u8]) -> Result<SourceKey, String> {
+        let (placement_id, mut fields) = KeyDecoder::new(bytes)?;
+        let key = match placement_id {
+            CUSTOMER_ID => SourceKey::Customer(fields.field(CUSTKEY)?),
+            ORDERS_ID => SourceKey::Orders(fields.field(CUSTKEY)?, fields.field(ORDERKEY)?),
+            LINEITEM_ID => SourceKey::Lineitem(
+                fields.field(CUSTKEY)?,
+                fields.field(ORDERKEY)?,
+                fields.field(LINENUMBER)?,
+            ),
+            _ => return Err(format!("unknown placement id {placement_id}")),
+        };
+        fields.finish()?;
+        Ok(key)
     }
 }
 
@@ -174,9 +167,7 @@ pub enum SourcePayload {
 }
 
 #[derive(Default)]
-pub struct CustomerOrdersLineitemIndex {
-    pub base: MergedIndex<CustomerOrdersLineitemDefinition>,
-}
+pub struct CustomerOrdersLineitemIndex;
 
 impl CustomerOrdersLineitemIndex {
     pub fn build_batch(
@@ -186,7 +177,7 @@ impl CustomerOrdersLineitemIndex {
         let encoded = rows
             .into_iter()
             .map(|(key, payload, weight)| {
-                let folded = self.fold(&key)?;
+                let folded = self.fold(&key);
                 let bytes = self.encode_payload(&payload)?;
                 if self.decode_payload(folded.as_bytes(), bytes.as_bytes())? != payload {
                     return Err("payload does not match source key".into());
@@ -197,26 +188,37 @@ impl CustomerOrdersLineitemIndex {
         dbsp::trace::merged_index::batch::build_batch(encoded)
     }
 
-    pub fn fold(&self, key: &SourceKey) -> Result<FoldedKey, String> {
-        self.base.fold(key)
+    pub fn fold(&self, key: &SourceKey) -> FoldedKey {
+        CustomerOrdersLineitemDefinition::fold(key)
     }
 
     pub fn unfold(&self, key: &[u8]) -> Result<SourceKey, String> {
-        self.base.unfold(key)
+        CustomerOrdersLineitemDefinition::unfold(key)
     }
 
-    pub fn customer_prefix(&self, customer_id: i64) -> Vec<u8> {
-        self.base.prefix(CUSTOMER, &[customer_id]).unwrap()
+    /// The bytes shared by every key of one customer.
+    pub fn prefix_custkey(&self, customer_id: i64) -> Vec<u8> {
+        KeyEncoder::new().field(CUSTKEY, &customer_id).prefix()
     }
 
-    pub fn order_prefix(&self, customer_id: i64, order_id: i64) -> Vec<u8> {
-        self.base.prefix(ORDERS, &[customer_id, order_id]).unwrap()
+    /// The bytes shared by every key of one order.
+    pub fn prefix_custkey_orderkey(&self, customer_id: i64, order_id: i64) -> Vec<u8> {
+        KeyEncoder::new()
+            .field(CUSTKEY, &customer_id)
+            .field(ORDERKEY, &order_id)
+            .prefix()
     }
 
-    pub fn line_prefix(&self, customer_id: i64, order_id: i64) -> Vec<u8> {
-        self.base
-            .prefix_with_next_tag(LINEITEM, &[customer_id, order_id])
-            .unwrap()
+    /// The bytes shared by every line of one order, through the line tag.
+    pub fn prefix_custkey_orderkey_then_linenumber(
+        &self,
+        customer_id: i64,
+        order_id: i64,
+    ) -> Vec<u8> {
+        KeyEncoder::new()
+            .field(CUSTKEY, &customer_id)
+            .field(ORDERKEY, &order_id)
+            .then_tag(LINENUMBER)
     }
 
     pub fn encode_payload(&self, payload: &SourcePayload) -> Result<PayloadBytes, String> {
@@ -230,12 +232,12 @@ impl CustomerOrdersLineitemIndex {
     }
 
     pub fn decode_payload(&self, key: &[u8], bytes: &[u8]) -> Result<SourcePayload, String> {
-        let (source_index, _) = CustomerOrdersLineitemDefinition::project(&self.unfold(key)?);
-        match source_index {
-            CUSTOMER => decode::<CustomerPayload>(bytes).map(SourcePayload::Customer),
-            ORDERS => decode::<OrdersPayload>(bytes).map(SourcePayload::Orders),
-            LINEITEM => decode::<LineitemPayload>(bytes).map(SourcePayload::Lineitem),
-            _ => unreachable!("unfold returned a declared source index"),
+        match self.unfold(key)? {
+            SourceKey::Customer(_) => decode::<CustomerPayload>(bytes).map(SourcePayload::Customer),
+            SourceKey::Orders(..) => decode::<OrdersPayload>(bytes).map(SourcePayload::Orders),
+            SourceKey::Lineitem(..) => {
+                decode::<LineitemPayload>(bytes).map(SourcePayload::Lineitem)
+            }
         }
     }
 }

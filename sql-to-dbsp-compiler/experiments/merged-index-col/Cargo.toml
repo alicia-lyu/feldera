@@ -12,6 +12,7 @@ feldera-sqllib = { path = "../../../crates/sqllib" }
 rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
 
 [dev-dependencies]
+proptest = "1.5.0"
 feldera-storage = { path = "../../../crates/storage" }
 feldera-types = { path = "../../../crates/feldera-types" }
 tempfile = "3"

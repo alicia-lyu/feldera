@@ -270,7 +270,7 @@ pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>
 /// Seek one current complete Lineitem range, decoding only matching rows.
 pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
     let index = CustomerOrdersLineitemIndex::default();
-    let prefix = index.line_prefix(order.customer_key, order.key);
+    let prefix = index.prefix_custkey_orderkey_then_linenumber(order.customer_key, order.key);
     let mut cursor = snapshot.cursor();
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
