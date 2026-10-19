@@ -49,9 +49,21 @@ The placement map (order → customer) comes only from Orders rows in the same t
 
 Never infer an unmeasured quantity from leftover arithmetic, such as assigning residual storage to the index; the user rejected this as circular. Make no performance or savings claim without a raw artifact.
 
-### 2026-10-14: Leave the record-size gap open
+### 2026-10-16: Typed merged-index values
 
-After the POSIX fix and setup full compaction, the merged index still stores 1.68 times the bytes of the four native join traces it replaces, because each record is about twice as large. The investigation stops there: no encoding measurement or redesign is scheduled. Evidence is in [measurement.md](measurement.md#write-and-storage-investigation-2026-10-14).
+The merged index stores each value as the typed `SourcePayload`, not as `rkyv` bytes wrapped in a byte string. Only the folded key is a byte string, because its byte order is its query order.
+
+### 2026-10-16: Front-code byte-string keys, decoded on load
+
+Folded keys are unique, so the key level of the merged index deduplicates nothing, and DBSP's layer files store every key in full. The fix is prefix truncation in DBSP: on disk, each key in a data block is stored as the length of the prefix it shares with the previous key plus the remaining suffix. Reading expands each block to its ordinary form before any other code sees it, so cursors, seeks, and the buffer cache are unchanged; only disk bytes and I/O shrink. The user chose this over a per-block prefix read in place (LeanStore style) and over front coding kept in the cache.
+
+### 2026-10-16: Measure without block compression
+
+Storage compression stays off in the R5 runs, so front coding's effect is measured on its own.
+
+### 2026-10-16: "Key level" and "value level", not "column 0"
+
+The docs call the two nesting levels of a layer file the key level and the value level. They do not use DBSP's "column 0" and "column 1".
 
 ### 2026-09-28: Maintained views exclude selection predicates
 
@@ -86,6 +98,7 @@ These directions apply to the 2026-10-08 advisor deck; they do not set research 
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. |
 | 2026-09-28 | Require a transaction-level folded-key uniqueness check before a delta is incorporated. | 2026-10-12: no validator; uniqueness follows from the base tables' primary keys. |
 | 2026-09-28 | A physical old/new bit, or base/pending bit, in each stored record. | 2026-09-28: before/after read handles. |

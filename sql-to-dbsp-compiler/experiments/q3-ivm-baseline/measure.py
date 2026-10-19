@@ -203,6 +203,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.extend(["--diagnostics", str(Path(spec["run_dir"]) / "diagnostics")])
     if args.get("setup_full_compaction"):
         command.append("--setup-full-compaction")
+    if args.get("front_code_byte_keys"):
+        command.append("--front-code-byte-keys")
     return command
 
 
@@ -284,6 +286,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--setup-full-compaction", action="store_true",
                         help="fully compact the circuit and the merged index after loading, "
                              "before the refreshes; its cost is reported in the load section")
+    parser.add_argument("--front-code-byte-keys", action="store_true",
+                        help="front-code byte-string keys in storage files (the merged "
+                             "index's key level); native runs have no such keys")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
@@ -318,6 +323,7 @@ def run(argv: list[str]) -> int:
                           "verify": not args.no_verify,
                           "diagnostics": args.diagnostics,
                           "setup_full_compaction": args.setup_full_compaction,
+                          "front_code_byte_keys": args.front_code_byte_keys,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
         "inputs": {}, "executables": {}, "runs": [], "errors": [],
@@ -360,7 +366,8 @@ def run(argv: list[str]) -> int:
                                  "compaction_timeout_secs": args.compaction_timeout_secs,
                                  "no_verify": args.no_verify,
                                  "diagnostics": args.diagnostics,
-                                 "setup_full_compaction": args.setup_full_compaction}}
+                                 "setup_full_compaction": args.setup_full_compaction,
+                                 "front_code_byte_keys": args.front_code_byte_keys}}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",

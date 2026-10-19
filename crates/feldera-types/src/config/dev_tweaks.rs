@@ -53,6 +53,15 @@ pub struct DevTweaks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetch_join: Option<bool>,
 
+    /// Whether to front-code byte-string keys in storage files: each key is
+    /// stored as the length of the prefix it shares with the previous key and
+    /// the remaining suffix, and expanded again when read. It applies only to
+    /// files whose keys are raw byte strings with no auxiliary data, such as
+    /// a merged index's folded keys. Files written with it cannot be read by
+    /// older versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front_code_byte_keys: Option<bool>,
+
     /// Whether to asynchronously fetch keys needed for the distinct operator
     /// from storage.  Asynchronous fetching should be faster for high-latency
     /// storage, such as object storage, but it could use excessive amounts of
@@ -319,6 +328,9 @@ impl DevTweaks {
     }
     pub fn fetch_join(&self) -> bool {
         self.fetch_join.unwrap_or(false)
+    }
+    pub fn front_code_byte_keys(&self) -> bool {
+        self.front_code_byte_keys.unwrap_or(false)
     }
     pub fn fetch_distinct(&self) -> bool {
         self.fetch_distinct.unwrap_or(false)

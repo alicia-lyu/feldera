@@ -5,7 +5,8 @@
 use super::filter::{bloom_false_positive_rate, rate_can_evict, resident_modules};
 use super::format::MODULAR_BLOOM_FILTER_BLOCK_MAGIC;
 use super::format::{
-    BloomFilterBlock, Compression, FileTrailer, ModularBloomFilterHeader, RoaringBitmapFilterBlock,
+    BloomFilterBlock, Compression, FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer,
+    ModularBloomFilterHeader, RoaringBitmapFilterBlock,
 };
 use super::{AnyFactories, BatchKeyFilter, Deserializer, Factories};
 use crate::dynamic::{DynVec, WeightTrait};
@@ -99,6 +100,15 @@ pub enum CorruptionError {
         /// Actual file size.
         u64,
     ),
+
+    /// A front-coded data block does not decode.
+    #[error("Front-coded data block ({location}) is corrupt: {reason}")]
+    FrontCoding {
+        /// Block location.
+        location: BlockLocation,
+        /// What is wrong with it.
+        reason: String,
+    },
 
     /// Block has invalid checksum.
     #[error(
@@ -1505,7 +1515,7 @@ impl ImmutableFileRef {
 
 /// Upper bound on a block's decompressed size, used to reject a corrupt length
 /// prefix before it is turned into an allocation.
-const MAX_DECOMPRESSED_LEN: usize = 1 << 30;
+pub(super) const MAX_DECOMPRESSED_LEN: usize = 1 << 30;
 
 fn decompress(
     compression: Option<Compression>,
@@ -1626,6 +1636,11 @@ fn decompress(
             computed_checksum,
         }
         .into());
+    }
+    if raw[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC {
+        return super::front_code::decode(&raw)
+            .map(Arc::new)
+            .map_err(|reason| CorruptionError::FrontCoding { location, reason }.into());
     }
     Ok(raw)
 }

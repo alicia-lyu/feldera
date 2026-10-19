@@ -108,6 +108,11 @@ pub const DATA_BLOCK_MAGIC: [u8; 4] = *b"LFDB";
 /// Magic number for index blocks.
 pub const INDEX_BLOCK_MAGIC: [u8; 4] = *b"LFIB";
 
+/// Magic number for a data block whose keys are front-coded on disk; see
+/// [`front_code`](super::front_code). Reading expands it to an ordinary
+/// [`DATA_BLOCK_MAGIC`] block.
+pub const FRONT_CODED_DATA_BLOCK_MAGIC: [u8; 4] = *b"LFDK";
+
 /// Magic number for the file trailer block.
 pub const FILE_TRAILER_BLOCK_MAGIC: [u8; 4] = *b"LFFT";
 
@@ -304,7 +309,8 @@ impl FileTrailer {
     pub fn unknown_incompatible_features(&self) -> Option<u64> {
         let unknown_incompatible_features = self.incompatible_features
             & !INCOMPATIBLE_FEATURE_ROARING_FILTERS
-            & !INCOMPATIBLE_FEATURE_MODULAR_FILTERS;
+            & !INCOMPATIBLE_FEATURE_MODULAR_FILTERS
+            & !INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS;
         if unknown_incompatible_features != 0 {
             Some(unknown_incompatible_features)
         } else {
@@ -337,6 +343,10 @@ pub const INCOMPATIBLE_FEATURE_ROARING_FILTERS: u64 = 1 << 0;
 /// Bit set to 1 in [FileTrailer::incompatible_features] if the file contains a
 /// Bloom filter with more than one module.
 pub const INCOMPATIBLE_FEATURE_MODULAR_FILTERS: u64 = 1 << 1;
+
+/// Bit set to 1 in [FileTrailer::incompatible_features] if the file contains
+/// data blocks with front-coded keys ([`FRONT_CODED_DATA_BLOCK_MAGIC`]).
+pub const INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS: u64 = 1 << 2;
 
 /// Information about a column.
 ///

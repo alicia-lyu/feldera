@@ -117,13 +117,20 @@ python3 measure.py \
 ```
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
-`--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--cgroup-root`,
-`--total-memory-bytes`).
+`--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`,
+`--cgroup-root`, `--total-memory-bytes`).
 
 `--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests
 full compaction for the circuit and the merged index and waits for compaction to finish, then
 publishes and starts the measured refreshes. Nothing is compacted on request after any refresh.
 The report's `load.setup_full_compaction` holds the setup's cost.
+
+`--front-code-byte-keys` (also a driver flag) sets DBSP's `front_code_byte_keys` dev tweak. Every
+storage file writer then front-codes data blocks whose keys are raw byte strings with no auxiliary
+data, which in this experiment is only the merged index's key level; native runs write the same
+files as without it. The report's `front_coding` holds the writer's counters: blocks written
+front-coded, `layout_fallbacks` (eligible blocks the encoder did not understand, which should be 0),
+and `size_fallbacks` (blocks that front coding would not have shrunk by a 512-byte sector).
 
 `--diagnostics` turns on the opt-in storage diagnostics. Each run directory then gains a
 `diagnostics/` directory (the driver's own `--diagnostics DIR`, which needs file storage and one run

@@ -1399,6 +1399,9 @@ impl Runtime {
         Parameters::default()
             .with_compression(compression)
             .with_compression_level(options.compression_level)
+            .with_front_code_byte_keys(Runtime::with_dev_tweaks(|tweaks| {
+                tweaks.front_code_byte_keys()
+            }))
     }
 
     fn inner(&self) -> &RuntimeInner {

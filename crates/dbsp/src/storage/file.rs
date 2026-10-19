@@ -103,6 +103,7 @@ use std::{fmt::Debug, ptr::NonNull};
 pub mod block_stats;
 mod filter;
 pub mod format;
+mod front_code;
 mod item;
 pub mod reader;
 pub mod writer;

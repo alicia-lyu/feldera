@@ -4,7 +4,7 @@ use crate::{
     trace::DbspSerializer,
 };
 use rkyv::{Archive, Fallible, Serialize, archived_value, with::Inline};
-use std::{marker::PhantomData, mem::transmute};
+use std::{any::TypeId, marker::PhantomData, mem::transmute};
 
 /// An object-safe interface to types that represent (key, auxiliary data) pair.
 ///
@@ -95,6 +95,13 @@ where
         bytes: &'a [u8],
         pos: usize,
     ) -> &'a dyn ArchivedItem<'a, K, A>;
+
+    /// Whether data blocks of these items may be front-coded on disk: true
+    /// only for a `Vec<u8>` key with an auxiliary value whose archive is
+    /// empty, the layout that [`front_code`](super::front_code) understands.
+    fn front_codable_key(&self) -> bool {
+        false
+    }
 }
 
 /// Struct that implements the [`Item`] trait.
@@ -270,6 +277,9 @@ where
                 archived_value::<RefTup2<'a, K, A>>(bytes, pos);
             Tup2Deserialize::new(archived)
         }
+    }
+    fn front_codable_key(&self) -> bool {
+        TypeId::of::<K>() == TypeId::of::<Vec<u8>>() && size_of::<A::Archived>() == 0
     }
 }
 

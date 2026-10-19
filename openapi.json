@@ -10498,6 +10498,12 @@
             "default": null,
             "nullable": true
           },
+          "front_code_byte_keys": {
+            "type": "boolean",
+            "description": "Whether to front-code byte-string keys in storage files: each key is\nstored as the length of the prefix it shares with the previous key and\nthe remaining suffix, and expanded again when read. It applies only to\nfiles whose keys are raw byte strings with no auxiliary data, such as\na merged index's folded keys. Files written with it cannot be read by\nolder versions.",
+            "default": null,
+            "nullable": true
+          },
           "max_level0_batch_size_records": {
             "type": "integer",
             "format": "int32",

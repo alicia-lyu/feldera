@@ -15,10 +15,10 @@ use crate::storage::{
             BatchMetadata, BlockHeader, BloomFilterBlockRef, COMPATIBLE_FEATURE_FILTER64,
             COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT, DATA_BLOCK_MAGIC, DataBlockHeader,
             FILE_TRAILER_BLOCK_MAGIC, FileTrailer, FileTrailerColumn, FixedLen,
-            INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_ROARING_FILTERS,
-            INDEX_BLOCK_MAGIC, IndexBlockHeader, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
-            ModularBloomFilterBlockRef, NodeType, ROARING_BITMAP_FILTER_BLOCK_MAGIC,
-            RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
+            INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS, INCOMPATIBLE_FEATURE_MODULAR_FILTERS,
+            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader,
+            MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ModularBloomFilterBlockRef, NodeType,
+            ROARING_BITMAP_FILTER_BLOCK_MAGIC, RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
         },
         reader::TreeNode,
     },
@@ -40,7 +40,13 @@ use feldera_buffer_cache::CacheEntry;
 use feldera_storage::StoragePath;
 use lz4_flex::block::{compress_into, get_maximum_output_size};
 use snap::raw::{Encoder, max_compress_len};
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use std::{
     marker::PhantomData,
     mem::{replace, take},
@@ -141,6 +147,9 @@ pub struct Parameters {
 
     /// Compression level, for codecs that have one.
     pub compression_level: Option<i32>,
+    /// Whether to front-code the keys of data blocks whose items allow it
+    /// (see [`ItemFactory::front_codable_key`](super::item::ItemFactory::front_codable_key)).
+    pub front_code_byte_keys: bool,
 }
 
 impl Parameters {
@@ -171,6 +180,14 @@ impl Parameters {
         }
     }
 
+    /// Returns these parameters with `front_code_byte_keys` updated.
+    pub fn with_front_code_byte_keys(self, front_code_byte_keys: bool) -> Self {
+        Self {
+            front_code_byte_keys,
+            ..self
+        }
+    }
+
     /// Returns these parameters with `compression_level` updated.
     pub fn with_compression_level(self, compression_level: Option<i32>) -> Self {
         Self {
@@ -190,6 +207,7 @@ impl Default for Parameters {
             max_branch: usize::MAX,
             compression: Some(Compression::Snappy),
             compression_level: None,
+            front_code_byte_keys: false,
         }
     }
 }
@@ -339,8 +357,13 @@ impl ColumnWriter {
         A: DataTrait + ?Sized,
     {
         let rows = data_block.rows();
-        let (block, location) =
-            block_writer.write_block(data_block.raw, self.parameters.compression)?;
+        let front_code = self.parameters.front_code_byte_keys
+            && self.factories.item_factory::<K, A>().front_codable_key();
+        let (block, location) = block_writer.write_block_with_front_coding(
+            data_block.raw,
+            self.parameters.compression,
+            front_code,
+        )?;
 
         super::reader::DataBlock::<K, A>::from_raw_with_cache(
             block,
@@ -1054,7 +1077,22 @@ struct BlockWriter {
     zstd: Option<ZstdCompressor<'static>>,
     zstd_level: i32,
     offset: u64,
+    /// Whether any block has been written front-coded, which the file
+    /// trailer must declare.
+    wrote_front_coded: bool,
 }
+
+/// Data blocks written front-coded, process-wide.
+pub static FRONT_CODED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Data blocks eligible for front coding but written as they are because
+/// their layout did not match what the encoder understands. Nonzero means
+/// a bug or an unexpected archive layout.
+pub static FRONT_CODING_LAYOUT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Data blocks eligible for front coding but written as they are because
+/// front coding would not have saved space.
+pub static FRONT_CODING_SIZE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 impl BlockWriter {
     fn new(
@@ -1076,6 +1114,7 @@ impl BlockWriter {
                 level.clamp(*range.start(), *range.end())
             }),
             offset: 0,
+            wrote_front_coded: false,
         }
     }
 
@@ -1088,6 +1127,54 @@ impl BlockWriter {
     }
 
     fn write_block(
+        &mut self,
+        block: FBuf,
+        compression: Option<Compression>,
+    ) -> Result<(Arc<FBuf>, BlockLocation), StorageError> {
+        self.write_block_with_front_coding(block, compression, false)
+    }
+
+    /// Writes `block`, front-coded if `front_code` is set and front coding
+    /// makes it smaller, and returns the block as readers will see it.
+    fn write_block_with_front_coding(
+        &mut self,
+        mut block: FBuf,
+        compression: Option<Compression>,
+        front_code: bool,
+    ) -> Result<(Arc<FBuf>, BlockLocation), StorageError> {
+        if !front_code {
+            return self.write_encoded_block(block, compression);
+        }
+        // Checksum the block as readers will see it, padded as it would be
+        // written without front coding.
+        if compression.is_none() {
+            block.resize(block.len().next_multiple_of(512), 0);
+        }
+        let checksum = crc32c(&block[4..]).to_le_bytes();
+        block[..4].copy_from_slice(checksum.as_slice());
+        let Some(encoded) = super::front_code::encode(&block) else {
+            FRONT_CODING_LAYOUT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return self.write_encoded_block(block, compression);
+        };
+        // Uncompressed blocks occupy whole sectors, so only a saved sector
+        // saves space.
+        let saves_space = match compression {
+            None => encoded.len().div_ceil(512) < block.len().div_ceil(512),
+            Some(_) => encoded.len() < block.len(),
+        };
+        if !saves_space {
+            FRONT_CODING_SIZE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return self.write_encoded_block(block, compression);
+        }
+        FRONT_CODED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        self.wrote_front_coded = true;
+        let (_, location) = self.write_encoded_block(encoded, compression)?;
+        Ok((Arc::new(block), location))
+    }
+
+    /// Checksums `block`, compresses it with `compression` (or pads it to a
+    /// multiple of 512 bytes), and writes it.
+    fn write_encoded_block(
         &mut self,
         mut block: FBuf,
         compression: Option<Compression>,
@@ -1352,6 +1439,9 @@ impl Writer {
 
         // Write the file trailer block.
 
+        if self.writer.wrote_front_coded {
+            incompatible_features |= INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS;
+        }
         let mut file_trailer = FileTrailer {
             header: BlockHeader::new(&FILE_TRAILER_BLOCK_MAGIC),
             version: VERSION_NUMBER,

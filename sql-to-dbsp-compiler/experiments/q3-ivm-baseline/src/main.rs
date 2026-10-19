@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -20,6 +21,9 @@ use dbsp::circuit::{
     CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
 };
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
+use dbsp::storage::file::writer::{
+    FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS, FRONT_CODING_SIZE_FALLBACKS,
+};
 use dbsp_adapters::{CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
@@ -574,6 +578,9 @@ struct Config {
     /// Fully compact the circuit and the merged index after loading, before
     /// the measured refreshes, so both modes start from one run per spine.
     setup_full_compaction: bool,
+    /// Front-code byte-string keys in storage files (the merged index's key
+    /// level); see the DBSP dev tweak of the same name.
+    front_code_byte_keys: bool,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -638,6 +645,7 @@ impl Config {
                 "--runs" => config.runs = args.next().context("--runs needs number")?.parse()?,
                 "--no-verify" => config.verify = false,
                 "--setup-full-compaction" => config.setup_full_compaction = true,
+                "--front-code-byte-keys" => config.front_code_byte_keys = true,
                 "--r5" => config.r5 = true,
                 "--refresh-list" => {
                     config.refresh_list =
@@ -1064,6 +1072,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut circuit_config =
         CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
     circuit_config.dev_tweaks.fetch_join = Some(config.r5);
+    circuit_config.dev_tweaks.front_code_byte_keys = Some(config.front_code_byte_keys);
     let storage_path = config
         .storage_path
         .as_ref()
@@ -1347,8 +1356,15 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 "no forced compaction; loading waits for normal background merges only; no final wait"
             },
             "setup_full_compaction": config.setup_full_compaction,
+            "front_code_byte_keys": config.front_code_byte_keys,
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
+        },
+        // Process-wide writer counters: this process runs one measurement.
+        "front_coding": {
+            "blocks": FRONT_CODED_BLOCKS.load(Ordering::Relaxed),
+            "layout_fallbacks": FRONT_CODING_LAYOUT_FALLBACKS.load(Ordering::Relaxed),
+            "size_fallbacks": FRONT_CODING_SIZE_FALLBACKS.load(Ordering::Relaxed),
         },
         "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
             "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
@@ -2341,6 +2357,24 @@ mod measurement_tests {
             resources["backend_write_bytes"].as_u64().unwrap()
         );
         assert_eq!(compacted["refreshes"].as_array().unwrap().len(), 6);
+
+        // Front coding applies only to the merged index's byte-string keys,
+        // and every eligible block has the layout the encoder understands.
+        // The counters are process-wide, so only their signs are checked.
+        let config = Config {
+            storage_path: Some(directory.join("front-coded-storage")),
+            report: Some(directory.join("front-coded-report.json")),
+            front_code_byte_keys: true,
+            ..config
+        };
+        run(&config, 1)?;
+        let front_coded: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        assert_eq!(front_coded["configuration"]["front_code_byte_keys"], true);
+        let coding = &front_coded["front_coding"];
+        assert_eq!(coding["layout_fallbacks"], 0);
+        if cfg!(feature = "merged-index") {
+            assert!(coding["blocks"].as_u64().unwrap() > 0);
+        }
         Ok(())
     }
 }

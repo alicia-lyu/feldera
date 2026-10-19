@@ -17,7 +17,8 @@ use crate::{
         file::{
             TouchedWindowCount,
             format::{
-                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, FileTrailer,
+                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, FRONT_CODED_DATA_BLOCK_MAGIC,
+                FileTrailer, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
                 INCOMPATIBLE_FEATURE_MODULAR_FILTERS, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
                 ROARING_BITMAP_FILTER_BLOCK_MAGIC,
             },
@@ -48,6 +49,7 @@ use binrw::BinRead;
 use feldera_storage::file::FileId;
 use feldera_storage::{FileCommitter, FileReader, FileRw, StoragePath};
 use feldera_types::config::{StorageConfig, StorageOptions};
+use proptest::prelude::*;
 use rand::{Rng, seq::SliceRandom, thread_rng};
 use tempfile::tempdir;
 
@@ -2359,4 +2361,298 @@ fn a_legacy_filter_has_no_ladder_to_descend() {
             assert!(filters.maybe_contains_key(key as &DynData, None));
         }
     });
+}
+
+/// Byte-string keys shaped like the merged index's folded keys: many keys
+/// share long prefixes, so front coding has work to do.
+struct FoldedKeys;
+
+impl FoldedKeys {
+    /// Customer, order, and line of row `row0`: 8 lines per order, 4 orders
+    /// per customer.
+    fn fields(row0: usize) -> (u64, u64, u32) {
+        let (line, order) = (row0 % 8, row0 / 8);
+        ((order / 4) as u64, order as u64, line as u32)
+    }
+}
+
+impl TwoColumns for FoldedKeys {
+    type K0 = Vec<u8>;
+    type A0 = ();
+    type K1 = i64;
+    type A1 = i64;
+
+    fn n0() -> usize {
+        3000
+    }
+    fn key0(row0: usize) -> Self::K0 {
+        let (customer, order, line) = Self::fields(row0);
+        let mut key = vec![1];
+        key.extend_from_slice(&customer.to_be_bytes());
+        key.push(2);
+        key.extend_from_slice(&order.to_be_bytes());
+        key.push(3);
+        key.extend_from_slice(&line.to_be_bytes());
+        key.extend_from_slice(&[0, 3]);
+        key
+    }
+    fn near0(row0: usize) -> (Self::K0, Self::K0) {
+        // Consecutive keys differ before their last byte, so dropping the
+        // last byte sorts just before the key and appending a byte sorts just
+        // after it.
+        let key = Self::key0(row0);
+        let mut after = key.clone();
+        after.push(0);
+        (key[..key.len() - 1].to_vec(), after)
+    }
+    fn aux0(_row0: usize) -> Self::A0 {}
+
+    fn n1(row0: usize) -> usize {
+        1 + row0 % 3
+    }
+    fn key1(row0: usize, row1: usize) -> Self::K1 {
+        (row0 * 4 + row1 * 2) as i64
+    }
+    fn near1(row0: usize, row1: usize) -> (Self::K1, Self::K1) {
+        let key1 = Self::key1(row0, row1);
+        (key1 - 1, key1 + 1)
+    }
+    fn aux1(_row0: usize, row1: usize) -> Self::A1 {
+        row1 as i64 + 1
+    }
+}
+
+fn front_coded(parameters: Parameters) -> Parameters {
+    parameters.with_front_code_byte_keys(true)
+}
+
+#[test]
+fn front_coded_two_columns_uncompressed() {
+    init_test_logger();
+    let parameters = front_coded(Parameters::default().with_compression(None));
+    test_two_columns::<FoldedKeys>(parameters.clone());
+    test_two_columns_multifetch::<FoldedKeys>(parameters);
+}
+
+#[test]
+fn front_coded_two_columns_snappy() {
+    init_test_logger();
+    let parameters = front_coded(Parameters::default().with_compression(Some(Compression::Snappy)));
+    test_two_columns::<FoldedKeys>(parameters.clone());
+    test_two_columns_multifetch::<FoldedKeys>(parameters);
+}
+
+#[test]
+fn front_coded_two_columns_zstd() {
+    init_test_logger();
+    let parameters = front_coded(Parameters::default().with_compression(Some(Compression::Zstd)));
+    test_two_columns::<FoldedKeys>(parameters.clone());
+    test_two_columns_multifetch::<FoldedKeys>(parameters);
+}
+
+#[test]
+fn byte_keys_are_unchanged_without_the_switch() {
+    init_test_logger();
+    test_two_columns::<FoldedKeys>(Parameters::default().with_compression(None));
+}
+
+/// Writes the [`FoldedKeys`] file with `parameters` and returns its reader.
+fn write_folded_keys(
+    parameters: Parameters,
+) -> (
+    Reader<(
+        &'static DynData,
+        &'static DynData,
+        (&'static DynData, &'static DynData, ()),
+    )>,
+    tempfile::TempDir,
+) {
+    let factories0 = Factories::<DynData, DynData>::new::<Vec<u8>, ()>();
+    let factories1 = Factories::<DynData, DynData>::new::<i64, i64>();
+    let tempdir = tempdir().unwrap();
+    let storage_backend = <dyn StorageBackend>::new(
+        &StorageConfig {
+            path: tempdir.path().to_string_lossy().to_string(),
+            cache: Default::default(),
+        },
+        &StorageOptions::default(),
+    )
+    .unwrap();
+    let mut writer = Writer2::new(
+        &factories0,
+        &factories1,
+        test_buffer_cache,
+        &*storage_backend,
+        parameters,
+        None,
+    )
+    .unwrap();
+    for row0 in 0..FoldedKeys::n0() {
+        for row1 in 0..FoldedKeys::n1(row0) {
+            writer
+                .write1((&FoldedKeys::key1(row0, row1), &FoldedKeys::aux1(row0, row1)))
+                .unwrap();
+        }
+        writer
+            .write0((&FoldedKeys::key0(row0), &FoldedKeys::aux0(row0)))
+            .unwrap();
+    }
+    let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
+    reader.evict();
+    (reader, tempdir)
+}
+
+/// The front-coded data blocks of `reader`'s file, as stored on disk. Blocks
+/// start on 512-byte boundaries, and the decoder ignores bytes after a block.
+fn front_coded_blocks<N>(reader: &Reader<(&'static DynData, &'static DynData, N)>) -> Vec<Arc<FBuf>>
+where
+    (&'static DynData, &'static DynData, N): ColumnSpec,
+{
+    let file_size = reader.byte_size().unwrap();
+    (0..file_size - 512)
+        .step_by(512)
+        .filter_map(|offset| {
+            let len = (file_size - 512 - offset).min(64 * 1024) as usize;
+            let block = reader
+                .file_handle()
+                .read_block(BlockLocation::new(offset, len).unwrap())
+                .unwrap();
+            (block[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC).then_some(block)
+        })
+        .collect()
+}
+
+#[test]
+fn front_coding_shrinks_byte_keys_and_marks_the_file() {
+    init_test_logger();
+    let plain = Parameters::default().with_compression(None);
+    let (unencoded, _dir) = write_folded_keys(plain.clone());
+    let (encoded, _dir2) = write_folded_keys(front_coded(plain));
+
+    assert_eq!(
+        incompatible_features(&unencoded) & INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+        0
+    );
+    assert_ne!(
+        incompatible_features(&encoded) & INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+        0
+    );
+    assert!(front_coded_blocks(&unencoded).is_empty());
+    assert!(!front_coded_blocks(&encoded).is_empty());
+    assert!(
+        encoded.byte_size().unwrap() < unencoded.byte_size().unwrap(),
+        "front coding must shrink the file: {} vs {} bytes",
+        encoded.byte_size().unwrap(),
+        unencoded.byte_size().unwrap()
+    );
+}
+
+#[test]
+fn integer_keys_are_never_front_coded() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let storage_backend = <dyn StorageBackend>::new(
+        &StorageConfig {
+            path: tempdir.path().to_string_lossy().to_string(),
+            cache: Default::default(),
+        },
+        &StorageOptions::default(),
+    )
+    .unwrap();
+    let factories = Factories::<DynData, DynData>::new::<i64, ()>();
+    let mut writer = Writer1::new(
+        &factories,
+        test_buffer_cache,
+        &*storage_backend,
+        front_coded(Parameters::default().with_compression(None)),
+        None,
+    )
+    .unwrap();
+    for key in 0..10_000i64 {
+        writer.write0((&key, &())).unwrap();
+    }
+    let (reader, _) = writer.into_reader(BatchMetadata::default()).unwrap();
+    assert_eq!(
+        incompatible_features(&reader) & INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+        0
+    );
+}
+
+#[test]
+fn corrupt_front_coded_blocks_fail_without_panicking() {
+    init_test_logger();
+    let (reader, _dir) =
+        write_folded_keys(front_coded(Parameters::default().with_compression(None)));
+    let block = front_coded_blocks(&reader).into_iter().next().unwrap();
+    let original = super::front_code::decode(&block).unwrap();
+
+    // Any single-byte change decodes to an error or, if it falls in padding
+    // after the block, to the original block.
+    for position in 4..block.len().min(2048) {
+        let mut mutated = block.as_slice().to_vec();
+        mutated[position] ^= 0x5a;
+        if let Ok(decoded) = super::front_code::decode(&mutated) {
+            assert_eq!(decoded.as_slice(), original.as_slice(), "byte {position}");
+        }
+    }
+    // Truncation is always an error before the end of the encoded content.
+    for len in 0..64 {
+        assert!(
+            super::front_code::decode(&block[..len]).is_err(),
+            "{len} bytes"
+        );
+    }
+}
+
+/// Sorted, distinct byte strings over a small alphabet, so that neighbours
+/// share prefixes. With `fixed_len`, every string has that length and the
+/// data blocks use a stride value map; otherwise lengths vary and they use
+/// an array value map.
+fn sorted_byte_strings(fixed_len: Option<usize>) -> impl Strategy<Value = Vec<Vec<u8>>> {
+    let lengths = match fixed_len {
+        Some(len) => len..=len,
+        None => 0..=48,
+    };
+    prop::collection::btree_set(prop::collection::vec(0u8..4, lengths), 3..800)
+        .prop_map(|set| set.into_iter().collect())
+}
+
+/// Checks a front-coded one-column file of every other string in `strings`,
+/// with the strings between them as seek targets.
+fn check_front_coded_byte_keys(mut strings: Vec<Vec<u8>>, compression: Option<Compression>) {
+    if strings.len() % 2 == 0 {
+        strings.pop();
+    }
+    let n = strings.len() / 2;
+    test_one_column(
+        n,
+        |row| {
+            (
+                strings[row * 2].clone(),
+                strings[row * 2 + 1].clone(),
+                strings[row * 2 + 2].clone(),
+                (),
+            )
+        },
+        front_coded(Parameters::default().with_compression(compression)),
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn front_coded_variable_length_keys_read_back(
+        strings in sorted_byte_strings(None),
+        snappy in any::<bool>(),
+    ) {
+        check_front_coded_byte_keys(strings, snappy.then_some(Compression::Snappy));
+    }
+
+    #[test]
+    fn front_coded_fixed_length_keys_read_back(
+        strings in (7usize..=9).prop_flat_map(|len| sorted_byte_strings(Some(len))),
+    ) {
+        check_front_coded_byte_keys(strings, None);
+    }
 }
