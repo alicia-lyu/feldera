@@ -56,6 +56,7 @@ pub mod variant;
 pub use variant::*;
 pub mod flat_variant;
 
+mod ordered_key;
 /// VARIANT in the Parquet variant binary encoding.
 mod variant_binary;
 pub use flat_variant::casts::*;

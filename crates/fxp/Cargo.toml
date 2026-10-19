@@ -31,6 +31,7 @@ feldera-types = { workspace = true, optional = true }
 rand = { workspace = true, features = ["small_rng"] }
 
 [dev-dependencies]
+proptest = { workspace = true }
 serde_json = { workspace = true }
 num-bigint = { workspace = true }
 itertools.workspace = true

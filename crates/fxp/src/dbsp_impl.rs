@@ -1,6 +1,7 @@
 use dbsp::NumEntries;
 use dbsp::algebra::{HasOne, HasZero, MulByRef, OptionWeightType};
 use dbsp::dynamic::{HashRepr, OrdRepr};
+use dbsp::trace::merged_index::OrderedKey;
 use dbsp::utils::{IsNone, SupportsRoaring};
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::DecimalFormat,
@@ -167,6 +168,100 @@ impl<'de, C, AUX> DeserializeWithContext<'de, C, AUX> for DynamicDecimal {
         D: Deserializer<'de>,
     {
         serde::Deserialize::deserialize(deserializer)
+    }
+}
+
+/// A decimal encodes as its `i128` mantissa. Two values of the same type share
+/// a scale, so mantissa order is value order. Decoding rejects mantissas
+/// outside `MIN..=MAX`, which no value of this precision has.
+impl<const P: usize, const S: usize> OrderedKey for Fixed<P, S> {
+    const WIDTH: usize = i128::WIDTH;
+
+    fn encode_ordered(&self, out: &mut Vec<u8>) {
+        self.0.encode_ordered(out);
+    }
+
+    fn decode_ordered(bytes: &[u8]) -> Option<Self> {
+        let mantissa = i128::decode_ordered(bytes)?;
+        (Self::MIN.0..=Self::MAX.0)
+            .contains(&mantissa)
+            .then_some(Self(mantissa))
+    }
+}
+
+#[cfg(test)]
+mod ordered_key_test {
+    use crate::Fixed;
+    use dbsp::trace::merged_index::OrderedKey;
+    use proptest::prelude::*;
+    use std::fmt::Debug;
+
+    fn encode<T: OrderedKey>(value: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        value.encode_ordered(&mut bytes);
+        bytes
+    }
+
+    /// Checks the `OrderedKey` contract on one pair of values.
+    fn check_ordered<T: OrderedKey + Debug>(a: T, b: T) {
+        let (encoded_a, encoded_b) = (encode(&a), encode(&b));
+        assert_eq!(encoded_a.len(), T::WIDTH);
+        assert_eq!(encoded_b.len(), T::WIDTH);
+        assert_eq!(
+            encoded_a.cmp(&encoded_b),
+            a.cmp(&b),
+            "order of {a:?}, {b:?}"
+        );
+        assert_eq!(T::decode_ordered(&encoded_a).as_ref(), Some(&a));
+        assert_eq!(T::decode_ordered(&encoded_b).as_ref(), Some(&b));
+        assert_eq!(T::decode_ordered(&encoded_a[1..]), None);
+    }
+
+    type Price = Fixed<15, 2>;
+    type Wide = Fixed<38, 10>;
+
+    fn price(mantissa: i128) -> Price {
+        Fixed(mantissa)
+    }
+
+    fn wide(mantissa: i128) -> Wide {
+        Fixed(mantissa)
+    }
+
+    #[test]
+    fn boundaries() {
+        let step = price(1);
+        let values = [Price::MIN, -step, Price::ZERO, step, Price::MAX];
+        for a in values {
+            for b in values {
+                check_ordered(a, b);
+            }
+        }
+        let values = [Wide::MIN, wide(-1), Wide::ZERO, wide(1), Wide::MAX];
+        for a in values {
+            for b in values {
+                check_ordered(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_mantissa() {
+        assert_eq!(Price::decode_ordered(&encode(&(Price::MAX.0 + 1))), None);
+        assert_eq!(Price::decode_ordered(&encode(&(Price::MIN.0 - 1))), None);
+        assert_eq!(Price::decode_ordered(&encode(&i128::MIN)), None);
+    }
+
+    proptest! {
+        #[test]
+        fn price_contract(a in Price::MIN.0..=Price::MAX.0, b in Price::MIN.0..=Price::MAX.0) {
+            check_ordered(price(a), price(b));
+        }
+
+        #[test]
+        fn wide_contract(a in Wide::MIN.0..=Wide::MAX.0, b in Wide::MIN.0..=Wide::MAX.0) {
+            check_ordered(wide(a), wide(b));
+        }
     }
 }
 

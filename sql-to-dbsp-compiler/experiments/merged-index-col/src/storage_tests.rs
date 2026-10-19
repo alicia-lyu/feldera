@@ -89,11 +89,7 @@ fn customer_group(c: i64) -> Vec<SourceRow> {
 
 // The signed oracle folds source rows independently of batch construction.
 fn encoded_row(index: &CustomerOrdersLineitemIndex, row: &SourceRow) -> Row {
-    (
-        index.fold(&row.0).unwrap().as_bytes().to_vec(),
-        row.1.clone(),
-        row.2,
-    )
+    (index.fold(&row.0).as_bytes().to_vec(), row.1.clone(), row.2)
 }
 
 fn typed_row(index: &CustomerOrdersLineitemIndex, row: &Row) -> SourceRow {
@@ -146,7 +142,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         .unwrap(),
     ));
     run_in_circuit_with_storage_config(config, || {
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
             SourcePayload,
@@ -351,7 +347,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         // Check exact and absent keys for every source, including the old moved keys.
         for c in [20, 160_000, 10, 30, 200_000] {
             for (key, _, _) in customer_group(c) {
-                let folded = index.fold(&key).unwrap().as_bytes().to_vec();
+                let folded = index.fold(&key).as_bytes().to_vec();
                 cursor.rewind_keys();
                 assert_eq!(
                     cursor.seek_key_exact(folded.erase(), None),
@@ -367,9 +363,9 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         for c in [20, 40, 160_000] {
             let order = 1_000_000 + 2 * c;
             for (prefix, count) in [
-                (index.customer_prefix(c), 7),
-                (index.order_prefix(c, order), 3),
-                (index.line_prefix(c, order), 2),
+                (index.prefix_custkey(c), 7),
+                (index.prefix_custkey_orderkey(c, order), 3),
+                (index.prefix_custkey_orderkey_then_linenumber(c, order), 2),
             ] {
                 cursor.rewind_keys();
                 cursor.seek_key(prefix.erase());
@@ -424,7 +420,7 @@ fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
     ));
     run_in_circuit_with_storage_config(config, || {
         assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         for rows in [Vec::new(), customer_group(1)] {
             let batch = index.build_batch(rows.clone()).unwrap();
             assert_eq!(batch.location(), BatchLocation::Memory);

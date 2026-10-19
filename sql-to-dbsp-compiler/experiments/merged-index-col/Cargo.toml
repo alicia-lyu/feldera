@@ -14,6 +14,7 @@ rkyv = { version = "0.7", default-features = false, features = ["std", "size_64"
 size-of = { version = "0.1.7", package = "feldera-size-of" }
 
 [dev-dependencies]
+proptest = "1.5.0"
 feldera-storage = { path = "../../../crates/storage" }
 feldera-types = { path = "../../../crates/feldera-types" }
 tempfile = "3"

@@ -55,7 +55,7 @@ impl ManualIndex {
             // spine's background compaction, belongs to the merged index.
             with_write_owner(WriteOwner::MergedIndex, || {
                 cache_runtime.with_buffer_cache(0, || {
-                    let index = CustomerOrdersLineitemIndex::default();
+                    let index = CustomerOrdersLineitemIndex;
                     // Folded byte keys; typed payloads.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
@@ -270,8 +270,8 @@ pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>
 
 /// Seek one current complete Lineitem range, decoding only matching rows.
 pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
-    let index = CustomerOrdersLineitemIndex::default();
-    let prefix = index.line_prefix(order.customer_key, order.key);
+    let index = CustomerOrdersLineitemIndex;
+    let prefix = index.prefix_custkey_orderkey_then_linenumber(order.customer_key, order.key);
     let mut cursor = snapshot.cursor();
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();

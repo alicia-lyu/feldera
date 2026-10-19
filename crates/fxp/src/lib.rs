@@ -24,7 +24,8 @@
 //! * `size_of`: Implements [size_of] traits for measuring data sizes.
 //!
 //! * `dbsp` (depends on `serde`, `rkyv`, and `size_of`): Implements [DBSP]
-//!   traits for [Fixed] and [DynamicDecimal].
+//!   traits for [Fixed] and [DynamicDecimal], including the merged-index key
+//!   encoding for [Fixed].
 //!
 //! [rkyv]: https://rkyv.org/
 //! [serde]: https://serde.rs/
