@@ -1,9 +1,10 @@
 # Deferred designs
 
-Two designs here are not implemented. Neither is a prerequisite for R3 reconstruction or R4 verification. They are kept because a later workload might need them.
+The designs and work items here are not implemented. None is a prerequisite for R3 reconstruction or R4 verification. They are kept because a later workload might need them.
 
 - A single-owner atomic protocol for publishing before/after views.
 - Shared scan sessions that let several readers share one range cursor.
+- Later work on the general merged-index definition, outside its roadmap.
 
 ## What R3 does instead
 
@@ -251,3 +252,12 @@ physical EOF, close lagging readers, and hold borrowed values during pressure. A
 sealing, independent seeks, cross-step view lifetime, oversized records, dependency cycles, external-order
 changes, and failure during commit. Compare both state-provider results and the shared IVM output with the
 retained-state baseline; report high-water bytes and every spill, reread, sort, and access-path write.
+
+## General merged-index definition: later work
+
+These items lie outside the roadmap in [general-definition.md](general-definition.md).
+
+- **Variable-width keys,** such as VARCHAR. They need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
+- **Generated readers and joins,** replacing the exact-shape matching in `Q3MergedIndexBinding`.
+- **Inferring the trie** from foreign-key and primary-key metadata.
+- **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).

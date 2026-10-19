@@ -53,6 +53,8 @@ These were found by the 2026-10-12 review and are tracked here, not yet schedule
 - [decisions.md](decisions.md): confirmed decisions, withdrawn ideas, open questions.
 - [WORKFLOW.md](WORKFLOW.md): every command (compile, test, verify, measure).
 - [col-storage.md](col-storage.md): folded-key encoding and batch and file layout.
+- [general-definition.md](general-definition.md): the key-trie spec for declaring a merged index,
+  and the roadmap for generating its definition.
 - [reconstruction.md](reconstruction.md): the transaction contract, the placement map, R3 and R4.
 - [measurement.md](measurement.md): R5 definitions and the pending Linux campaign.
 - [native-state-read-contracts.md](native-state-read-contracts.md): the four generated reads.

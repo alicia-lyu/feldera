@@ -65,6 +65,26 @@ Storage compression stays off in the R5 runs, so front coding's effect is measur
 
 The docs call the two nesting levels of a layer file the key level and the value level. They do not use DBSP's "column 0" and "column 1".
 
+### 2026-10-16: Merged indexes are declared as key-trie specs
+
+A merged index is declared as a key-trie spec file, which the SQL compiler checks against the schema. The spec carries no derivable data: tags, ids, index names, and key columns come from a fixed traversal. Every placement declares its payload, and `*` marks a primary index that carries all non-key columns. A key value from another table is written `[domain via Relation]`. The design is in [general-definition.md](general-definition.md).
+
+### 2026-10-16: The static trie is a nested literal
+
+The parsed trie is a nested tree literal that mirrors the spec. It stores no indices, parent links, tags, ids, or paths; a pre-order walk recomputes them on each request. A domain's tag is its first appearance in the walk + 1, and a placement's id is its visit position + 1. Tries are small, so clean code wins over speed.
+
+### 2026-10-16: Key fields are fixed-width and NOT NULL
+
+Key types are fixed-width only, and every key column is NOT NULL, so there is no NULL key encoding for now.
+
+### 2026-10-16: The first scope is the definition
+
+The first scope is the definition and typed fold, unfold, and prefixes. Readers and joins stay hand-written. Roadmap Step 2 covers keys only and does not depend on typed payloads.
+
+### 2026-10-16: Hand-written prefix names match the emitter's
+
+The hand-written COL prefix functions are named as the emitter will name them: `prefix_custkey`, `prefix_custkey_orderkey`, and `prefix_custkey_orderkey_then_linenumber`.
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
