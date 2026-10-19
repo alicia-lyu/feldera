@@ -191,22 +191,9 @@ Folding needs, for each key type, a fixed-width byte encoding whose `memcmp` ord
 
 There is no encoding for NULL, because key columns are NOT NULL (see Validation). Floats are not key types.
 
-## Decisions from this session
+## Decisions
 
-These are user decisions of 2026-10-16. They are recorded here until they are entered in [decisions.md](decisions.md).
-
-- A merged index is declared as a key-trie spec file, which the SQL compiler checks against the schema.
-- The spec carries no derivable data. Tags, ids, names, and key columns come from a fixed traversal.
-- Every placement declares its payload in the trie, and `*` marks a primary index that carries all non-key columns.
-- A key value from another table is written as `[domain via Relation]`.
-- The parsed trie is a static data structure that mirrors the spec. Everything else is computed from it.
-- The first scope is the definition and typed fold, unfold, and prefix. Readers and joins stay hand-written.
-- Key types are fixed-width only.
-- Key columns must be NOT NULL, so there is no NULL key encoding for now.
-- The static trie is a nested tree literal that mirrors the spec. It stores no indices, parent links, tags, ids, or paths. A pre-order walk recomputes them on each request, and clean code wins over speed.
-- Tags are the first appearance in the pre-order walk + 1, and placement ids are the visit position + 1.
-- Step 2 covers keys only. It does not depend on the typed-payload change, which landed separately.
-- The hand-written COL prefix functions are named the way the emitter will name them: `prefix_custkey`, `prefix_custkey_orderkey`, and `prefix_custkey_orderkey_then_linenumber`.
+The user's decisions for this design, dated 2026-10-16, are recorded in [decisions.md](decisions.md).
 
 ## Roadmap
 
@@ -228,19 +215,4 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
 5. **Switch.** COL uses the generated module, and the hand-written definition moves to `TRASH/`.
    - Exit check: `verify.sh` transcripts are unchanged.
 
-Later work, outside this roadmap:
-
-- Variable-width keys such as VARCHAR. These need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
-- Generated readers and joins, replacing the exact-shape matching in `Q3MergedIndexBinding`.
-- Inferring the trie from foreign-key and primary-key metadata.
-- Nullable key columns. Two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
-
-## Pending doc integration
-
-This document was written while other agents were editing the tree, so no other file was changed. Once those files are free, they need these edits:
-
-- **[decisions.md](decisions.md):** add the decisions listed above as dated entries.
-- **[deferred.md](deferred.md):** add the three items of later work.
-- **[col-storage.md](col-storage.md):** replace the paragraph that begins "A future SQL compiler extension could emit these static definitions" with a pointer to this document.
-- **[README.md](README.md):** add this document to the reading guide.
-- **The repository `CLAUDE.md`:** add a row for this document under "Where the code lives".
+Later work, outside this roadmap, is listed in [deferred.md](deferred.md).
