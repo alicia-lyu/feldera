@@ -306,3 +306,6 @@ mod tests;
 
 #[cfg(test)]
 mod storage_tests;
+
+#[cfg(test)]
+mod layout_tests;
