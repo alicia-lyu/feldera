@@ -122,11 +122,20 @@ The logs name Spines by circuit node. Matching record counts and block bytes ide
 
 The six refreshes stay in memory in both modes, so the window shows no writes. That is not evidence of a disk saving.
 
-### Remaining gap: record size (unresolved)
+### Record size (2026-10-16 to 2026-10-19)
 
-With equal compaction and the POSIX fix, the merged index holds fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but takes 1.68 times the bytes. Data blocks dominate in both. Per record, the merged index costs about 121 B; in large-group, each additional Lineitem record costs about 123 B. The native Lineitem join trace costs 69 B per row (141,312 B for 2,048 rows).
+With equal compaction and the POSIX fix, the merged index held fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but took 1.68 times the bytes. Splitting each run's data-block bytes by level (`block_stats`, reported as `key_level` and `value_level` in `run-contents.json`) located the gap, and two changes followed. Each step ran all three workloads, three repetitions per mode, with `--setup-full-compaction --diagnostics`. Every repetition of every workload gave the same bytes, and native mode did not change between steps.
 
-Deduction, not measured: the merged index's Spine stores keys and values as `Vec<u8>` (`OrdIndexedWSetFactories<DynData, DynData, DynZWeight>` over `Vec<u8>`, in `ManualIndex::new`). Each record therefore carries a 25-byte folded key and an `rkyv`-encoded payload (`PayloadBytes`), each inside a byte vector with its own length and alignment, where native traces store typed tuples. Attributing the 54-byte difference to these parts needs a measurement that varies the encoding.
+| Step (artifact under `target/`) | Merged-index file | Key-level data | Value-level data | Disk usage at window end |
+| --- | --- | --- | --- | --- |
+| Byte-string values (`r5-level-baseline/`) | 317,440 B | 132,096 B | 173,056 B | 806,912 B |
+| Typed values (`r5-typed-values/`) | 358,400 B | 132,096 B | 212,992 B | 847,872 B |
+| Typed values, front-coded keys (`r5-front-coded/`) | 259,584 B | 33,280 B | 212,992 B | 749,056 B |
+| Native: four join traces | 188,928 B | 13,312 B | 168,448 B | 678,400 B |
+
+- **Key level.** Every folded key is distinct, so the key level stores all 2,624 keys and shares nothing between them; before front coding it took about 50 B per key. Front coding (`front_code.rs`, `--front-code-byte-keys`) stores each key as the length of the prefix it shares with the previous key and the rest of its bytes. It cut the key level to 33,280 B, about 12.7 B per key. The native Lineitem trace's key level takes 11 B per key (5,632 B for 512 keys). In every run the writer front-coded 17 blocks, with no layout or size fallbacks.
+- **Value level.** Storing `SourcePayload` itself instead of its `rkyv` bytes inside a `Vec<u8>` made the value level larger, not smaller: 212,992 B against 173,056 B. Deduction, not measured: an archived enum is as large as its largest variant, and `SqlDecimal` archives as a 16-byte-aligned `i128`, so every Customer and Order row pays for a Lineitem-sized payload. Which value encoding to keep is open.
+- **Remaining gap.** The merged index still takes 1.37 times the bytes of the four join traces, and its value level is now most of it. The six refreshes still stay in memory, so the window shows no writes in either mode.
 
 ## Deferred
 
