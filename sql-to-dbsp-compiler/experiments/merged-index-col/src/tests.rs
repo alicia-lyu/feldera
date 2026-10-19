@@ -22,7 +22,7 @@ use proptest::prelude::*;
 use tempfile::tempdir;
 
 fn index() -> CustomerOrdersLineitemIndex {
-    CustomerOrdersLineitemIndex::default()
+    CustomerOrdersLineitemIndex
 }
 
 fn customer_row(id: i64, segment: &str, weight: i64) -> (SourceKey, SourcePayload, i64) {

@@ -150,7 +150,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         .unwrap(),
     ));
     run_in_circuit_with_storage_config(config, || {
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
             Vec<u8>,
@@ -428,7 +428,7 @@ fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
     ));
     run_in_circuit_with_storage_config(config, || {
         assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         for rows in [Vec::new(), customer_group(1)] {
             let batch = index.build_batch(rows.clone()).unwrap();
             assert_eq!(batch.location(), BatchLocation::Memory);

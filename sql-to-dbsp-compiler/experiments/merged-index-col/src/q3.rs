@@ -97,7 +97,7 @@ impl Q3State {
         delta: &SpineSnapshot<OrdersBatch>,
     ) -> Result<SpineSnapshot<CustomerBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for customer in requested_keys(delta) {
             let key = index.fold(&SourceKey::Customer(customer));
@@ -126,7 +126,7 @@ impl Q3State {
         delta: &SpineSnapshot<CustomerBatch>,
     ) -> Result<SpineSnapshot<OrdersBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for customer in requested_keys(delta) {
             scan(
@@ -158,7 +158,7 @@ impl Q3State {
         delta: &SpineSnapshot<LineitemBatch>,
     ) -> Result<SpineSnapshot<JoinedOrdersBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
             for &customer in placements(&views, order)? {
@@ -219,7 +219,7 @@ impl Q3State {
         delta: &SpineSnapshot<JoinedOrdersBatch>,
     ) -> Result<SpineSnapshot<LineitemBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex::default();
+        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
             for &customer in placements(&views, order)? {

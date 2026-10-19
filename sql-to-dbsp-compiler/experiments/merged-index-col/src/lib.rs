@@ -166,7 +166,6 @@ pub enum SourcePayload {
     Lineitem(LineitemPayload),
 }
 
-#[derive(Default)]
 pub struct CustomerOrdersLineitemIndex;
 
 impl CustomerOrdersLineitemIndex {
