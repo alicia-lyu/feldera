@@ -261,3 +261,11 @@ These items lie outside the roadmap in [general-definition.md](general-definitio
 - **Generated readers and joins,** replacing the exact-shape matching in `Q3MergedIndexBinding`.
 - **Inferring the trie** from foreign-key and primary-key metadata.
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
+
+## Native packing
+
+Native packing (packed tuples, narrowed decimals) is not planned. Two barriers stand in order:
+  1. Native values are sorted and compared within a key, so a packed form needs an order-preserving encoding or a decode for each comparison.
+  2. Native types are shared by the whole program and by DBSP's storage format, so the change needs a new storage format version for every pipeline.
+
+  Neither barrier is a decoding cost. No native packing number has been measured.

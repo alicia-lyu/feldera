@@ -61,15 +61,17 @@ COL fills in the definition as `CustomerOrdersLineitemDefinition`, with `SourceK
 
 Payload rules:
 
-- The stored value is the typed enum `SourcePayload`, a DBSP `DBData` type. Its variant must match the source index that the folded key names (`SourcePayload::matches`). `build_batch` rejects a mismatch, and the Q3 readers report one as an error.
-- Only K needs an order-preserving encoding. The value order is `SourcePayload`'s derived order. It serves equality and merging, not queries.
-- Values were byte strings (`PayloadBytes`) until 2026-10-16. Files from that time must be regenerated; there is no migration.
+- The stored value is opaque bytes (`Vec<u8>`): the packed encoding of one payload, with no tag. The key's placement id names the source, so a value is readable only together with its key. `decode_payload(&SourceKey, &[u8])` dispatches on the key's variant. Decoding accepts only canonical bytes and returns an error for a truncated, over-long, or out-of-range value. A value decoded with the wrong key's variant fails the same way, except by coincidence of lengths; the Q3 readers always decode with the key they read.
+- `SourcePayload` is the in-memory input and output type. Its variant must match the source index that the folded key names (`SourcePayload::matches`). `build_batch` rejects a mismatch before it encodes.
+- Only K needs an order-preserving encoding. Values are compared as byte strings. The comparison serves equality and merging, not queries, and is sound because each K is unique.
+- The packed encoding writes fields back to back, little-endian, with no padding. A string is a LEB128 length and UTF-8 bytes. A decimal takes the narrowest integer that holds its declared precision (`i16` for `P` up to 4, `i32` up to 9, `i64` up to 18, else `i128`).
+- Values were byte strings (`PayloadBytes`) until 2026-10-16, then the typed enum `SourcePayload` until 2026-10-19. Files from those times must be regenerated; there is no migration.
 
 A future SQL compiler extension could emit these static definitions; see [general-definition.md](general-definition.md). That is not implemented. Any generator must reproduce the exact folded bytes and payload types before it replaces the handwritten definition.
 
 ## Batch layout
 
-`batch::build_batch::<P>` in DBSP turns `(FoldedKey, P, ZWeight)` rows into one immutable `MergedIndexBatch`, an `OrdIndexedWSet` over byte keys and values of the payload type `P` (`SourcePayload` for COL):
+`batch::build_batch::<P>` in DBSP turns `(FoldedKey, P, ZWeight)` rows into one immutable `MergedIndexBatch`, an `OrdIndexedWSet` over byte keys and values of a stored value type `P` (`Vec<u8>` for COL, the packed payload):
 
 - It sorts by `(K, payload)`, adds the weights of equal pairs, reports overflow as an error, and omits zero totals.
 - It requests `BatchLocation::Memory` for the initial run. Feldera's generic builders can choose a file during construction; this explicit request keeps the initial run in memory (test `initial_col_run_stays_in_memory_when_runtime_selects_files`).
@@ -97,7 +99,7 @@ A file-backed run has two levels, written by `Writer2` (`crates/dbsp/src/storage
 
 ```text
 key level:   FoldedKey (bytes), nothing else
-value level: SourcePayload, then weight (ZWeight)
+value level: packed payload bytes (Vec<u8>), then weight (ZWeight)
 ```
 
 `MergedIndex::write_parent` writes all values of one K, then K itself. The caller supplies strictly increasing keys, because the file format requires unique keys within each group. Test `native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots` in `merged-index-col/src/storage_tests.rs` reopens a compacted file run and compares its keys, payloads, and weights with the original run.
