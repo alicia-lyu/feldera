@@ -1402,6 +1402,9 @@ impl Runtime {
             .with_front_code_byte_keys(Runtime::with_dev_tweaks(|tweaks| {
                 tweaks.front_code_byte_keys()
             }))
+            .with_elide_value_headers(Runtime::with_dev_tweaks(|tweaks| {
+                tweaks.elide_value_headers()
+            }))
     }
 
     fn inner(&self) -> &RuntimeInner {

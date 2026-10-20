@@ -319,6 +319,22 @@ class MeasureTest(unittest.TestCase):
             measure.parse_args([*self.args, "--front-code-byte-keys"]).front_code_byte_keys)
         self.assertFalse(measure.parse_args(self.args).front_code_byte_keys)
 
+    def test_elide_value_headers_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "elide_value_headers": True}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        self.assertIn("--elide-value-headers", measure.driver_command(spec, inputs))
+        spec["args"]["elide_value_headers"] = False
+        self.assertNotIn("--elide-value-headers", measure.driver_command(spec, inputs))
+        self.assertTrue(
+            measure.parse_args([*self.args, "--elide-value-headers"]).elide_value_headers)
+        self.assertFalse(measure.parse_args(self.args).elide_value_headers)
+        # Key front coding and value-header elision are independent switches.
+        self.assertFalse(
+            measure.parse_args([*self.args, "--elide-value-headers"]).front_code_byte_keys)
+
     def test_cli_rejects_invalid_cache_and_timeout(self) -> None:
         with self.assertRaises(SystemExit):
             measure.parse_args([*self.args, "--cache-bytes", "1024"])

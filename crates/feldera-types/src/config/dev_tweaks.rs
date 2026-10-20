@@ -62,6 +62,16 @@ pub struct DevTweaks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub front_code_byte_keys: Option<bool>,
 
+    /// Whether to elide the redundant header of byte-string values in storage
+    /// files: each value is stored as its length, its bytes, and its weight,
+    /// and its 16-byte header is rebuilt when read. It applies only to files
+    /// whose values are raw byte strings with an `i64` weight, such as a
+    /// merged index's packed payloads, and is independent of
+    /// `front_code_byte_keys`. Files written with it cannot be read by older
+    /// versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elide_value_headers: Option<bool>,
+
     /// Whether to asynchronously fetch keys needed for the distinct operator
     /// from storage.  Asynchronous fetching should be faster for high-latency
     /// storage, such as object storage, but it could use excessive amounts of
@@ -331,6 +341,9 @@ impl DevTweaks {
     }
     pub fn front_code_byte_keys(&self) -> bool {
         self.front_code_byte_keys.unwrap_or(false)
+    }
+    pub fn elide_value_headers(&self) -> bool {
+        self.elide_value_headers.unwrap_or(false)
     }
     pub fn fetch_distinct(&self) -> bool {
         self.fetch_distinct.unwrap_or(false)

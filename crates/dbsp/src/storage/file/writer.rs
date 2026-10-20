@@ -15,10 +15,11 @@ use crate::storage::{
             BatchMetadata, BlockHeader, BloomFilterBlockRef, COMPATIBLE_FEATURE_FILTER64,
             COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT, DATA_BLOCK_MAGIC, DataBlockHeader,
             FILE_TRAILER_BLOCK_MAGIC, FileTrailer, FileTrailerColumn, FixedLen,
-            INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS, INCOMPATIBLE_FEATURE_MODULAR_FILTERS,
-            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader,
-            MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ModularBloomFilterBlockRef, NodeType,
-            ROARING_BITMAP_FILTER_BLOCK_MAGIC, RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
+            INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+            INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_ROARING_FILTERS,
+            INDEX_BLOCK_MAGIC, IndexBlockHeader, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
+            ModularBloomFilterBlockRef, NodeType, ROARING_BITMAP_FILTER_BLOCK_MAGIC,
+            RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
         },
         reader::TreeNode,
     },
@@ -150,6 +151,12 @@ pub struct Parameters {
     /// Whether to front-code the keys of data blocks whose items allow it
     /// (see [`ItemFactory::front_codable_key`](super::item::ItemFactory::front_codable_key)).
     pub front_code_byte_keys: bool,
+
+    /// Whether to elide the `ArchivedVec` headers of the values of data
+    /// blocks whose items allow it (see
+    /// [`ItemFactory::elidable_value_headers`](super::item::ItemFactory::elidable_value_headers)).
+    /// It is independent of `front_code_byte_keys`.
+    pub elide_value_headers: bool,
 }
 
 impl Parameters {
@@ -188,6 +195,14 @@ impl Parameters {
         }
     }
 
+    /// Returns these parameters with `elide_value_headers` updated.
+    pub fn with_elide_value_headers(self, elide_value_headers: bool) -> Self {
+        Self {
+            elide_value_headers,
+            ..self
+        }
+    }
+
     /// Returns these parameters with `compression_level` updated.
     pub fn with_compression_level(self, compression_level: Option<i32>) -> Self {
         Self {
@@ -208,6 +223,7 @@ impl Default for Parameters {
             compression: Some(Compression::Snappy),
             compression_level: None,
             front_code_byte_keys: false,
+            elide_value_headers: false,
         }
     }
 }
@@ -357,12 +373,18 @@ impl ColumnWriter {
         A: DataTrait + ?Sized,
     {
         let rows = data_block.rows();
-        let front_code = self.parameters.front_code_byte_keys
-            && self.factories.item_factory::<K, A>().front_codable_key();
-        let (block, location) = block_writer.write_block_with_front_coding(
+        let items = self.factories.item_factory::<K, A>();
+        let encoding = if self.parameters.front_code_byte_keys && items.front_codable_key() {
+            Some(DiskEncoding::FrontCodedKeys)
+        } else if self.parameters.elide_value_headers && items.elidable_value_headers() {
+            Some(DiskEncoding::ElidedValueHeaders)
+        } else {
+            None
+        };
+        let (block, location) = block_writer.write_block_with_encoding(
             data_block.raw,
             self.parameters.compression,
-            front_code,
+            encoding,
         )?;
 
         super::reader::DataBlock::<K, A>::from_raw_with_cache(
@@ -1080,6 +1102,48 @@ struct BlockWriter {
     /// Whether any block has been written front-coded, which the file
     /// trailer must declare.
     wrote_front_coded: bool,
+    /// Whether any block has been written with elided value headers, which
+    /// the file trailer must declare.
+    wrote_elided_value_headers: bool,
+}
+
+/// A disk-only encoding of a data block (see [`front_code`](super::front_code)).
+#[derive(Clone, Copy, Debug)]
+enum DiskEncoding {
+    /// Front-code the keys.
+    FrontCodedKeys,
+    /// Elide the `ArchivedVec` headers of the values.
+    ElidedValueHeaders,
+}
+
+impl DiskEncoding {
+    fn encode(self, block: &[u8]) -> Option<FBuf> {
+        match self {
+            DiskEncoding::FrontCodedKeys => super::front_code::encode(block),
+            DiskEncoding::ElidedValueHeaders => super::front_code::encode_values(block),
+        }
+    }
+
+    fn written_blocks(self) -> &'static AtomicU64 {
+        match self {
+            DiskEncoding::FrontCodedKeys => &FRONT_CODED_BLOCKS,
+            DiskEncoding::ElidedValueHeaders => &ELIDED_VALUE_HEADER_BLOCKS,
+        }
+    }
+
+    fn layout_fallbacks(self) -> &'static AtomicU64 {
+        match self {
+            DiskEncoding::FrontCodedKeys => &FRONT_CODING_LAYOUT_FALLBACKS,
+            DiskEncoding::ElidedValueHeaders => &VALUE_ELISION_LAYOUT_FALLBACKS,
+        }
+    }
+
+    fn size_fallbacks(self) -> &'static AtomicU64 {
+        match self {
+            DiskEncoding::FrontCodedKeys => &FRONT_CODING_SIZE_FALLBACKS,
+            DiskEncoding::ElidedValueHeaders => &VALUE_ELISION_SIZE_FALLBACKS,
+        }
+    }
 }
 
 /// Data blocks written front-coded, process-wide.
@@ -1093,6 +1157,18 @@ pub static FRONT_CODING_LAYOUT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Data blocks eligible for front coding but written as they are because
 /// front coding would not have saved space.
 pub static FRONT_CODING_SIZE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Data blocks written with elided value headers, process-wide.
+pub static ELIDED_VALUE_HEADER_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Data blocks eligible for value-header elision but written as they are
+/// because their layout did not match what the encoder understands. Nonzero
+/// means a bug or an unexpected archive layout.
+pub static VALUE_ELISION_LAYOUT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Data blocks eligible for value-header elision but written as they are
+/// because elision would not have saved space.
+pub static VALUE_ELISION_SIZE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 impl BlockWriter {
     fn new(
@@ -1115,6 +1191,7 @@ impl BlockWriter {
             }),
             offset: 0,
             wrote_front_coded: false,
+            wrote_elided_value_headers: false,
         }
     }
 
@@ -1131,20 +1208,20 @@ impl BlockWriter {
         block: FBuf,
         compression: Option<Compression>,
     ) -> Result<(Arc<FBuf>, BlockLocation), StorageError> {
-        self.write_block_with_front_coding(block, compression, false)
+        self.write_block_with_encoding(block, compression, None)
     }
 
-    /// Writes `block`, front-coded if `front_code` is set and front coding
-    /// makes it smaller, and returns the block as readers will see it.
-    fn write_block_with_front_coding(
+    /// Writes `block` with `encoding`, if there is one and it makes the block
+    /// smaller, and returns the block as readers will see it.
+    fn write_block_with_encoding(
         &mut self,
         mut block: FBuf,
         compression: Option<Compression>,
-        front_code: bool,
+        encoding: Option<DiskEncoding>,
     ) -> Result<(Arc<FBuf>, BlockLocation), StorageError> {
-        if !front_code {
+        let Some(encoding) = encoding else {
             return self.write_encoded_block(block, compression);
-        }
+        };
         // Checksum the block as readers will see it, padded as it would be
         // written without front coding.
         if compression.is_none() {
@@ -1152,8 +1229,8 @@ impl BlockWriter {
         }
         let checksum = crc32c(&block[4..]).to_le_bytes();
         block[..4].copy_from_slice(checksum.as_slice());
-        let Some(encoded) = super::front_code::encode(&block) else {
-            FRONT_CODING_LAYOUT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let Some(encoded) = encoding.encode(&block) else {
+            encoding.layout_fallbacks().fetch_add(1, Ordering::Relaxed);
             return self.write_encoded_block(block, compression);
         };
         // Uncompressed blocks occupy whole sectors, so only a saved sector
@@ -1163,11 +1240,14 @@ impl BlockWriter {
             Some(_) => encoded.len() < block.len(),
         };
         if !saves_space {
-            FRONT_CODING_SIZE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            encoding.size_fallbacks().fetch_add(1, Ordering::Relaxed);
             return self.write_encoded_block(block, compression);
         }
-        FRONT_CODED_BLOCKS.fetch_add(1, Ordering::Relaxed);
-        self.wrote_front_coded = true;
+        encoding.written_blocks().fetch_add(1, Ordering::Relaxed);
+        match encoding {
+            DiskEncoding::FrontCodedKeys => self.wrote_front_coded = true,
+            DiskEncoding::ElidedValueHeaders => self.wrote_elided_value_headers = true,
+        }
         let (_, location) = self.write_encoded_block(encoded, compression)?;
         Ok((Arc::new(block), location))
     }
@@ -1441,6 +1521,9 @@ impl Writer {
 
         if self.writer.wrote_front_coded {
             incompatible_features |= INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS;
+        }
+        if self.writer.wrote_elided_value_headers {
+            incompatible_features |= INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS;
         }
         let mut file_trailer = FileTrailer {
             header: BlockHeader::new(&FILE_TRAILER_BLOCK_MAGIC),

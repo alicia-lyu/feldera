@@ -22,7 +22,8 @@ use dbsp::circuit::{
 };
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
 use dbsp::storage::file::writer::{
-    FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS, FRONT_CODING_SIZE_FALLBACKS,
+    ELIDED_VALUE_HEADER_BLOCKS, FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS,
+    FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
 use dbsp_adapters::{CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
@@ -581,6 +582,10 @@ struct Config {
     /// Front-code byte-string keys in storage files (the merged index's key
     /// level); see the DBSP dev tweak of the same name.
     front_code_byte_keys: bool,
+    /// Drop the redundant `ArchivedVec` header of byte-string values in
+    /// storage files (the merged index's value level); see the DBSP dev
+    /// tweak of the same name.
+    elide_value_headers: bool,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -646,6 +651,7 @@ impl Config {
                 "--no-verify" => config.verify = false,
                 "--setup-full-compaction" => config.setup_full_compaction = true,
                 "--front-code-byte-keys" => config.front_code_byte_keys = true,
+                "--elide-value-headers" => config.elide_value_headers = true,
                 "--r5" => config.r5 = true,
                 "--refresh-list" => {
                     config.refresh_list =
@@ -1073,6 +1079,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
     circuit_config.dev_tweaks.fetch_join = Some(config.r5);
     circuit_config.dev_tweaks.front_code_byte_keys = Some(config.front_code_byte_keys);
+    circuit_config.dev_tweaks.elide_value_headers = Some(config.elide_value_headers);
     let storage_path = config
         .storage_path
         .as_ref()
@@ -1357,6 +1364,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
             "setup_full_compaction": config.setup_full_compaction,
             "front_code_byte_keys": config.front_code_byte_keys,
+            "elide_value_headers": config.elide_value_headers,
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
         },
@@ -1365,6 +1373,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "blocks": FRONT_CODED_BLOCKS.load(Ordering::Relaxed),
             "layout_fallbacks": FRONT_CODING_LAYOUT_FALLBACKS.load(Ordering::Relaxed),
             "size_fallbacks": FRONT_CODING_SIZE_FALLBACKS.load(Ordering::Relaxed),
+        },
+        "value_header_elision": {
+            "blocks": ELIDED_VALUE_HEADER_BLOCKS.load(Ordering::Relaxed),
+            "layout_fallbacks": VALUE_ELISION_LAYOUT_FALLBACKS.load(Ordering::Relaxed),
+            "size_fallbacks": VALUE_ELISION_SIZE_FALLBACKS.load(Ordering::Relaxed),
         },
         "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
             "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
@@ -2375,6 +2388,22 @@ mod measurement_tests {
         if cfg!(feature = "merged-index") {
             assert!(coding["blocks"].as_u64().unwrap() > 0);
         }
+        // Value-header elision is a separate switch: with only key front
+        // coding on, no value block is elided.
+        assert_eq!(front_coded["value_header_elision"]["blocks"], 0);
+
+        // Elision applies to the merged index's byte-string values.
+        let config = Config {
+            storage_path: Some(directory.join("elided-storage")),
+            report: Some(directory.join("elided-report.json")),
+            front_code_byte_keys: false,
+            elide_value_headers: true,
+            ..config
+        };
+        run(&config, 1)?;
+        let elided: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
+        assert_eq!(elided["configuration"]["elide_value_headers"], true);
+        assert_eq!(elided["value_header_elision"]["layout_fallbacks"], 0);
         Ok(())
     }
 }

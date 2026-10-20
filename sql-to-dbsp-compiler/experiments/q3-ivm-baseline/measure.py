@@ -205,6 +205,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.append("--setup-full-compaction")
     if args.get("front_code_byte_keys"):
         command.append("--front-code-byte-keys")
+    if args.get("elide_value_headers"):
+        command.append("--elide-value-headers")
     return command
 
 
@@ -289,6 +291,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--front-code-byte-keys", action="store_true",
                         help="front-code byte-string keys in storage files (the merged "
                              "index's key level); native runs have no such keys")
+    parser.add_argument("--elide-value-headers", action="store_true",
+                        help="drop the redundant 16-byte header of every byte-string value in "
+                             "storage files, and rebuild it on read (the merged index's value "
+                             "level); native runs have no such values")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
@@ -324,6 +330,7 @@ def run(argv: list[str]) -> int:
                           "diagnostics": args.diagnostics,
                           "setup_full_compaction": args.setup_full_compaction,
                           "front_code_byte_keys": args.front_code_byte_keys,
+                          "elide_value_headers": args.elide_value_headers,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
         "inputs": {}, "executables": {}, "runs": [], "errors": [],
@@ -367,7 +374,8 @@ def run(argv: list[str]) -> int:
                                  "no_verify": args.no_verify,
                                  "diagnostics": args.diagnostics,
                                  "setup_full_compaction": args.setup_full_compaction,
-                                 "front_code_byte_keys": args.front_code_byte_keys}}
+                                 "front_code_byte_keys": args.front_code_byte_keys,
+                                 "elide_value_headers": args.elide_value_headers}}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",

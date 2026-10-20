@@ -102,6 +102,13 @@ where
     fn front_codable_key(&self) -> bool {
         false
     }
+
+    /// Whether data blocks of these items may have their value headers
+    /// elided on disk: true only for a `Vec<u8>` key with an `i64` auxiliary
+    /// value, the layout that [`front_code`](super::front_code) understands.
+    fn elidable_value_headers(&self) -> bool {
+        false
+    }
 }
 
 /// Struct that implements the [`Item`] trait.
@@ -280,6 +287,9 @@ where
     }
     fn front_codable_key(&self) -> bool {
         TypeId::of::<K>() == TypeId::of::<Vec<u8>>() && size_of::<A::Archived>() == 0
+    }
+    fn elidable_value_headers(&self) -> bool {
+        TypeId::of::<K>() == TypeId::of::<Vec<u8>>() && TypeId::of::<A>() == TypeId::of::<i64>()
     }
 }
 

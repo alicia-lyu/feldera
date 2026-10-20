@@ -5,8 +5,8 @@
 use super::filter::{bloom_false_positive_rate, rate_can_evict, resident_modules};
 use super::format::MODULAR_BLOOM_FILTER_BLOCK_MAGIC;
 use super::format::{
-    BloomFilterBlock, Compression, FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer,
-    ModularBloomFilterHeader, RoaringBitmapFilterBlock,
+    BloomFilterBlock, Compression, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC,
+    FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer, ModularBloomFilterHeader, RoaringBitmapFilterBlock,
 };
 use super::{AnyFactories, BatchKeyFilter, Deserializer, Factories};
 use crate::dynamic::{DynVec, WeightTrait};
@@ -1637,7 +1637,9 @@ fn decompress(
         }
         .into());
     }
-    if raw[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC {
+    if raw[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC
+        || raw[4..8] == ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC
+    {
         return super::front_code::decode(&raw)
             .map(Arc::new)
             .map_err(|reason| CorruptionError::FrontCoding { location, reason }.into());
