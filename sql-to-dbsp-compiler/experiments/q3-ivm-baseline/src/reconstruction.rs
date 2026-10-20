@@ -15,8 +15,8 @@ use dbsp::{DynZWeight, Runtime, ZWeight};
 use feldera_sqllib::{Date, SqlDecimal};
 use feldera_storage::StoragePath;
 use merged_index_col::{
-    decode_payload, CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,
-    SourcePayload,
+    decode_payload, CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload,
+    SourceKey, SourcePayload,
 };
 
 use crate::data::{Customer, Line, Order};
