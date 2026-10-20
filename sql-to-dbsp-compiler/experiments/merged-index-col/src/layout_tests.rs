@@ -22,8 +22,8 @@ use dbsp::{
             Factories,
         },
     },
-    utils::Tup2,
-    ZWeight,
+    utils::{Tup1, Tup2, Tup4},
+    DBData, ZWeight,
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
 use rkyv::{to_bytes, Archived};
@@ -131,6 +131,30 @@ fn payload_item_bytes() {
     for (name, size, align) in archives {
         eprintln!("Archived<{name}>: size {size}, align {align}");
     }
+    let native_item = item_bytes(native_lineitem_value(1));
+    eprintln!(
+        "native lineitem item {native_item}, Archived<Tup4<..>>: size {}, align {}",
+        size_of::<Archived<NativeLineitemValue>>(),
+        align_of::<Archived<NativeLineitemValue>>()
+    );
+    // A byte-string item is the variant's archive, padding to the 8-byte
+    // alignment of the `ArchivedVec` header, the header, and the weight.
+    let archive_lens = [
+        payload_archive(&customer_payload()).len(),
+        payload_archive(&orders_payload()).len(),
+        payload_archive(&lineitem_payload()).len(),
+    ];
+    for (((source, item), archive), header) in byte_string
+        .iter()
+        .zip(archive_lens)
+        .zip([size_of::<Archived<Vec<u8>>>(); 3])
+    {
+        let weight = size_of::<ZWeight>();
+        eprintln!(
+            "byte string, {source}: item {item} = archive {archive} + padding {} + header {header} + weight {weight}",
+            item - archive - header - weight
+        );
+    }
     // The enum's archive is its root, the last bytes of `to_bytes`. Its first
     // byte is the variant's discriminant (Customer 0, Orders 1, Lineitem 2);
     // the variant's fields start at the variant's alignment.
@@ -155,12 +179,13 @@ fn payload_item_bytes() {
         archives.map(|(_, size, align)| (size, align)),
         [(64, 16), (16, 8), (8, 4), (48, 16)]
     );
+    assert_eq!(archive_lens, [16, 8, 48]);
+    assert_eq!(native_item, 64);
 }
 
-/// Writes `ROWS` rows of one source to a layer file laid out like a merged
-/// index (folded key, then payload and weight) and accounts for its bytes.
-fn single_source_file(row: impl Fn(i64) -> (SourceKey, SourcePayload)) -> BlockBytes {
-    let index = CustomerOrdersLineitemIndex;
+/// Writes `groups`, each a key and its values with weight 1, to a layer file
+/// and accounts for its bytes.
+fn layer_file<K: DBData, V: DBData>(groups: impl IntoIterator<Item = (K, Vec<V>)>) -> BlockBytes {
     let tempdir = tempfile::tempdir().unwrap();
     let backend = <dyn StorageBackend>::new(
         &StorageConfig {
@@ -170,8 +195,8 @@ fn single_source_file(row: impl Fn(i64) -> (SourceKey, SourcePayload)) -> BlockB
         &StorageOptions::default(),
     )
     .unwrap();
-    let keys = Factories::<DynData, DynData>::new::<Vec<u8>, ()>();
-    let values = Factories::<DynData, DynData>::new::<SourcePayload, ZWeight>();
+    let keys = Factories::<DynData, DynData>::new::<K, ()>();
+    let values = Factories::<DynData, DynData>::new::<V, ZWeight>();
     let mut writer = Writer2::new(
         &keys,
         &values,
@@ -181,13 +206,11 @@ fn single_source_file(row: impl Fn(i64) -> (SourceKey, SourcePayload)) -> BlockB
         None,
     )
     .unwrap();
-    for id in 0..ROWS {
-        let (key, payload) = row(id);
-        assert!(payload.matches(&key));
-        writer.write1((&payload, &(1 as ZWeight))).unwrap();
-        writer
-            .write0((&index.fold(&key).as_bytes().to_vec(), &()))
-            .unwrap();
+    for (key, values) in groups {
+        for value in &values {
+            writer.write1((value, &(1 as ZWeight))).unwrap();
+        }
+        writer.write0((&key, &())).unwrap();
     }
     let path = tempdir.path().join(writer.path().as_ref());
     // The file is deleted when its last reader drops.
@@ -195,51 +218,100 @@ fn single_source_file(row: impl Fn(i64) -> (SourceKey, SourcePayload)) -> BlockB
     layer_file_block_bytes(&path).unwrap()
 }
 
+/// The `ROWS` rows of one source, as the merged index stores them: a folded
+/// key with one value, made from the row's payload by `value`.
+fn merged_index_file<V: DBData>(
+    row: impl Fn(i64) -> (SourceKey, SourcePayload),
+    value: impl Fn(SourcePayload) -> V,
+) -> BlockBytes {
+    let index = CustomerOrdersLineitemIndex;
+    layer_file((0..ROWS).map(|id| {
+        let (key, payload) = row(id);
+        assert!(payload.matches(&key));
+        (index.fold(&key).as_bytes().to_vec(), vec![value(payload)])
+    }))
+}
+
+/// Makes the row of one source with the given id.
+type SourceRow = fn(i64) -> (SourceKey, SourcePayload);
+
+fn customer_row(id: i64) -> (SourceKey, SourcePayload) {
+    (
+        SourceKey::Customer(id),
+        SourcePayload::Customer(customer_payload()),
+    )
+}
+
+fn orders_row(id: i64) -> (SourceKey, SourcePayload) {
+    (
+        SourceKey::Orders(id / 4, id),
+        SourcePayload::Orders(orders_payload()),
+    )
+}
+
+fn lineitem_row(id: i64) -> (SourceKey, SourcePayload) {
+    (
+        SourceKey::Lineitem(id / 16, id / 4, (id % 4) as i32 + 1),
+        SourcePayload::Lineitem(lineitem_payload()),
+    )
+}
+
+/// The archive of the payload's own variant, the byte-string value stored
+/// before values were typed.
+fn byte_string(payload: SourcePayload) -> Vec<u8> {
+    match payload {
+        SourcePayload::Customer(p) => payload_archive(&p),
+        SourcePayload::Orders(p) => payload_archive(&p),
+        SourcePayload::Lineitem(p) => payload_archive(&p),
+    }
+}
+
+/// The native Lineitem join trace's value: line number, extended price,
+/// discount, and ship date (`q3-ivm-baseline`'s generated circuit).
+type NativeLineitemValue = Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
+
+fn native_lineitem_value(line: i32) -> NativeLineitemValue {
+    let p = lineitem_payload();
+    Tup4(line, p.extended_price, p.discount, p.ship_date)
+}
+
+fn value_bytes_per_row(bytes: &BlockBytes) -> f64 {
+    let values = &bytes.levels[1];
+    values.data as f64 / values.rows as f64
+}
+
 #[test]
 fn value_level_bytes_by_source() {
-    let files = [
-        (
-            "customer",
-            single_source_file(|id| {
-                (
-                    SourceKey::Customer(id),
-                    SourcePayload::Customer(customer_payload()),
-                )
-            }),
-        ),
-        (
-            "orders",
-            single_source_file(|id| {
-                (
-                    SourceKey::Orders(id / 4, id),
-                    SourcePayload::Orders(orders_payload()),
-                )
-            }),
-        ),
-        (
-            "lineitem",
-            single_source_file(|id| {
-                (
-                    SourceKey::Lineitem(id / 16, id / 4, (id % 4) as i32 + 1),
-                    SourcePayload::Lineitem(lineitem_payload()),
-                )
-            }),
-        ),
+    let rows: [(&str, SourceRow); 3] = [
+        ("customer", customer_row),
+        ("orders", orders_row),
+        ("lineitem", lineitem_row),
     ];
-    for (source, bytes) in &files {
-        let values = &bytes.levels[1];
+    let typed = rows.map(|(_, row)| merged_index_file(row, |payload| payload));
+    let byte_strings = rows.map(|(_, row)| merged_index_file(row, byte_string));
+    // The native trace keys lines by order: four lines per order key.
+    let native = layer_file(
+        (0..ROWS / 4).map(|order| (Tup1(order), (1..=4).map(native_lineitem_value).collect())),
+    );
+    for (((source, _), typed), byte_string) in rows.iter().zip(&typed).zip(&byte_strings) {
         eprintln!(
-            "{source}: {} rows, value-level data {} B ({:.2} B per row), file {} B",
-            values.rows,
-            values.data,
-            values.data as f64 / values.rows as f64,
-            bytes.total()
+            "{source}: value-level data, typed {} B ({:.2} B per row), byte string {} B ({:.2} B per row)",
+            typed.levels[1].data,
+            value_bytes_per_row(typed),
+            byte_string.levels[1].data,
+            value_bytes_per_row(byte_string),
         );
     }
-    // Measured on aarch64, 2026-10-19: every source's values take the same
-    // bytes on disk.
-    assert_eq!(
-        files.map(|(_, bytes)| bytes.levels[1].data),
-        [166_400, 166_400, 166_400]
+    eprintln!(
+        "native lineitem: value-level data {} B ({:.2} B per row)",
+        native.levels[1].data,
+        value_bytes_per_row(&native)
     );
+
+    // Measured on aarch64, 2026-10-19. Typed values take the same bytes
+    // whatever their source; byte strings take their own variant's bytes.
+    let data = |bytes: &BlockBytes| bytes.levels[1].data;
+    assert_eq!(typed.each_ref().map(data), [166_400, 166_400, 166_400]);
+    assert_eq!(byte_strings.each_ref().map(data), [82_944, 66_560, 148_992]);
+    assert_eq!(data(&native), 132_608);
 }

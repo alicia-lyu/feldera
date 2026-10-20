@@ -152,20 +152,33 @@ What changed is the stored type:
   - a discriminant (the tag) that says which variant follows;
   - room for the largest variant.
 
-Measured on aarch64 by `layout_tests.rs` in `merged-index-col`:
+The enum layout came from the typed-values commit `59b566016`; the Steps 1–2 merge kept it unchanged.
 
-| Source | Typed item | Byte-string item | Values on disk, 2,048 rows of one source |
-| --- | --- | --- | --- |
-| Customer | 80 B | 40 B | 166,400 B |
-| Orders | 80 B | 32 B | 166,400 B |
-| Lineitem | 80 B | 72 B | 166,400 B |
+Measured on aarch64 by `layout_tests.rs` in `merged-index-col`. Each value-level figure is from a layer file of 2,048 rows of one source, written in the merged index's layout: folded key, then value and weight.
 
-An item is the `rkyv` archive of one value and its weight. Typed items are `SourcePayload`; byte-string items are the variant's archive in a `Vec<u8>`, the encoding used before `59b566016`.
+| Source | Typed item | Typed values on disk | Byte-string item | Byte-string values on disk |
+| --- | --- | --- | --- | --- |
+| Customer | 80 B | 166,400 B (81.25 B per row) | 40 B | 82,944 B (40.50 B per row) |
+| Orders | 80 B | 166,400 B (81.25 B per row) | 32 B | 66,560 B (32.50 B per row) |
+| Lineitem | 80 B | 166,400 B (81.25 B per row) | 72 B | 148,992 B (72.75 B per row) |
+| Native Lineitem trace value | 64 B | 132,608 B (64.75 B per row) | | |
 
-- **Variant sizing.** `Archived<SourcePayload>` is 64 B with 16-byte alignment, whatever the variant. Single-source files have identical value levels (81.25 B per row). A dump of the archive shows each Orders value as 8 bytes of data followed by 56 zero bytes.
-- **The tag.** `Archived<LineitemPayload>` is 48 B, so the enum adds 16 B to every Lineitem value. The dump shows the tag byte (`02`) followed by 15 zero bytes, because the decimals that follow need 16-byte alignment. Native traces store their rows without an enum.
-- **For comparison, from different artifacts.** The native Lineitem trace takes 64.75 B per value row (132,608 B for 2,048 rows, `target/r5-front-coded/`). A Lineitem-only merged-index file takes 81.25 B per row.
-- **Same in both modes, not a cause of the gap.** `SqlDecimal` is always an `i128`, and its 16-byte alignment applies to both modes. Inside `Archived<LineitemPayload>` the compiler moves `ship_date` after the two decimals, leaving 12 bytes of padding at the end.
+An item is the `rkyv` archive of one value and its weight.
+
+- **Typed:** `SourcePayload`.
+- **Byte string:** the variant's own archive in a `Vec<u8>`, the encoding used before `59b566016`.
+- **Native:** `Tup4<i32, SqlDecimal<15,2>, SqlDecimal<4,2>, Date>`, the value of the generated circuit's Lineitem join trace. The native-shaped file has four lines per order key. It takes exactly the bytes of the real native Lineitem trace in `target/r5-front-coded/` (132,608 B).
+
+Findings:
+
+- **The layer file stores variable-size values without padding them to a common size.** `ValueBuilder::try_add_item` appends each item's archive after the previous one and records its offset. Byte-string files differ by source, and each takes its item size plus 0.5 to 0.75 B per row on disk.
+- **Byte strings carry a 16 B header.** A byte-string item is the variant's archive, a 16 B `ArchivedVec` header (relative pointer and length) and the 8 B weight, with no padding: Lineitem is 48 + 16 + 8 = 72 B.
+- **Native rows pay alignment instead.** A native Lineitem item is a 48 B tuple and the 8 B weight, rounded up to 64 B because the tuple's decimals need 16-byte alignment. So before typing, a merged-index Lineitem value cost 8 B more than a native one: the 16 B header, less the 8 B of alignment padding that the native value pays.
+- **Typing added the enum.** `Archived<SourcePayload>` is 64 B with 16-byte alignment, whatever the variant.
+  - A dump shows each Orders value as the tag byte (`01`) and 8 bytes of data in a 64 B slot.
+  - A Lineitem value is the tag byte (`02`), 15 zero bytes, then the 48 B `Archived<LineitemPayload>`. Its decimals need 16-byte alignment, so the tag takes 16 B.
+  - Native values have no tag.
+- **Same in both modes, not a cause of the gap.** `SqlDecimal` is always an `i128` with 16-byte alignment. Inside `Archived<LineitemPayload>`, the compiler moves `ship_date` after the two decimals, which leaves 12 bytes of padding at the end.
 
 Which value encoding to keep is the user's decision.
 
