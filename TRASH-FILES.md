@@ -58,3 +58,4 @@ docs/design/merged-index/slides-oct-8/figures/matching-read.tex - moved to TRASH
 docs/design/merged-index/slides-oct-8/figures/trace-growth.tex - moved to TRASH/ - figure of a deleted slide
 docs/design/merged-index/q3-write-storage-investigation.md - moved to TRASH/ - staging notes, consolidated into the measurement.md investigation section
 target/r5-typed-values.clustered.log - moved to TRASH/r5-typed-values-killed/ - measurement killed mid-build at the 2-hour limit, before any run
+git-index.lock-2026-10-20 - moved to TRASH/ - stale empty .git/index.lock left when the disk filled at 16:02; no git process was running
