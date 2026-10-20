@@ -12,8 +12,8 @@ use feldera_types::{
 };
 
 use super::{
-    CustomerOrdersLineitemIndex, CustomerPayload, Date, LineitemPayload, OrdersPayload, SourceKey,
-    SourcePayload, SqlDecimal, SqlString,
+    decode_payload, encode_payload, CustomerOrdersLineitemIndex, CustomerPayload, Date,
+    LineitemPayload, OrdersPayload, SourceKey, SourcePayload, SqlDecimal, SqlString, StoredPayload,
 };
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
@@ -26,7 +26,8 @@ use dbsp::{
 };
 
 type IndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
-type Row = (Vec<u8>, SourcePayload, ZWeight);
+/// A folded key, its stored payload bytes, and a weight.
+type Row = (Vec<u8>, StoredPayload, ZWeight);
 
 const BATCHES: usize = 16;
 const CUSTOMERS_PER_BATCH: usize = 10_000;
@@ -89,11 +90,17 @@ fn customer_group(c: i64) -> Vec<SourceRow> {
 
 // The signed oracle folds source rows independently of batch construction.
 fn encoded_row(index: &CustomerOrdersLineitemIndex, row: &SourceRow) -> Row {
-    (index.fold(&row.0).as_bytes().to_vec(), row.1.clone(), row.2)
+    (
+        index.fold(&row.0).as_bytes().to_vec(),
+        encode_payload(&row.1),
+        row.2,
+    )
 }
 
 fn typed_row(index: &CustomerOrdersLineitemIndex, row: &Row) -> SourceRow {
-    (index.unfold(&row.0).unwrap(), row.1.clone(), row.2)
+    let key = index.unfold(&row.0).unwrap();
+    let payload = decode_payload(&key, &row.1).unwrap();
+    (key, payload, row.2)
 }
 
 fn read_rows(
@@ -110,7 +117,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
         while cursor.val_valid() {
             rows.push((
                 key.clone(),
-                cursor.val().downcast_checked::<SourcePayload>().clone(),
+                cursor.val().downcast_checked::<StoredPayload>().clone(),
                 *cursor.weight().downcast_checked::<ZWeight>(),
             ));
             cursor.step_val();
@@ -120,7 +127,7 @@ fn read_cursor(cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>) -> Ve
     rows
 }
 
-fn apply(oracle: &mut BTreeMap<(Vec<u8>, SourcePayload), ZWeight>, row: &Row) {
+fn apply(oracle: &mut BTreeMap<(Vec<u8>, StoredPayload), ZWeight>, row: &Row) {
     let entry = oracle.entry((row.0.clone(), row.1.clone())).or_default();
     *entry += row.2;
     if *entry == 0 {
@@ -145,7 +152,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let index = CustomerOrdersLineitemIndex;
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
-            SourcePayload,
+            StoredPayload,
             ZWeight,
         >();
         let mut trace = Spine::<IndexBatch>::new(
@@ -380,7 +387,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
                     while cursor.val_valid() {
                         observed.push((
                             key.clone(),
-                            cursor.val().downcast_checked::<SourcePayload>().clone(),
+                            cursor.val().downcast_checked::<StoredPayload>().clone(),
                             *cursor.weight().downcast_checked::<ZWeight>(),
                         ));
                         cursor.step_val();
@@ -428,9 +435,9 @@ fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
             assert_eq!(read_rows(&batch), expected);
         }
         // Confirm this runtime would place a generic nonempty builder on disk.
-        let factories = OrdIndexedWSetFactories::new::<Vec<u8>, SourcePayload, ZWeight>();
+        let factories = OrdIndexedWSetFactories::new::<Vec<u8>, StoredPayload, ZWeight>();
         let mut generic = <IndexBatch as Batch>::Builder::with_capacity(&factories, 1, 1);
-        generic.push_val_diff(SourcePayload::default().erase(), 1_i64.erase());
+        generic.push_val_diff(StoredPayload::default().erase(), 1_i64.erase());
         generic.push_key(vec![1_u8].erase());
         assert_eq!(generic.done().location(), BatchLocation::Storage);
     });

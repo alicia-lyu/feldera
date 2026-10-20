@@ -4,8 +4,8 @@
 //! immutable views. Order placement comes exclusively from that transaction's
 //! complete Orders delta. These readers never insert into a historical trace.
 //!
-//! Requested rows are decoded and copied into temporary native batches so the
-//! existing join can consume them. This is suboptimal: a future reconstructed
+//! Requested rows are decoded (each stored payload with its key) and copied
+//! into temporary native batches so the existing join can consume them. This is suboptimal: a future reconstructed
 //! cursor could avoid this materialization and its possible sorting costs.
 
 use std::{
@@ -26,7 +26,7 @@ use dbsp::{
 };
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
-use super::{CustomerOrdersLineitemIndex, SourceKey, SourcePayload};
+use super::{decode_payload, CustomerOrdersLineitemIndex, SourceKey, SourcePayload, StoredPayload};
 
 pub type CustomerBatch = OrdIndexedZSet<Tup1<i64>, Tup1<SqlString>>;
 pub type OrdersBatch = OrdIndexedZSet<Tup1<i64>, Tup3<i64, Date, i32>>;
@@ -263,7 +263,7 @@ fn scan(
     index: &CustomerOrdersLineitemIndex,
     snapshot: &SourceSnapshot,
     prefix: &[u8],
-    mut visit: impl FnMut(SourceKey, &SourcePayload, i64) -> Result<(), String>,
+    mut visit: impl FnMut(SourceKey, SourcePayload, i64) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut cursor = snapshot.cursor();
     let seek = prefix.to_vec();
@@ -276,10 +276,10 @@ fn scan(
         let key = index.unfold(bytes)?;
         while cursor.val_valid() {
             let weight = **cursor.weight();
-            let payload = cursor.val().downcast_checked::<SourcePayload>();
-            if !payload.matches(&key) {
-                return Err(format!("stored payload does not match key {key:?}"));
-            }
+            // The stored bytes carry no tag: the key names the fields.
+            let stored = cursor.val().downcast_checked::<StoredPayload>();
+            let payload = decode_payload(&key, stored)
+                .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
             visit(key.clone(), payload, weight)?;
             cursor.step_val();
         }
