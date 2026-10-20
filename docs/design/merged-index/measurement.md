@@ -8,7 +8,7 @@ This file defines what is measured and what remains pending. Commands (the runne
 
 - Harness, runner, and macOS smoke runs (measurement version 2) are done.
 - macOS runs are smoke tests only. Their highest RSS (43.2 MiB) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
-- The smoke runs' write and storage gap is explained down to record size; see [the investigation](#write-and-storage-investigation-2026-10-14). The merged index still stores more bytes than the four join traces it replaces.
+- The smoke runs' write and storage gap is explained down to record size; see [the investigation](#write-and-storage-investigation-2026-10-14). With the packed payloads of [Packed, untagged values](#packed-untagged-values-2026-10-19-to-2026-10-20), the merged index's file is smaller than the four join traces' files in these runs.
 - Pending: the Linux pilot, pressure instrumentation, and the three-repetition campaign, all below. No input-preparation helper exists for the campaign.
 
 ## Definitions
@@ -35,6 +35,7 @@ The driver's snapshot reads and the manual-index auxiliary thread would otherwis
 The JSON report (`q3-ivm-baseline/src/main.rs`) records:
 
 - `measurement_version` (2), `completion_boundary` (`last_refresh_complete`), and `compaction_policy` (`no forced compaction; loading waits for normal background merges only; no final wait`, or with `--setup-full-compaction`, `setup full compaction after loading, before the refreshes; no compaction requested after any refresh; no final wait`);
+- `configuration.front_code_byte_keys` and `configuration.elide_value_headers` (booleans), with the writer counters `front_coding` and `value_header_elision` (blocks written encoded, `layout_fallbacks`, `size_fallbacks`; see [WORKFLOW.md](WORKFLOW.md));
 - `configuration.setup_full_compaction` (boolean) and `load.setup_full_compaction`: `null` by default; with the flag, `wait_for_compaction_ms`, `elapsed_ms` (request full compaction plus wait for compaction to finish), and a `resources` block with that setup's writes by owner. `load.background_merge_wait_ms` excludes this time;
 - `sequence.snapshot_publication_transactions` (0; the loading phase reports 1);
 - `load.background_merge_wait_ms` and `load.observed_storage_bytes` (loading only, not part of the refresh sequence);
@@ -124,18 +125,21 @@ The six refreshes stay in memory in both modes, so the window shows no writes. T
 
 ### Record size (2026-10-16 to 2026-10-19)
 
-With equal compaction and the POSIX fix, the merged index held fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but took 1.68 times the bytes. Splitting each run's data-block bytes by level (`block_stats`, reported as `key_level` and `value_level` in `run-contents.json`) located the gap, and two changes followed. Each step ran all three workloads, three repetitions per mode, with `--setup-full-compaction --diagnostics`. Every repetition of every workload gave the same bytes, and native mode did not change between steps.
+With equal compaction and the POSIX fix, the merged index held fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but took 1.68 times the bytes. Splitting each run's data-block bytes by level (`block_stats`, reported as `key_level` and `value_level` in `run-contents.json`) located the gap, and four changes followed. Each step ran all three workloads, three repetitions per mode, with `--setup-full-compaction --diagnostics`. Every repetition of every workload gave the same bytes, and native mode did not change between steps.
 
 | Step (artifact under `target/`) | Merged-index file | Key-level data | Value-level data | Disk usage at window end |
 | --- | --- | --- | --- | --- |
 | Byte-string values (`r5-level-baseline/`) | 317,440 B | 132,096 B | 173,056 B | 806,912 B |
 | Typed values (`r5-typed-values/`) | 358,400 B | 132,096 B | 212,992 B | 847,872 B |
 | Typed values, front-coded keys (`r5-front-coded/`) | 259,584 B | 33,280 B | 212,992 B | 749,056 B |
+| Packed values, front-coded keys (`r5-packed-values/`) | 151,040 B | 33,280 B | 107,008 B | 640,512 B |
+| Packed values, front-coded keys, elided value headers (`r5-packed-elided/`) | 111,104 B | 33,280 B | 67,072 B | 600,576 B |
 | Native: four join traces | 188,928 B | 13,312 B | 168,448 B | 678,400 B |
 
 - **Key level.** Every folded key is distinct, so the key level stores all 2,624 keys and shares nothing between them; before front coding it took about 50 B per key. Front coding (`front_code.rs`, `--front-code-byte-keys`) stores each key as the length of the prefix it shares with the previous key and the rest of its bytes. It cut the key level to 33,280 B, about 12.7 B per key. The native Lineitem trace's key level takes 11 B per key (5,632 B for 512 keys). In every run the writer front-coded 17 blocks, with no layout or size fallbacks.
 - **Value level.** Storing `SourcePayload` itself, instead of each variant's `rkyv` bytes inside a `Vec<u8>`, made the value level larger, not smaller: 212,992 B against 173,056 B. See "Value level" below.
-- **Remaining gap.** The merged index still takes 1.37 times the bytes of the four join traces, and its value level is now most of it. The six refreshes still stay in memory, so the window shows no writes in either mode.
+- **Gap after front coding.** The merged index took 1.37 times the bytes of the four join traces' files (259,584 B against 188,928 B), and its value level was most of it.
+- **Packed values.** The next section changes the stored value. The six refreshes still stay in memory, so the window shows no writes in either mode.
 
 #### Value level (2026-10-19)
 
@@ -180,7 +184,56 @@ Findings:
   - Native values have no tag.
 - **Same in both modes, not a cause of the gap.** `SqlDecimal` is always an `i128` with 16-byte alignment. Inside `Archived<LineitemPayload>`, the compiler moves `ship_date` after the two decimals, which leaves 12 bytes of padding at the end.
 
-Which value encoding to keep is the user's decision.
+The user's decision of 2026-10-19 (see [decisions.md](decisions.md)) is to drop the enum and store packed bytes. The next section measures it.
+
+### Packed, untagged values (2026-10-19 to 2026-10-20)
+
+The stored value is now the packed bytes of `encode_payload` in a `Vec<u8>`, decoded with the row's folded key (see [col-storage.md](col-storage.md)). Three changes are attributed separately, as [decisions.md](decisions.md) records:
+
+1. **The enum.** The stored `SourcePayload` carried a tag and room for the largest variant.
+2. **The byte-string header.** Every `Vec<u8>` value pays a 16 B `ArchivedVec` root. `--elide-value-headers` drops it on disk and rebuilds it on read (`front_code.rs`, `encode_values`). It does not depend on what the bytes encode.
+3. **Packing.** The fields are written back to back, little-endian, with no padding. Strings are a LEB128 length and UTF-8 bytes, and decimals take the narrowest integer that holds their precision.
+
+#### Layout files
+
+`layout_tests.rs` writes, for each source, 2,048 rows in the merged index's layout (folded key, then value and weight), once per encoding, with no compression. Each figure is the value-level data-block bytes of the file, read back from it. The artifact is `target/r5-packed-values/layout-tests.txt` (test `value_level_bytes_by_encoding`, which pins these numbers).
+
+| Source | Typed | `rkyv` bytes | `rkyv` bytes, elided | Packed | Packed, elided |
+| --- | --- | --- | --- | --- | --- |
+| Customer | 166,400 B (81.25 B per row) | 82,944 B (40.50) | 56,832 B (27.75) | 82,944 B (40.50) | 46,592 B (22.75) |
+| Orders | 166,400 B (81.25) | 66,560 B (32.50) | 37,376 B (18.25) | 66,560 B (32.50) | 37,376 B (18.25) |
+| Lineitem | 166,400 B (81.25) | 148,992 B (72.75) | 120,832 B (59.00) | 82,944 B (40.50) | 51,712 B (25.25) |
+
+The native baseline is the `Tup4` value of the generated circuit's Lineitem join trace, written with four lines per order key: 132,608 B (64.75 B per row). That file equals the real native trace's value level in `target/r5-front-coded/` (132,608 B). The native value is not a byte string, so elision does not apply to it.
+
+#### R5 smoke runs
+
+`measure.py --cache-bytes 33554432 --memory-target-bytes 536870912 --batch 512 --runs 3 --no-verify --diagnostics --setup-full-compaction --front-code-byte-keys`, with `--elide-value-headers` added for the second campaign. Inputs are the three smoke workloads of `target/r5-smoke-inputs/` (large-group, clustered, scattered). The artifacts are `target/r5-packed-values/` and `target/r5-packed-elided/`, each with a `summary.json` of the per-run figures.
+
+- Every repetition of every workload gave the same bytes in both modes, and the three workloads agree with each other.
+- The native figures equal those of `r5-front-coded/` in all six campaigns (`target/r5-packed-values/native-sanity.txt`): four join traces of 188,928 B, with 13,312 B of key level, 168,448 B of value level, and 678,400 B of disk usage at the window end.
+- Key front coding wrote the same 17 blocks as before, with no fallbacks. Value-header elision wrote 13 blocks. It had no layout fallback and one size fallback, a block that elision would not have shrunk by a 512-byte sector.
+- The table above has the merged index's rows. Packed values changed only the value level, from 212,992 B to 107,008 B. Elision changed it again, to 67,072 B.
+
+#### Three comparisons
+
+Each compares measured figures. None infers an unmeasured quantity.
+
+- **Enum.** The typed enum took 166,400 B in each layout file. The `rkyv` bytes of each source's own payload took 82,944, 66,560, and 148,992 B. In R5 the merged index's value level was 212,992 B with the enum (`r5-typed-values/`) and 173,056 B with `rkyv` bytes (`r5-level-baseline/`).
+- **Structure, with the same encoding.** The merged index's Lineitem value as `rkyv` bytes took 148,992 B in its layout file, against 132,608 B for the native value. With the header elided it took 120,832 B, less than the native value in these files. The two files differ in shape (one value per folded key, against four lines per order key), and nothing here separates that from the header.
+- **Byte-string header.** Elision shrank every byte-string layout file: `rkyv` bytes from 82,944, 66,560, and 148,992 B to 56,832, 37,376, and 120,832 B, and packed bytes from 82,944, 66,560, and 82,944 B to 46,592, 37,376, and 51,712 B. In R5 it shrank the packed value level from 107,008 B to 67,072 B. It is a disk-format change that any byte-string value can use.
+- **Packing.** Without elision, packing left the Customer and Orders layout files unchanged and shrank Lineitem's, from 148,992 B to 82,944 B. With elision, it left Orders unchanged and shrank Customer's from 56,832 B to 46,592 B and Lineitem's from 120,832 B to 51,712 B. In R5 the packed value level was 107,008 B, against 173,056 B for `rkyv` bytes in `r5-level-baseline/`. Key front coding does not change the value level (`r5-typed-values/` and `r5-front-coded/` both have 212,992 B), so the two runs compare.
+
+#### What packing does and does not show
+
+Packing is neither a unique advantage of the merged index nor orthogonal to it.
+
+- Its byte savings do not come from the merged structure, and native could reach a similar gain.
+- The merged index makes packing cheap. Keys are unique, so values need only byte equality. The payload format is private. Every read goes through one decode point, `decode_payload`.
+- In native, packing is costly. Values are sorted and compared within a key, so a packed form needs an order-preserving encoding or a decode before each comparison. Native types are shared by the whole program and by DBSP's storage format, so the change needs a new format version ([deferred.md](deferred.md#native-packing)).
+- Decoding is not a differentiator: DBSP's cursors deserialize `rkyv` items in both modes.
+
+No figure here is a native packing result, and no run here measures decoding CPU. Both stay unmeasured.
 
 ## Deferred
 
