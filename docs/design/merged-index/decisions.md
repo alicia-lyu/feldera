@@ -129,6 +129,18 @@ A placement's index id is the constant `INDEX_ID_<PLACEMENT>`, for example `INDE
 
 Generated key and payload structs derive `Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd`, and nothing else: no rkyv, `SizeOf`, `IsNone`, or `OrdRepr`. The stored value is packed bytes, so the typed payload is never archived. The typed-value measurement in `layout_tests.rs` keeps using the hand-written structs.
 
+### 2026-10-20: Payloads must be packable, and a trie must place something
+
+Every payload column is NOT NULL and has a packed encoding: an integer, BOOLEAN, DATE, TIME, TIMESTAMP, DECIMAL, or VARCHAR. A trie has at least one placement. Without these, the generated module would not compile. Nullable and other payload types are deferred.
+
+### 2026-10-20: The emitter checks generated Rust names
+
+The emitter rejects a spec whose derived Rust names collide (for example, domains `ab` and `aB` both give `TAG_AB`) or whose column names are not Rust identifiers. A Rust keyword used as a name becomes a raw identifier, such as `r#type`.
+
+### 2026-10-20: The generated `unfold` reports an "unknown index id"
+
+The hand-written `unfold` says "unknown placement id"; the generated one says "unknown index id", following the `INDEX_ID_` naming.
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
