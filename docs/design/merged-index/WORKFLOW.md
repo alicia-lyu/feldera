@@ -59,6 +59,13 @@ cargo +1.96.1 test --offline -p dbsp --lib merged_index
 cargo +1.96.1 test --offline -p dbsp --lib supplied_snapshot_join
 ```
 
+The merged-index spec parser and validator test in the SQL compiler, with Java 21 configured:
+
+```bash
+# From sql-to-dbsp-compiler
+mvn test -pl SQL-compiler -Dtest='MergedIndex*Test' -Dsurefire.failIfNoSpecifiedTests=false
+```
+
 ## Verify R3 and R4
 
 ```bash

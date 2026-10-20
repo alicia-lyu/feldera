@@ -1,6 +1,6 @@
 # General merged-index definition
 
-This document is a design and a roadmap. Roadmap Steps 1 and 2 are implemented: the key encoders, and the static trie with the reshaped `MergedIndexDefinition`. The spec parser, the emitter, and the switch to generated code are not.
+This document is a design and a roadmap. Roadmap Steps 1 to 3 are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, and the spec parser and validator in the SQL compiler. The emitter and the switch to generated code are not.
 
 It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
@@ -109,6 +109,18 @@ Each failure is a compiler error that names the spec line.
    - `*` appears only where the key is exactly the primary key.
    - A list names existing non-key columns, without duplicates.
 
+The SQL compiler implements the parser and these checks in package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex`:
+
+- `MergedIndexSpecParser` turns spec text into a `KeyTrie`, a Java mirror of the Rust trie below.
+- `MergedIndexValidator` checks the trie against the compiled tables and views and returns a `ValidatedMergedIndex`, which holds each placement's key and payload columns with their types.
+- Errors are `SpecError`s with a spec line and column. The parser stops at the first error; the validator reports all of them.
+
+Three details are settled by that implementation:
+
+- **Placements come first.** Inside a node, placements are written before child nodes, because a node's placements get their ids first.
+- **Names are unquoted SQL identifiers.** Relation and column names are matched in the compiler's canonical casing. Derived names keep the spec's spelling. Domain names are case-sensitive.
+- **Views are rejected.** A spec may name a view, but views have no primary key, so rule 5 rejects every placement on one (see [decisions.md](decisions.md)).
+
 ## The static trie
 
 The parsed trie becomes a static Rust value, `KeyTrie` in `merged_index/trie.rs`. It is a nested tree that mirrors the spec and stores nothing that can be derived:
@@ -205,10 +217,10 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
 2. **Static trie and reshaped trait.** Implemented, for keys only: `KeyTrie`, the new `MergedIndexDefinition`, `KeyEncoder` and `KeyDecoder`, and the hand-written COL ported to them with a hand-written `TRIE`.
    - Exit check: the COL tests and `verify.sh` pass with unchanged transcripts. The golden-byte tests are unchanged.
    - Exit check: `check_against_trie` and a proptest tie COL's hard-coded tags and ids to its trie.
-3. **Parser and validator** in the SQL compiler, with no emission yet.
-   - Exit check: JUnit tests of the derivation. COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
-   - Exit check: one failing case per validation rule.
-4. **Emitter, and COL regenerated.** Write `col.mi` and generate the COL module with the two new flags. Commit the generated file, and make `verify.sh` fail if it is stale.
+3. **Parser and validator** in the SQL compiler, with no emission yet. Implemented; see the end of the Validation section.
+   - Exit check: JUnit tests of the derivation (`MergedIndexDerivationTest`). COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
+   - Exit check: one failing case per validation rule (`MergedIndexValidatorTest`); syntax errors are in `MergedIndexSpecParserTest`.
+4. **Emitter, and COL regenerated.** Write `col.mi` and generate the COL module with the two new flags. Commit the generated file, and make `verify.sh` fail if it is stale. The flags also report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
    - Exit check: the generated and hand-written tries are equal.
    - Exit check: `fold` is byte-identical over property-based keys.
    - Exit check: the prefixes match, and sample payloads archive to identical bytes.

@@ -74,6 +74,7 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | COL keys, payloads, Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Design and roadmap for declaring merged indexes as key-trie specs | `docs/design/merged-index/general-definition.md` |
+| Spec parser and schema validator (roadmap Step 3; no emission yet) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 
 ### Experiment commands
