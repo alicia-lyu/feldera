@@ -1,7 +1,7 @@
 use dbsp::NumEntries;
 use dbsp::algebra::{HasOne, HasZero, MulByRef, OptionWeightType};
 use dbsp::dynamic::{HashRepr, OrdRepr};
-use dbsp::trace::merged_index::OrderedKey;
+use dbsp::trace::merged_index::{OrderedKey, PackedField};
 use dbsp::utils::{IsNone, SupportsRoaring};
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::DecimalFormat,
@@ -189,6 +189,35 @@ impl<const P: usize, const S: usize> OrderedKey for Fixed<P, S> {
     }
 }
 
+/// A decimal packs as its mantissa in the narrowest integer that holds `P`
+/// digits: `i16` up to 4, `i32` up to 9, `i64` up to 18, else `i128`. A
+/// stored column has one type, so the width is a function of the type and
+/// needs no tag. Decoding rejects mantissas outside `MIN..=MAX`: the narrow
+/// integers hold values that `P` digits do not, such as 10000 in an `i16`.
+impl<const P: usize, const S: usize> PackedField for Fixed<P, S> {
+    fn encode_packed(&self, out: &mut Vec<u8>) {
+        const INVARIANT: &str = "a decimal's mantissa fits its declared precision";
+        match P {
+            0..=4 => i16::try_from(self.0).expect(INVARIANT).encode_packed(out),
+            5..=9 => i32::try_from(self.0).expect(INVARIANT).encode_packed(out),
+            10..=18 => i64::try_from(self.0).expect(INVARIANT).encode_packed(out),
+            _ => self.0.encode_packed(out),
+        }
+    }
+
+    fn decode_packed(input: &mut &[u8]) -> Option<Self> {
+        let mantissa = match P {
+            0..=4 => i128::from(i16::decode_packed(input)?),
+            5..=9 => i128::from(i32::decode_packed(input)?),
+            10..=18 => i128::from(i64::decode_packed(input)?),
+            _ => i128::decode_packed(input)?,
+        };
+        (Self::MIN.0..=Self::MAX.0)
+            .contains(&mantissa)
+            .then_some(Self(mantissa))
+    }
+}
+
 #[cfg(test)]
 mod ordered_key_test {
     use crate::Fixed;
@@ -261,6 +290,102 @@ mod ordered_key_test {
         #[test]
         fn wide_contract(a in Wide::MIN.0..=Wide::MAX.0, b in Wide::MIN.0..=Wide::MAX.0) {
             check_ordered(wide(a), wide(b));
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_field_test {
+    use crate::Fixed;
+    use dbsp::trace::merged_index::PackedField;
+    use proptest::prelude::*;
+    use std::fmt::Debug;
+
+    fn encode<T: PackedField>(value: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        value.encode_packed(&mut bytes);
+        bytes
+    }
+
+    fn decode<T: PackedField>(bytes: &[u8]) -> Option<T> {
+        T::decode_packed(&mut &bytes[..])
+    }
+
+    /// Checks that a value encodes in `width` bytes, round-trips, and is
+    /// rejected from every strict prefix of its encoding.
+    fn check_round_trip<T: PackedField + PartialEq + Debug>(value: T, width: usize) {
+        let bytes = encode(&value);
+        assert_eq!(bytes.len(), width, "width of {value:?}");
+        assert_eq!(decode::<T>(&bytes).as_ref(), Some(&value));
+        for len in 0..width {
+            assert_eq!(decode::<T>(&bytes[..len]), None, "{len}-byte prefix");
+        }
+    }
+
+    /// Checks the limits of `Fixed<P, S>`: that its mantissa boundaries
+    /// round-trip in `width` bytes, and that a mantissa one past either
+    /// limit is rejected even where the narrow integer can hold it.
+    fn check_limits<const P: usize, const S: usize>(width: usize) {
+        for mantissa in [Fixed::<P, S>::MIN.0, -1, 0, 1, Fixed::<P, S>::MAX.0] {
+            check_round_trip(Fixed::<P, S>(mantissa), width);
+        }
+        for mantissa in [Fixed::<P, S>::MAX.0 + 1, Fixed::<P, S>::MIN.0 - 1] {
+            let le_bytes = mantissa.to_le_bytes();
+            // The little-endian low bytes are the narrow integer's encoding,
+            // and the mantissa fits that integer for every P tested here.
+            assert_eq!(decode::<Fixed<P, S>>(&le_bytes[..width]), None);
+        }
+    }
+
+    #[test]
+    fn limits_round_trip_at_each_narrowing_width() {
+        check_limits::<1, 0>(2);
+        check_limits::<4, 2>(2);
+        check_limits::<5, 2>(4);
+        check_limits::<9, 3>(4);
+        check_limits::<10, 3>(8);
+        check_limits::<15, 2>(8);
+        check_limits::<18, 4>(8);
+        check_limits::<19, 4>(16);
+        check_limits::<38, 10>(16);
+    }
+
+    #[test]
+    fn narrowing_is_little_endian() {
+        assert_eq!(encode(&Fixed::<4, 2>(0x0102)), [2, 1]);
+        assert_eq!(encode(&Fixed::<9, 3>(-1)), [0xff; 4]);
+    }
+
+    type P15 = Fixed<15, 2>;
+
+    proptest! {
+        #[test]
+        fn p4_round_trips(mantissa in Fixed::<4, 2>::MIN.0..=Fixed::<4, 2>::MAX.0) {
+            check_round_trip(Fixed::<4, 2>(mantissa), 2);
+        }
+
+        #[test]
+        fn p9_round_trips(mantissa in Fixed::<9, 3>::MIN.0..=Fixed::<9, 3>::MAX.0) {
+            check_round_trip(Fixed::<9, 3>(mantissa), 4);
+        }
+
+        #[test]
+        fn p15_round_trips(mantissa in P15::MIN.0..=P15::MAX.0) {
+            check_round_trip(Fixed::<15, 2>(mantissa), 8);
+        }
+
+        #[test]
+        fn p38_round_trips(mantissa in Fixed::<38, 10>::MIN.0..=Fixed::<38, 10>::MAX.0) {
+            check_round_trip(Fixed::<38, 10>(mantissa), 16);
+        }
+
+        #[test]
+        fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..20)) {
+            // A successful decode must re-encode to the bytes it consumed.
+            let mut input = bytes.as_slice();
+            if let Some(value) = P15::decode_packed(&mut input) {
+                prop_assert_eq!(encode(&value), &bytes[..8]);
+            }
         }
     }
 }
