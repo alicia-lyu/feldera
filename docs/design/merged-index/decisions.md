@@ -105,6 +105,18 @@ Report the enum, the byte-string header, and packing as three separate changes. 
 
 A spec may name a view, but the validator rejects every placement on one. Key uniqueness requires a primary key, and the SQL compiler records none for views. This is acceptable for now. The design leaves room for a later way to declare a view's key; see [deferred.md](deferred.md#general-merged-index-definition-later-work).
 
+### 2026-10-20: Placements come before child nodes in a spec
+
+Inside a node, placements are written before child nodes. A node's placements get their ids before its children's, so this keeps ids in written order. The parser rejects a placement that follows a child.
+
+### 2026-10-20: Spec names are unquoted SQL identifiers
+
+Relation and column names in a spec are unquoted SQL identifiers, matched in the compiler's canonical casing. Derived names keep the spec's spelling, and domain names are case-sensitive. Quoted identifiers are deferred.
+
+### 2026-10-20: The spec flags arrive with the emitter
+
+Roadmap Step 3 adds no compiler flag. `--merged-index` and `--merged-index-output` arrive in Step 4, together with reporting spec errors as compiler errors.
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.

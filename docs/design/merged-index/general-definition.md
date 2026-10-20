@@ -115,7 +115,7 @@ The SQL compiler implements the parser and these checks in package `org.dbsp.sql
 - `MergedIndexValidator` checks the trie against the compiled tables and views and returns a `ValidatedMergedIndex`, which holds each placement's key and payload columns with their types.
 - Errors are `SpecError`s with a spec line and column. The parser stops at the first error; the validator reports all of them.
 
-Three details are settled by that implementation:
+Three details of that implementation are confirmed decisions (see [decisions.md](decisions.md)):
 
 - **Placements come first.** Inside a node, placements are written before child nodes, because a node's placements get their ids first.
 - **Names are unquoted SQL identifiers.** Relation and column names are matched in the compiler's canonical casing. Derived names keep the spec's spelling. Domain names are case-sensitive.
