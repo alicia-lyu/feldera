@@ -305,7 +305,7 @@ fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[..len]
 }
 
-fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
+pub(crate) fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -317,7 +317,7 @@ fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-fn read_leb128(bytes: &[u8], position: &mut usize) -> Result<usize, String> {
+pub(crate) fn read_leb128(bytes: &[u8], position: &mut usize) -> Result<usize, String> {
     let mut value = 0usize;
     for shift in (0..usize::BITS).step_by(7) {
         let byte = *bytes.get(*position).ok_or("a length runs past the block")?;
