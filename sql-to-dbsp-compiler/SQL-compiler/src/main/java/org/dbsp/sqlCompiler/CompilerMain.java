@@ -31,6 +31,7 @@ import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.ToJsonOuterVisitor;
+import org.dbsp.sqlCompiler.compiler.backend.rust.MergedIndexRustEmitter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.StubsWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCrates;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCratesWriter;
@@ -39,6 +40,11 @@ import org.dbsp.sqlCompiler.compiler.backend.dot.ToDot;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
 import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
+import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.MergedIndexSpecException;
+import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.MergedIndexSpecParser;
+import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.MergedIndexValidator;
+import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.SpecError;
+import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.ValidatedMergedIndex;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.IndentStream;
@@ -154,6 +160,36 @@ public class CompilerMain {
         }
     }
 
+    /** Checks the merged-index spec in {@code specFile} against the compiled program
+     * and writes its Rust module to {@code outputFile}. Reports every problem as an error. */
+    private void emitMergedIndex(DBSPCompiler compiler, String specFile, String outputFile) {
+        String specText;
+        try {
+            specText = Utilities.readFile(Paths.get(specFile));
+        } catch (IOException e) {
+            compiler.reportError(SourcePositionRange.INVALID,
+                    "Error reading file", Utilities.singleQuote(specFile) + " " + e.getMessage());
+            return;
+        }
+        String rust;
+        try {
+            ValidatedMergedIndex index = MergedIndexValidator.validate(MergedIndexSpecParser.parse(specText), compiler);
+            // The file name alone, so that the output does not depend on where the compiler runs.
+            String specName = Paths.get(specFile).getFileName().toString();
+            rust = MergedIndexRustEmitter.emit(index, compiler, specName);
+        } catch (MergedIndexSpecException e) {
+            for (SpecError error : e.errors)
+                compiler.reportError(SourcePositionRange.INVALID,
+                        "Invalid merged index spec", specFile + ":" + error);
+            return;
+        }
+        try {
+            Files.writeString(Paths.get(outputFile), rust);
+        } catch (IOException e) {
+            compiler.reportError(SourcePositionRange.INVALID, "Error writing to file", e.getMessage());
+        }
+    }
+
     /** Run compiler, return exit code. */
     CompilerMessages run() {
         DBSPCompiler compiler = new DBSPCompiler(this.options);
@@ -218,6 +254,12 @@ public class CompilerMain {
                         "Error writing to file", e.getMessage());
                 return compiler.messages;
             }
+        }
+        if (this.options.ioOptions.mergedIndexSpec != null && this.options.ioOptions.mergedIndexOutput != null) {
+            this.emitMergedIndex(compiler,
+                    this.options.ioOptions.mergedIndexSpec, this.options.ioOptions.mergedIndexOutput);
+            if (compiler.hasErrors())
+                return compiler.messages;
         }
 
         String dotFormat = null;

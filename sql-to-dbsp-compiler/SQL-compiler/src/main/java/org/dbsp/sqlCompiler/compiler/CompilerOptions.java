@@ -196,6 +196,12 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         public String emitPlan = null;
         @Nullable @Parameter(names = "--dataflow", description = "Emit the Dataflow graph of the program in the specified JSON file")
         public String emitDataflow = null;
+        @Nullable @Parameter(names = "--merged-index",
+                description = "Merged-index spec to check against the program; requires --merged-index-output")
+        public String mergedIndexSpec = null;
+        @Nullable @Parameter(names = "--merged-index-output",
+                description = "Rust file in which to emit the merged index of --merged-index")
+        public String mergedIndexOutput = null;
         @Parameter(names = {"--je", "-je"}, description = "Emit error messages as a JSON array to the error output")
         public boolean emitJsonErrors = false;
         @Parameter(names = {"--js", "-js"},
@@ -290,6 +296,11 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                         "--q3-merged-index requires single-crate Rust Catalog output");
                 return false;
             }
+            if ((this.mergedIndexSpec == null) != (this.mergedIndexOutput == null)) {
+                reporter.reportError(SourcePositionRange.INVALID, "Invalid options",
+                        "--merged-index and --merged-index-output must be used together");
+                return false;
+            }
             return true;
         }
 
@@ -309,6 +320,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                     ",\n\temitJsonErrors=" + this.emitJsonErrors +
                     ",\n\temitJsonSchema=" + Utilities.singleQuote(this.emitJsonSchema) +
                     ",\n\temitPlan=" + this.emitPlan +
+                    ",\n\tmergedIndexSpec=" + Utilities.singleQuote(this.mergedIndexSpec) +
+                    ",\n\tmergedIndexOutput=" + Utilities.singleQuote(this.mergedIndexOutput) +
                     ",\n\temitPng=" + this.emitPng +
                     ",\n\terrorFile=" + Utilities.singleQuote(this.errorFile) +
                     ",\n\tinputFile=" + Utilities.singleQuote(this.inputFile) +

@@ -117,6 +117,18 @@ Relation and column names in a spec are unquoted SQL identifiers, matched in the
 
 Roadmap Step 3 adds no compiler flag. `--merged-index` and `--merged-index-output` arrive in Step 4, together with reporting spec errors as compiler errors.
 
+### 2026-10-20: Generated names come from the spec
+
+Each placement gets a key struct `<Placement>Key`, with fields named by domain, and a payload struct `<Placement>Payload`, with fields named by SQL column. The `Key` and `Payload` enums have one variant per placement, named by the placement. The names do not imitate the hand-written `SourceKey` and `CustomerPayload`, so Step 5 renames their uses in `q3.rs` and `reconstruction.rs`.
+
+### 2026-10-20: Index-id constants are named `INDEX_ID_`
+
+A placement's index id is the constant `INDEX_ID_<PLACEMENT>`, for example `INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY`, after the design's term "index id". `IDX_` was rejected because it reads as an array position.
+
+### 2026-10-20: Generated structs get plain derives
+
+Generated key and payload structs derive `Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd`, and nothing else: no rkyv, `SizeOf`, `IsNone`, or `OrdRepr`. The stored value is packed bytes, so the typed payload is never archived. The typed-value measurement in `layout_tests.rs` keeps using the hand-written structs.
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.

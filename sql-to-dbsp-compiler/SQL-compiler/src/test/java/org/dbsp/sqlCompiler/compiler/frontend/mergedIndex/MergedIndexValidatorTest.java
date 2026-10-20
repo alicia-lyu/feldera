@@ -267,6 +267,28 @@ public class MergedIndexValidatorTest {
     }
 
     @Test
+    public void rejectsNullablePayloadColumn() {
+        String sql = "CREATE TABLE T (k BIGINT NOT NULL PRIMARY KEY, v INT);";
+        assertInvalid(sql, "domains { k = T.k; }\nmerged_index M { k {\nT: v; } }", 3,
+                "payload column `v` is nullable");
+        assertInvalid(sql, "domains { k = T.k; }\nmerged_index M { k {\nT: *; } }", 3,
+                "payload column `v` is nullable");
+    }
+
+    @Test
+    public void rejectsPayloadTypeWithoutPackedEncoding() {
+        String sql = "CREATE TABLE T (k BIGINT NOT NULL PRIMARY KEY, v DOUBLE NOT NULL);";
+        assertInvalid(sql, "domains { k = T.k; }\nmerged_index M { k {\nT: v; } }", 3,
+                "payload column `v` has type DOUBLE NOT NULL, which has no packed encoding");
+    }
+
+    @Test
+    public void rejectsTrieWithoutPlacements() {
+        assertInvalid(Q3_SCHEMA, "domains { k = Customer.c_custkey; }\nmerged_index M { k { } }", 2,
+                "merged index `M` places no relation");
+    }
+
+    @Test
     public void rejectsDuplicatePayloadColumn() {
         assertColInvalid("o_orderdate, o_shippriority", "o_orderdate, o_orderdate", 11,
                 "payload column `o_orderdate` is listed twice");

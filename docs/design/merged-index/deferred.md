@@ -263,6 +263,7 @@ These items lie outside the roadmap in [general-definition.md](general-definitio
 - **Inferring the trie** from foreign-key and primary-key metadata.
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 - **Placements on views.** The validator rejects them because views have no primary key (decision of 2026-10-20). Allowing them needs a way to declare or infer a view's unique key, for example in the spec or from the view's query.
+- **Nullable and other payload types.** A payload column must be NOT NULL and have a packed encoding: an integer, BOOLEAN, DATE, TIME, TIMESTAMP, DECIMAL, or VARCHAR. Nullable columns need a packed `Option` encoding; floats, binary strings, and the other SQL types need their own.
 - **Quoted identifiers in specs.** Relation and column names are unquoted SQL identifiers, matched in the compiler's canonical casing. A table whose name needs quotes cannot be named yet.
 
 ## Native packing

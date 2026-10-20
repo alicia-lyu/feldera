@@ -80,15 +80,21 @@ public record KeyTrie(String name, List<Domain> domains, List<Node> children, Sp
         return placed;
     }
 
-    /** The tag of a domain: its position of first appearance in the walk, plus 1.
-     * Empty if no node uses the domain. */
-    public OptionalInt domainTag(String domain) {
+    /** The domains that some node uses, in order of first appearance in the walk,
+     * which is tag order. */
+    public List<String> domainsInTagOrder() {
         List<String> appearances = new ArrayList<>();
         visitPreorder(this.children, new ArrayList<>(), (path, node) -> {
             if (!appearances.contains(node.domain()))
                 appearances.add(node.domain());
         });
-        int position = appearances.indexOf(domain);
+        return appearances;
+    }
+
+    /** The tag of a domain: its position of first appearance in the walk, plus 1.
+     * Empty if no node uses the domain. */
+    public OptionalInt domainTag(String domain) {
+        int position = this.domainsInTagOrder().indexOf(domain);
         return position < 0 ? OptionalInt.empty() : OptionalInt.of(position + 1);
     }
 
@@ -104,7 +110,7 @@ public record KeyTrie(String name, List<Domain> domains, List<Node> children, Sp
 
     /** Calls {@code visit} on every node in {@code nodes} and below, in pre-order.
      * The first argument is the node's path, which ends with its own domain. */
-    static void visitPreorder(List<Node> nodes, List<String> path, BiConsumer<List<String>, Node> visit) {
+    public static void visitPreorder(List<Node> nodes, List<String> path, BiConsumer<List<String>, Node> visit) {
         for (Node node : nodes) {
             path.add(node.domain());
             visit.accept(path, node);

@@ -3,17 +3,27 @@ package org.dbsp.sqlCompiler.compiler.frontend.mergedIndex;
 import org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.KeyTrie.PlacedIndex;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
  * A key trie that passed validation, with what only the schema can tell:
- * each placement's key and payload columns and their types.
+ * each domain's type, and each placement's key and payload columns and their types.
  * Tags, ids, and names are still derived from {@link #trie}.
  *
- * @param placements One per placement of {@code trie}, in pre-order.
+ * @param domainTypes The NOT NULL type shared by each domain's columns, by domain name.
+ * @param placements  One per placement of {@code trie}, in pre-order.
  */
-public record ValidatedMergedIndex(KeyTrie trie, List<ResolvedPlacement> placements) {
+public record ValidatedMergedIndex(
+        KeyTrie trie, Map<String, DBSPType> domainTypes, List<ResolvedPlacement> placements) {
+    public ValidatedMergedIndex {
+        domainTypes = Collections.unmodifiableMap(new LinkedHashMap<>(domainTypes));
+        placements = List.copyOf(placements);
+    }
+
     /** A column of the SQL program. {@code relation} is spelled as in the spec,
      * {@code column} as in the schema. */
     public record Column(String relation, String column, DBSPType type) {}

@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,9 +49,18 @@ public final class MergedIndexValidator {
             DBSPTypeCode.UINT8, DBSPTypeCode.UINT16, DBSPTypeCode.UINT32, DBSPTypeCode.UINT64, DBSPTypeCode.UINT128,
             DBSPTypeCode.BOOL, DBSPTypeCode.DATE, DBSPTypeCode.TIME, DBSPTypeCode.TIMESTAMP, DBSPTypeCode.DECIMAL);
 
+    /** Payload types with a packed encoding ({@code PackedField} in DBSP): the key types and strings. */
+    private static final Set<DBSPTypeCode> PACKED_PAYLOAD_TYPES = EnumSet.copyOf(FIXED_WIDTH_KEY_TYPES);
+
+    static {
+        PACKED_PAYLOAD_TYPES.add(DBSPTypeCode.STRING);
+    }
+
     private final KeyTrie trie;
     private final DBSPCompiler compiler;
     private final List<SpecError> errors = new ArrayList<>();
+    /** The NOT NULL type of each declared domain whose columns resolve, by domain name. */
+    private final Map<String, DBSPType> domainTypes = new LinkedHashMap<>();
 
     private MergedIndexValidator(KeyTrie trie, DBSPCompiler compiler) {
         this.trie = trie;
@@ -67,7 +77,7 @@ public final class MergedIndexValidator {
         List<ResolvedPlacement> resolved = validator.resolvePlacements();
         if (!validator.errors.isEmpty())
             throw new MergedIndexSpecException(validator.errors);
-        return new ValidatedMergedIndex(trie, resolved);
+        return new ValidatedMergedIndex(trie, validator.domainTypes, resolved);
     }
 
     // Rules 1-3: domains, their types, and fixed width
@@ -114,10 +124,13 @@ public final class MergedIndexValidator {
                             + domain.name() + "` has type " + this.sqlType(firstTyped));
                 }
             }
-            if (domainType != null && !FIXED_WIDTH_KEY_TYPES.contains(domainType.code))
+            if (domainType == null)
+                continue;
+            if (!FIXED_WIDTH_KEY_TYPES.contains(domainType.code))
                 this.error(domain.position(), "domain `" + domain.name() + "` has type " + this.sqlType(firstTyped)
                         + ", which is not fixed-width; key types are integers, BOOLEAN, DATE, TIME, "
                         + "TIMESTAMP, and DECIMAL");
+            this.domainTypes.putIfAbsent(domain.name(), domainType.withMayBeNull(false));
         }
     }
 
@@ -126,8 +139,11 @@ public final class MergedIndexValidator {
     private void checkCounts() {
         if (this.trie.domains().size() > KeyTrie.MAX_TAGS)
             this.error(this.trie.position(), "more than " + KeyTrie.MAX_TAGS + " domains");
-        if (this.trie.placements().size() > KeyTrie.MAX_TAGS)
+        int placementCount = this.trie.placements().size();
+        if (placementCount > KeyTrie.MAX_TAGS)
             this.error(this.trie.position(), "more than " + KeyTrie.MAX_TAGS + " placements");
+        if (placementCount == 0)
+            this.error(this.trie.position(), "merged index `" + this.trie.name() + "` places no relation");
     }
 
     /** Checks the sibling nodes in {@code nodes}, then recurses into each of them.
@@ -236,7 +252,7 @@ public final class MergedIndexValidator {
                 this.error(placement.position(), "`*` requires the key of `" + placement.relation()
                         + "` to be exactly its primary key; list the payload columns instead");
             for (RelColumnMetadata column : columns) {
-                if (!ownKeyColumns.contains(column.getName()))
+                if (!ownKeyColumns.contains(column.getName()) && this.checkPacked(column, placement.position()))
                     payloadColumns.add(this.toColumn(placement.relation(), column));
             }
         } else {
@@ -250,7 +266,7 @@ public final class MergedIndexValidator {
                     this.error(name.position(), "payload column `" + name.name() + "` is a key column");
                 } else if (!seen.add(column.get().getName())) {
                     this.error(name.position(), "payload column `" + name.name() + "` is listed twice");
-                } else {
+                } else if (this.checkPacked(column.get(), name.position())) {
                     payloadColumns.add(this.toColumn(placement.relation(), column.get()));
                 }
             }
@@ -348,6 +364,24 @@ public final class MergedIndexValidator {
 
     private Column toColumn(String relation, RelColumnMetadata column) {
         return new Column(relation, column.getName().name(), this.typeOf(column));
+    }
+
+    /** Reports, at {@code position}, a payload column whose values have no packed encoding.
+     * @return whether the column can be packed. */
+    private boolean checkPacked(RelColumnMetadata column, SpecPosition position) {
+        DBSPType type = this.typeOf(column);
+        String name = column.getName().name();
+        if (type.mayBeNull) {
+            this.error(position, "payload column `" + name + "` is nullable; packed payloads have no NULL");
+            return false;
+        }
+        if (!PACKED_PAYLOAD_TYPES.contains(type.code)) {
+            this.error(position, "payload column `" + name + "` has type " + typeName(column)
+                    + ", which has no packed encoding; payload types are integers, BOOLEAN, DATE, TIME, "
+                    + "TIMESTAMP, DECIMAL, and VARCHAR");
+            return false;
+        }
+        return true;
     }
 
     private DBSPType typeOf(RelColumnMetadata column) {

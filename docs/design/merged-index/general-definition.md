@@ -1,6 +1,6 @@
 # General merged-index definition
 
-This document is a design and a roadmap. Roadmap Steps 1 to 3 are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, and the spec parser and validator in the SQL compiler. The emitter and the switch to generated code are not.
+This document is a design and a roadmap. Roadmap Steps 1 to 4 are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, the spec parser and validator in the SQL compiler, and the emitter, which generates COL's module beside the hand-written one. The switch to the generated module is not.
 
 It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
@@ -105,9 +105,11 @@ Each failure is a compiler error that names the spec line.
    - No domain repeats on one path.
    - A relation is placed at a node at most once.
    - There are at most 255 domains and 255 placements, because tags and ids are one byte.
+   - There is at least one placement.
 7. **Payloads are valid.**
    - `*` appears only where the key is exactly the primary key.
    - A list names existing non-key columns, without duplicates.
+   - Every payload column, including those that `*` brings in, has a packed encoding: it is NOT NULL, and its type is an integer, BOOLEAN, DATE, TIME, TIMESTAMP, DECIMAL, or VARCHAR (see "Packed payload fields").
 
 The SQL compiler implements the parser and these checks in package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex`:
 
@@ -160,19 +162,27 @@ The compiler's Java model has the same shape, and the emitter prints it as this 
 
 ## Generated code
 
-For one spec, the compiler emits one Rust module containing the following items.
+For one spec, `MergedIndexRustEmitter` (in the compiler's `backend/rust` package) emits one Rust module. The emitter derives every item from the trie at generation time and writes the results as constants and straight-line code, so `fold` never walks the trie at run time. For a placement `OrdersByCustkeyOrderkey` and a domain `custkey`, the module contains:
 
-- **`const TRIE: KeyTrie`.**
-- **A key struct per placement.** Its field types come from the SQL column types, rendered by the existing `ToRustInnerVisitor`. For example, the Lineitem key has `custkey: i64`, `orderkey: i64`, and `linenumber: i32`.
-- **A payload struct per placement,** with fields in payload order.
-- **Packed codecs.** Per placement, an `encode` that writes the fields back to back with `PayloadEncoder`, and a `decode` over `PayloadDecoder`. A `decode` dispatching on the placement id calls the right one. No `Payload` enum is stored: the value is opaque bytes, readable only with its key.
-- **A `Key` enum** over the key structs, and a `Payload` enum as the in-memory input and output type only.
-- **An implementation of `MergedIndexDefinition`.** Its `fold` and `unfold` are straight-line code: constant tags, and one key encoder call per domain in path order. `unfold` selects the placement from the last byte, then checks length and tags.
-- **Typed prefix functions:**
+- **Constants:**
+  - `TAG_CUSTKEY`, one per domain in tag order;
+  - `INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY`, one per placement.
+- **`TRIE`,** the trie as a `KeyTrie` value. Generic code and tests query it at run time.
+- **A key struct per placement,** `OrdersByCustkeyOrderkeyKey`, with one field per path domain, named by the domain. Field types come from the SQL column types, rendered by the existing `ToRustInnerVisitor`. For example, the Lineitem key has `custkey: i64` (from `o_custkey`, through the `via`), `orderkey: i64`, and `linenumber: i32`.
+- **A payload struct per placement,** `OrdersByCustkeyOrderkeyPayload`, with fields named by SQL column, in payload order. It has `encode` (to packed bytes, with `PayloadEncoder`) and `decode` (with `PayloadDecoder`). Both structs derive `Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd`.
+- **`Key` and `Payload` enums,** with one variant per placement, named by the placement. `Payload` is the in-memory input and output type only: the stored value is opaque bytes, readable only with its key.
+  - `Payload::matches(&Key)` checks that a payload belongs to its key's placement.
+  - `encode_payload` and `decode_payload(&Key, &[u8])` dispatch on the placement.
+- **`<IndexName>Definition`,** an implementation of `MergedIndexDefinition`. Its `fold` and `unfold` are straight-line code: constant tags, and one key encoder call per domain in path order. `unfold` selects the placement from the last byte, then checks length and tags.
+- **Typed prefix functions,** with one parameter per path domain:
   - `prefix_<path>` per node: the bytes shared by every key in that node's sort range, the note's β(v, a);
-  - `prefix_<path>_then_<domain>` per child edge, which replaces today's `prefix_with_next_tag`.
+  - `prefix_<path>_then_<domain>` per child edge.
 
-The output is selected by two new compiler flags, `--merged-index <spec>` and `--merged-index-output <file.rs>`. The circuit and `--q3-merged-index` are untouched.
+The emitter rejects a spec whose derived Rust names collide or are not Rust identifiers. A Rust keyword such as `type` becomes a raw identifier, `r#type`.
+
+The compiler flags `--merged-index <spec>` and `--merged-index-output <file.rs>` select the output; each requires the other. Spec errors are reported as compiler errors that name `spec:line:column`. The circuit and `--q3-merged-index` are untouched.
+
+For COL, `merged-index-col/generate.sh` runs the compiler on `q3-ivm-baseline/query.sql` and `merged-index-col/col.mi`, formats the result with rustfmt 1.96.1, and writes the committed `src/generated.rs`. The compiler wrapper always exits 0, so the script treats a missing output as the failure.
 
 ## DBSP prerequisites
 
@@ -190,7 +200,7 @@ Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` wr
 
 This replaced the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
 
-Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL rejects a payload of the wrong variant with `SourcePayload::matches` before it encodes. Generating that check, or adding `type Payload` and placement functions to the trait, is left to Step 4.
+Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL rejects a payload of the wrong variant with `SourcePayload::matches` before it encodes. The generated module provides the same check as `Payload::matches`. Adding `type Payload` and placement functions to the trait remains open.
 
 ### Packed payload fields
 
@@ -225,10 +235,10 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
 3. **Parser and validator** in the SQL compiler, with no emission yet. Implemented; see the end of the Validation section.
    - Exit check: JUnit tests of the derivation (`MergedIndexDerivationTest`). COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
    - Exit check: one failing case per validation rule (`MergedIndexValidatorTest`); syntax errors are in `MergedIndexSpecParserTest`.
-4. **Emitter, and COL regenerated.** Write `col.mi` and generate the COL module with the two new flags. Commit the generated file, and make `verify.sh` fail if it is stale. The flags also report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
-   - Exit check: the generated and hand-written tries are equal.
+4. **Emitter, and COL regenerated.** Implemented: `merged-index-col/col.mi`, `generate.sh`, and the committed `src/generated.rs`, which sits beside the hand-written definition. `verify.sh` regenerates the module and fails if the committed file differs. The flags report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
+   - Exit check: the generated and hand-written tries are equal (`merged-index-col/src/generated_tests.rs`).
    - Exit check: `fold` is byte-identical over property-based keys.
-   - Exit check: the prefixes match, and sample payloads archive to identical bytes.
+   - Exit check: the prefixes match, and sample payloads encode to identical packed bytes. Since 2026-10-19 the stored value is packed bytes rather than an archive.
 5. **Switch.** COL uses the generated module, and the hand-written definition moves to `TRASH/`.
    - Exit check: `verify.sh` transcripts are unchanged.
 

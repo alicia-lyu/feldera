@@ -107,7 +107,7 @@ public class MergedIndexDerivationTest {
         assertEquals(List.of("o_custkey", "o_orderdate", "o_shippriority"),
                 columnNames(orders.placement("OrdersByOrderkey").orElseThrow().payloadColumns()));
 
-        String keyInTheMiddle = "CREATE TABLE W (a INT, k BIGINT NOT NULL PRIMARY KEY, b DATE);";
+        String keyInTheMiddle = "CREATE TABLE W (a INT NOT NULL, k BIGINT NOT NULL PRIMARY KEY, b DATE NOT NULL);";
         ValidatedMergedIndex w = validate(keyInTheMiddle,
                 "domains { k = W.k; } merged_index M { k { W: *; } }");
         assertEquals(List.of("a", "b"), columnNames(w.placement("WByK").orElseThrow().payloadColumns()));
