@@ -74,7 +74,9 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | COL keys, packed payloads (`encode_payload`, `decode_payload`), Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Design and roadmap for declaring merged indexes as key-trie specs | `docs/design/merged-index/general-definition.md` |
-| Spec parser and schema validator (roadmap Step 3; no emission yet) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
+| Spec parser and schema validator (roadmap Step 3) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
+| Rust emitter for a spec (Step 4), selected by `--merged-index` and `--merged-index-output` | `MergedIndexRustEmitter.java` (`backend/rust`), `CompilerMain.emitMergedIndex` |
+| COL spec, its generated module (committed, not yet used), and the generated-vs-hand-written checks | `merged-index-col/col.mi`, `generate.sh`, `src/generated.rs`, `src/generated_tests.rs` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 
 ### Experiment commands
@@ -90,7 +92,7 @@ cargo +1.96.1 test --offline --locked --features merged-index
 python3 measure.py --help           # R5 measurement runner
 ```
 
-The COL library tests with `cargo +1.96.1 test --offline --locked` in its own directory. The DBSP side tests with `cargo +1.96.1 test --offline -p dbsp --lib merged_index` (also `supplied_snapshot_join`).
+The COL library tests with `cargo +1.96.1 test --offline --locked` in its own directory. After changing `col.mi`, the schema, or the emitter, rebuild the compiler JAR (`mvn package -DskipTests` in `SQL-compiler`), run `merged-index-col/generate.sh`, and commit `src/generated.rs`; `verify.sh` fails on a stale file. The DBSP side tests with `cargo +1.96.1 test --offline -p dbsp --lib merged_index` (also `supplied_snapshot_join`).
 
 ### Contracts that the code enforces but the docs omit
 

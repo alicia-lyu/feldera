@@ -67,7 +67,7 @@ Payload rules:
 - The packed encoding writes fields back to back, little-endian, with no padding. A string is a LEB128 length and UTF-8 bytes. A decimal takes the narrowest integer that holds its declared precision (`i16` for `P` up to 4, `i32` up to 9, `i64` up to 18, else `i128`).
 - Values were byte strings (`PayloadBytes`) until 2026-10-16, then the typed enum `SourcePayload` until 2026-10-19. Files from those times must be regenerated; there is no migration.
 
-A future SQL compiler extension could emit these static definitions; see [general-definition.md](general-definition.md). That is not implemented. Any generator must reproduce the exact folded bytes and payload types before it replaces the handwritten definition.
+The SQL compiler also emits this definition from the spec `merged-index-col/col.mi`, as the committed `src/generated.rs` (see [general-definition.md](general-definition.md)). COL still uses the hand-written definition. `generated_tests.rs` checks that the generated one produces the same trie, folded keys, prefixes, and packed payload bytes, which is the condition for replacing the hand-written one in roadmap Step 5.
 
 ## Batch layout
 

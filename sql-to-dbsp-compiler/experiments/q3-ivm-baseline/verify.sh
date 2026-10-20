@@ -4,6 +4,7 @@ set -euo pipefail
 experiment_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 manifest="${experiment_dir}/Cargo.toml"
 col_manifest="${experiment_dir}/../merged-index-col/Cargo.toml"
+col_dir="${experiment_dir}/../merged-index-col"
 artifacts="${experiment_dir}/target/r4-verification/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "${artifacts}"
 
@@ -55,11 +56,17 @@ test -s "${artifacts}/native.json"
 test -s "${artifacts}/reconstructed.json"
 run_check transcript-comparison cmp "${artifacts}/native.json" "${artifacts}/reconstructed.json"
 
+# The committed generated module must match what col.mi and the compiler produce now.
+run_check col-generation "${col_dir}/generate.sh" "${artifacts}/generated.rs"
+run_check col-generated-fresh cmp "${artifacts}/generated.rs" "${col_dir}/src/generated.rs"
 run_check col-format cargo +1.96.1 fmt --manifest-path "${col_manifest}" --all -- --check
 run_check col-tests cargo +1.96.1 test --manifest-path "${col_manifest}" --offline --locked -j2
 run_check col-clippy cargo +1.96.1 clippy --manifest-path "${col_manifest}" \
   --offline --locked --all-targets -j2 -- -D warnings
 run_check runner-tests python3 -m unittest discover -s "${experiment_dir}" -p test_measure.py -v
-run_check shell-syntax bash -n "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh"
+# bash -n checks only its first file, so check each script separately.
+for script in "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh" "${col_dir}/generate.sh"; do
+  run_check "shell-syntax-$(basename "$(dirname "${script}")")-$(basename "${script}" .sh)" bash -n "${script}"
+done
 run_check whitespace git -C "${experiment_dir}" diff --check -- . ../merged-index-col
 echo "RF1/RF2 suites, reader projections, and exact transaction transcripts agree."

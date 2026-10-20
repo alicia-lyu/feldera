@@ -59,12 +59,29 @@ cargo +1.96.1 test --offline -p dbsp --lib merged_index
 cargo +1.96.1 test --offline -p dbsp --lib supplied_snapshot_join
 ```
 
-The merged-index spec parser and validator test in the SQL compiler, with Java 21 configured:
+The merged-index spec parser, validator, and emitter test in the SQL compiler, with Java 21 configured:
 
 ```bash
 # From sql-to-dbsp-compiler
 mvn test -pl SQL-compiler -Dtest='MergedIndex*Test' -Dsurefire.failIfNoSpecifiedTests=false
 ```
+
+## Regenerate the COL module
+
+`merged-index-col/src/generated.rs` is generated from `merged-index-col/col.mi` and the Q3 schema,
+and committed. Regenerate it after changing the spec, `query.sql`, or the emitter:
+
+```bash
+# From sql-to-dbsp-compiler/SQL-compiler: the wrapper runs this JAR
+mvn package -DskipTests
+# From sql-to-dbsp-compiler/experiments/merged-index-col
+./generate.sh                 # or ./generate.sh <output.rs>
+cargo +1.96.1 test --offline --locked generated
+```
+
+`generate.sh` runs the compiler with `--noRust --merged-index col.mi --merged-index-output`, then
+formats the result with rustfmt 1.96.1. The compiler wrapper always exits 0, so the script fails
+when the compiler writes no file; the compiler's errors name `col.mi:line:column`.
 
 ## Verify R3 and R4
 
@@ -73,9 +90,10 @@ mvn test -pl SQL-compiler -Dtest='MergedIndex*Test' -Dsurefire.failIfNoSpecified
 ./verify.sh
 ```
 
-`verify.sh` generates and tests both modes, then runs formatting checks, strict Clippy, the COL
-suite, the Python runner tests, a shell-syntax check, and a whitespace check, all with
-`--offline --locked`. It compares the native and reconstructed transaction transcripts with `cmp`.
+`verify.sh` generates and tests both modes, then regenerates the COL module and fails if the
+committed `generated.rs` differs (`col-generated-fresh`). It then runs formatting checks, strict
+Clippy, the COL suite, the Python runner tests, a syntax check of each shell script, and a
+whitespace check, all with `--offline --locked`. It compares the native and reconstructed transaction transcripts with `cmp`.
 It restores native generation on exit, even after a failure. Logs and transcripts go to a fresh
 `target/r4-verification/` directory; `CARGO_TARGET_DIR` can point at an existing build cache.
 What the tests cover is in [reconstruction.md](reconstruction.md).

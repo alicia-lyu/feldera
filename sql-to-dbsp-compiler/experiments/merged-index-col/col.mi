@@ -1,0 +1,20 @@
+-- The Customer-Orders-Lineitem (COL) merged index over q3-ivm-baseline/query.sql.
+-- generate.sh compiles this spec into src/generated.rs.
+
+domains {
+  custkey    = Customer.c_custkey, Orders.o_custkey;
+  orderkey   = Orders.o_orderkey, Lineitem.l_orderkey;
+  linenumber = Lineitem.l_linenumber;
+}
+
+merged_index CustomerOrdersLineitem {
+  custkey {
+    Customer: *;
+    orderkey {
+      Orders: o_orderdate, o_shippriority;
+      linenumber {
+        Lineitem [custkey via Orders]: l_shipdate, l_extendedprice, l_discount;
+      }
+    }
+  }
+}
