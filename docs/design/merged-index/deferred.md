@@ -5,6 +5,7 @@ The designs and work items here are not implemented. None is a prerequisite for 
 - A single-owner atomic protocol for publishing before/after views.
 - Shared scan sessions that let several readers share one range cursor.
 - Later work on the general merged-index definition, outside its roadmap.
+- Native packing of values.
 
 ## What R3 does instead
 
@@ -263,3 +264,12 @@ These items lie outside the roadmap in [general-definition.md](general-definitio
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 - **Placements on views.** The validator rejects them because views have no primary key (decision of 2026-10-20). Allowing them needs a way to declare or infer a view's unique key, for example in the spec or from the view's query.
 - **Quoted identifiers in specs.** Relation and column names are unquoted SQL identifiers, matched in the compiler's canonical casing. A table whose name needs quotes cannot be named yet.
+
+## Native packing
+
+Native packing (packed tuples, narrowed decimals) is not planned. Two barriers stand in order:
+
+1. Native values are sorted and compared within a key, so a packed form needs an order-preserving encoding or a decode for each comparison.
+2. Native types are shared by the whole program and by DBSP's storage format, so the change needs a new storage format version for every pipeline.
+
+Neither barrier is a decoding cost. No native packing number has been measured.

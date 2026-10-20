@@ -1,56 +1,78 @@
-//! Front coding of byte-string keys in data blocks.
+//! Disk-only encodings of data blocks that hold byte strings.
 //!
-//! Keys in a layer file are sorted, so neighbouring keys often share a long
-//! prefix: the merged index folds customer, order, and line identifiers into
-//! one byte string, and every line of an order repeats its first 19 bytes.
-//! A front-coded data block stores each key as the length of the prefix it
-//! shares with the previous key in the block, followed by the remaining
-//! suffix.
+//! Two independent transforms live here. Each changes only the bytes on
+//! disk: the reader expands an encoded block back to the exact bytes the
+//! writer built before any other code sees it, so cursors, seeks, and the
+//! buffer cache work on ordinary data blocks.
 //!
-//! Front coding changes only the bytes on disk. The reader expands each
-//! front-coded block back to the exact bytes the writer built before any
-//! other code sees it, so cursors, seeks, and the buffer cache work on
-//! ordinary data blocks.
+//! - **Front coding** applies to keys. Keys in a layer file are sorted, so
+//!   neighbouring keys often share a long prefix: the merged index folds
+//!   customer, order, and line identifiers into one byte string, and every
+//!   line of an order repeats its first 19 bytes. A front-coded data block
+//!   stores each key as the length of the prefix it shares with the previous
+//!   key in the block, followed by the remaining suffix.
+//! - **Value-header elision** applies to values. A `Vec<u8>` value is stored
+//!   with a 16-byte `ArchivedVec` root, which is redundant on disk: its
+//!   relative pointer always points at the bytes just before it, and its
+//!   length follows from the item's bounds. An elided data block stores each
+//!   item as the length of its bytes, the bytes, and the weight.
 //!
 //! # Applicability
 //!
-//! The encoder understands one item layout: a key of type `Vec<u8>` paired
-//! with an auxiliary value whose archive is empty, which is the key level of
-//! an indexed batch. With rkyv's `size_64` layout, such an item is the key's
-//! bytes, zero padding to an 8-byte boundary, and a 16-byte `ArchivedVec`
-//! root (a native-endian `i64` relative pointer followed by a native-endian
-//! `u64` length). [`encode`] checks this layout for every item, and checks
-//! that decoding reproduces the original block, before it returns an encoded
-//! block. Any other block is left as it is.
+//! With rkyv's `size_64` layout, an archived `Vec<u8>` is the bytes, zero
+//! padding to an 8-byte boundary, and a 16-byte root (a native-endian `i64`
+//! relative pointer followed by a native-endian `u64` length).
+//!
+//! - Front coding understands one item layout: a key of type `Vec<u8>`
+//!   paired with an auxiliary value whose archive is empty, which is the key
+//!   level of an indexed batch. The item is the archived `Vec<u8>`.
+//! - Value-header elision understands a `Vec<u8>` paired with an `i64`
+//!   weight, which is the value level of an indexed batch. The item is the
+//!   archived `Vec<u8>` followed by the 8-byte weight.
+//!
+//! [`encode`] and [`encode_values`] check the layout for every item, and
+//! check that decoding reproduces the original block, before they return an
+//! encoded block. Any other block is left as it is.
 //!
 //! # Encoded block format
 //!
-//! All integers in the header are little-endian `u32`s.
+//! Both transforms share one format apart from the magic and the per-item
+//! entries. All integers in the header are little-endian `u32`s.
 //!
 //! | Offset | Contents |
 //! |---|---|
 //! | 0 | checksum of bytes 4.. (the block's own checksum) |
-//! | 4 | [`FRONT_CODED_DATA_BLOCK_MAGIC`] |
+//! | 4 | the transform's magic |
 //! | 8 | length of the decoded block |
 //! | 12 | checksum of the decoded block |
 //! | 16 | end of the decoded block's items |
 //! | 20 | length of the copied tail |
 //! | 24 | bytes 8..32 of the decoded block's header |
-//! | 48 | per key: shared-prefix length and suffix length (LEB128), suffix |
+//! | 48 | the per-item entries |
 //! | ... | the decoded block from the end of its items, without trailing zeros |
+//!
+//! The per-item entries are:
+//!
+//! - **Front coding** ([`FRONT_CODED_DATA_BLOCK_MAGIC`]): the shared-prefix
+//!   length and the suffix length (LEB128), then the suffix.
+//! - **Value-header elision** ([`ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC`]):
+//!   the length of the bytes (LEB128), the bytes, and the weight as it was
+//!   stored (8 bytes).
 //!
 //! The tail holds the value map and row groups. Bytes of the decoded block
 //! after the tail are zero.
 
 use crc32c::crc32c;
 
-use super::format::{DATA_BLOCK_MAGIC, FRONT_CODED_DATA_BLOCK_MAGIC};
+use super::format::{
+    DATA_BLOCK_MAGIC, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC, FRONT_CODED_DATA_BLOCK_MAGIC,
+};
 use crate::storage::buffer_cache::FBuf;
 
 /// Length of a data block's header, after which its items start.
 const DATA_HEADER_LEN: usize = 32;
 
-/// Length of the header of a front-coded block.
+/// Length of the header of an encoded block.
 const ENCODED_HEADER_LEN: usize = 48;
 
 /// Length of an archived `Vec<u8>`: a relative pointer and a length.
@@ -59,8 +81,43 @@ const ROOT_LEN: usize = 16;
 /// Alignment of an archived `Vec<u8>`.
 const ROOT_ALIGN: usize = 8;
 
-/// Front-codes the data block `decoded`, whose checksum is already in its
-/// first four bytes.
+/// Length of an archived `i64` weight, which follows the root of a value.
+const WEIGHT_LEN: usize = 8;
+
+/// The two item layouts that this module understands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Layout {
+    /// A `Vec<u8>` key with an empty auxiliary archive.
+    Keys,
+    /// A `Vec<u8>` value with an `i64` weight.
+    Values,
+}
+
+impl Layout {
+    fn magic(self) -> [u8; 4] {
+        match self {
+            Layout::Keys => FRONT_CODED_DATA_BLOCK_MAGIC,
+            Layout::Values => ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC,
+        }
+    }
+
+    fn from_magic(magic: &[u8]) -> Option<Self> {
+        [Layout::Keys, Layout::Values]
+            .into_iter()
+            .find(|layout| layout.magic() == magic)
+    }
+
+    /// The length of the archive that follows an item's bytes and padding.
+    fn archive_len(self) -> usize {
+        match self {
+            Layout::Keys => ROOT_LEN,
+            Layout::Values => ROOT_LEN + WEIGHT_LEN,
+        }
+    }
+}
+
+/// Front-codes the keys of the data block `decoded`, whose checksum is
+/// already in its first four bytes.
 ///
 /// Returns `None`, and the caller writes `decoded` as it is, when the block
 /// does not have the item layout described in the [module](self)
@@ -68,19 +125,42 @@ const ROOT_ALIGN: usize = 8;
 /// decides whether it saves space. Its own checksum is left as zero for the
 /// caller to fill in.
 pub(super) fn encode(decoded: &[u8]) -> Option<FBuf> {
+    encode_layout(decoded, Layout::Keys)
+}
+
+/// Elides the `ArchivedVec` roots of the values of the data block `decoded`,
+/// whose checksum is already in its first four bytes.
+///
+/// The contract is that of [`encode`].
+pub(super) fn encode_values(decoded: &[u8]) -> Option<FBuf> {
+    encode_layout(decoded, Layout::Values)
+}
+
+fn encode_layout(decoded: &[u8], layout: Layout) -> Option<FBuf> {
     let header = DecodedHeader::parse(decoded)?;
     let mut entries = Vec::with_capacity(decoded.len() / 2);
     let mut cursor = DATA_HEADER_LEN;
     let mut previous: &[u8] = &[];
     for index in 0..header.n_values {
         let root = header.item_offset(decoded, index)?;
-        let key = item_key(decoded, cursor, root)?;
-        let shared = common_prefix_len(previous, key);
-        write_leb128(&mut entries, shared);
-        write_leb128(&mut entries, key.len() - shared);
-        entries.extend_from_slice(&key[shared..]);
-        previous = key;
-        cursor = root + ROOT_LEN;
+        let bytes = item_bytes(decoded, cursor, root)?;
+        match layout {
+            Layout::Keys => {
+                let shared = common_prefix_len(previous, bytes);
+                write_leb128(&mut entries, shared);
+                write_leb128(&mut entries, bytes.len() - shared);
+                entries.extend_from_slice(&bytes[shared..]);
+                previous = bytes;
+            }
+            Layout::Values => {
+                let weight =
+                    decoded.get(root + ROOT_LEN..root.checked_add(layout.archive_len())?)?;
+                write_leb128(&mut entries, bytes.len());
+                entries.extend_from_slice(bytes);
+                entries.extend_from_slice(weight);
+            }
+        }
+        cursor = root.checked_add(layout.archive_len())?;
     }
     let items_end = cursor;
     if items_end > header.tail_start {
@@ -90,7 +170,7 @@ pub(super) fn encode(decoded: &[u8]) -> Option<FBuf> {
 
     let mut encoded = FBuf::with_capacity(ENCODED_HEADER_LEN + entries.len() + tail.len());
     encoded.extend_from_slice(&[0; 4]);
-    encoded.extend_from_slice(&FRONT_CODED_DATA_BLOCK_MAGIC);
+    encoded.extend_from_slice(&layout.magic());
     for field in [decoded.len(), 0, items_end, tail.len()] {
         encoded.extend_from_slice(&u32::try_from(field).ok()?.to_le_bytes());
     }
@@ -106,8 +186,8 @@ pub(super) fn encode(decoded: &[u8]) -> Option<FBuf> {
     }
 }
 
-/// Expands the front-coded block `encoded` back to the data block it was
-/// made from, and verifies that block's checksum.
+/// Expands the encoded block `encoded`, of either transform, back to the
+/// data block it was made from, and verifies that block's checksum.
 ///
 /// `encoded` may carry padding after its tail. Returns a description of the
 /// first inconsistency found; it never panics on malformed input.
@@ -118,9 +198,7 @@ pub(super) fn decode(encoded: &[u8]) -> Result<FBuf, String> {
             encoded.len()
         ));
     }
-    if encoded[4..8] != FRONT_CODED_DATA_BLOCK_MAGIC {
-        return Err("bad magic".into());
-    }
+    let layout = Layout::from_magic(&encoded[4..8]).ok_or("bad magic")?;
     let field = |offset: usize| {
         u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap()) as usize
     };
@@ -148,8 +226,15 @@ pub(super) fn decode(encoded: &[u8]) -> Result<FBuf, String> {
     let mut cursor = DATA_HEADER_LEN;
     let mut previous = DATA_HEADER_LEN..DATA_HEADER_LEN;
     for index in 0..n_values {
-        let shared = read_leb128(encoded, &mut input)?;
-        let suffix_len = read_leb128(encoded, &mut input)?;
+        // Where this item's bytes come from. Front coding copies the shared
+        // prefix from the previous item; elision has no shared prefix.
+        let (shared, suffix_len) = match layout {
+            Layout::Keys => (
+                read_leb128(encoded, &mut input)?,
+                read_leb128(encoded, &mut input)?,
+            ),
+            Layout::Values => (0, read_leb128(encoded, &mut input)?),
+        };
         if shared > previous.len() {
             return Err(format!(
                 "key {index} shares more than the previous key's length"
@@ -158,27 +243,35 @@ pub(super) fn decode(encoded: &[u8]) -> Result<FBuf, String> {
         let suffix = encoded
             .get(input..)
             .and_then(|rest| rest.get(..suffix_len))
-            .ok_or_else(|| format!("key {index}'s suffix runs past the block"))?;
+            .ok_or_else(|| format!("item {index}'s bytes run past the block"))?;
         input += suffix_len;
-        let key_len = shared
+        let len = shared
             .checked_add(suffix_len)
-            .ok_or_else(|| format!("key {index} is too long"))?;
+            .ok_or_else(|| format!("item {index} is too long"))?;
         let root = cursor
-            .checked_add(key_len)
+            .checked_add(len)
             .map(|end| end.next_multiple_of(ROOT_ALIGN))
             .filter(|root| {
-                root.checked_add(ROOT_LEN)
+                root.checked_add(layout.archive_len())
                     .is_some_and(|end| end <= items_end)
             })
-            .ok_or_else(|| format!("key {index} runs past the end of the items"))?;
+            .ok_or_else(|| format!("item {index} runs past the end of the items"))?;
 
         decoded.copy_within(previous.start..previous.start + shared, cursor);
-        decoded[cursor + shared..cursor + key_len].copy_from_slice(suffix);
+        decoded[cursor + shared..cursor + len].copy_from_slice(suffix);
         let relative = cursor as i64 - root as i64;
         decoded[root..root + 8].copy_from_slice(&relative.to_ne_bytes());
-        decoded[root + 8..root + ROOT_LEN].copy_from_slice(&(key_len as u64).to_ne_bytes());
-        previous = cursor..cursor + key_len;
-        cursor = root + ROOT_LEN;
+        decoded[root + 8..root + ROOT_LEN].copy_from_slice(&(len as u64).to_ne_bytes());
+        if layout == Layout::Values {
+            let weight = encoded
+                .get(input..)
+                .and_then(|rest| rest.get(..WEIGHT_LEN))
+                .ok_or_else(|| format!("item {index}'s weight runs past the block"))?;
+            decoded[root + ROOT_LEN..root + ROOT_LEN + WEIGHT_LEN].copy_from_slice(weight);
+            input += WEIGHT_LEN;
+        }
+        previous = cursor..cursor + len;
+        cursor = root + layout.archive_len();
     }
     if cursor != items_end {
         return Err(format!("items end at {cursor}, not at {items_end}"));
@@ -277,10 +370,10 @@ fn decode_varint_width(tag: u8) -> Option<Option<usize>> {
         .map(|varint| Some(varint.len()))
 }
 
-/// Returns the key of the item whose root is at `root`, checking that the
-/// key's bytes start at `cursor` and are followed only by zero padding up to
-/// the root.
-fn item_key(block: &[u8], cursor: usize, root: usize) -> Option<&[u8]> {
+/// Returns the bytes of the archived `Vec<u8>` whose root is at `root`,
+/// checking that they start at `cursor` and are followed only by zero padding
+/// up to the root.
+fn item_bytes(block: &[u8], cursor: usize, root: usize) -> Option<&[u8]> {
     let fields = block.get(root..root.checked_add(ROOT_LEN)?)?;
     let relative = i64::from_ne_bytes(fields[..8].try_into().unwrap());
     let len = usize::try_from(u64::from_ne_bytes(fields[8..].try_into().unwrap())).ok()?;
@@ -305,7 +398,7 @@ fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[..len]
 }
 
-fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
+pub(crate) fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -317,7 +410,7 @@ fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-fn read_leb128(bytes: &[u8], position: &mut usize) -> Result<usize, String> {
+pub(crate) fn read_leb128(bytes: &[u8], position: &mut usize) -> Result<usize, String> {
     let mut value = 0usize;
     for shift in (0..usize::BITS).step_by(7) {
         let byte = *bytes.get(*position).ok_or("a length runs past the block")?;

@@ -125,7 +125,7 @@ python3 measure.py \
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
 `--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`,
-`--cgroup-root`, `--total-memory-bytes`).
+`--elide-value-headers`, `--cgroup-root`, `--total-memory-bytes`).
 
 `--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests
 full compaction for the circuit and the merged index and waits for compaction to finish, then
@@ -138,6 +138,14 @@ data, which in this experiment is only the merged index's key level; native runs
 files as without it. The report's `front_coding` holds the writer's counters: blocks written
 front-coded, `layout_fallbacks` (eligible blocks the encoder did not understand, which should be 0),
 and `size_fallbacks` (blocks that front coding would not have shrunk by a 512-byte sector).
+
+`--elide-value-headers` (also a driver flag) sets DBSP's `elide_value_headers` dev tweak. It is
+independent of `--front-code-byte-keys`, so each is measured on its own. Every storage file writer
+then drops the redundant 16-byte `ArchivedVec` header of each byte-string value in data blocks whose
+items are a `Vec<u8>` with an `i64` weight, which in this experiment is only the merged index's value
+level (its packed payloads), and rebuilds the header when the block is read. Native runs write the
+same files as without it. The report's `value_header_elision` holds the counters, with the same
+meaning as `front_coding`'s: `blocks`, `layout_fallbacks` (should be 0), and `size_fallbacks`.
 
 `--diagnostics` turns on the opt-in storage diagnostics. Each run directory then gains a
 `diagnostics/` directory (the driver's own `--diagnostics DIR`, which needs file storage and one run

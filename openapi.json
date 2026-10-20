@@ -10466,6 +10466,12 @@
             "default": null,
             "nullable": true
           },
+          "elide_value_headers": {
+            "type": "boolean",
+            "description": "Whether to elide the redundant header of byte-string values in storage\nfiles: each value is stored as its length, its bytes, and its weight,\nand its 16-byte header is rebuilt when read. It applies only to files\nwhose values are raw byte strings with an `i64` weight, such as a\nmerged index's packed payloads, and is independent of\n`front_code_byte_keys`. Files written with it cannot be read by older\nversions.",
+            "default": null,
+            "nullable": true
+          },
           "enable_roaring": {
             "type": "boolean",
             "description": "Whether file-backed batches may use roaring membership filters when the\nkey type supports them.",

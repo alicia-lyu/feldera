@@ -85,6 +85,22 @@ The first scope is the definition and typed fold, unfold, and prefixes. Readers 
 
 The hand-written COL prefix functions are named as the emitter will name them: `prefix_custkey`, `prefix_custkey_orderkey`, and `prefix_custkey_orderkey_then_linenumber`.
 
+### 2026-10-19: Drop the stored payload enum
+
+The merged index no longer stores `SourcePayload`. The key's placement id already names the source, so the tag is redundant. The stored value is opaque bytes (`Vec<u8>`), decoded together with the key. `SourcePayload` remains the in-memory input and output type. This supersedes the 2026-10-16 typed-values entry for the stored value.
+
+### 2026-10-19: Packed per-placement payload encoding
+
+Each placement packs its payload fields back to back, little-endian, with no alignment padding. A string is a LEB128 length plus UTF-8 bytes. A decimal is narrowed by its declared precision `P`: `i16` up to 4, `i32` up to 9, `i64` up to 18, else `i128`. Decoding accepts only canonical bytes, range-checks every narrowed value, and returns an error instead of panicking.
+
+### 2026-10-19: Elide the byte-string header on disk, as a separate transform
+
+Every `Vec<u8>` value pays a 16 B `ArchivedVec` root, although its relative pointer and length follow from the item's position and bounds. A disk-only transform in `front_code.rs` drops the root for value-level `(Vec<u8>, weight)` items and rebuilds it on load, whatever the bytes encode. It has its own block magic, incompatible-feature bit, writer option, and `measure.py` flag, so it is measured apart from key front coding.
+
+### 2026-10-19: Report three attributions, and frame packing as neither unique nor orthogonal
+
+Report the enum, the byte-string header, and packing as three separate changes. Packing is neither a unique advantage of the merged index nor orthogonal to it. The merged index makes it cheap (unique keys need only byte equality, the format is private, and one decode point reads every value), and native could reach a similar gain at higher engineering cost. Decoding is not a differentiator, and nothing here claims native packing's bytes or decoding CPU cost.
+
 ### 2026-10-20: Views cannot be placed, for now
 
 A spec may name a view, but the validator rejects every placement on one. Key uniqueness requires a primary key, and the SQL compiler records none for views. This is acceptable for now. The design leaves room for a later way to declare a view's key; see [deferred.md](deferred.md#general-merged-index-definition-later-work).
@@ -123,6 +139,7 @@ These directions apply to the 2026-10-08 advisor deck; they do not set research 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
+| 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |
 | 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. |
 | 2026-09-28 | Require a transaction-level folded-key uniqueness check before a delta is incorporated. | 2026-10-12: no validator; uniqueness follows from the base tables' primary keys. |
 | 2026-09-28 | A physical old/new bit, or base/pending bit, in each stored record. | 2026-09-28: before/after read handles. |

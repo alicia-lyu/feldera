@@ -164,8 +164,9 @@ For one spec, the compiler emits one Rust module containing the following items.
 
 - **`const TRIE: KeyTrie`.**
 - **A key struct per placement.** Its field types come from the SQL column types, rendered by the existing `ToRustInnerVisitor`. For example, the Lineitem key has `custkey: i64`, `orderkey: i64`, and `linenumber: i32`.
-- **A payload struct per placement,** with fields in payload order and the DBData derives that the typed payloads require.
-- **`Key` and `Payload` enums** over those structs.
+- **A payload struct per placement,** with fields in payload order.
+- **Packed codecs.** Per placement, an `encode` that writes the fields back to back with `PayloadEncoder`, and a `decode` over `PayloadDecoder`. A `decode` dispatching on the placement id calls the right one. No `Payload` enum is stored: the value is opaque bytes, readable only with its key.
+- **A `Key` enum** over the key structs, and a `Payload` enum as the in-memory input and output type only.
 - **An implementation of `MergedIndexDefinition`.** Its `fold` and `unfold` are straight-line code: constant tags, and one key encoder call per domain in path order. `unfold` selects the placement from the last byte, then checks length and tags.
 - **Typed prefix functions:**
   - `prefix_<path>` per node: the bytes shared by every key in that node's sort range, the note's β(v, a);
@@ -189,7 +190,11 @@ Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` wr
 
 This replaced the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
 
-Payloads are not part of the trait. The typed-payload change, which landed separately, made `build_batch`, `batch_cursor`, and `write_parent` generic over a payload type `P: DBData` and removed `PayloadBytes`. COL rejects a payload of the wrong variant with `SourcePayload::matches`. Generating that check, or adding `type Payload` and placement functions to the trait, is left to Step 4.
+Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL rejects a payload of the wrong variant with `SourcePayload::matches` before it encodes. Generating that check, or adding `type Payload` and placement functions to the trait, is left to Step 4.
+
+### Packed payload fields
+
+Payload fields are packed by the trait `PackedField` in `merged_index/packed.rs`. It is the payload counterpart of `OrderedKey` and differs in three ways: it needs no byte order, so values are little-endian; it has no fixed width, so a string is a LEB128 length and UTF-8 bytes; and a decimal is narrowed by its declared precision (`P` up to 4 as `i16`, up to 9 as `i32`, up to 18 as `i64`, else `i128`). Decoding accepts only canonical bytes and range-checks every narrowed value. `PayloadEncoder` and `PayloadDecoder` are straight-line helpers in the style of `KeyEncoder` and `KeyDecoder`; `PayloadDecoder::finish` rejects trailing bytes. The implementations for dates, times, timestamps, and strings are in `crates/sqllib/src/packed_field.rs`, and for `Fixed` in `crates/fxp/src/dbsp_impl.rs`.
 
 ### Order-preserving key encoders
 

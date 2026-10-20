@@ -9,7 +9,7 @@ use size_of::SizeOf;
 
 use dbsp::trace::merged_index::{
     ColumnRef, Domain, FoldedKey, KeyDecoder, KeyEncoder, KeyTrie, MergedIndexDefinition, Node,
-    Payload, Placement, Via,
+    Payload, PayloadDecoder, PayloadEncoder, Placement, Via,
 };
 
 /// The domain tags and placement ids that the trie below derives.
@@ -221,15 +221,19 @@ pub struct LineitemPayload {
     OrdRepr,
 )]
 #[archive_attr(derive(Eq, Ord, PartialEq, PartialOrd))]
-/// The stored value of a merged-index row. Its variant must match the source
-/// index named by the row's folded key.
+/// The in-memory payload of a merged-index row. Its variant must match the
+/// source index named by the row's folded key.
+///
+/// The index does not store this type: it stores the packed bytes of
+/// [`encode_payload`]. The DBData derives remain so that the layout tests can
+/// measure the typed form against the packed one.
 pub enum SourcePayload {
     Customer(CustomerPayload),
     Orders(OrdersPayload),
     Lineitem(LineitemPayload),
 }
 
-/// DBSP needs a default value; it is never stored.
+/// The `DBData` derives need a default value; it is never stored.
 impl Default for SourcePayload {
     fn default() -> Self {
         Self::Customer(CustomerPayload::default())
@@ -248,6 +252,50 @@ impl SourcePayload {
     }
 }
 
+/// The stored form of a payload: packed bytes with no tag, readable only
+/// together with the row's folded key.
+pub type StoredPayload = Vec<u8>;
+
+/// Packs `payload`: its fields back to back, in declaration order, each
+/// little-endian, with no padding. A string is a LEB128 length and UTF-8
+/// bytes; a decimal takes the narrowest integer that holds its precision.
+pub fn encode_payload(payload: &SourcePayload) -> StoredPayload {
+    match payload {
+        SourcePayload::Customer(p) => PayloadEncoder::new().field(&p.segment).finish(),
+        SourcePayload::Orders(p) => PayloadEncoder::new()
+            .field(&p.order_date)
+            .field(&p.ship_priority)
+            .finish(),
+        SourcePayload::Lineitem(p) => PayloadEncoder::new()
+            .field(&p.ship_date)
+            .field(&p.extended_price)
+            .field(&p.discount)
+            .finish(),
+    }
+}
+
+/// The inverse of [`encode_payload`]. The key's variant names the fields to
+/// read. Rejects truncated, over-long, non-canonical, and out-of-range bytes.
+pub fn decode_payload(key: &SourceKey, bytes: &[u8]) -> Result<SourcePayload, String> {
+    let mut fields = PayloadDecoder::new(bytes);
+    let payload = match key {
+        SourceKey::Customer(_) => SourcePayload::Customer(CustomerPayload {
+            segment: fields.field()?,
+        }),
+        SourceKey::Orders(..) => SourcePayload::Orders(OrdersPayload {
+            order_date: fields.field()?,
+            ship_priority: fields.field()?,
+        }),
+        SourceKey::Lineitem(..) => SourcePayload::Lineitem(LineitemPayload {
+            ship_date: fields.field()?,
+            extended_price: fields.field()?,
+            discount: fields.field()?,
+        }),
+    };
+    fields.finish()?;
+    Ok(payload)
+}
+
 pub struct CustomerOrdersLineitemIndex;
 
 impl CustomerOrdersLineitemIndex {
@@ -261,7 +309,7 @@ impl CustomerOrdersLineitemIndex {
                 if !payload.matches(&key) {
                     return Err("payload does not match source key".into());
                 }
-                Ok((self.fold(&key), payload, weight))
+                Ok((self.fold(&key), encode_payload(&payload), weight))
             })
             .collect::<Result<Vec<_>, String>>()?;
         dbsp::trace::merged_index::batch::build_batch(folded)

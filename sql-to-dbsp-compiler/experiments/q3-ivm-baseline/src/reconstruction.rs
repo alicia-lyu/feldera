@@ -15,8 +15,8 @@ use dbsp::{DynZWeight, Runtime, ZWeight};
 use feldera_sqllib::{Date, SqlDecimal};
 use feldera_storage::StoragePath;
 use merged_index_col::{
-    CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload, SourceKey,
-    SourcePayload,
+    decode_payload, CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload,
+    SourceKey, SourcePayload,
 };
 
 use crate::data::{Customer, Line, Order};
@@ -56,10 +56,10 @@ impl ManualIndex {
             with_write_owner(WriteOwner::MergedIndex, || {
                 cache_runtime.with_buffer_cache(0, || {
                     let index = CustomerOrdersLineitemIndex;
-                    // Folded byte keys; typed payloads.
+                    // Folded byte keys; packed payload bytes.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
-                        SourcePayload,
+                        Vec<u8>,
                         ZWeight,
                     >();
                     let mut trace = Spine::<IndexBatch>::new(
@@ -280,9 +280,8 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
         if !key.starts_with(&prefix) {
             break;
         }
-        let SourceKey::Lineitem(customer, order_key, number) =
-            index.unfold(&key).map_err(anyhow::Error::msg)?
-        else {
+        let line_key = index.unfold(&key).map_err(anyhow::Error::msg)?;
+        let SourceKey::Lineitem(customer, order_key, number) = line_key else {
             bail!("non-Lineitem row inside Lineitem range");
         };
         if customer != order.customer_key || order_key != order.key {
@@ -292,7 +291,10 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
             if **cursor.weight() != 1 {
                 bail!("current Lineitem does not have unit multiplicity");
             }
-            let SourcePayload::Lineitem(payload) = cursor.val().downcast_checked::<SourcePayload>()
+            // The stored bytes carry no tag: the key names the fields.
+            let stored = cursor.val().downcast_checked::<Vec<u8>>();
+            let SourcePayload::Lineitem(payload) =
+                decode_payload(&line_key, stored).map_err(anyhow::Error::msg)?
             else {
                 bail!("Lineitem payload has unexpected type");
             };

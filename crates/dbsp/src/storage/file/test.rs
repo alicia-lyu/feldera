@@ -17,8 +17,9 @@ use crate::{
         file::{
             TouchedWindowCount,
             format::{
-                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, FRONT_CODED_DATA_BLOCK_MAGIC,
-                FileTrailer, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression,
+                ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC, FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer,
+                INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
                 INCOMPATIBLE_FEATURE_MODULAR_FILTERS, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
                 ROARING_BITMAP_FILTER_BLOCK_MAGIC,
             },
@@ -2502,9 +2503,21 @@ fn write_folded_keys(
     (reader, tempdir)
 }
 
-/// The front-coded data blocks of `reader`'s file, as stored on disk. Blocks
-/// start on 512-byte boundaries, and the decoder ignores bytes after a block.
+/// The front-coded data blocks of `reader`'s file, as stored on disk.
 fn front_coded_blocks<N>(reader: &Reader<(&'static DynData, &'static DynData, N)>) -> Vec<Arc<FBuf>>
+where
+    (&'static DynData, &'static DynData, N): ColumnSpec,
+{
+    blocks_with_magic(reader, FRONT_CODED_DATA_BLOCK_MAGIC)
+}
+
+/// The data blocks of `reader`'s file that start with `magic`, as stored on
+/// disk. Blocks start on 512-byte boundaries, and the decoder ignores bytes
+/// after a block.
+fn blocks_with_magic<N>(
+    reader: &Reader<(&'static DynData, &'static DynData, N)>,
+    magic: [u8; 4],
+) -> Vec<Arc<FBuf>>
 where
     (&'static DynData, &'static DynData, N): ColumnSpec,
 {
@@ -2517,7 +2530,7 @@ where
                 .file_handle()
                 .read_block(BlockLocation::new(offset, len).unwrap())
                 .unwrap();
-            (block[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC).then_some(block)
+            (block[4..8] == magic).then_some(block)
         })
         .collect()
 }
@@ -2655,4 +2668,267 @@ proptest! {
     ) {
         check_front_coded_byte_keys(strings, None);
     }
+}
+
+/// Byte-string values with an `i64` weight, shaped like the merged index's
+/// packed payloads: they vary in length, and each group's values are sorted.
+struct ByteValues;
+
+impl TwoColumns for ByteValues {
+    type K0 = i64;
+    type A0 = ();
+    type K1 = Vec<u8>;
+    type A1 = i64;
+
+    fn n0() -> usize {
+        2000
+    }
+    fn key0(row0: usize) -> Self::K0 {
+        row0 as i64 * 4
+    }
+    fn near0(row0: usize) -> (Self::K0, Self::K0) {
+        let key = Self::key0(row0);
+        (key - 1, key + 1)
+    }
+    fn aux0(_row0: usize) -> Self::A0 {}
+
+    fn n1(row0: usize) -> usize {
+        1 + row0 % 3
+    }
+    /// The index of the value, a marker, and a filler whose length varies
+    /// from 0 to 36 bytes, so values are not all the same size.
+    fn key1(row0: usize, row1: usize) -> Self::K1 {
+        let mut value = vec![0, row1 as u8, 0x80];
+        value.resize(3 + (row0 * 5 + row1 * 7) % 37, 0xa5);
+        value
+    }
+    fn near1(row0: usize, row1: usize) -> (Self::K1, Self::K1) {
+        let value = Self::key1(row0, row1);
+        let mut after = value.clone();
+        after.push(0);
+        (vec![0, row1 as u8, 0x7f], after)
+    }
+    fn aux1(row0: usize, row1: usize) -> Self::A1 {
+        (row0 * 3 + row1) as i64 - 1000
+    }
+}
+
+fn elided(parameters: Parameters) -> Parameters {
+    parameters.with_elide_value_headers(true)
+}
+
+type TwoColumnReader = Reader<(
+    &'static DynData,
+    &'static DynData,
+    (&'static DynData, &'static DynData, ()),
+)>;
+
+/// Writes the two-column file of `T` with `parameters` and returns its reader.
+fn write_two_columns<T: TwoColumns>(
+    parameters: Parameters,
+) -> (TwoColumnReader, tempfile::TempDir) {
+    let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
+    let factories1 = Factories::<DynData, DynData>::new::<T::K1, T::A1>();
+    let tempdir = tempdir().unwrap();
+    let storage_backend = <dyn StorageBackend>::new(
+        &StorageConfig {
+            path: tempdir.path().to_string_lossy().to_string(),
+            cache: Default::default(),
+        },
+        &StorageOptions::default(),
+    )
+    .unwrap();
+    let mut writer = Writer2::new(
+        &factories0,
+        &factories1,
+        test_buffer_cache,
+        &*storage_backend,
+        parameters,
+        None,
+    )
+    .unwrap();
+    for row0 in 0..T::n0() {
+        for row1 in 0..T::n1(row0) {
+            writer
+                .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
+                .unwrap();
+        }
+        writer.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
+    }
+    let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
+    reader.evict();
+    (reader, tempdir)
+}
+
+#[test]
+fn elided_value_headers_two_columns() {
+    init_test_logger();
+    for compression in [None, Some(Compression::Snappy), Some(Compression::Zstd)] {
+        let parameters = elided(Parameters::default().with_compression(compression));
+        test_two_columns::<ByteValues>(parameters.clone());
+        test_two_columns_multifetch::<ByteValues>(parameters);
+    }
+}
+
+#[test]
+fn byte_values_are_unchanged_without_the_switch() {
+    init_test_logger();
+    test_two_columns::<ByteValues>(Parameters::default().with_compression(None));
+    let (reader, _dir) =
+        write_two_columns::<ByteValues>(Parameters::default().with_compression(None));
+    assert_eq!(
+        incompatible_features(&reader) & INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS,
+        0
+    );
+    assert!(blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).is_empty());
+}
+
+#[test]
+fn eliding_value_headers_shrinks_the_file_and_marks_it() {
+    init_test_logger();
+    let plain = Parameters::default().with_compression(None);
+    let (unencoded, _dir) = write_two_columns::<ByteValues>(plain.clone());
+    let (encoded, _dir2) = write_two_columns::<ByteValues>(elided(plain));
+
+    assert_eq!(
+        incompatible_features(&encoded) & INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS,
+        INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS
+    );
+    // The two transforms have separate switches, magics, and feature bits.
+    assert_eq!(
+        incompatible_features(&encoded) & INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
+        0
+    );
+    assert!(front_coded_blocks(&encoded).is_empty());
+    assert!(!blocks_with_magic(&encoded, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).is_empty());
+    assert!(
+        encoded.byte_size().unwrap() < unencoded.byte_size().unwrap(),
+        "eliding must shrink the file: {} vs {} bytes",
+        encoded.byte_size().unwrap(),
+        unencoded.byte_size().unwrap()
+    );
+}
+
+#[test]
+fn front_coding_does_not_elide_value_headers() {
+    init_test_logger();
+    let (reader, _dir) =
+        write_folded_keys(front_coded(Parameters::default().with_compression(None)));
+    assert_eq!(
+        incompatible_features(&reader) & INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS,
+        0
+    );
+    assert!(blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).is_empty());
+}
+
+#[test]
+fn only_byte_string_values_with_a_weight_are_elided() {
+    init_test_logger();
+    // The folded-keys file has byte-string keys with an empty auxiliary
+    // value, and `i64` values with `i64` weights. Neither has the layout, so
+    // the switch changes nothing.
+    let (reader, _dir) = write_folded_keys(elided(Parameters::default().with_compression(None)));
+    assert_eq!(
+        incompatible_features(&reader) & INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS,
+        0
+    );
+    assert!(blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).is_empty());
+}
+
+#[test]
+fn corrupt_elided_value_blocks_fail_without_panicking() {
+    init_test_logger();
+    let (reader, _dir) =
+        write_two_columns::<ByteValues>(elided(Parameters::default().with_compression(None)));
+    let block = blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC)
+        .into_iter()
+        .next()
+        .unwrap();
+    let original = super::front_code::decode(&block).unwrap();
+
+    // Any single-byte change decodes to an error or, if it falls in padding
+    // after the block, to the original block.
+    for position in 4..block.len().min(2048) {
+        let mut mutated = block.as_slice().to_vec();
+        mutated[position] ^= 0x5a;
+        if let Ok(decoded) = super::front_code::decode(&mutated) {
+            assert_eq!(decoded.as_slice(), original.as_slice(), "byte {position}");
+        }
+    }
+    for len in 0..64 {
+        assert!(
+            super::front_code::decode(&block[..len]).is_err(),
+            "{len} bytes"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Arbitrary bytes behind the elided-value magic never panic the decoder.
+    #[test]
+    fn arbitrary_elided_value_blocks_never_panic(
+        body in prop::collection::vec(any::<u8>(), 0..300),
+    ) {
+        let mut block = vec![0; 4];
+        block.extend_from_slice(&ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC);
+        block.extend_from_slice(&body);
+        let _ = super::front_code::decode(&block);
+    }
+
+    /// Sorted byte strings of every length from 0 to 48 survive elision,
+    /// including the empty string and strings that fill their padding.
+    #[test]
+    fn elided_variable_length_values_read_back(
+        strings in sorted_byte_strings(None),
+        snappy in any::<bool>(),
+    ) {
+        check_elided_byte_values(strings, snappy.then_some(Compression::Snappy));
+    }
+}
+
+/// Writes `strings` as one group of a two-column file's value level, with
+/// elision on, and reads them back with their weights.
+fn check_elided_byte_values(strings: Vec<Vec<u8>>, compression: Option<Compression>) {
+    let factories0 = Factories::<DynData, DynData>::new::<i64, ()>();
+    let factories1 = Factories::<DynData, DynData>::new::<Vec<u8>, i64>();
+    let tempdir = tempdir().unwrap();
+    let storage_backend = <dyn StorageBackend>::new(
+        &StorageConfig {
+            path: tempdir.path().to_string_lossy().to_string(),
+            cache: Default::default(),
+        },
+        &StorageOptions::default(),
+    )
+    .unwrap();
+    let mut writer = Writer2::new(
+        &factories0,
+        &factories1,
+        test_buffer_cache,
+        &*storage_backend,
+        elided(Parameters::default().with_compression(compression)),
+        None,
+    )
+    .unwrap();
+    for (index, string) in strings.iter().enumerate() {
+        writer.write1((string, &(index as i64 - 7))).unwrap();
+    }
+    writer.write0((&0i64, &())).unwrap();
+    let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
+    reader.evict();
+
+    let rows0 = reader.rows();
+    let rows1 = rows0.nth(0).unwrap().next_column().unwrap();
+    // SAFETY: the file was written with `Vec<u8>` values and `i64` weights.
+    let mut cursor = unsafe { rows1.first() }.unwrap();
+    for (index, string) in strings.iter().enumerate() {
+        let found = cursor.key().unwrap().downcast_checked::<Vec<u8>>();
+        assert_eq!(found, string, "value {index}");
+        let mut weight = 0i64;
+        unsafe { cursor.aux(weight.erase_mut()) }.unwrap();
+        assert_eq!(weight, index as i64 - 7, "weight {index}");
+        unsafe { cursor.move_next() }.unwrap();
+    }
+    assert!(!cursor.has_value());
 }

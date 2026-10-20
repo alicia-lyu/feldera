@@ -41,8 +41,10 @@ fn cursor_row(
 ) -> (SourceKey, SourcePayload, ZWeight) {
     let weight = *cursor.weight().downcast_checked::<ZWeight>();
     let key = cursor.key().downcast_checked::<Vec<u8>>();
-    let payload = cursor.val().downcast_checked::<SourcePayload>();
-    (index.unfold(key).unwrap(), payload.clone(), weight)
+    let key = index.unfold(key).unwrap();
+    let stored = cursor.val().downcast_checked::<StoredPayload>();
+    let payload = decode_payload(&key, stored).unwrap();
+    (key, payload, weight)
 }
 
 fn read_cursor(
@@ -78,7 +80,7 @@ fn memory_batch_sorts_and_consolidates_within_batch() {
     assert_eq!(batch.key_count(), 2);
     assert_eq!(batch.len(), 3);
     assert_eq!(
-        read_cursor(&index, &mut batch_cursor::<SourcePayload>(&[batch])),
+        read_cursor(&index, &mut batch_cursor::<StoredPayload>(&[batch])),
         vec![
             customer_row(1, "A", 2),
             customer_row(2, "A", 4),
@@ -126,7 +128,7 @@ fn cursor_consolidates_batches_without_changing_stored_rows() {
         customer_row(4, "B", 2),
         customer_row(5, "negative", -3),
     ];
-    let mut cursor = batch_cursor::<SourcePayload>(&batches);
+    let mut cursor = batch_cursor::<StoredPayload>(&batches);
     assert_eq!(read_cursor(&index, &mut cursor), expected);
     cursor.rewind_keys();
     assert_eq!(read_cursor(&index, &mut cursor), expected);
@@ -152,7 +154,7 @@ fn cursor_exact_and_lower_bound_seeks_after_rewind() {
             ])
             .unwrap(),
     ];
-    let mut cursor = batch_cursor::<SourcePayload>(&batches);
+    let mut cursor = batch_cursor::<StoredPayload>(&batches);
     let first = index.fold(&SourceKey::Customer(1));
     assert!(cursor.seek_key_exact(first.as_bytes().to_vec().erase(), None));
     assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
@@ -205,7 +207,7 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
             .unwrap(),
     ];
     let prefix = index.prefix_custkey(5);
-    let mut cursor = batch_cursor::<SourcePayload>(&batches);
+    let mut cursor = batch_cursor::<StoredPayload>(&batches);
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
     while cursor.key_valid()
@@ -227,14 +229,14 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
 #[test]
 fn empty_batches_and_cancelled_rows_are_skipped() {
     let index = index();
-    assert!(!batch_cursor::<SourcePayload>(&[]).key_valid());
+    assert!(!batch_cursor::<StoredPayload>(&[]).key_valid());
     let empty = [index.build_batch([]).unwrap()];
-    assert!(!batch_cursor::<SourcePayload>(&empty).key_valid());
+    assert!(!batch_cursor::<StoredPayload>(&empty).key_valid());
     let cancelled = [
         index.build_batch([customer_row(1, "A", 1)]).unwrap(),
         index.build_batch([customer_row(1, "A", -1)]).unwrap(),
     ];
-    assert!(!batch_cursor::<SourcePayload>(&cancelled).key_valid());
+    assert!(!batch_cursor::<StoredPayload>(&cancelled).key_valid());
     let batches = [
         index.build_batch([]).unwrap(),
         index
@@ -244,7 +246,7 @@ fn empty_batches_and_cancelled_rows_are_skipped() {
     ];
     assert_eq!(batches[0].len(), 0);
     assert_eq!(batches[1].key_count(), 0);
-    let mut cursor = batch_cursor::<SourcePayload>(&batches);
+    let mut cursor = batch_cursor::<StoredPayload>(&batches);
     assert_eq!(
         read_cursor(&index, &mut cursor),
         vec![customer_row(2, "B", -3)]
@@ -371,7 +373,7 @@ fn typed_payloads_round_trip_and_must_match_their_keys() {
     let batch = index
         .build_batch(rows.iter().cloned().map(|(key, payload)| (key, payload, 1)))
         .unwrap();
-    let mut stored = read_cursor(&index, &mut batch_cursor::<SourcePayload>(&[batch]));
+    let mut stored = read_cursor(&index, &mut batch_cursor::<StoredPayload>(&[batch]));
     stored.sort_by_key(|(key, ..)| index.fold(key));
     let mut expected: Vec<_> = rows
         .iter()
@@ -720,4 +722,188 @@ fn layer_file_weighted_children_and_seeks() {
     }
     let after = index.fold(&SourceKey::Customer(3));
     assert!(read_from(&reader, &index, after.as_bytes(), None, 1).is_empty());
+}
+
+/// One key and payload per source, at the limits of their field types.
+fn extreme_rows() -> [(SourceKey, SourcePayload); 3] {
+    [
+        (
+            SourceKey::Customer(i64::MAX),
+            SourcePayload::Customer(CustomerPayload {
+                segment: ("東京 café ".repeat(80)).into(),
+            }),
+        ),
+        (
+            SourceKey::Orders(i64::MIN, i64::MAX),
+            SourcePayload::Orders(OrdersPayload {
+                order_date: Date::from_days(i32::MIN),
+                ship_priority: i32::MAX,
+            }),
+        ),
+        (
+            SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
+            SourcePayload::Lineitem(LineitemPayload {
+                ship_date: Date::from_days(i32::MAX),
+                extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
+                discount: SqlDecimal::<4, 2>::new(-99, 2).unwrap(),
+            }),
+        ),
+    ]
+}
+
+fn lineitem_payload(
+    ship_date: i32,
+    price_mantissa: i128,
+    discount_mantissa: i128,
+) -> SourcePayload {
+    SourcePayload::Lineitem(LineitemPayload {
+        ship_date: Date::from_days(ship_date),
+        extended_price: SqlDecimal::<15, 2>::new(price_mantissa, 2).unwrap(),
+        discount: SqlDecimal::<4, 2>::new(discount_mantissa, 2).unwrap(),
+    })
+}
+
+#[test]
+fn packed_payloads_have_golden_bytes() {
+    let customer = SourcePayload::Customer(CustomerPayload {
+        segment: "BUILDING".into(),
+    });
+    assert_eq!(encode_payload(&customer), b"\x08BUILDING");
+
+    let orders = SourcePayload::Orders(OrdersPayload {
+        order_date: Date::from_days(1),
+        ship_priority: -2,
+    });
+    assert_eq!(
+        encode_payload(&orders),
+        [1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]
+    );
+
+    // A date takes 4 bytes, the price 8 (precision 15), the discount 2
+    // (precision 4); nothing is padded and nothing is tagged.
+    let lineitem = lineitem_payload(2, 100, 5);
+    assert_eq!(
+        encode_payload(&lineitem),
+        [2, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 5, 0]
+    );
+}
+
+#[test]
+fn packed_payloads_round_trip_with_their_keys() {
+    for (key, payload) in extreme_rows() {
+        let bytes = encode_payload(&payload);
+        assert_eq!(decode_payload(&key, &bytes).as_ref(), Ok(&payload));
+    }
+    // The limits of each narrowed decimal round-trip.
+    let key = SourceKey::Lineitem(1, 2, 3);
+    for price in [-(10_i128.pow(15) - 1), 0, 10_i128.pow(15) - 1] {
+        for discount in [-9_999, 0, 9_999] {
+            let payload = lineitem_payload(0, price, discount);
+            let bytes = encode_payload(&payload);
+            assert_eq!(decode_payload(&key, &bytes), Ok(payload));
+        }
+    }
+}
+
+#[test]
+fn packed_payload_decoding_needs_the_matching_key() {
+    let rows = extreme_rows();
+    for (i, (key, _)) in rows.iter().enumerate() {
+        for (j, (_, payload)) in rows.iter().enumerate() {
+            let result = decode_payload(key, &encode_payload(payload));
+            assert_eq!(result.is_ok(), i == j, "{key:?} with {payload:?}");
+        }
+    }
+}
+
+#[test]
+fn packed_payloads_reject_truncated_trailing_and_out_of_range_bytes() {
+    for (key, payload) in extreme_rows() {
+        let bytes = encode_payload(&payload);
+        for len in 0..bytes.len() {
+            assert!(
+                decode_payload(&key, &bytes[..len]).is_err(),
+                "{key:?} decoded from {len} of {} bytes",
+                bytes.len()
+            );
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_payload(&key, &trailing).is_err(), "{key:?}");
+    }
+
+    let key = SourceKey::Lineitem(1, 2, 3);
+    let packed = |price: i64, discount: i16| {
+        let mut bytes = vec![0, 0, 0, 0];
+        bytes.extend_from_slice(&price.to_le_bytes());
+        bytes.extend_from_slice(&discount.to_le_bytes());
+        bytes
+    };
+    assert!(decode_payload(&key, &packed(0, 0)).is_ok());
+    // The narrow integers hold these mantissas, but the declared precisions
+    // do not: precision 4 ends at 9,999 and precision 15 at 10^15 - 1.
+    for discount in [10_000, -10_000, i16::MAX, i16::MIN] {
+        assert!(decode_payload(&key, &packed(0, discount)).is_err());
+    }
+    for price in [10_i64.pow(15), -(10_i64.pow(15)), i64::MAX, i64::MIN] {
+        assert!(decode_payload(&key, &packed(price, 0)).is_err());
+    }
+
+    // Strings: a padded length, invalid UTF-8, and a length past the input.
+    let customer = SourceKey::Customer(1);
+    assert!(decode_payload(&customer, b"\x01A").is_ok());
+    assert!(decode_payload(&customer, b"\x81\x00A").is_err());
+    assert!(decode_payload(&customer, b"\x01\xff").is_err());
+    assert!(decode_payload(&customer, b"\x02A").is_err());
+}
+
+proptest! {
+    #[test]
+    fn packed_lineitems_round_trip(
+        ship_date: i32,
+        price in -(10_i128.pow(15) - 1)..=(10_i128.pow(15) - 1),
+        discount in -9_999_i128..=9_999,
+    ) {
+        let key = SourceKey::Lineitem(1, 2, 3);
+        let payload = lineitem_payload(ship_date, price, discount);
+        prop_assert_eq!(decode_payload(&key, &encode_payload(&payload)), Ok(payload));
+    }
+
+    #[test]
+    fn packed_orders_and_customers_round_trip(
+        order_date: i32,
+        ship_priority: i32,
+        segment in "\\PC{0,40}",
+    ) {
+        let orders = SourcePayload::Orders(OrdersPayload {
+            order_date: Date::from_days(order_date),
+            ship_priority,
+        });
+        let customer = SourcePayload::Customer(CustomerPayload {
+            segment: segment.as_str().into(),
+        });
+        for (key, payload) in [
+            (SourceKey::Orders(1, 2), orders),
+            (SourceKey::Customer(1), customer),
+        ] {
+            prop_assert_eq!(decode_payload(&key, &encode_payload(&payload)), Ok(payload));
+        }
+    }
+
+    /// Whatever bytes decode must be exactly the encoding of what they
+    /// decode to, so a payload has one stored form.
+    #[test]
+    fn packed_payload_decoding_is_canonical(
+        bytes in proptest::collection::vec(any::<u8>(), 0..24),
+    ) {
+        for key in [
+            SourceKey::Customer(1),
+            SourceKey::Orders(1, 2),
+            SourceKey::Lineitem(1, 2, 3),
+        ] {
+            if let Ok(payload) = decode_payload(&key, &bytes) {
+                prop_assert_eq!(encode_payload(&payload), bytes.clone());
+            }
+        }
+    }
 }
