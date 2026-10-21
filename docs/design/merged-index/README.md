@@ -63,6 +63,7 @@ These were found by the 2026-10-12 review and are tracked here, not yet schedule
 - [support.md](support.md): the trace and cursor interface and acceptance criteria.
 - [deferred.md](deferred.md): designs not implemented, such as shared scan sessions.
 - [references.md](references.md): sibling-repository sources and their roles.
+- [history.md](history.md): dated, non-authoritative records of superseded measurements and gaps.
 - [slides-oct-8/](slides-oct-8/README.md): the 2026-10-08 advisor deck.
 - Experiments:
   - [q3-ivm-baseline](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/README.md)

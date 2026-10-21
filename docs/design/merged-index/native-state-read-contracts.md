@@ -343,22 +343,13 @@ and price; no BUILDING filter runs in this circuit. The unchanged order
 belongs to both `O⁻` and `O⁺`. Projecting either replacement delta to its
 unchanged identity and summing would yield zero, although its payload changes.
 
-## Compatibility gaps before R3 (historical, 2026-10-06)
+## Compatibility gaps before R3 (archived)
 
-This section records what R2 observed before R3 existed. R3 has since closed
-the runtime-integration gap for RF1/RF2 (see
-[R3 RF1/RF2 binding](#r3-rf1rf2-binding) and
-[reconstruction.md](reconstruction.md)). The other rows describe the storage
-design at that date; [col-storage.md](col-storage.md) is current.
-
-| Boundary | Native request | Storage prototype at 2026-10-06 |
-| --- | --- | --- |
-| Key placement | `B⁺` and `L⁻` request order-ID keys; `O⁻` requests customer-ID keys. Logical equality uses native IDs; folded bytes encode physical placement. | The reusable COL definition (`merged-index-col/src/lib.rs`) places Customer at `(c)`, Orders at `(c,o)`, and extended Lineitem at `(c,o,l)`. Prefix helpers require the customer ID as well as the order ID. |
-| Identity widths | Customer and order IDs are `i64`; line number is `i32`. | COL uses `SourceKey::Customer(i64)`, `Orders(i64, i64)`, and `Lineitem(i64, i64, i32)`. |
-| Payload representation | `SqlString`, `Date`, and fixed-precision `SqlDecimal` types, as listed above. | COL stores segment as `SqlString`, dates as `Date`, ship priority as `i32`, price as `SqlDecimal<15, 2>`, and discount as `SqlDecimal<4, 2>`. |
-| Cursor representation | Each join reads its typed key/value relation, including the joined `B` projection. | The general merged-index batch (`crates/dbsp/src/trace/merged_index/batch.rs`, a public module) stores folded byte keys and serialized payload bytes and exposes consolidated byte rows. Payload codecs live in COL; the typed projections are the Q3 readers described below. |
-| Logical versus physical Lineitem | `s5` carries order ID and line number, with no customer ID. | The `LINEITEM` index, named `LineitemByCustomer` (`merged-index-col/src/lib.rs`), folds the extended row under a customer-leading key; the producer supplies the customer from the same transaction's Orders. |
-| Runtime integration | The default generated joins build native retained traces and read current and delayed snapshots. | Default generation still does. With `--q3-merged-index`, the compiler instead emits the supplied-snapshot joins that read the merged index (R3 below). |
+On 2026-10-06, before R3 existed, the storage prototype differed from the native reads in key placement,
+identity widths, payload representation, cursor representation, Lineitem placement, and runtime integration.
+R3 closed the runtime-integration gap for RF1/RF2 (see [R3 RF1/RF2 binding](#r3-rf1rf2-binding) and
+[reconstruction.md](reconstruction.md)). The row-by-row table is in
+[history.md](history.md#2026-10-06-compatibility-gaps-before-r3); [col-storage.md](col-storage.md) is current.
 
 R3 had to implement the four bindings with the documented tuples, signed
 weights, key and value order, absence, and before/after visibility, and to stop

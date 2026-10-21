@@ -2,25 +2,25 @@
 
 R5 compares native and reconstructed maintenance of `V = Customer ⋈ Orders ⋈ Lineitem` under identical RF1/RF2 refreshes with file-backed maintained state. Reconstructed mode reads the Customer–Orders–Lineitem (COL) merged index in place of four traces (see [reconstruction.md](reconstruction.md)).
 
-This file defines what is measured and what remains pending. Commands (the runner, input generation, the pilot) are in [WORKFLOW.md](WORKFLOW.md). Numbers are in [RESULTS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md); their raw artifacts are local-only, in git-ignored `target/` directories. Following [decisions.md](decisions.md), nothing here infers an unmeasured quantity.
+This file defines what is measured and what remains pending. Commands (the runner, input generation, the pilot) are in the [Linux handoff](WORKFLOW.md#linux-handoff) section of WORKFLOW.md. The version 2 macOS smoke numbers are in [history.md](history.md#2026-10-08-r5-version-2-smoke-runs); [RESULTS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md) holds the column definitions and a stub for the pending rerun in the current configuration. Raw artifacts are local-only, in git-ignored `target/` directories. Following [decisions.md](decisions.md), nothing here infers an unmeasured quantity.
 
 ## Status
 
 - Harness, runner, and macOS smoke runs (measurement version 2) are done.
-- macOS runs are smoke tests only. Their highest RSS (43.2 MiB) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
-- The smoke runs' write and storage gap is explained down to record size; see [the investigation](#write-and-storage-investigation-2026-10-14). With the packed payloads of [Packed, untagged values](#packed-untagged-values-2026-10-19-to-2026-10-20), the merged index's file is smaller than the four join traces' files in these runs.
-- Pending: the Linux pilot, pressure instrumentation, and the three-repetition campaign, all below. No input-preparation helper exists for the campaign.
+- macOS runs are smoke tests only. Their highest RSS (43.2 MiB, [history.md](history.md#2026-10-08-r5-version-2-smoke-runs)) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
+- The smoke runs' write and storage gap is explained down to record size; see [the investigation](history.md#2026-10-14-write-and-storage-investigation). With the packed payloads of [Packed, untagged values](#packed-untagged-values-2026-10-19-to-2026-10-20), the merged index's file is smaller than the four join traces' files in these runs.
+- Pending: the Linux pilot, pressure instrumentation, and the three-repetition campaign, all below. Input preparation for the campaign (`prepare_inputs.py`) is being added in a parallel commit; reconcile this line when it lands.
 
 ## Definitions
 
 - **Setup versus measured.** Initial loading is setup and is excluded. The measured sequence is the refreshes only, from the first refresh to the last refresh's publication and cleanup.
-- **Completion boundary** (version 2). `completion_boundary=last_refresh_complete`. There is no forced compaction, no final compaction wait, and no extra publication transaction. Loading waits only for naturally eligible background merges, then publishes once with an empty transaction. Version 1 forced a final compaction; its results are historical and not comparable (see RESULTS.md).
+- **Completion boundary** (version 2). `completion_boundary=last_refresh_complete`. There is no forced compaction, no final compaction wait, and no extra publication transaction. Loading waits only for naturally eligible background merges, then publishes once with an empty transaction. Version 1 forced a final compaction; its results are historical and not comparable (see [history.md](history.md#2026-10-08-r5-version-1-smoke-runs)).
 - **Refresh deltas stay whole.** Each refresh is complete in RAM. An oversized legitimate refresh must fail rather than be split to fit a budget.
 - **Durability.** Refresh completion implies none. Checkpoint costs are deferred.
 - **Equality of inputs.** Both modes receive the same logical refreshes; the runner records input and executable SHA-256 hashes in a manifest (`measure.py`).
 - **Excluded.** Independent full-join validation runs only on request (`--no-verify` omits it) and is outside the measured interval. Reconstruction decoding, copying, sorting, spill, and output cleanup remain inside their real intervals.
 
-Per-refresh phases (`discovery`, `checks_input_preparation`, `index`, `q3`, `publication_cleanup`, `combined_maintenance = index + q3`), sequence wall time and CPU, and the storage, RSS, and cache columns are defined in RESULTS.md beside their values. Backend read and write counters are storage-backend operations, not OS I/O. OS I/O is available only through cgroup `io.stat` on Linux.
+Per-refresh phases (`discovery`, `checks_input_preparation`, `index`, `q3`, `publication_cleanup`, `combined_maintenance = index + q3`), sequence wall time and CPU, and the storage, RSS, and cache columns are defined in RESULTS.md. Backend read and write counters are storage-backend operations, not OS I/O. On Linux the driver also records OS physical `read_bytes` and `write_bytes` from `/proc/self/io` (`linux_physical_io` in `q3-ivm-baseline/src/measurement.rs`); these count the whole process, and they are `null` on macOS. When `--cgroup-root` is given, the runner additionally records the run cgroup's `io.stat` (`cgroup_evidence` in `measure.py`).
 
 ## RF2 discovery
 
@@ -53,17 +53,23 @@ Three macOS smoke workloads exist, each starting from 64 Customers, 512 Orders, 
 
 ## Pending: Linux campaign
 
-macOS gives no enforced memory limit, so qualification needs Linux. The runner (`measure.py`) already supports `--cgroup-root` and `--total-memory-bytes`: it creates a cgroup v2 child per run with `memory.max` set, `memory.swap.max=0`, copies the input files inside that cgroup before loading, and records `memory.peak`, `memory.events`, and `io.stat`.
+macOS gives no enforced memory limit, so qualification needs Linux. The runner (`measure.py`) already supports `--cgroup-root` and `--total-memory-bytes`: it creates a cgroup v2 child per run with `memory.max` set, `memory.swap.max=0`, copies the input files inside that cgroup before loading, and records `memory.peak` (`null` on a kernel without that file), `memory.events`, and `io.stat`.
 
 Plan (not yet executed):
 
-1. **Inputs.** SF 10 dbgen: `dbgen -s 10 -T c`, `-T o`, and `-U 3` (about 1.5 million Customers, 15 million Orders, 60 million Lines; each RF1 about 15,000 Orders and 60,000 Lines). The sizes are the dbgen scale-factor figures and are unchecked here.
+1. **Inputs.** SF 10 dbgen: `dbgen -s 10 -T c`, `dbgen -s 10 -T o`, and `dbgen -s 10 -U 3`; a bare `-U 3` would use scale factor 1, the default in dbgen's `driver.c` (about 1.5 million Customers, 15 million Orders, 60 million Lines; each RF1 about 15,000 Orders and 60,000 Lines). The sizes are the dbgen scale-factor figures and are unchecked here.
 2. **RF2 deletions.** Three sets of 15,000 distinct existing base Orders, never reused across pairs. Clustered: drawn from the first 7,500 Customers' range. Scattered: fixed-seed uniform sample of existing Order rows (record the seed), not of integers in the sparse key range. Pair each with RF1 inputs of the same complete Order and Lineitem groups, mapped to a narrow or broad Customer range respectively. Keep Orders ascending and Lineitems grouped by Order.
 3. **Settings.** Fresh process, storage directory, and cgroup per run. `memory.max` 1 GiB, swap 0, cache 128 MiB, runtime RSS target 512 MiB, one worker, 10,000-row loading target, three repetitions; identical across modes. Input hashes must match between modes.
-4. **Pilot first** (one repetition, per workload). Require `load.observed_storage_bytes > memory.max` in both modes, aiming at roughly four times the limit. This checks stored-state scale only. Do not substitute transient peak disk size, and do not treat it as proof of memory pressure.
+4. **Pilot first** (one repetition, per workload; the exact command is in the [Linux handoff](WORKFLOW.md#linux-handoff)). Require `load.observed_storage_bytes > memory.max` in both modes, aiming at roughly four times the limit. This checks stored-state scale only. Do not substitute transient peak disk size, and do not treat it as proof of memory pressure.
 5. **Campaign** (`--runs 3`, fresh destinations) only after both pilots pass and the pressure instrumentation below exists.
 
-On Linux, the storage cache reads state with `O_DIRECT`, while ordinary input reads use the page cache and count against the cgroup; this is from the earlier plan and unverified against current code.
+On Linux, storage files open with `O_DIRECT`, while input reads go through the page cache and count against the cgroup. This was checked against the code:
+
+- `StorageCacheConfig::to_custom_open_flags` (`crates/feldera-types/src/config.rs`) returns `O_DIRECT` for `FelderaCache` on Linux, and 0 for `PageCache` and on other systems.
+- `cache_flags` (`crates/dbsp/src/storage/backend.rs`) applies those flags when the POSIX backend creates and opens a file (`posixio_impl.rs`).
+- The driver selects `FelderaCache` (`main.rs`).
+- The `.tbl` inputs are read with `BufReader` over `File` (`main.rs`, `workload.rs`), so they use the page cache. The runner's input copy (`private_inputs`) also runs inside the cgroup.
+- `FBuf::ALIGNMENT` is 512 (`crates/storage/src/fbuf.rs`). A filesystem that needs larger direct-I/O alignment (a 4Kn disk) or that rejects `O_DIRECT` (tmpfs, some overlay filesystems) may fail; whether this build then fails is not tested here. Put the storage path on a local ext4 or xfs filesystem.
 
 ## Pending: pressure evidence
 
@@ -76,9 +82,11 @@ The runner records cgroup limits, peak, events, and I/O. It does not sample runt
 
 Until these are recorded in RESULTS.md, with raw artifacts, make no memory-pressure, reclaim, or beyond-memory claim.
 
-## Write and storage investigation (2026-10-14)
+## Setup compaction and the compaction threshold
 
-In the macOS smoke runs, reconstructed mode wrote more and stored more than native mode, although it drops four join traces. This section records why, from direct evidence. Raw artifacts are local and git-ignored: `target/r5-diagnostics/` (before the fixes), `target/r5-posix-fix/`, and `target/r5-posix-fix-setup-compaction/`. Each holds the three workloads, three repetitions per mode, with `--diagnostics`.
+A Spine starts a background compaction when one of its levels reaches 8 runs (`MIN_LEVEL0_MERGE_BATCHES`). Writes inside the measured window therefore depend on where each Spine stands against that threshold when the window opens, not on how much state it keeps. `--setup-full-compaction` removes that dependence. After loading, it requests full compaction, waits for compaction to finish, then publishes and starts the refreshes, so both modes start from one run per Spine. No compaction is requested after any refresh.
+
+Loading itself is unchanged. The merged index takes a run from every transaction that touches any of its tables, so it reaches the threshold one refresh earlier than each native trace, by design. The evidence for both points (the 2026-10-14 smoke runs, the POSIX flush fix, and the write attribution by owner) is in [history.md](history.md#2026-10-14-write-and-storage-investigation).
 
 ### Terms
 
@@ -87,104 +95,21 @@ In the macOS smoke runs, reconstructed mode wrote more and stored more than nati
 - **Base-relation state:** the base tables stored by primary key (Feldera's "input map").
 - **Operations**, named separately: finish a transaction, request full compaction, wait for compaction to finish, publish snapshots, release snapshots.
 
-### State kept by each mode
-
-Only the joins differ. Both modes keep base-relation state (`add_input_map_persistent`), the delta accumulators (`dyn_shard_accumulate`), and V (`register_materialized_output_zset_persistent`). Native `dyn_join_generic` builds four join traces with `dyn_shard_accumulate_trace`. Reconstructed `dyn_join_generic_with_snapshot_readers` builds none; it reads the merged index, one Spine that `ManualIndex::new` creates on its auxiliary thread.
-
-### Instruments
-
-- **Writes by owner.** Each file writer records an owner when it is created: `query` (join traces, V, query execution), `base_relation`, or `merged_index`. A Spine's owner is set at creation and carried into its background compaction. The owners always sum to the backend totals (tests in `crates/dbsp/tests/write_attribution_*.rs`, check in `measure.py`).
-- **`--diagnostics`.** A flush log, a compaction log, and each Spine's run contents at the end of the window (see [WORKFLOW.md](WORKFLOW.md)). In all runs the flush log matches the counters, and every run's block bytes sum to its file size. Turning diagnostics on leaves large-group's totals unchanged.
-
-The logs name Spines by circuit node. Matching record counts and block bytes identifies them: in native mode, `AccumulateZ1Trace nn42`, `nn37`, `nn56`, and `nn51` are the Customer, Orders, Orders ⋈ Customer, and Lineitem join traces, and `nn65` is V. In reconstructed mode, `nn51` is V.
-
-### Cause 1: the POSIX writer flushed every block after the first MiB (fixed)
-
-- **Evidence.** `VectoredWrite::flush` (`posixio_impl.rs`) cleared its buffers but not its byte count, so once a file had buffered 1 MiB, every later block flushed on its own. In large-group, the merged index's 1,590,272-byte compaction output took one 1 MiB flush plus 68 small ones; every other file took one flush.
-- **Fix.** Reset the count on flush (`f7fec2391`, an upstream DBSP change). Regression test: `crates/dbsp/tests/posix_flush_threshold.rs` (385 flushes before, 3 after).
-- **Effect.** Large-group reconstructed writes fall from 72 operations to 5; the merged index's from 69 to 2. Bytes are unchanged (2,171,392 B). Native is unchanged (6 operations, 765,952 B).
-
-### Cause 2: the merged index reached the compaction threshold one refresh earlier
-
-- **Evidence.** Loading is one Customer transaction and six Order and Lineitem transactions. The merged index takes a run from all 7; each native trace from at most 6. At the first refresh, the merged index reaches 8 runs and compacts: in large-group, 12,625 records in and 12,625 out, all written to disk, including the 10,000 RF1 Lines that RF2 then deletes. Native traces reach 8 runs one refresh later, so their compaction cancels RF1 against RF2 (22,048 records in, 2,048 out).
-- **Consequence.** Writes inside the window depend on where each Spine stands against the threshold when the window opens, not on how much state it keeps. In clustered and scattered, native compactions sometimes finish after the window closes, which is why those results varied between repetitions.
-- **Treatment.** `--setup-full-compaction` (`035eeab8e`) starts both modes from one run per Spine: after loading, request full compaction, wait for compaction to finish, then publish and start the refreshes. No compaction is requested after any refresh. The loading itself is unchanged: the merged index takes a run from every transaction that touches any of its tables, so it reaches the threshold sooner by design.
-
-### Results after both changes (observations; all repetitions identical)
-
-| | Native | Reconstructed |
-| --- | --- | --- |
-| Setup compaction writes, base relation | 3 ops, 206,848 B | 3 ops, 206,848 B |
-| Setup compaction writes, query | 5 ops, 471,552 B | 1 op, 282,624 B (V) |
-| Setup compaction writes, merged index | 0 | 1 op, 317,440 B |
-| Join state on disk (four join traces, or the merged index) | 188,928 B for 3,136 rows | 317,440 B for 2,624 rows |
-| Writes inside the window, all owners | 0 | 0 |
-| Disk usage at window end | 678,400 B | 806,912 B |
-
-The six refreshes stay in memory in both modes, so the window shows no writes. That is not evidence of a disk saving.
-
-### Record size (2026-10-16 to 2026-10-19)
+## Record size (2026-10-16 to 2026-10-19)
 
 With equal compaction and the POSIX fix, the merged index held fewer rows than the four join traces (2,624 against 3,136, because it does not repeat Orders ⋈ Customer) but took 1.68 times the bytes. Splitting each run's data-block bytes by level (`block_stats`, reported as `key_level` and `value_level` in `run-contents.json`) located the gap, and four changes followed. Each step ran all three workloads, three repetitions per mode, with `--setup-full-compaction --diagnostics`. Every repetition of every workload gave the same bytes, and native mode did not change between steps.
 
+The table keeps the rows that match the current configuration. The rows for the byte-string and typed-value steps are in [history.md](history.md#2026-10-16-to-2026-10-19-record-size-typed-value-steps).
+
 | Step (artifact under `target/`) | Merged-index file | Key-level data | Value-level data | Disk usage at window end |
 | --- | --- | --- | --- | --- |
-| Byte-string values (`r5-level-baseline/`) | 317,440 B | 132,096 B | 173,056 B | 806,912 B |
-| Typed values (`r5-typed-values/`) | 358,400 B | 132,096 B | 212,992 B | 847,872 B |
-| Typed values, front-coded keys (`r5-front-coded/`) | 259,584 B | 33,280 B | 212,992 B | 749,056 B |
 | Packed values, front-coded keys (`r5-packed-values/`) | 151,040 B | 33,280 B | 107,008 B | 640,512 B |
 | Packed values, front-coded keys, elided value headers (`r5-packed-elided/`) | 111,104 B | 33,280 B | 67,072 B | 600,576 B |
 | Native: four join traces | 188,928 B | 13,312 B | 168,448 B | 678,400 B |
 
-- **Key level.** Every folded key is distinct, so the key level stores all 2,624 keys and shares nothing between them; before front coding it took about 50 B per key. Front coding (`front_code.rs`, `--front-code-byte-keys`) stores each key as the length of the prefix it shares with the previous key and the rest of its bytes. It cut the key level to 33,280 B, about 12.7 B per key. The native Lineitem trace's key level takes 11 B per key (5,632 B for 512 keys). In every run the writer front-coded 17 blocks, with no layout or size fallbacks.
-- **Value level.** Storing `SourcePayload` itself, instead of each variant's `rkyv` bytes inside a `Vec<u8>`, made the value level larger, not smaller: 212,992 B against 173,056 B. See "Value level" below.
-- **Gap after front coding.** The merged index took 1.37 times the bytes of the four join traces' files (259,584 B against 188,928 B), and its value level was most of it.
+- **Key level.** Every folded key is distinct, so the key level stores all 2,624 keys and shares nothing between them; before front coding it took about 50 B per key (132,096 B; see history.md). Front coding (`front_code.rs`, `--front-code-byte-keys`) stores each key as the length of the prefix it shares with the previous key and the rest of its bytes. It cut the key level to 33,280 B, about 12.7 B per key. The native Lineitem trace's key level takes 11 B per key (5,632 B for 512 keys). In every run the writer front-coded 17 blocks, with no layout or size fallbacks.
 - **Packed values.** The next section changes the stored value. The six refreshes still stay in memory, so the window shows no writes in either mode.
-
-#### Value level (2026-10-19)
-
-The payload fields are the same Q3 projections before and after typing (`59b566016`) and the Steps 1–2 merge (`0669eba04`):
-
-- Customer: `segment`.
-- Orders: `order_date` and `ship_priority`.
-- Lineitem: `ship_date`, `extended_price` and `discount`.
-
-What changed is the stored type:
-
-- **Before typing:** `encode_payload` archived only the row's own variant struct into a `Vec<u8>`, so each row was as long as its own variant.
-- **After typing:** the stored value is `SourcePayload`. Its archive, `Archived<SourcePayload>`, is generated by `#[derive(Archive)]`. Like any Rust enum, it is fixed-size and holds:
-  - a discriminant (the tag) that says which variant follows;
-  - room for the largest variant.
-
-The enum layout came from the typed-values commit `59b566016`; the Steps 1–2 merge kept it unchanged.
-
-Measured on aarch64 by `layout_tests.rs` in `merged-index-col`. Each value-level figure is from a layer file of 2,048 rows of one source, written in the merged index's layout: folded key, then value and weight.
-
-| Source | Typed item | Typed values on disk | Byte-string item | Byte-string values on disk |
-| --- | --- | --- | --- | --- |
-| Customer | 80 B | 166,400 B (81.25 B per row) | 40 B | 82,944 B (40.50 B per row) |
-| Orders | 80 B | 166,400 B (81.25 B per row) | 32 B | 66,560 B (32.50 B per row) |
-| Lineitem | 80 B | 166,400 B (81.25 B per row) | 72 B | 148,992 B (72.75 B per row) |
-| Native Lineitem trace value | 64 B | 132,608 B (64.75 B per row) | | |
-
-An item is the `rkyv` archive of one value and its weight.
-
-- **Typed:** `SourcePayload`.
-- **Byte string:** the variant's own archive in a `Vec<u8>`, the encoding used before `59b566016`.
-- **Native:** `Tup4<i32, SqlDecimal<15,2>, SqlDecimal<4,2>, Date>`, the value of the generated circuit's Lineitem join trace. The native-shaped file has four lines per order key. It takes exactly the bytes of the real native Lineitem trace in `target/r5-front-coded/` (132,608 B).
-
-Findings:
-
-- **The layer file stores variable-size values without padding them to a common size.** `ValueBuilder::try_add_item` appends each item's archive after the previous one and records its offset. Byte-string files differ by source, and each takes its item size plus 0.5 to 0.75 B per row on disk.
-- **Byte strings carry a 16 B header.** A byte-string item is the variant's archive, a 16 B `ArchivedVec` header (relative pointer and length) and the 8 B weight, with no padding: Lineitem is 48 + 16 + 8 = 72 B.
-- **Native rows pay alignment instead.** A native Lineitem item is a 48 B tuple and the 8 B weight, rounded up to 64 B because the tuple's decimals need 16-byte alignment. So before typing, a merged-index Lineitem value cost 8 B more than a native one: the 16 B header, less the 8 B of alignment padding that the native value pays.
-- **Typing added the enum.** `Archived<SourcePayload>` is 64 B with 16-byte alignment, whatever the variant.
-  - A dump shows each Orders value as the tag byte (`01`) and 8 bytes of data in a 64 B slot.
-  - A Lineitem value is the tag byte (`02`), 15 zero bytes, then the 48 B `Archived<LineitemPayload>`. Its decimals need 16-byte alignment, so the tag takes 16 B.
-  - Native values have no tag.
-- **Same in both modes, not a cause of the gap.** `SqlDecimal` is always an `i128` with 16-byte alignment. Inside `Archived<LineitemPayload>`, the compiler moves `ship_date` after the two decimals, which leaves 12 bytes of padding at the end.
-
-The user's decision of 2026-10-19 (see [decisions.md](decisions.md)) is to drop the enum and store packed bytes. The next section measures it.
+- **Retired steps.** Storing `SourcePayload` itself made the value level larger, not smaller, and front coding alone left the merged index 1.37 times the bytes of the four join traces. Both comparisons, and the value-level analysis behind the decision to pack, are in [history.md](history.md#2026-10-19-value-level).
 
 ### Packed, untagged values (2026-10-19 to 2026-10-20)
 
@@ -196,13 +121,13 @@ The stored value is now the packed bytes of `encode_payload` in a `Vec<u8>`, dec
 
 #### Layout files
 
-`layout_tests.rs` writes, for each source, 2,048 rows in the merged index's layout (folded key, then value and weight), once per encoding, with no compression. Each figure is the value-level data-block bytes of the file, read back from it. The artifact is `target/r5-packed-values/layout-tests.txt` (test `value_level_bytes_by_encoding`, which pins these numbers).
+`layout_tests.rs` writes, for each source, 2,048 rows in the merged index's layout (folded key, then value and weight), once per encoding, with no compression. Each figure is the value-level data-block bytes of the file, read back from it. The artifact is `target/r5-packed-values/layout-tests.txt` (test `value_level_bytes_by_encoding`, which pins these numbers). The typed and `rkyv`-bytes columns are in [history.md](history.md#2026-10-20-layout-files-typed-and-rkyv-columns).
 
-| Source | Typed | `rkyv` bytes | `rkyv` bytes, elided | Packed | Packed, elided |
-| --- | --- | --- | --- | --- | --- |
-| Customer | 166,400 B (81.25 B per row) | 82,944 B (40.50) | 56,832 B (27.75) | 82,944 B (40.50) | 46,592 B (22.75) |
-| Orders | 166,400 B (81.25) | 66,560 B (32.50) | 37,376 B (18.25) | 66,560 B (32.50) | 37,376 B (18.25) |
-| Lineitem | 166,400 B (81.25) | 148,992 B (72.75) | 120,832 B (59.00) | 82,944 B (40.50) | 51,712 B (25.25) |
+| Source | Packed | Packed, elided |
+| --- | --- | --- |
+| Customer | 82,944 B (40.50 B per row) | 46,592 B (22.75) |
+| Orders | 66,560 B (32.50) | 37,376 B (18.25) |
+| Lineitem | 82,944 B (40.50) | 51,712 B (25.25) |
 
 The native baseline is the `Tup4` value of the generated circuit's Lineitem join trace, written with four lines per order key: 132,608 B (64.75 B per row). That file equals the real native trace's value level in `target/r5-front-coded/` (132,608 B). The native value is not a byte string, so elision does not apply to it.
 
@@ -219,7 +144,8 @@ The native baseline is the `Tup4` value of the generated circuit's Lineitem join
 
 Each compares measured figures. None infers an unmeasured quantity.
 
-- **Enum.** The typed enum took 166,400 B in each layout file. The `rkyv` bytes of each source's own payload took 82,944, 66,560, and 148,992 B. In R5 the merged index's value level was 212,992 B with the enum (`r5-typed-values/`) and 173,056 B with `rkyv` bytes (`r5-level-baseline/`).
+The comparisons below cite `rkyv`-bytes and typed-value figures; those are in [history.md](history.md), together with the enum comparison.
+
 - **Structure, with the same encoding.** The merged index's Lineitem value as `rkyv` bytes took 148,992 B in its layout file, against 132,608 B for the native value. With the header elided it took 120,832 B, less than the native value in these files. The two files differ in shape (one value per folded key, against four lines per order key), and nothing here separates that from the header.
 - **Byte-string header.** Elision shrank every byte-string layout file: `rkyv` bytes from 82,944, 66,560, and 148,992 B to 56,832, 37,376, and 120,832 B, and packed bytes from 82,944, 66,560, and 82,944 B to 46,592, 37,376, and 51,712 B. In R5 it shrank the packed value level from 107,008 B to 67,072 B. It is a disk-format change that any byte-string value can use.
 - **Packing.** Without elision, packing left the Customer and Orders layout files unchanged and shrank Lineitem's, from 148,992 B to 82,944 B. With elision, it left Orders unchanged and shrank Customer's from 56,832 B to 46,592 B and Lineitem's from 120,832 B to 51,712 B. In R5 the packed value level was 107,008 B, against 173,056 B for `rkyv` bytes in `r5-level-baseline/`. Key front coding does not change the value level (`r5-typed-values/` and `r5-front-coded/` both have 212,992 B), so the two runs compare.
