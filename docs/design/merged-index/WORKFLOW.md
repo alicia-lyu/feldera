@@ -213,6 +213,204 @@ native generation, and starts a fresh process and storage directory for each mod
 (three by default). Definitions of the reported intervals, the compaction policy, and the pending
 Linux qualification are in [measurement.md](measurement.md).
 
+## Linux handoff
+
+This section is for a fresh agent on a fresh Linux machine that will run the R5 pilot. It is the
+only place for these commands; [measurement.md](measurement.md) defines what is measured and why.
+Anything marked "unverified" could not be checked from the repository.
+
+### State a clone needs
+
+- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. The branch is not
+  pushed: the user must push it or supply it (for example as a `git bundle`).
+- `q3-ivm-baseline/src/lib.rs`, `src/stubs.rs`, and `plan.json` are generated and git-ignored.
+  `measure.py` runs `generate.sh` itself.
+- Raw artifacts (reports, run directories) are git-ignored and local to the machine.
+
+### Toolchain
+
+- Rust: install rustup, then `rustup toolchain install 1.96.1 --component rustfmt clippy`. Every
+  cargo command passes `+1.96.1`.
+- Fetch dependencies online once. The runner builds with `--offline --locked`, which fails without
+  a populated registry cache. `q3-ivm-baseline` and `merged-index-col` are separate workspaces with
+  their own `Cargo.lock`, so fetch in each directory you will build in. Fetch at the repository root
+  too if you will run the DBSP tests.
+
+  ```bash
+  # From sql-to-dbsp-compiler/experiments/q3-ivm-baseline, then from merged-index-col
+  cargo +1.96.1 fetch --locked
+  ```
+
+- Java: JDK 21 (19 to 21 work, per the repository CLAUDE.md) and Maven. Set `JAVA_HOME` to the
+  Linux JDK path (for example `/usr/lib/jvm/java-21-openjdk-amd64` on Debian-family systems;
+  unverified) and put its `bin` first on `PATH`.
+- SQL compiler: from `sql-to-dbsp-compiler`, run `./build.sh`. It needs network access, because
+  it fetches or builds Calcite (`calcite-build`, pinned by `calcite_version.env`) and Maven
+  dependencies, and then runs `mvn package -DskipTests`. It uses GNU `sed -i`, which Linux has.
+- Python: 3.9 or later. `measure.py` calls `Path.is_relative_to`, added in Python 3.9. It has no
+  third-party imports.
+- `git`, `make`, and `gcc` to build dbgen.
+
+### Generate TPC-H inputs
+
+`dbgen` comes from tpch-kit (`https://github.com/gregrahn/tpch-kit.git` per its README). Build it
+on Linux:
+
+```bash
+cd tpch-kit/dbgen
+make MACHINE=LINUX DATABASE=POSTGRESQL
+```
+
+Run from the `dbgen` directory, which holds `dists.dss`. Output goes to the current directory
+unless the `DSS_PATH` environment variable is set (`dss.h`). Use a fresh `$DBGEN_OUT` with room for
+the SF 10 files (measure it with `du` afterwards):
+
+```bash
+export DSS_PATH="$DBGEN_OUT"
+./dbgen -s 10 -T c      # customer.tbl
+./dbgen -s 10 -T o      # orders.tbl and lineitem.tbl
+./dbgen -s 10 -U 3      # refresh sets: orders.tbl.u1.., lineitem.tbl.u1.., delete.1..
+```
+
+- `-s 10` must be on every call: a bare `-U 3` uses scale factor 1 (the default in `driver.c`).
+- `-T c` writes only Customers, and `-T o` writes Orders with Lineitems (`driver.c`). The update
+  files `orders.tbl.u1`, `lineitem.tbl.u1`, and `delete.1` exist in the author's checkout from a
+  `-U 1` run. The names for sets 2 and 3 follow the same pattern (unverified).
+- Sizes are dbgen's scale-factor figures (about 1.5 million Customers, 15 million Orders, 60
+  million Lines) and are unchecked here.
+
+### Prepare the workloads
+
+The campaign needs one `refreshes.json` per workload (clustered and scattered; format in "Measure R5"),
+next to the refresh files it names. Both workloads share the base files in `$DBGEN_OUT`. The helper is `prepare_inputs.py` in
+`q3-ivm-baseline`. **The CLI is being added in a parallel commit; reconcile this block with it.**
+Intended interface:
+
+```bash
+python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS" --seed 1 --pairs 3
+```
+
+It should produce `$R5_INPUTS/clustered/refreshes.json`, `$R5_INPUTS/scattered/refreshes.json`, and
+`$R5_INPUTS/prepare-manifest.json`. The workload rules (three RF2 sets of 15,000 distinct existing
+Orders, never reused; clustered from the first 7,500 Customers' range; scattered by a fixed-seed
+uniform sample of existing Orders; Orders ascending and Lineitems grouped by Order) are in
+[measurement.md](measurement.md#pending-linux-campaign). Record the seed.
+
+### cgroup v2 root
+
+`measure.py` creates one child cgroup per run under `--cgroup-root` and moves the run into it. It
+checks the following (`cgroup_available`, `configure_cgroup`, `enter_cgroup`, `verify_membership`):
+
+- The machine runs the unified cgroup v2 hierarchy: the root is under `/sys/fs/cgroup`, has
+  `cgroup.controllers` listing `memory`, and has `memory` in `cgroup.subtree_control`. The run's
+  `/proc/self/cgroup` must read `0::<path>`.
+- The root is writable by the user running `measure.py`, and no ancestor's `memory.max` is below
+  `--total-memory-bytes`.
+- Each child's `memory.max` and `memory.swap.max` (set to `0`) must be written and read back. If
+  swap accounting is off, `memory.swap.max` is missing or not writable and the run fails.
+- The child moves itself in by writing its PID to the child's `cgroup.procs` in a `preexec_fn`.
+  The kernel requires the writer to have write access to the `cgroup.procs` of the common ancestor
+  of the source and the destination cgroup. So the process that runs `measure.py` should sit in a
+  cgroup that shares a user-writable ancestor with every child. The recipe below puts it in a leaf
+  next to the run cgroups, because the kernel's no-internal-processes rule forbids a process in
+  the root once `memory` is enabled for its children (kernel rule, unverified here).
+
+A recipe that satisfies these (unverified on any machine; adapt as needed, and see the
+[kernel's cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)):
+
+```bash
+sudo mkdir -p /sys/fs/cgroup/r5/driver
+echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo +memory | sudo tee /sys/fs/cgroup/r5/cgroup.subtree_control
+sudo chown -R "$USER" /sys/fs/cgroup/r5
+echo $$ | sudo tee /sys/fs/cgroup/r5/driver/cgroup.procs   # this shell now lives in r5/driver
+```
+
+Then pass `--cgroup-root /sys/fs/cgroup/r5`. The first move needs `sudo` because the source and
+destination share only the real root. Later moves, from `r5/driver` to `r5/r5-<id>-run-<n>-<mode>`,
+share `r5`, which the user owns. `r5` itself holds no process, as the "no internal processes" rule
+requires. An alternative is `systemd-run` with `-p Delegate=yes`; it is untested here.
+
+Also:
+
+- `memory.peak` needs kernel 5.19 or later (per the kernel documentation, unverified here). On an
+  older kernel `cgroup_evidence` records it as `null`, and the run still completes.
+- The runner never removes the child cgroups. After the runs have exited, remove them by hand:
+  `find /sys/fs/cgroup/r5 -mindepth 1 -maxdepth 1 -name 'r5-*' -type d -exec rmdir {} +`.
+
+### Storage path and disk budget
+
+- Put `--storage-path` on a local ext4 or xfs filesystem, not tmpfs or an overlay filesystem. Storage
+  files open with `O_DIRECT`, and `FBuf::ALIGNMENT` is 512 bytes (see
+  [measurement.md](measurement.md#pending-linux-campaign)).
+- With `--cgroup-root`, every run copies all of its inputs into `<run dir>/input` (`private_inputs`
+  in `measure.py`: the three base files and every refresh file) and hashes the copy. The copies are
+  never deleted. Per-run input size is the size of the SF 10 `.tbl` files plus the refresh files:
+  measure it with `du -shc "$DBGEN_OUT"/*.tbl "$DBGEN_OUT"/*.u* "$DBGEN_OUT"/delete.*` and
+  adjust for the refresh files that `prepare_inputs.py` actually writes. Budget that figure times the run count, plus each
+  run's maintained storage (`<run dir>/storage`). One campaign of `--runs N` makes `2N` runs
+  (native and reconstructed), so a pilot (`--runs 1`) makes two.
+- `measure.py` also hashes the inputs once for the manifest, and builds both release executables
+  under `q3-ivm-baseline/target/`; keep room for the build.
+
+### Pilot command
+
+Run once per workload, from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`, with the
+compiler built and `JAVA_HOME` set, from a shell inside the cgroup tree above. Use fresh
+`--report` and `--storage-path` values each time.
+
+```bash
+python3 measure.py \
+  --customer "$DBGEN_OUT/customer.tbl" \
+  --orders "$DBGEN_OUT/orders.tbl" \
+  --lineitem "$DBGEN_OUT/lineitem.tbl" \
+  --refresh-list "$R5_INPUTS/clustered/refreshes.json" \
+  --report "$R5_OUT/pilot-clustered-report.json" \
+  --storage-path "$R5_OUT/pilot-clustered-runs" \
+  --cgroup-root /sys/fs/cgroup/r5 \
+  --total-memory-bytes 1073741824 \
+  --cache-bytes 134217728 \
+  --memory-target-bytes 536870912 \
+  --runs 1 \
+  --batch 10000 \
+  --no-verify \
+  --setup-full-compaction \
+  --front-code-byte-keys \
+  --elide-value-headers
+```
+
+Repeat with `scattered`. Why each flag:
+
+- `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.
+- `--cache-bytes 134217728`: the 128 MiB worker cache (a whole number of MiB).
+- `--memory-target-bytes 536870912`: the 512 MiB runtime memory-pressure target.
+- `--runs 1`: one repetition per mode for the pilot. The campaign uses `--runs 3`.
+- `--batch 10000`: the loading target of 10,000 rows per transaction.
+- `--no-verify`: required for qualification (`qualification` rejects a verified run).
+- `--setup-full-compaction`: both modes start the refreshes from one run per Spine.
+- `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index.
+  Native runs write the same files with or without them.
+
+**Pilot pass criterion.** For both runs in the report (`runs[].qualification`), `status` must be
+`qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
+limit, the cgroup proof matched (`cgroup.enforced`), verification was off, and
+`load.observed_storage_bytes` exceeded the limit. Also check that the top-level `status` is
+`complete` and `errors` is empty. A qualifying pilot shows only that the loaded state exceeds the
+limit. It does not show memory pressure.
+
+### Known limits
+
+- Without `--cgroup-root`, a Linux run is `nonqualifying` (reason "no cgroup v2 total memory
+  limit"), yet the campaign still reports `status: complete`. Read each run's `qualification`.
+- `memory.peak`, `memory.events`, and `io.stat` are read once, after the run exits. They cover the
+  whole run, including the input-copy phase, loading, and setup compaction, not only maintenance.
+  The driver's `/proc/self/io` counters are per interval, but they are process-wide.
+- Pressure sampling and the before and after maintenance snapshots are not implemented
+  ([measurement.md](measurement.md#pending-pressure-evidence)).
+- Until those exist, make none of these claims: runtime memory pressure, reclaim or refault
+  behavior, beyond-memory behavior, equal-memory performance, a disk saving at SF 10, or a
+  maintenance-only I/O figure. No SF 10 run has been measured.
+
 ## Inspect the compiler pipeline
 
 These commands produce compiler artifacts only; none runs a benchmark. Set paths first and use a
