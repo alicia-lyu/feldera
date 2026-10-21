@@ -141,6 +141,12 @@ The emitter rejects a spec whose derived Rust names collide (for example, domain
 
 The hand-written `unfold` says "unknown placement id"; the generated one says "unknown index id", following the `INDEX_ID_` naming.
 
+### 2026-10-21: Pin and retire the typed and rkyv value measurements
+
+At roadmap Step 5, record the final typed (`SourcePayload`) and rkyv value-level bytes in [col-storage.md](col-storage.md), then retire those parts of `layout_tests.rs`. Only the packed measurement remains. Generated types keep plain derives. This replaces the last sentence of the 2026-10-20 plain-derives entry.
+
+Summing spine run bytes instead (`layer_file_block_bytes` per spine file, as `q3-ivm-baseline/src/diagnostics.rs` does) was considered and does not help. It changes how bytes are counted, not what is stored, so the typed and rkyv encodings would still need their rkyv and DBData derives.
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.

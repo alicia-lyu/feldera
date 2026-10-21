@@ -240,6 +240,7 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
    - Exit check: `fold` is byte-identical over property-based keys.
    - Exit check: the prefixes match, and sample payloads encode to identical packed bytes. Since 2026-10-19 the stored value is packed bytes rather than an archive.
 5. **Switch.** COL uses the generated module, and the hand-written definition moves to `TRASH/`.
+   - The typed and rkyv value-level bytes that `layout_tests.rs` pins are recorded in [col-storage.md](col-storage.md), and those measurements are retired. Only the packed measurement remains, so generated types keep plain derives (see [decisions.md](decisions.md), 2026-10-21).
    - Exit check: `verify.sh` transcripts are unchanged.
 
 Later work, outside this roadmap, is listed in [deferred.md](deferred.md).
