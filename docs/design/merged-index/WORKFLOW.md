@@ -219,6 +219,20 @@ This section is for a fresh agent on a fresh Linux machine that will run the R5 
 only place for these commands; [measurement.md](measurement.md) defines what is measured and why.
 Anything marked "unverified" could not be checked from the repository.
 
+### Pre-flight checks
+
+These depend on the Linux machine and were not testable on macOS. Each fails loudly at startup
+rather than corrupting results. Run them before building anything.
+
+| Check | Command | If it fails |
+| --- | --- | --- |
+| Unified cgroup v2 with the memory controller | `stat -fc %T /sys/fs/cgroup` prints `cgroup2fs`; `cat /sys/fs/cgroup/cgroup.controllers` lists `memory` | The machine cannot qualify a run. Stop and report. |
+| Kernel 5.19 or later, for `memory.peak` | `uname -r` | Runs complete, but `memory.peak` is `null`. Report the version. |
+| Swap accounting on | After the recipe below, `ls /sys/fs/cgroup/r5/driver/memory.swap.max` | `configure_cgroup` fails on the first run. Enable swap accounting or report. |
+| Delegation works | The recipe below, then `cat /proc/self/cgroup` prints `0::/r5/driver` | Adapt the recipe; do not run without `--cgroup-root`. |
+| Storage path accepts 512-byte `O_DIRECT` | `df -T <storage dir>` shows ext4 or xfs; `sudo blockdev --getss <device>` prints 512 | Use another filesystem or disk. A 4 KiB logical sector, tmpfs, or overlay may fail with "Invalid argument" on the first state write (untested). |
+| Disk room | `df -h <storage dir>` against the budget below | Free space or lower `--runs`. |
+
 ### State a clone needs
 
 - Branch `docs/merged-index-tidy-up`, or any commit that contains this section. The branch is not
@@ -261,40 +275,46 @@ cd tpch-kit/dbgen
 make MACHINE=LINUX DATABASE=POSTGRESQL
 ```
 
-Run from the `dbgen` directory, which holds `dists.dss`. Output goes to the current directory
-unless the `DSS_PATH` environment variable is set (`dss.h`). Use a fresh `$DBGEN_OUT` with room for
-the SF 10 files (measure it with `du` afterwards):
+`DSS_CONFIG` names the directory that holds `dists.dss`, and `DSS_PATH` the output directory.
+Run from inside a fresh `$DBGEN_OUT` with room for the SF 10 files:
 
 ```bash
-export DSS_PATH="$DBGEN_OUT"
-./dbgen -s 10 -T c      # customer.tbl
-./dbgen -s 10 -T o      # orders.tbl and lineitem.tbl
-./dbgen -s 10 -U 3      # refresh sets: orders.tbl.u1.., lineitem.tbl.u1.., delete.1..
+export DSS_CONFIG=/path/to/tpch-kit/dbgen
+cd "$DBGEN_OUT"
+DSS_PATH=. "$DSS_CONFIG/dbgen" -s 10 -T c -f   # customer.tbl
+DSS_PATH=. "$DSS_CONFIG/dbgen" -s 10 -T o -f   # orders.tbl and lineitem.tbl
+DSS_PATH=. "$DSS_CONFIG/dbgen" -s 10 -U 3      # orders.tbl.u1..u3, lineitem.tbl.u1..u3, delete.1..delete.3
 ```
 
+These were run on macOS at `-s 0.01`, which produced exactly the files named above.
+
 - `-s 10` must be on every call: a bare `-U 3` uses scale factor 1 (the default in `driver.c`).
-- `-T c` writes only Customers, and `-T o` writes Orders with Lineitems (`driver.c`). The update
-  files `orders.tbl.u1`, `lineitem.tbl.u1`, and `delete.1` exist in the author's checkout from a
-  `-U 1` run. The names for sets 2 and 3 follow the same pattern (unverified).
-- Sizes are dbgen's scale-factor figures (about 1.5 million Customers, 15 million Orders, 60
-  million Lines) and are unchecked here.
+- Do not pass `-f` with `-U`: dbgen then ignores `-U` and regenerates the base tables.
+- Keep `DSS_PATH` short. Update file paths are formatted into a 128-byte buffer (`upath` in
+  `print.c`), and a long `DSS_PATH` crashed dbgen on macOS. Hence `DSS_PATH=.` from inside the
+  output directory.
+- Each update set has `0.1%` of the base Orders by the dbgen formula: 15,000 at SF 10 (unchecked).
+  At SF 1 a run gave 1,500 Orders and 5,822 Lines; at SF 0.01 it gave 10 Orders per set.
+- Base sizes are dbgen's scale-factor figures (about 1.5 million Customers, 15 million Orders, 60
+  million Lines) and are unchecked here. `prepare-manifest.json` records the real counts.
 
 ### Prepare the workloads
 
 The campaign needs one `refreshes.json` per workload (clustered and scattered; format in "Measure R5"),
 next to the refresh files it names. Both workloads share the base files in `$DBGEN_OUT`. The helper is `prepare_inputs.py` in
-`q3-ivm-baseline`. **The CLI is being added in a parallel commit; reconcile this block with it.**
-Intended interface:
+`q3-ivm-baseline`:
 
 ```bash
 python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS" --seed 1 --pairs 3
 ```
 
-It should produce `$R5_INPUTS/clustered/refreshes.json`, `$R5_INPUTS/scattered/refreshes.json`, and
-`$R5_INPUTS/prepare-manifest.json`. The workload rules (three RF2 sets of 15,000 distinct existing
-Orders, never reused; clustered from the first 7,500 Customers' range; scattered by a fixed-seed
-uniform sample of existing Orders; Orders ascending and Lineitems grouped by Order) are in
-[measurement.md](measurement.md#pending-linux-campaign). Record the seed.
+It writes, for each of `clustered/` and `scattered/`, the files `rf1-orders-K.tbl`,
+`rf1-lines-K.tbl`, and `rf2-delete-K.tbl` for each pair K, and a `refreshes.json` ordered RF1 1,
+RF2 1, RF1 2, and so on. `$R5_INPUTS/prepare-manifest.json` records the seed, the base and per-pair
+counts, each pair's Customer range, and the SHA-256 of every input and output. The script refuses
+an `--out` that already holds either workload. The selection rules are in its module docstring and
+summarized in [measurement.md](measurement.md#pending-linux-campaign). The whole path (dbgen,
+`prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01.
 
 ### cgroup v2 root
 
