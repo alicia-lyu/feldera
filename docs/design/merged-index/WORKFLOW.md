@@ -105,7 +105,7 @@ first (native or reconstructed, per the previous section), then run it from a fr
 directory. `$TPCH_DATA` is the dbgen output directory.
 
 ```bash
-cargo run --release -- \
+cargo +1.96.1 run --release --offline --locked -- \
   --customer "$TPCH_DATA/customer.tbl" \
   --orders "$TPCH_DATA/orders.tbl" \
   --lineitem "$TPCH_DATA/lineitem.tbl" \
@@ -128,18 +128,40 @@ integrity.
 
 ## Measure R5
 
+A macOS smoke run with the current configuration. `$SMOKE_INPUTS` holds `customer.tbl`,
+`orders.tbl`, `lineitem.tbl`, and `refreshes.json` of one small workload (how the earlier smoke
+inputs in `target/r5-smoke-inputs/` were generated is not recorded in the repository).
+Both destinations must be new:
+
 ```bash
 # From sql-to-dbsp-compiler/experiments/q3-ivm-baseline, compiler built
 python3 measure.py \
-  --customer "$TPCH_DATA/customer.tbl" \
-  --orders "$TPCH_DATA/orders.tbl" \
-  --lineitem "$TPCH_DATA/lineitem.tbl" \
-  --refresh-list "$TPCH_DATA/refreshes.json" \
-  --report target/r5-measurements/report.json \
-  --cache-bytes 1073741824 \
-  --memory-target-bytes 4294967296 \
-  --no-verify
+  --customer "$SMOKE_INPUTS/customer.tbl" \
+  --orders "$SMOKE_INPUTS/orders.tbl" \
+  --lineitem "$SMOKE_INPUTS/lineitem.tbl" \
+  --refresh-list "$SMOKE_INPUTS/refreshes.json" \
+  --report target/r5-measurements/smoke-report.json \
+  --storage-path target/r5-measurements/smoke-runs \
+  --batch 512 \
+  --cache-bytes 33554432 \
+  --memory-target-bytes 536870912 \
+  --runs 3 \
+  --no-verify \
+  --setup-full-compaction \
+  --front-code-byte-keys \
+  --elide-value-headers
 ```
+
+`--storage-path` is the campaign root. Each run gets a new `run-<repetition>-<mode>` directory
+under it, holding `storage/`, `driver.json`, and the logs. The Linux campaign adds `--cgroup-root`
+and `--total-memory-bytes`; see the [Linux handoff](#linux-handoff).
+
+The runner always starts the driver with `--r5`. That flag (`Config::from_args` in `src/main.rs`)
+selects the measured configuration: it turns on DBSP's native join fetch and records it as
+`native_join_fetch` in the report. It is accepted only with one worker, one run per process
+(`--runs 1`), `--storage-path`, `--cache-bytes`, `--memory-target-bytes`, and `--report`;
+otherwise the driver exits with an error. Running the driver by hand with `--r5` therefore needs
+all of those. `--cache-bytes` must be a whole number of MiB.
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
 `--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`,
