@@ -76,7 +76,7 @@ and committed. Regenerate it after changing the spec, `query.sql`, or the emitte
 mvn package -DskipTests
 # From sql-to-dbsp-compiler/experiments/merged-index-col
 ./generate.sh                 # or ./generate.sh <output.rs>
-cargo +1.96.1 test --offline --locked generated
+cargo +1.96.1 test --offline --locked
 ```
 
 `generate.sh` runs the compiler with `--noRust --merged-index col.mi --merged-index-output`, then

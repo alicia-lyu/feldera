@@ -1,7 +1,9 @@
 use super::*;
 use dbsp::trace::merged_index::batch::batch_cursor;
 use dbsp::trace::merged_index::testing::check_against_trie;
-use dbsp::trace::merged_index::{write_parent, ColumnRef, MergedIndexDefinition, PlacedIndex};
+use dbsp::trace::merged_index::{
+    write_parent, ColumnRef, FoldedKey, MergedIndexDefinition, PlacedIndex,
+};
 use dbsp::{
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeight, Erase},
     storage::{
@@ -21,40 +23,73 @@ use feldera_types::config::{StorageConfig, StorageOptions};
 use proptest::prelude::*;
 use tempfile::tempdir;
 
-fn index() -> CustomerOrdersLineitemIndex {
-    CustomerOrdersLineitemIndex
+fn fold(key: &Key) -> FoldedKey {
+    CustomerOrdersLineitemDefinition::fold(key)
 }
 
-fn customer_row(id: i64, segment: &str, weight: i64) -> (SourceKey, SourcePayload, i64) {
-    (
-        SourceKey::Customer(id),
-        SourcePayload::Customer(CustomerPayload {
-            segment: segment.into(),
-        }),
-        weight,
-    )
+fn unfold(bytes: &[u8]) -> Result<Key, String> {
+    CustomerOrdersLineitemDefinition::unfold(bytes)
+}
+
+fn customer_key(custkey: i64) -> Key {
+    Key::CustomerByCustkey(CustomerByCustkeyKey { custkey })
+}
+
+fn order_key(custkey: i64, orderkey: i64) -> Key {
+    Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey { custkey, orderkey })
+}
+
+fn line_key(custkey: i64, orderkey: i64, linenumber: i32) -> Key {
+    Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+        custkey,
+        orderkey,
+        linenumber,
+    })
+}
+
+fn customer_payload(segment: &str) -> Payload {
+    Payload::CustomerByCustkey(CustomerByCustkeyPayload {
+        c_mktsegment: segment.into(),
+    })
+}
+
+fn orders_payload(order_date: i32, ship_priority: i32) -> Payload {
+    Payload::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyPayload {
+        o_orderdate: Date::from_days(order_date),
+        o_shippriority: ship_priority,
+    })
+}
+
+fn lineitem_payload(ship_date: i32, price_mantissa: i128, discount_mantissa: i128) -> Payload {
+    Payload::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberPayload {
+        l_shipdate: Date::from_days(ship_date),
+        l_extendedprice: SqlDecimal::<15, 2>::new(price_mantissa, 2).unwrap(),
+        l_discount: SqlDecimal::<4, 2>::new(discount_mantissa, 2).unwrap(),
+    })
+}
+
+fn customer_row(custkey: i64, segment: &str, weight: i64) -> (Key, Payload, i64) {
+    (customer_key(custkey), customer_payload(segment), weight)
 }
 
 fn cursor_row(
-    index: &CustomerOrdersLineitemIndex,
     cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
-) -> (SourceKey, SourcePayload, ZWeight) {
+) -> (Key, Payload, ZWeight) {
     let weight = *cursor.weight().downcast_checked::<ZWeight>();
     let key = cursor.key().downcast_checked::<Vec<u8>>();
-    let key = index.unfold(key).unwrap();
+    let key = unfold(key).unwrap();
     let stored = cursor.val().downcast_checked::<StoredPayload>();
     let payload = decode_payload(&key, stored).unwrap();
     (key, payload, weight)
 }
 
 fn read_cursor(
-    index: &CustomerOrdersLineitemIndex,
     cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
-) -> Vec<(SourceKey, SourcePayload, ZWeight)> {
+) -> Vec<(Key, Payload, ZWeight)> {
     let mut rows = Vec::new();
     while cursor.key_valid() {
         while cursor.val_valid() {
-            rows.push(cursor_row(index, cursor));
+            rows.push(cursor_row(cursor));
             cursor.step_val();
         }
         cursor.step_key();
@@ -64,23 +99,21 @@ fn read_cursor(
 
 #[test]
 fn memory_batch_sorts_and_consolidates_within_batch() {
-    let index = index();
-    let batch = index
-        .build_batch([
-            customer_row(2, "B", 1),
-            customer_row(1, "A", 3),
-            customer_row(2, "B", -2),
-            customer_row(1, "A", -1),
-            customer_row(3, "gone", 1),
-            customer_row(3, "gone", -1),
-            customer_row(2, "A", 4),
-        ])
-        .unwrap();
+    let batch = build_batch([
+        customer_row(2, "B", 1),
+        customer_row(1, "A", 3),
+        customer_row(2, "B", -2),
+        customer_row(1, "A", -1),
+        customer_row(3, "gone", 1),
+        customer_row(3, "gone", -1),
+        customer_row(2, "A", 4),
+    ])
+    .unwrap();
     assert_eq!(batch.location(), BatchLocation::Memory);
     assert_eq!(batch.key_count(), 2);
     assert_eq!(batch.len(), 3);
     assert_eq!(
-        read_cursor(&index, &mut batch_cursor::<StoredPayload>(&[batch])),
+        read_cursor(&mut batch_cursor::<StoredPayload>(&[batch])),
         vec![
             customer_row(1, "A", 2),
             customer_row(2, "A", 4),
@@ -91,36 +124,31 @@ fn memory_batch_sorts_and_consolidates_within_batch() {
 
 #[test]
 fn cursor_consolidates_batches_without_changing_stored_rows() {
-    let index = index();
     let batches = [
-        index
-            .build_batch([
-                customer_row(1, "A", 2),
-                customer_row(2, "gone", 1),
-                customer_row(3, "old", 1),
-                customer_row(4, "A", 1),
-                customer_row(5, "negative", -3),
-            ])
-            .unwrap(),
-        index
-            .build_batch([
-                customer_row(1, "A", 3),
-                customer_row(2, "gone", -1),
-                customer_row(3, "old", -1),
-                customer_row(3, "new", 1),
-                customer_row(4, "B", 2),
-            ])
-            .unwrap(),
-        index
-            .build_batch([customer_row(1, "A", -1), customer_row(4, "A", -1)])
-            .unwrap(),
+        build_batch([
+            customer_row(1, "A", 2),
+            customer_row(2, "gone", 1),
+            customer_row(3, "old", 1),
+            customer_row(4, "A", 1),
+            customer_row(5, "negative", -3),
+        ])
+        .unwrap(),
+        build_batch([
+            customer_row(1, "A", 3),
+            customer_row(2, "gone", -1),
+            customer_row(3, "old", -1),
+            customer_row(3, "new", 1),
+            customer_row(4, "B", 2),
+        ])
+        .unwrap(),
+        build_batch([customer_row(1, "A", -1), customer_row(4, "A", -1)]).unwrap(),
     ];
     assert!(batches
         .iter()
         .all(|batch| batch.location() == BatchLocation::Memory));
     let stored_before: Vec<_> = batches
         .iter()
-        .map(|batch| read_cursor(&index, &mut batch.cursor()))
+        .map(|batch| read_cursor(&mut batch.cursor()))
         .collect();
     let expected = vec![
         customer_row(1, "A", 4),
@@ -129,84 +157,55 @@ fn cursor_consolidates_batches_without_changing_stored_rows() {
         customer_row(5, "negative", -3),
     ];
     let mut cursor = batch_cursor::<StoredPayload>(&batches);
-    assert_eq!(read_cursor(&index, &mut cursor), expected);
+    assert_eq!(read_cursor(&mut cursor), expected);
     cursor.rewind_keys();
-    assert_eq!(read_cursor(&index, &mut cursor), expected);
+    assert_eq!(read_cursor(&mut cursor), expected);
     let stored_after: Vec<_> = batches
         .iter()
-        .map(|batch| read_cursor(&index, &mut batch.cursor()))
+        .map(|batch| read_cursor(&mut batch.cursor()))
         .collect();
     assert_eq!(stored_before, stored_after);
 }
 
 #[test]
 fn cursor_exact_and_lower_bound_seeks_after_rewind() {
-    let index = index();
     let batches = [
-        index
-            .build_batch([customer_row(1, "A", 1), customer_row(2, "gone", 1)])
-            .unwrap(),
-        index
-            .build_batch([
-                customer_row(1, "A", 2),
-                customer_row(2, "gone", -1),
-                customer_row(3, "B", 1),
-            ])
-            .unwrap(),
+        build_batch([customer_row(1, "A", 1), customer_row(2, "gone", 1)]).unwrap(),
+        build_batch([
+            customer_row(1, "A", 2),
+            customer_row(2, "gone", -1),
+            customer_row(3, "B", 1),
+        ])
+        .unwrap(),
     ];
     let mut cursor = batch_cursor::<StoredPayload>(&batches);
-    let first = index.fold(&SourceKey::Customer(1));
+    let first = fold(&customer_key(1));
     assert!(cursor.seek_key_exact(first.as_bytes().to_vec().erase(), None));
-    assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
-    let cancelled = index.fold(&SourceKey::Customer(2));
+    assert_eq!(cursor_row(&mut cursor), customer_row(1, "A", 3));
+    let cancelled = fold(&customer_key(2));
     assert!(!cursor.seek_key_exact(cancelled.as_bytes().to_vec().erase(), None));
-    let after = index.fold(&SourceKey::Customer(4));
+    let after = fold(&customer_key(4));
     assert!(!cursor.seek_key_exact(after.as_bytes().to_vec().erase(), None));
     cursor.rewind_keys();
     cursor.seek_key(cancelled.as_bytes().to_vec().erase());
-    assert_eq!(
-        read_cursor(&index, &mut cursor),
-        vec![customer_row(3, "B", 1)]
-    );
+    assert_eq!(read_cursor(&mut cursor), vec![customer_row(3, "B", 1)]);
     cursor.rewind_keys();
     cursor.seek_key(first.as_bytes().to_vec().erase());
-    assert_eq!(cursor_row(&index, &mut cursor), customer_row(1, "A", 3));
+    assert_eq!(cursor_row(&mut cursor), customer_row(1, "A", 3));
     cursor.seek_key(after.as_bytes().to_vec().erase());
     assert!(!cursor.key_valid());
 }
 
 #[test]
 fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
-    let index = index();
-    let order = (
-        SourceKey::Orders(5, 2),
-        SourcePayload::Orders(OrdersPayload {
-            order_date: Date::from_days(1),
-            ship_priority: 0,
-        }),
-        1,
-    );
-    let line = (
-        SourceKey::Lineitem(5, 2, 1),
-        SourcePayload::Lineitem(LineitemPayload {
-            ship_date: Date::from_days(2),
-            extended_price: SqlDecimal::<15, 2>::new(100, 2).unwrap(),
-            discount: SqlDecimal::<4, 2>::new(5, 2).unwrap(),
-        }),
-        1,
-    );
+    let order = (order_key(5, 2), orders_payload(1, 0), 1);
+    let line = (line_key(5, 2, 1), lineitem_payload(2, 100, 5), 1);
     let batches = [
-        index
-            .build_batch([customer_row(6, "other", 1), order.clone()])
-            .unwrap(),
-        index
-            .build_batch([line.clone(), customer_row(5, "A", 1)])
-            .unwrap(),
-        index
-            .build_batch([order.clone(), customer_row(5, "A", -1)])
-            .unwrap(),
+        build_batch([customer_row(6, "other", 1), order.clone()]).unwrap(),
+        build_batch([line.clone(), customer_row(5, "A", 1)]).unwrap(),
+        build_batch([order.clone(), customer_row(5, "A", -1)]).unwrap(),
     ];
-    let prefix = index.prefix_custkey(5);
+    let prefix = prefix_custkey(5);
     let mut cursor = batch_cursor::<StoredPayload>(&batches);
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
@@ -217,70 +216,51 @@ fn cursor_scans_interleaved_sources_and_stops_at_prefix_boundary() {
             .starts_with(&prefix)
     {
         while cursor.val_valid() {
-            rows.push(cursor_row(&index, &mut cursor));
+            rows.push(cursor_row(&mut cursor));
             cursor.step_val();
         }
         cursor.step_key();
     }
     assert_eq!(rows, vec![(order.0, order.1, 2), line]);
-    assert_eq!(cursor_row(&index, &mut cursor), customer_row(6, "other", 1));
+    assert_eq!(cursor_row(&mut cursor), customer_row(6, "other", 1));
 }
 
 #[test]
 fn empty_batches_and_cancelled_rows_are_skipped() {
-    let index = index();
     assert!(!batch_cursor::<StoredPayload>(&[]).key_valid());
-    let empty = [index.build_batch([]).unwrap()];
+    let empty = [build_batch([]).unwrap()];
     assert!(!batch_cursor::<StoredPayload>(&empty).key_valid());
     let cancelled = [
-        index.build_batch([customer_row(1, "A", 1)]).unwrap(),
-        index.build_batch([customer_row(1, "A", -1)]).unwrap(),
+        build_batch([customer_row(1, "A", 1)]).unwrap(),
+        build_batch([customer_row(1, "A", -1)]).unwrap(),
     ];
     assert!(!batch_cursor::<StoredPayload>(&cancelled).key_valid());
     let batches = [
-        index.build_batch([]).unwrap(),
-        index
-            .build_batch([customer_row(1, "A", 1), customer_row(1, "A", -1)])
-            .unwrap(),
-        index.build_batch([customer_row(2, "B", -3)]).unwrap(),
+        build_batch([]).unwrap(),
+        build_batch([customer_row(1, "A", 1), customer_row(1, "A", -1)]).unwrap(),
+        build_batch([customer_row(2, "B", -3)]).unwrap(),
     ];
     assert_eq!(batches[0].len(), 0);
     assert_eq!(batches[1].key_count(), 0);
     let mut cursor = batch_cursor::<StoredPayload>(&batches);
-    assert_eq!(
-        read_cursor(&index, &mut cursor),
-        vec![customer_row(2, "B", -3)]
-    );
+    assert_eq!(read_cursor(&mut cursor), vec![customer_row(2, "B", -3)]);
     cursor.rewind_keys();
-    let first = index.fold(&SourceKey::Customer(1));
+    let first = fold(&customer_key(1));
     cursor.seek_key(first.as_bytes().to_vec().erase());
-    assert_eq!(cursor_row(&index, &mut cursor), customer_row(2, "B", -3));
+    assert_eq!(cursor_row(&mut cursor), customer_row(2, "B", -3));
 }
 
 #[test]
 fn batch_rejects_weight_overflow_and_mismatched_payload() {
-    let index = index();
-    assert!(index
-        .build_batch([customer_row(1, "A", i64::MAX), customer_row(1, "A", 1),])
-        .is_err());
-    assert!(index
-        .build_batch([(
-            SourceKey::Customer(1),
-            SourcePayload::Orders(OrdersPayload {
-                order_date: Date::from_days(1),
-                ship_priority: 0,
-            }),
-            1,
-        )])
-        .is_err());
+    assert!(build_batch([customer_row(1, "A", i64::MAX), customer_row(1, "A", 1),]).is_err());
+    assert!(build_batch([(customer_key(1), orders_payload(1, 0), 1,)]).is_err());
 }
 
 #[test]
 fn exact_folded_keys_and_order() {
-    let index = index();
-    let customer = index.fold(&SourceKey::Customer(-1));
-    let order = index.fold(&SourceKey::Orders(-1, 0));
-    let line = index.fold(&SourceKey::Lineitem(-1, 0, 1));
+    let customer = fold(&customer_key(-1));
+    let order = fold(&order_key(-1, 0));
+    let line = fold(&line_key(-1, 0, 1));
     assert_eq!(
         customer.as_bytes(),
         &[1, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1]
@@ -297,90 +277,74 @@ fn exact_folded_keys_and_order() {
         ]
     );
     assert!(customer < order && order < line);
-    assert_eq!(index.prefix_custkey(-1), customer.as_bytes()[..9]);
-    assert_eq!(index.prefix_custkey_orderkey(-1, 0), order.as_bytes()[..18]);
+    assert_eq!(prefix_custkey(-1), customer.as_bytes()[..9]);
+    assert_eq!(prefix_custkey_orderkey(-1, 0), order.as_bytes()[..18]);
     assert_eq!(
-        index.prefix_custkey_orderkey_then_linenumber(-1, 0),
+        prefix_custkey_orderkey_then_linenumber(-1, 0),
         line.as_bytes()[..19]
     );
     for key in [
-        SourceKey::Customer(i64::MIN),
-        SourceKey::Orders(i64::MAX, i64::MIN),
-        SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MAX),
+        customer_key(i64::MIN),
+        order_key(i64::MAX, i64::MIN),
+        line_key(i64::MIN, i64::MAX, i32::MAX),
     ] {
-        assert_eq!(index.unfold(index.fold(&key).as_bytes()), Ok(key));
+        assert_eq!(unfold(fold(&key).as_bytes()), Ok(key));
     }
-    assert!(index.fold(&SourceKey::Customer(-1)) < index.fold(&SourceKey::Customer(0)));
-    assert!(index.fold(&SourceKey::Customer(0)) < index.fold(&SourceKey::Customer(1)));
+    assert!(fold(&customer_key(-1)) < fold(&customer_key(0)));
+    assert!(fold(&customer_key(0)) < fold(&customer_key(1)));
 }
 
 #[test]
 fn malformed_folded_keys_are_rejected() {
-    let index = index();
-    for key in [
-        SourceKey::Customer(1),
-        SourceKey::Orders(1, 2),
-        SourceKey::Lineitem(1, 2, 3),
-    ] {
-        let bytes = index.fold(&key).as_bytes().to_vec();
-        assert!(index.unfold(&bytes[..bytes.len() - 1]).is_err());
+    assert!(unfold(&[]).is_err());
+    for key in [customer_key(1), order_key(1, 2), line_key(1, 2, 3)] {
+        let bytes = fold(&key).as_bytes().to_vec();
+        assert!(unfold(&bytes[..bytes.len() - 1]).is_err());
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(index.unfold(&extra).is_err());
+        assert!(unfold(&extra).is_err());
         let mut bad_index = bytes.clone();
         bad_index[bytes.len() - 2] = 0xff;
-        assert!(index.unfold(&bad_index).is_err());
+        assert!(unfold(&bad_index).is_err());
         let mut bad_id = bytes.clone();
         *bad_id.last_mut().unwrap() = 0xff;
-        assert!(index.unfold(&bad_id).is_err());
+        assert!(unfold(&bad_id).is_err());
         for offset in [0, 9, 18]
             .into_iter()
             .filter(|offset| *offset < bytes.len() - 2)
         {
             let mut bad_domain = bytes.clone();
             bad_domain[offset] = 0xff;
-            assert!(index.unfold(&bad_domain).is_err());
+            assert!(unfold(&bad_domain).is_err());
         }
     }
 }
 
 #[test]
 fn typed_payloads_round_trip_and_must_match_their_keys() {
-    let index = index();
     let rows = [
         (
-            SourceKey::Customer(i64::MAX),
-            SourcePayload::Customer(CustomerPayload {
-                segment: ("東京 café ".repeat(80)).into(),
-            }),
+            customer_key(i64::MAX),
+            customer_payload(&"東京 café ".repeat(80)),
         ),
         (
-            SourceKey::Orders(i64::MIN, i64::MAX),
-            SourcePayload::Orders(OrdersPayload {
-                order_date: Date::from_days(i32::MIN),
-                ship_priority: i32::MAX,
-            }),
+            order_key(i64::MIN, i64::MAX),
+            orders_payload(i32::MIN, i32::MAX),
         ),
         (
-            SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
-            SourcePayload::Lineitem(LineitemPayload {
-                ship_date: Date::from_days(i32::MAX),
-                extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
-                discount: SqlDecimal::<4, 2>::new(-99, 2).unwrap(),
-            }),
+            line_key(i64::MIN, i64::MAX, i32::MIN),
+            lineitem_payload(i32::MAX, -123_456, -99),
         ),
     ];
-    let batch = index
-        .build_batch(rows.iter().cloned().map(|(key, payload)| (key, payload, 1)))
-        .unwrap();
-    let mut stored = read_cursor(&index, &mut batch_cursor::<StoredPayload>(&[batch]));
-    stored.sort_by_key(|(key, ..)| index.fold(key));
+    let batch = build_batch(rows.iter().cloned().map(|(key, payload)| (key, payload, 1))).unwrap();
+    let mut stored = read_cursor(&mut batch_cursor::<StoredPayload>(&[batch]));
+    stored.sort_by_key(|(key, ..)| fold(key));
     let mut expected: Vec<_> = rows
         .iter()
         .cloned()
         .map(|(key, payload)| (key, payload, 1))
         .collect();
-    expected.sort_by_key(|(key, ..)| index.fold(key));
+    expected.sort_by_key(|(key, ..)| fold(key));
     assert_eq!(stored, expected);
 
     // Each payload variant belongs to exactly one source index.
@@ -389,9 +353,7 @@ fn typed_payloads_round_trip_and_must_match_their_keys() {
             let matches = i == j;
             assert_eq!(payload.matches(key), matches, "{key:?} with {payload:?}");
             assert_eq!(
-                index
-                    .build_batch([(key.clone(), payload.clone(), 1)])
-                    .is_ok(),
+                build_batch([(key.clone(), payload.clone(), 1)]).is_ok(),
                 matches,
                 "{key:?} with {payload:?}"
             );
@@ -457,15 +419,31 @@ fn trie_is_valid_and_derives_the_spec() {
 }
 
 #[test]
-fn hard_coded_tags_and_ids_agree_with_the_trie_at_the_extremes() {
+fn tags_and_ids_agree_with_the_trie_at_the_extremes() {
+    assert_eq!(
+        [TAG_CUSTKEY, TAG_ORDERKEY, TAG_LINENUMBER].map(Some),
+        ["custkey", "orderkey", "linenumber"].map(|domain| TRIE.domain_tag(domain))
+    );
+    assert_eq!(
+        [
+            INDEX_ID_CUSTOMER_BY_CUSTKEY,
+            INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+            INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER
+        ],
+        TRIE.placements()
+            .iter()
+            .map(|placed| placed.id)
+            .collect::<Vec<_>>()[..]
+    );
+    assert_eq!(CustomerOrdersLineitemDefinition::TRIE, TRIE);
     check_against_trie::<CustomerOrdersLineitemDefinition>([
-        SourceKey::Customer(i64::MIN),
-        SourceKey::Customer(i64::MAX),
-        SourceKey::Orders(i64::MIN, i64::MAX),
-        SourceKey::Orders(i64::MAX, i64::MIN),
-        SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
-        SourceKey::Lineitem(i64::MAX, i64::MIN, i32::MAX),
-        SourceKey::Lineitem(0, 0, 0),
+        customer_key(i64::MIN),
+        customer_key(i64::MAX),
+        order_key(i64::MIN, i64::MAX),
+        order_key(i64::MAX, i64::MIN),
+        line_key(i64::MIN, i64::MAX, i32::MIN),
+        line_key(i64::MAX, i64::MIN, i32::MAX),
+        line_key(0, 0, 0),
     ]);
 }
 
@@ -473,9 +451,9 @@ proptest! {
     #[test]
     fn folding_round_trips_and_agrees_with_the_trie(customer: i64, order: i64, line: i32) {
         check_against_trie::<CustomerOrdersLineitemDefinition>([
-            SourceKey::Customer(customer),
-            SourceKey::Orders(customer, order),
-            SourceKey::Lineitem(customer, order, line),
+            customer_key(customer),
+            order_key(customer, order),
+            line_key(customer, order, line),
         ]);
     }
 
@@ -486,7 +464,7 @@ proptest! {
         right: (i64, i64, i32),
     ) {
         let fold = |(c, o, l): (i64, i64, i32)| {
-            CustomerOrdersLineitemDefinition::fold(&SourceKey::Lineitem(c, o, l))
+            CustomerOrdersLineitemDefinition::fold(&line_key(c, o, l))
         };
         prop_assert_eq!(fold(left).cmp(&fold(right)), left.cmp(&right));
     }
@@ -494,12 +472,11 @@ proptest! {
     /// Every key of a customer, order, or line range starts with that range's prefix.
     #[test]
     fn prefixes_cover_exactly_their_ranges(customer: i64, order: i64, line: i32) {
-        let index = index();
-        let customer_prefix = index.prefix_custkey(customer);
-        let order_prefix = index.prefix_custkey_orderkey(customer, order);
-        let line_prefix = index.prefix_custkey_orderkey_then_linenumber(customer, order);
-        let order_key = index.fold(&SourceKey::Orders(customer, order));
-        let line_key = index.fold(&SourceKey::Lineitem(customer, order, line));
+        let customer_prefix = prefix_custkey(customer);
+        let order_prefix = prefix_custkey_orderkey(customer, order);
+        let line_prefix = prefix_custkey_orderkey_then_linenumber(customer, order);
+        let order_key = fold(&order_key(customer, order));
+        let line_key = fold(&line_key(customer, order, line));
         prop_assert!(order_key.as_bytes().starts_with(&customer_prefix));
         prop_assert!(order_key.as_bytes().starts_with(&order_prefix));
         prop_assert!(line_key.as_bytes().starts_with(&order_prefix));
@@ -510,17 +487,13 @@ proptest! {
 
 #[test]
 fn prefixes_nest_and_end_at_the_expected_tags() {
-    let index = index();
-    let customer = index.prefix_custkey(12);
-    let order = index.prefix_custkey_orderkey(12, -4);
-    let line = index.prefix_custkey_orderkey_then_linenumber(12, -4);
+    let customer = prefix_custkey(12);
+    let order = prefix_custkey_orderkey(12, -4);
+    let line = prefix_custkey_orderkey_then_linenumber(12, -4);
     assert!(order.starts_with(&customer));
     assert!(line.starts_with(&order));
     assert_eq!(line.last(), Some(&3));
-    assert_eq!(
-        index.fold(&SourceKey::Lineitem(12, -4, 7)).as_bytes()[..line.len()],
-        line
-    );
+    assert_eq!(fold(&line_key(12, -4, 7)).as_bytes()[..line.len()], line);
 }
 
 fn test_buffer_cache() -> Option<std::sync::Arc<dbsp::storage::buffer_cache::BufferCache>> {
@@ -538,14 +511,13 @@ type LayerReader = Reader<(
 )>;
 
 /// Reads only the file produced by `Writer2` in this fixture. That file's
-/// rkyv rows have the concrete `Vec<u8>`, `SourcePayload`, and `ZWeight` types in `LayerReader`.
+/// rkyv rows have the concrete `Vec<u8>`, `StoredPayload`, and `ZWeight` types in `LayerReader`.
 fn read_from(
     reader: &LayerReader,
-    index: &CustomerOrdersLineitemIndex,
     lower_bound: &[u8],
     prefix: Option<&[u8]>,
     max_rows: usize,
-) -> Vec<(SourceKey, Vec<(SourcePayload, ZWeight)>)> {
+) -> Vec<(Key, Vec<(Payload, ZWeight)>)> {
     let mut result = Vec::new();
     let target = lower_bound.to_vec();
     // SAFETY: `reader` comes directly from the matching Writer2 above. Its
@@ -558,16 +530,18 @@ fn read_from(
         if prefix.is_some_and(|prefix| !key.starts_with(prefix)) {
             break;
         }
+        let key = unfold(&key).unwrap();
         let mut child = unsafe { cursor.next_column().unwrap().first().unwrap() };
         let mut children = Vec::new();
         while child.has_value() {
-            let payload = child.key().unwrap().downcast_checked::<SourcePayload>();
+            let stored = child.key().unwrap().downcast_checked::<StoredPayload>();
+            let payload = decode_payload(&key, stored).unwrap();
             let mut weight = 0_i64;
             unsafe { child.aux(weight.erase_mut()).unwrap() };
-            children.push((payload.clone(), weight));
+            children.push((payload, weight));
             unsafe { child.move_next().unwrap() };
         }
-        result.push((index.unfold(&key).unwrap(), children));
+        result.push((key, children));
         unsafe { cursor.move_next().unwrap() };
     }
     result
@@ -575,7 +549,6 @@ fn read_from(
 
 #[test]
 fn layer_file_weighted_children_and_seeks() {
-    let index = index();
     let temp = tempdir().unwrap();
     let backend = <dyn StorageBackend>::new(
         &StorageConfig {
@@ -586,7 +559,7 @@ fn layer_file_weighted_children_and_seeks() {
     )
     .unwrap();
     let factory0 = Factories::<DynData, DynUnit>::new::<Vec<u8>, ()>();
-    let factory1 = Factories::<DynData, DynWeight>::new::<SourcePayload, ZWeight>();
+    let factory1 = Factories::<DynData, DynWeight>::new::<StoredPayload, ZWeight>();
     let mut writer = Writer2::new(
         &factory0,
         &factory1,
@@ -598,82 +571,22 @@ fn layer_file_weighted_children_and_seeks() {
     .unwrap();
 
     let fixtures = [
+        (customer_key(1), vec![(customer_payload("BUILDING"), 1)]),
+        (order_key(1, 10), vec![(orders_payload(1, 0), 1)]),
+        (line_key(1, 10, 1), vec![(lineitem_payload(4, 100, 5), 1)]),
+        (line_key(1, 10, 2), vec![(lineitem_payload(5, 200, 7), 1)]),
         (
-            SourceKey::Customer(1),
-            vec![(
-                SourcePayload::Customer(CustomerPayload {
-                    segment: "BUILDING".into(),
-                }),
-                1,
-            )],
+            order_key(1, 20),
+            vec![(orders_payload(1, 0), -1), (orders_payload(2, 0), 1)],
         ),
-        (
-            SourceKey::Orders(1, 10),
-            vec![(
-                SourcePayload::Orders(OrdersPayload {
-                    order_date: Date::from_days(1),
-                    ship_priority: 0,
-                }),
-                1,
-            )],
-        ),
-        (
-            SourceKey::Lineitem(1, 10, 1),
-            vec![(
-                SourcePayload::Lineitem(LineitemPayload {
-                    ship_date: Date::from_days(4),
-                    extended_price: SqlDecimal::<15, 2>::new(100, 2).unwrap(),
-                    discount: SqlDecimal::<4, 2>::new(5, 2).unwrap(),
-                }),
-                1,
-            )],
-        ),
-        (
-            SourceKey::Lineitem(1, 10, 2),
-            vec![(
-                SourcePayload::Lineitem(LineitemPayload {
-                    ship_date: Date::from_days(5),
-                    extended_price: SqlDecimal::<15, 2>::new(200, 2).unwrap(),
-                    discount: SqlDecimal::<4, 2>::new(7, 2).unwrap(),
-                }),
-                1,
-            )],
-        ),
-        (
-            SourceKey::Orders(1, 20),
-            vec![
-                (
-                    SourcePayload::Orders(OrdersPayload {
-                        order_date: Date::from_days(1),
-                        ship_priority: 0,
-                    }),
-                    -1,
-                ),
-                (
-                    SourcePayload::Orders(OrdersPayload {
-                        order_date: Date::from_days(2),
-                        ship_priority: 0,
-                    }),
-                    1,
-                ),
-            ],
-        ),
-        (
-            SourceKey::Customer(2),
-            vec![(
-                SourcePayload::Customer(CustomerPayload {
-                    segment: "AUTOMOBILE".into(),
-                }),
-                1,
-            )],
-        ),
+        (customer_key(2), vec![(customer_payload("AUTOMOBILE"), 1)]),
     ];
     let mut expected = Vec::new();
     for (key, payloads) in fixtures {
-        let folded = index.fold(&key);
+        let folded = fold(&key);
         let children: Vec<_> = payloads
             .into_iter()
-            .map(|(payload, weight)| (payload.clone(), weight, payload))
+            .map(|(payload, weight)| (encode_payload(&payload), weight, payload))
             .collect();
         assert!(children.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let stored: Vec<_> = children
@@ -685,25 +598,19 @@ fn layer_file_weighted_children_and_seeks() {
     }
     assert_eq!(writer.n_rows(), 6);
     let (reader, _) = writer.into_reader(BatchMetadata::default()).unwrap();
-    let observed = read_from(&reader, &index, expected[4].1.as_bytes(), None, 1);
+    let observed = read_from(&reader, expected[4].1.as_bytes(), None, 1);
     let expected_children: Vec<_> = expected[4]
         .2
         .iter()
         .map(|(_, weight, payload)| (payload.clone(), *weight))
         .collect();
-    assert_eq!(
-        observed,
-        vec![(SourceKey::Orders(1, 20), expected_children)]
-    );
+    assert_eq!(observed, vec![(order_key(1, 20), expected_children)]);
 
-    let between = index.fold(&SourceKey::Orders(1, 15));
-    assert_eq!(
-        read_from(&reader, &index, between.as_bytes(), None, 1),
-        observed
-    );
+    let between = fold(&order_key(1, 15));
+    assert_eq!(read_from(&reader, between.as_bytes(), None, 1), observed);
 
-    let prefix = index.prefix_custkey(1);
-    let scanned = read_from(&reader, &index, &prefix, Some(&prefix), usize::MAX);
+    let prefix = prefix_custkey(1);
+    let scanned = read_from(&reader, &prefix, Some(&prefix), usize::MAX);
     assert_eq!(
         scanned.iter().map(|(key, _)| key).collect::<Vec<_>>(),
         expected[..5]
@@ -720,60 +627,34 @@ fn layer_file_weighted_children_and_seeks() {
                 .collect::<Vec<_>>()
         );
     }
-    let after = index.fold(&SourceKey::Customer(3));
-    assert!(read_from(&reader, &index, after.as_bytes(), None, 1).is_empty());
+    let after = fold(&customer_key(3));
+    assert!(read_from(&reader, after.as_bytes(), None, 1).is_empty());
 }
 
 /// One key and payload per source, at the limits of their field types.
-fn extreme_rows() -> [(SourceKey, SourcePayload); 3] {
+fn extreme_rows() -> [(Key, Payload); 3] {
     [
         (
-            SourceKey::Customer(i64::MAX),
-            SourcePayload::Customer(CustomerPayload {
-                segment: ("東京 café ".repeat(80)).into(),
-            }),
+            customer_key(i64::MAX),
+            customer_payload(&"東京 café ".repeat(80)),
         ),
         (
-            SourceKey::Orders(i64::MIN, i64::MAX),
-            SourcePayload::Orders(OrdersPayload {
-                order_date: Date::from_days(i32::MIN),
-                ship_priority: i32::MAX,
-            }),
+            order_key(i64::MIN, i64::MAX),
+            orders_payload(i32::MIN, i32::MAX),
         ),
         (
-            SourceKey::Lineitem(i64::MIN, i64::MAX, i32::MIN),
-            SourcePayload::Lineitem(LineitemPayload {
-                ship_date: Date::from_days(i32::MAX),
-                extended_price: SqlDecimal::<15, 2>::new(-123_456, 2).unwrap(),
-                discount: SqlDecimal::<4, 2>::new(-99, 2).unwrap(),
-            }),
+            line_key(i64::MIN, i64::MAX, i32::MIN),
+            lineitem_payload(i32::MAX, -123_456, -99),
         ),
     ]
 }
 
-fn lineitem_payload(
-    ship_date: i32,
-    price_mantissa: i128,
-    discount_mantissa: i128,
-) -> SourcePayload {
-    SourcePayload::Lineitem(LineitemPayload {
-        ship_date: Date::from_days(ship_date),
-        extended_price: SqlDecimal::<15, 2>::new(price_mantissa, 2).unwrap(),
-        discount: SqlDecimal::<4, 2>::new(discount_mantissa, 2).unwrap(),
-    })
-}
-
 #[test]
 fn packed_payloads_have_golden_bytes() {
-    let customer = SourcePayload::Customer(CustomerPayload {
-        segment: "BUILDING".into(),
-    });
+    let customer = customer_payload("BUILDING");
     assert_eq!(encode_payload(&customer), b"\x08BUILDING");
 
-    let orders = SourcePayload::Orders(OrdersPayload {
-        order_date: Date::from_days(1),
-        ship_priority: -2,
-    });
+    let orders = orders_payload(1, -2);
     assert_eq!(
         encode_payload(&orders),
         [1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]
@@ -795,7 +676,7 @@ fn packed_payloads_round_trip_with_their_keys() {
         assert_eq!(decode_payload(&key, &bytes).as_ref(), Ok(&payload));
     }
     // The limits of each narrowed decimal round-trip.
-    let key = SourceKey::Lineitem(1, 2, 3);
+    let key = line_key(1, 2, 3);
     for price in [-(10_i128.pow(15) - 1), 0, 10_i128.pow(15) - 1] {
         for discount in [-9_999, 0, 9_999] {
             let payload = lineitem_payload(0, price, discount);
@@ -832,7 +713,7 @@ fn packed_payloads_reject_truncated_trailing_and_out_of_range_bytes() {
         assert!(decode_payload(&key, &trailing).is_err(), "{key:?}");
     }
 
-    let key = SourceKey::Lineitem(1, 2, 3);
+    let key = line_key(1, 2, 3);
     let packed = |price: i64, discount: i16| {
         let mut bytes = vec![0, 0, 0, 0];
         bytes.extend_from_slice(&price.to_le_bytes());
@@ -850,7 +731,7 @@ fn packed_payloads_reject_truncated_trailing_and_out_of_range_bytes() {
     }
 
     // Strings: a padded length, invalid UTF-8, and a length past the input.
-    let customer = SourceKey::Customer(1);
+    let customer = customer_key(1);
     assert!(decode_payload(&customer, b"\x01A").is_ok());
     assert!(decode_payload(&customer, b"\x81\x00A").is_err());
     assert!(decode_payload(&customer, b"\x01\xff").is_err());
@@ -864,7 +745,7 @@ proptest! {
         price in -(10_i128.pow(15) - 1)..=(10_i128.pow(15) - 1),
         discount in -9_999_i128..=9_999,
     ) {
-        let key = SourceKey::Lineitem(1, 2, 3);
+        let key = line_key(1, 2, 3);
         let payload = lineitem_payload(ship_date, price, discount);
         prop_assert_eq!(decode_payload(&key, &encode_payload(&payload)), Ok(payload));
     }
@@ -875,16 +756,11 @@ proptest! {
         ship_priority: i32,
         segment in "\\PC{0,40}",
     ) {
-        let orders = SourcePayload::Orders(OrdersPayload {
-            order_date: Date::from_days(order_date),
-            ship_priority,
-        });
-        let customer = SourcePayload::Customer(CustomerPayload {
-            segment: segment.as_str().into(),
-        });
+        let orders = orders_payload(order_date, ship_priority);
+        let customer = customer_payload(&segment);
         for (key, payload) in [
-            (SourceKey::Orders(1, 2), orders),
-            (SourceKey::Customer(1), customer),
+            (order_key(1, 2), orders),
+            (customer_key(1), customer),
         ] {
             prop_assert_eq!(decode_payload(&key, &encode_payload(&payload)), Ok(payload));
         }
@@ -897,9 +773,9 @@ proptest! {
         bytes in proptest::collection::vec(any::<u8>(), 0..24),
     ) {
         for key in [
-            SourceKey::Customer(1),
-            SourceKey::Orders(1, 2),
-            SourceKey::Lineitem(1, 2, 3),
+            customer_key(1),
+            order_key(1, 2),
+            line_key(1, 2, 3),
         ] {
             if let Ok(payload) = decode_payload(&key, &bytes) {
                 prop_assert_eq!(encode_payload(&payload), bytes.clone());

@@ -5139,10 +5139,7 @@ name = "merged-index-col"
 version = "0.1.0"
 dependencies = [
  "dbsp",
- "feldera-macros",
- "feldera-size-of",
  "feldera-sqllib",
- "rkyv",
 ]
 
 [[package]]

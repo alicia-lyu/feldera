@@ -72,11 +72,11 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 | Key trie (`trie.rs`), order-preserving key encoders, packed payload encoders (`packed.rs`), folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
 | Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
-| COL keys, packed payloads (`encode_payload`, `decode_payload`), Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
+| Q3 readers, `Q3State`, and the COL storage tests | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Design and roadmap for declaring merged indexes as key-trie specs | `docs/design/merged-index/general-definition.md` |
 | Spec parser and schema validator (roadmap Step 3) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
 | Rust emitter for a spec (Step 4), selected by `--merged-index` and `--merged-index-output` | `MergedIndexRustEmitter.java` (`backend/rust`), `CompilerMain.emitMergedIndex` |
-| COL spec, its generated module (committed, not yet used), and the generated-vs-hand-written checks | `merged-index-col/col.mi`, `generate.sh`, `src/generated.rs`, `src/generated_tests.rs` |
+| COL spec and its generated module, which COL re-exports as its definition (`lib.rs` adds only `build_batch`) | `merged-index-col/col.mi`, `generate.sh`, `src/generated.rs` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 
 ### Experiment commands

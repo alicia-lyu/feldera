@@ -158,7 +158,7 @@ What changed is the stored type:
 
 The enum layout came from the typed-values commit `59b566016`; the Steps 1–2 merge kept it unchanged.
 
-Measured on aarch64 by `layout_tests.rs` in `merged-index-col`. Each value-level figure is from a layer file of 2,048 rows of one source, written in the merged index's layout: folded key, then value and weight.
+Measured on aarch64 by `layout_tests.rs` in `merged-index-col`, before Step 5 retired these measurements. Each value-level figure is from a layer file of 2,048 rows of one source, written in the merged index's layout: folded key, then value and weight.
 
 | Source | Typed item | Typed values on disk | Byte-string item | Byte-string values on disk |
 | --- | --- | --- | --- | --- |
@@ -196,7 +196,7 @@ The stored value is now the packed bytes of `encode_payload` in a `Vec<u8>`, dec
 
 #### Layout files
 
-`layout_tests.rs` writes, for each source, 2,048 rows in the merged index's layout (folded key, then value and weight), once per encoding, with no compression. Each figure is the value-level data-block bytes of the file, read back from it. The artifact is `target/r5-packed-values/layout-tests.txt` (test `value_level_bytes_by_encoding`, which pins these numbers).
+`layout_tests.rs` writes, for each source, 2,048 rows in the merged index's layout (folded key, then value and weight), once per encoding, with no compression. Each figure is the value-level data-block bytes of the file, read back from it. The artifact is `target/r5-packed-values/layout-tests.txt` (test `value_level_bytes_by_encoding`, which pinned these numbers). At roadmap Step 5 that test was reduced to the packed and native measurements, now `packed_value_bytes_against_native_lineitem`; the typed and `rkyv` figures are recorded in [col-storage.md](col-storage.md).
 
 | Source | Typed | `rkyv` bytes | `rkyv` bytes, elided | Packed | Packed, elided |
 | --- | --- | --- | --- | --- | --- |

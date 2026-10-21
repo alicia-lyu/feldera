@@ -1,6 +1,6 @@
 # General merged-index definition
 
-This document is a design and a roadmap. Roadmap Steps 1 to 4 are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, the spec parser and validator in the SQL compiler, and the emitter, which generates COL's module beside the hand-written one. The switch to the generated module is not.
+This document is a design and a roadmap. All five roadmap steps are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, the spec parser and validator in the SQL compiler, the emitter, and the switch of COL to its generated module.
 
 It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
@@ -8,7 +8,7 @@ The trie spec supersedes the flat `key_domain` / `source_index` / `merged_index`
 
 ## Why
 
-COL is defined by hand. `merged-index-col/src/lib.rs` spells out its trie, a key enum, payload structs, and straight-line `fold` and `unfold`. A second merged index would need all of it written again.
+Until Step 5, COL was defined by hand. `merged-index-col/src/lib.rs` spelled out its trie, a key enum, payload structs, and straight-line `fold` and `unfold`. A second merged index would have needed all of it written again.
 
 Before Steps 1 and 2, the generic layer in `crates/dbsp/src/trace/merged_index/` had three limits:
 
@@ -62,7 +62,7 @@ Every placement declares its payload.
 - **`*` marks a primary index.** It carries all of the relation's non-key columns, in table order. It is allowed only where the index key is exactly the relation's primary key. In COL that is Customer.
 - **A column list marks a secondary index.** It carries exactly the listed columns, in the listed order.
   - Orders is secondary: its key, `(custkey, orderkey)`, puts a foreign key first.
-  - Lineitem is secondary too. Its list order also matches the hand-written `LineitemPayload`.
+  - Lineitem is secondary too. Its list order also matches the former hand-written `LineitemPayload`.
 
 ## Key values from another table: `via`
 
@@ -84,7 +84,7 @@ The compiler makes one pre-order traversal of the trie, visiting children in the
 - **Index names** follow `<Relation>By<Path>`, with the path's domains in CamelCase, e.g. `OrdersByCustkeyOrderkey`.
 - **Key columns** are, for each domain on the path from the root to the node, the relation's column in that domain, or the column named by its `via`.
 
-For COL, both tags and ids come out as 1, 2, 3, which are the values `CustomerOrdersLineitemDefinition` hard-codes today. Reordering the spec renumbers tags and ids, and so changes the stored bytes. That is acceptable, because the definition is compiled with the index it describes. The static trie records which numbering was used.
+For COL, both tags and ids come out as 1, 2, 3, which are the values the former hand-written `CustomerOrdersLineitemDefinition` hard-coded. Reordering the spec renumbers tags and ids, and so changes the stored bytes. That is acceptable, because the definition is compiled with the index it describes. The static trie records which numbering was used.
 
 ## Validation
 
@@ -158,7 +158,7 @@ The tree stores no indices, parent links, tags, ids, or paths. Each query walks 
 
 Tries are three or four levels deep, so this favors clean code over speed. Folding does not walk the tree: it uses constants, which `testing::check_against_trie` ties to the trie.
 
-The compiler's Java model has the same shape, and the emitter prints it as this Rust value. COL's `TRIE` in `merged-index-col/src/lib.rs` reads like its spec: `custkey { Customer; orderkey { Orders; linenumber { Lineitem [custkey via Orders] } } }`.
+The compiler's Java model has the same shape, and the emitter prints it as this Rust value. COL's `TRIE` in `merged-index-col/src/generated.rs` reads like its spec: `custkey { Customer; orderkey { Orders; linenumber { Lineitem [custkey via Orders] } } }`.
 
 ## Generated code
 
@@ -182,7 +182,7 @@ The emitter rejects a spec whose derived Rust names collide or are not Rust iden
 
 The compiler flags `--merged-index <spec>` and `--merged-index-output <file.rs>` select the output; each requires the other. Spec errors are reported as compiler errors that name `spec:line:column`. The circuit and `--q3-merged-index` are untouched.
 
-For COL, `merged-index-col/generate.sh` runs the compiler on `q3-ivm-baseline/query.sql` and `merged-index-col/col.mi`, formats the result with rustfmt 1.96.1, and writes the committed `src/generated.rs`. The compiler wrapper always exits 0, so the script treats a missing output as the failure.
+For COL, `merged-index-col/generate.sh` runs the compiler on `q3-ivm-baseline/query.sql` and `merged-index-col/col.mi`, formats the result with rustfmt 1.96.1, and writes the committed `src/generated.rs`, which COL's `lib.rs` re-exports. The compiler wrapper always exits 0, so the script treats a missing output as the failure.
 
 ## DBSP prerequisites
 
@@ -196,11 +196,11 @@ Implemented, for keys only. The trait now has these items:
 - `const TRIE: KeyTrie`;
 - typed `fold` and `unfold`. `fold` cannot fail, because the key's fields are typed.
 
-Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` writes `(tag, value)` pairs in path order and ends a key with `finish(id)`, `prefix()`, or `then_tag(tag)`. `KeyDecoder` checks the terminator, splits off the id, and reads one tagged field at a time. A definition, hand-written now and generated in Step 4, is straight-line code over them.
+Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` writes `(tag, value)` pairs in path order and ends a key with `finish(id)`, `prefix()`, or `then_tag(tag)`. `KeyDecoder` checks the terminator, splits off the id, and reads one tagged field at a time. A generated definition is straight-line code over them.
 
 This replaced the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
 
-Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL rejects a payload of the wrong variant with `SourcePayload::matches` before it encodes. The generated module provides the same check as `Payload::matches`. Adding `type Payload` and placement functions to the trait remains open.
+Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL's `build_batch` rejects a payload of the wrong variant with the generated `Payload::matches` before it encodes. Adding `type Payload` and placement functions to the trait remains open.
 
 ### Packed payload fields
 
@@ -235,12 +235,12 @@ These steps are ordered. Each ends with an exit check and lands with its own doc
 3. **Parser and validator** in the SQL compiler, with no emission yet. Implemented; see the end of the Validation section.
    - Exit check: JUnit tests of the derivation (`MergedIndexDerivationTest`). COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
    - Exit check: one failing case per validation rule (`MergedIndexValidatorTest`); syntax errors are in `MergedIndexSpecParserTest`.
-4. **Emitter, and COL regenerated.** Implemented: `merged-index-col/col.mi`, `generate.sh`, and the committed `src/generated.rs`, which sits beside the hand-written definition. `verify.sh` regenerates the module and fails if the committed file differs. The flags report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
-   - Exit check: the generated and hand-written tries are equal (`merged-index-col/src/generated_tests.rs`).
+4. **Emitter, and COL regenerated.** Implemented: `merged-index-col/col.mi`, `generate.sh`, and the committed `src/generated.rs`, which sat beside the hand-written definition until Step 5. `verify.sh` regenerates the module and fails if the committed file differs. The flags report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
+   - Exit check: the generated and hand-written tries are equal (`generated_tests.rs`, retired with the hand-written definition in Step 5).
    - Exit check: `fold` is byte-identical over property-based keys.
    - Exit check: the prefixes match, and sample payloads encode to identical packed bytes. Since 2026-10-19 the stored value is packed bytes rather than an archive.
-5. **Switch.** COL uses the generated module, and the hand-written definition moves to `TRASH/`.
-   - The typed and rkyv value-level bytes that `layout_tests.rs` pins are recorded in [col-storage.md](col-storage.md), and those measurements are retired. Only the packed measurement remains, so generated types keep plain derives (see [decisions.md](decisions.md), 2026-10-21).
+5. **Switch.** Implemented: COL uses the generated module, re-exported at the crate root, and the hand-written definition is in `TRASH/`. `lib.rs` keeps only `build_batch`.
+   - The typed and rkyv value-level bytes that `layout_tests.rs` pinned are recorded in [col-storage.md](col-storage.md), and those measurements are retired. Only the packed measurement remains, so generated types keep plain derives (see [decisions.md](decisions.md), 2026-10-21).
    - Exit check: `verify.sh` transcripts are unchanged.
 
 Later work, outside this roadmap, is listed in [deferred.md](deferred.md).

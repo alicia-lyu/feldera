@@ -1,58 +1,64 @@
 use super::*;
-use crate::{CustomerPayload, LineitemPayload, OrdersPayload};
+use crate::{
+    build_batch, CustomerByCustkeyPayload, LineitemByCustkeyOrderkeyLinenumberPayload,
+    OrdersByCustkeyOrderkeyPayload,
+};
 use dbsp::{
     dynamic::{DowncastTrait, DynData},
     trace::{BatchReaderFactories, OrdIndexedWSetFactories, WithSnapshot},
     DynZWeight,
 };
 
-type SourceRow = (SourceKey, SourcePayload, i64);
+type SourceRow = (Key, Payload, i64);
 
-fn customer(id: i64, segment: &str, weight: i64) -> SourceRow {
+fn customer(custkey: i64, segment: &str, weight: i64) -> SourceRow {
     (
-        SourceKey::Customer(id),
-        SourcePayload::Customer(CustomerPayload {
-            segment: segment.into(),
+        Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
+        Payload::CustomerByCustkey(CustomerByCustkeyPayload {
+            c_mktsegment: segment.into(),
         }),
         weight,
     )
 }
 
-fn order(c: i64, o: i64, day: i32, weight: i64) -> SourceRow {
+fn order(custkey: i64, orderkey: i64, day: i32, weight: i64) -> SourceRow {
     (
-        SourceKey::Orders(c, o),
-        SourcePayload::Orders(OrdersPayload {
-            order_date: Date::from_days(day),
-            ship_priority: 7,
+        Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey { custkey, orderkey }),
+        Payload::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyPayload {
+            o_orderdate: Date::from_days(day),
+            o_shippriority: 7,
         }),
         weight,
     )
 }
 
-fn line(c: i64, o: i64, l: i32, price: i128, weight: i64) -> SourceRow {
+fn line(custkey: i64, orderkey: i64, linenumber: i32, price: i128, weight: i64) -> SourceRow {
     (
-        SourceKey::Lineitem(c, o, l),
-        SourcePayload::Lineitem(LineitemPayload {
-            ship_date: Date::from_days(30),
-            extended_price: SqlDecimal::new(price, 2).unwrap(),
-            discount: SqlDecimal::new(4, 2).unwrap(),
+        Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+            custkey,
+            orderkey,
+            linenumber,
+        }),
+        Payload::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberPayload {
+            l_shipdate: Date::from_days(30),
+            l_extendedprice: SqlDecimal::new(price, 2).unwrap(),
+            l_discount: SqlDecimal::new(4, 2).unwrap(),
         }),
         weight,
     )
 }
 
 fn source(batches: Vec<Vec<SourceRow>>) -> SourceSnapshot {
-    let index = CustomerOrdersLineitemIndex;
     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
         Vec<u8>,
-        SourcePayload,
+        StoredPayload,
         i64,
     >();
     SourceSnapshot::with_batches(
         &factories,
         batches
             .into_iter()
-            .map(|rows| Arc::new(index.build_batch(rows).unwrap()))
+            .map(|rows| Arc::new(build_batch(rows).unwrap()))
             .collect(),
     )
 }

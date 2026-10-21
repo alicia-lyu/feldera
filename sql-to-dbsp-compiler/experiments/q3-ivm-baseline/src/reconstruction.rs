@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::dynamic::{DowncastTrait, DynData, Erase};
 use dbsp::storage::write_attribution::{with_write_owner, WriteOwner};
+use dbsp::trace::merged_index::MergedIndexDefinition;
 use dbsp::trace::{
     BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSetFactories, Spine,
     SpineSnapshot, Trace, TraceRole, WithSnapshot,
@@ -15,8 +16,10 @@ use dbsp::{DynZWeight, Runtime, ZWeight};
 use feldera_sqllib::{Date, SqlDecimal};
 use feldera_storage::StoragePath;
 use merged_index_col::{
-    decode_payload, CustomerOrdersLineitemIndex, CustomerPayload, LineitemPayload, OrdersPayload,
-    SourceKey, SourcePayload,
+    build_batch, decode_payload, prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey,
+    CustomerByCustkeyPayload, CustomerOrdersLineitemDefinition, Key,
+    LineitemByCustkeyOrderkeyLinenumberKey, LineitemByCustkeyOrderkeyLinenumberPayload,
+    OrdersByCustkeyOrderkeyKey, OrdersByCustkeyOrderkeyPayload, Payload,
 };
 
 use crate::data::{Customer, Line, Order};
@@ -24,7 +27,7 @@ use crate::Change;
 
 type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
-type SourceRow = (SourceKey, SourcePayload, ZWeight);
+type SourceRow = (Key, Payload, ZWeight);
 type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
@@ -55,7 +58,6 @@ impl ManualIndex {
             // spine's background compaction, belongs to the merged index.
             with_write_owner(WriteOwner::MergedIndex, || {
                 cache_runtime.with_buffer_cache(0, || {
-                    let index = CustomerOrdersLineitemIndex;
                     // Folded byte keys; packed payload bytes.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
@@ -106,7 +108,7 @@ impl ManualIndex {
                                 let _ = reply.send(trace.ro_snapshot());
                             }
                             Ok(Request::Append(rows, reply)) => {
-                                let result = index.build_batch(rows).map(|batch| {
+                                let result = build_batch(rows).map(|batch| {
                                     feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
                                     trace.ro_snapshot()
                                 });
@@ -203,9 +205,9 @@ fn sql_decimal<const P: usize, const S: usize>(hundredths: i64) -> Result<SqlDec
 
 fn customer_row(row: &Customer, insert: bool) -> SourceRow {
     (
-        SourceKey::Customer(row.key),
-        SourcePayload::Customer(CustomerPayload {
-            segment: row.segment.clone().into(),
+        Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: row.key }),
+        Payload::CustomerByCustkey(CustomerByCustkeyPayload {
+            c_mktsegment: row.segment.clone().into(),
         }),
         if insert { 1 } else { -1 },
     )
@@ -213,10 +215,13 @@ fn customer_row(row: &Customer, insert: bool) -> SourceRow {
 
 fn order_row(row: &Order, insert: bool) -> Result<SourceRow> {
     Ok((
-        SourceKey::Orders(row.customer_key, row.key),
-        SourcePayload::Orders(OrdersPayload {
-            order_date: sql_date(&row.date)?,
-            ship_priority: row.ship_priority,
+        Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+            custkey: row.customer_key,
+            orderkey: row.key,
+        }),
+        Payload::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyPayload {
+            o_orderdate: sql_date(&row.date)?,
+            o_shippriority: row.ship_priority,
         }),
         if insert { 1 } else { -1 },
     ))
@@ -224,11 +229,15 @@ fn order_row(row: &Order, insert: bool) -> Result<SourceRow> {
 
 fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
     Ok((
-        SourceKey::Lineitem(customer, row.order_key, row.number),
-        SourcePayload::Lineitem(LineitemPayload {
-            ship_date: sql_date(&row.ship_date)?,
-            extended_price: sql_decimal(row.price_cents)?,
-            discount: sql_decimal(row.discount_hundredths)?,
+        Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+            custkey: customer,
+            orderkey: row.order_key,
+            linenumber: row.number,
+        }),
+        Payload::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberPayload {
+            l_shipdate: sql_date(&row.ship_date)?,
+            l_extendedprice: sql_decimal(row.price_cents)?,
+            l_discount: sql_decimal(row.discount_hundredths)?,
         }),
         if insert { 1 } else { -1 },
     ))
@@ -270,8 +279,7 @@ pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>
 
 /// Seek one current complete Lineitem range, decoding only matching rows.
 pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
-    let index = CustomerOrdersLineitemIndex;
-    let prefix = index.prefix_custkey_orderkey_then_linenumber(order.customer_key, order.key);
+    let prefix = prefix_custkey_orderkey_then_linenumber(order.customer_key, order.key);
     let mut cursor = snapshot.cursor();
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
@@ -280,8 +288,14 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
         if !key.starts_with(&prefix) {
             break;
         }
-        let line_key = index.unfold(&key).map_err(anyhow::Error::msg)?;
-        let SourceKey::Lineitem(customer, order_key, number) = line_key else {
+        let line_key =
+            CustomerOrdersLineitemDefinition::unfold(&key).map_err(anyhow::Error::msg)?;
+        let Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+            custkey: customer,
+            orderkey: order_key,
+            linenumber: number,
+        }) = line_key
+        else {
             bail!("non-Lineitem row inside Lineitem range");
         };
         if customer != order.customer_key || order_key != order.key {
@@ -293,7 +307,7 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
             }
             // The stored bytes carry no tag: the key names the fields.
             let stored = cursor.val().downcast_checked::<Vec<u8>>();
-            let SourcePayload::Lineitem(payload) =
+            let Payload::LineitemByCustkeyOrderkeyLinenumber(payload) =
                 decode_payload(&line_key, stored).map_err(anyhow::Error::msg)?
             else {
                 bail!("Lineitem payload has unexpected type");
@@ -302,14 +316,14 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
                 order_key,
                 number,
                 price_cents: crate::data::decimal_hundredths(
-                    &payload.extended_price.to_string(),
+                    &payload.l_extendedprice.to_string(),
                     false,
                 )?,
                 discount_hundredths: crate::data::decimal_hundredths(
-                    &payload.discount.to_string(),
+                    &payload.l_discount.to_string(),
                     false,
                 )?,
-                ship_date: payload.ship_date.to_string(),
+                ship_date: payload.l_shipdate.to_string(),
             });
             cursor.step_val();
         }

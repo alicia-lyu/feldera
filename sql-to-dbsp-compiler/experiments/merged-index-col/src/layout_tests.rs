@@ -1,22 +1,16 @@
-//! Measures how many bytes a merged-index value takes, by source.
+//! Measures how many bytes the merged index's stored value takes, by source.
 //!
-//! Three encodings of the stored value are compared, each in a layer file of
-//! one source's rows:
+//! The stored value is the packed bytes of `encode_payload` in a `Vec<u8>`,
+//! written to a layer file of one source's rows, both plain and with
+//! value-header elision, a disk-only transform. Native Lineitem values are
+//! the baseline. The test reports each source's bytes per value row and pins
+//! the sizes, so that a change of encoding updates them on purpose.
 //!
-//! - the typed `SourcePayload`, whose archive is one fixed-size enum for every
-//!   source (the stored value from 2026-10-16 to 2026-10-19);
-//! - the `rkyv` bytes of the source's own payload struct in a `Vec<u8>`;
-//! - the packed bytes of `encode_payload` in a `Vec<u8>` (the stored value).
-//!
-//! Byte-string values are also written with value-header elision, a disk-only
-//! transform. Native Lineitem values are the baseline. These tests report each
-//! source's bytes per value row and pin the sizes, so that a change of
-//! encoding updates them on purpose.
+//! The typed payload archive and the `rkyv` byte-string measurements were
+//! retired at Step 5; their last figures are recorded in
+//! `docs/design/merged-index/col-storage.md`.
 
-use std::{
-    mem::{align_of, size_of},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use dbsp::{
     dynamic::DynData,
@@ -30,39 +24,42 @@ use dbsp::{
             Factories,
         },
     },
-    utils::{Tup1, Tup2, Tup4},
+    trace::merged_index::MergedIndexDefinition,
+    utils::{Tup1, Tup4},
     DBData, ZWeight,
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
-use rkyv::{to_bytes, Archived};
 
 use super::{
-    encode_payload, CustomerOrdersLineitemIndex, CustomerPayload, Date, LineitemPayload,
-    OrdersPayload, SourceKey, SourcePayload, SqlDecimal,
+    encode_payload, CustomerByCustkeyKey, CustomerByCustkeyPayload,
+    CustomerOrdersLineitemDefinition, Key, LineitemByCustkeyOrderkeyLinenumberKey,
+    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyKey,
+    OrdersByCustkeyOrderkeyPayload, Payload,
 };
+use feldera_sqllib::{Date, SqlDecimal};
 
 /// Rows per single-source file.
 const ROWS: i64 = 2_048;
 
-fn customer_payload() -> CustomerPayload {
+fn customer_payload() -> CustomerByCustkeyPayload {
     // TPC-H market segments are at most 10 bytes long.
-    CustomerPayload {
-        segment: "AUTOMOBILE".into(),
+    CustomerByCustkeyPayload {
+        c_mktsegment: "AUTOMOBILE".into(),
     }
 }
 
-fn orders_payload() -> OrdersPayload {
-    OrdersPayload {
-        order_date: Date::from_days(9_000),
-        ship_priority: 0,
+fn orders_payload() -> OrdersByCustkeyOrderkeyPayload {
+    OrdersByCustkeyOrderkeyPayload {
+        o_orderdate: Date::from_days(9_000),
+        o_shippriority: 0,
     }
 }
 
-fn lineitem_payload() -> LineitemPayload {
-    LineitemPayload {
-        ship_date: Date::from_days(9_010),
-        extended_price: SqlDecimal::<15, 2>::new(1_234_567, 2).unwrap(),
-        discount: SqlDecimal::<4, 2>::new(5, 2).unwrap(),
+fn lineitem_payload() -> LineitemByCustkeyOrderkeyLinenumberPayload {
+    LineitemByCustkeyOrderkeyLinenumberPayload {
+        l_shipdate: Date::from_days(9_010),
+        l_extendedprice: SqlDecimal::<15, 2>::new(1_234_567, 2).unwrap(),
+        l_discount: SqlDecimal::<4, 2>::new(5, 2).unwrap(),
     }
 }
 
@@ -71,124 +68,6 @@ fn buffer_cache() -> Option<Arc<BufferCache>> {
         static BUFFER_CACHE: Arc<BufferCache> = Arc::new(BufferCache::new(1024 * 1024));
     }
     Some(BUFFER_CACHE.with(Arc::clone))
-}
-
-/// Bytes of the archive of one value-level item, a value and its weight.
-fn item_bytes<T>(value: T) -> usize
-where
-    Tup2<T, ZWeight>: rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<256>>,
-{
-    to_bytes::<_, 256>(&Tup2(value, 1)).unwrap().len()
-}
-
-/// Bytes of the archive of `payload` alone, as `encode_payload` stored it
-/// before values were typed.
-fn payload_archive<T>(payload: &T) -> Vec<u8>
-where
-    T: rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<256>>,
-{
-    to_bytes::<_, 256>(payload).unwrap().to_vec()
-}
-
-#[test]
-fn payload_item_bytes() {
-    let typed = [
-        (
-            "customer",
-            item_bytes(SourcePayload::Customer(customer_payload())),
-        ),
-        (
-            "orders",
-            item_bytes(SourcePayload::Orders(orders_payload())),
-        ),
-        (
-            "lineitem",
-            item_bytes(SourcePayload::Lineitem(lineitem_payload())),
-        ),
-    ];
-    let byte_string = [
-        ("customer", item_bytes(payload_archive(&customer_payload()))),
-        ("orders", item_bytes(payload_archive(&orders_payload()))),
-        ("lineitem", item_bytes(payload_archive(&lineitem_payload()))),
-    ];
-    let archives = [
-        (
-            "SourcePayload",
-            size_of::<Archived<SourcePayload>>(),
-            align_of::<Archived<SourcePayload>>(),
-        ),
-        (
-            "CustomerPayload",
-            size_of::<Archived<CustomerPayload>>(),
-            align_of::<Archived<CustomerPayload>>(),
-        ),
-        (
-            "OrdersPayload",
-            size_of::<Archived<OrdersPayload>>(),
-            align_of::<Archived<OrdersPayload>>(),
-        ),
-        (
-            "LineitemPayload",
-            size_of::<Archived<LineitemPayload>>(),
-            align_of::<Archived<LineitemPayload>>(),
-        ),
-    ];
-    for ((source, typed), (_, bytes)) in typed.iter().zip(&byte_string) {
-        eprintln!("item bytes, {source}: typed {typed}, byte string {bytes}");
-    }
-    for (name, size, align) in archives {
-        eprintln!("Archived<{name}>: size {size}, align {align}");
-    }
-    let native_item = item_bytes(native_lineitem_value(1));
-    eprintln!(
-        "native lineitem item {native_item}, Archived<Tup4<..>>: size {}, align {}",
-        size_of::<Archived<NativeLineitemValue>>(),
-        align_of::<Archived<NativeLineitemValue>>()
-    );
-    // A byte-string item is the variant's archive, padding to the 8-byte
-    // alignment of the `ArchivedVec` header, the header, and the weight.
-    let archive_lens = [
-        payload_archive(&customer_payload()).len(),
-        payload_archive(&orders_payload()).len(),
-        payload_archive(&lineitem_payload()).len(),
-    ];
-    for (((source, item), archive), header) in byte_string
-        .iter()
-        .zip(archive_lens)
-        .zip([size_of::<Archived<Vec<u8>>>(); 3])
-    {
-        let weight = size_of::<ZWeight>();
-        eprintln!(
-            "byte string, {source}: item {item} = archive {archive} + padding {} + header {header} + weight {weight}",
-            item - archive - header - weight
-        );
-    }
-    // The enum's archive is its root, the last bytes of `to_bytes`. Its first
-    // byte is the variant's discriminant (Customer 0, Orders 1, Lineitem 2);
-    // the variant's fields start at the variant's alignment.
-    for payload in [
-        SourcePayload::Orders(orders_payload()),
-        SourcePayload::Lineitem(lineitem_payload()),
-    ] {
-        let bytes = to_bytes::<_, 256>(&payload).unwrap();
-        let root = &bytes[bytes.len() - size_of::<Archived<SourcePayload>>()..];
-        eprintln!("archived {payload:?}:");
-        for row in root.chunks(16) {
-            eprintln!("  {row:02x?}");
-        }
-    }
-
-    // Measured on aarch64, 2026-10-19. A typed value takes the same bytes
-    // whatever its source, because its archive is sized to the largest
-    // variant.
-    assert_eq!(typed.map(|(_, bytes)| bytes), [80, 80, 80]);
-    assert_eq!(byte_string.map(|(_, bytes)| bytes), [40, 32, 72]);
-    assert_eq!(
-        archives.map(|(_, size, align)| (size, align)),
-        [(64, 16), (16, 8), (8, 4), (48, 16)]
-    );
-    assert_eq!(archive_lens, [16, 8, 48]);
-    assert_eq!(native_item, 64);
 }
 
 /// Writes `groups`, each a key and its values with weight 1, to a layer file
@@ -223,55 +102,52 @@ fn layer_file<K: DBData, V: DBData>(
 }
 
 /// The `ROWS` rows of one source, as the merged index stores them: a folded
-/// key with one value, made from the row's payload by `value`.
-fn merged_index_file<V: DBData>(
-    row: impl Fn(i64) -> (SourceKey, SourcePayload),
-    value: impl Fn(SourcePayload) -> V,
-    parameters: Parameters,
-) -> BlockBytes {
-    let index = CustomerOrdersLineitemIndex;
+/// key with one value, the packed bytes of the row's payload.
+fn merged_index_file(row: SourceRow, parameters: Parameters) -> BlockBytes {
     layer_file(
         (0..ROWS).map(|id| {
             let (key, payload) = row(id);
             assert!(payload.matches(&key));
-            (index.fold(&key).as_bytes().to_vec(), vec![value(payload)])
+            (
+                CustomerOrdersLineitemDefinition::fold(&key)
+                    .as_bytes()
+                    .to_vec(),
+                vec![encode_payload(&payload)],
+            )
         }),
         parameters,
     )
 }
 
 /// Makes the row of one source with the given id.
-type SourceRow = fn(i64) -> (SourceKey, SourcePayload);
+type SourceRow = fn(i64) -> (Key, Payload);
 
-fn customer_row(id: i64) -> (SourceKey, SourcePayload) {
+fn customer_row(id: i64) -> (Key, Payload) {
     (
-        SourceKey::Customer(id),
-        SourcePayload::Customer(customer_payload()),
+        Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: id }),
+        Payload::CustomerByCustkey(customer_payload()),
     )
 }
 
-fn orders_row(id: i64) -> (SourceKey, SourcePayload) {
+fn orders_row(id: i64) -> (Key, Payload) {
     (
-        SourceKey::Orders(id / 4, id),
-        SourcePayload::Orders(orders_payload()),
+        Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+            custkey: id / 4,
+            orderkey: id,
+        }),
+        Payload::OrdersByCustkeyOrderkey(orders_payload()),
     )
 }
 
-fn lineitem_row(id: i64) -> (SourceKey, SourcePayload) {
+fn lineitem_row(id: i64) -> (Key, Payload) {
     (
-        SourceKey::Lineitem(id / 16, id / 4, (id % 4) as i32 + 1),
-        SourcePayload::Lineitem(lineitem_payload()),
+        Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+            custkey: id / 16,
+            orderkey: id / 4,
+            linenumber: (id % 4) as i32 + 1,
+        }),
+        Payload::LineitemByCustkeyOrderkeyLinenumber(lineitem_payload()),
     )
-}
-
-/// The archive of the payload's own variant, the byte-string value stored
-/// before values were typed.
-fn byte_string(payload: SourcePayload) -> Vec<u8> {
-    match payload {
-        SourcePayload::Customer(p) => payload_archive(&p),
-        SourcePayload::Orders(p) => payload_archive(&p),
-        SourcePayload::Lineitem(p) => payload_archive(&p),
-    }
 }
 
 /// The native Lineitem join trace's value: line number, extended price,
@@ -280,7 +156,7 @@ type NativeLineitemValue = Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
 
 fn native_lineitem_value(line: i32) -> NativeLineitemValue {
     let p = lineitem_payload();
-    Tup4(line, p.extended_price, p.discount, p.ship_date)
+    Tup4(line, p.l_extendedprice, p.l_discount, p.l_shipdate)
 }
 
 /// Writer parameters without compression, so that the file takes the bytes
@@ -303,78 +179,32 @@ fn native_lineitem_file() -> BlockBytes {
     )
 }
 
-/// The packed bytes of the payload, the value that the index stores.
-fn packed(payload: SourcePayload) -> Vec<u8> {
-    encode_payload(&payload)
-}
-
 fn value_bytes_per_row(bytes: &BlockBytes) -> f64 {
     let values = &bytes.levels[1];
     values.data as f64 / values.rows as f64
 }
 
+/// Value-level data bytes of the same 2,048 rows of each source, packed, with
+/// and without value-header elision, against the native Lineitem value. Each
+/// figure is the data-block bytes of a layer file written with no
+/// compression, read back from the file, not computed.
 #[test]
-fn value_level_bytes_by_source() {
-    let rows: [(&str, SourceRow); 3] = [
-        ("customer", customer_row),
-        ("orders", orders_row),
-        ("lineitem", lineitem_row),
-    ];
-    let typed = rows.map(|(_, row)| merged_index_file(row, |payload| payload, plain_file()));
-    let byte_strings = rows.map(|(_, row)| merged_index_file(row, byte_string, plain_file()));
-    // The native trace keys lines by order: four lines per order key.
-    let native = native_lineitem_file();
-    for (((source, _), typed), byte_string) in rows.iter().zip(&typed).zip(&byte_strings) {
-        eprintln!(
-            "{source}: value-level data, typed {} B ({:.2} B per row), byte string {} B ({:.2} B per row)",
-            typed.levels[1].data,
-            value_bytes_per_row(typed),
-            byte_string.levels[1].data,
-            value_bytes_per_row(byte_string),
-        );
-    }
-    eprintln!(
-        "native lineitem: value-level data {} B ({:.2} B per row)",
-        native.levels[1].data,
-        value_bytes_per_row(&native)
-    );
-
-    // Measured on aarch64, 2026-10-19. Typed values take the same bytes
-    // whatever their source; byte strings take their own variant's bytes.
-    let data = |bytes: &BlockBytes| bytes.levels[1].data;
-    assert_eq!(typed.each_ref().map(data), [166_400, 166_400, 166_400]);
-    assert_eq!(byte_strings.each_ref().map(data), [82_944, 66_560, 148_992]);
-    assert_eq!(data(&native), 132_608);
-}
-
-/// Value-level data bytes of the same 2,048 rows of each source under every
-/// encoding. Each figure is the data-block bytes of a layer file written with
-/// no compression, read back from the file, not computed.
-#[test]
-fn value_level_bytes_by_encoding() {
+fn packed_value_bytes_against_native_lineitem() {
     let rows: [(&str, SourceRow); 3] = [
         ("customer", customer_row),
         ("orders", orders_row),
         ("lineitem", lineitem_row),
     ];
     let data = |bytes: &BlockBytes| bytes.levels[1].data;
-    let measure = |value: fn(SourcePayload) -> Vec<u8>, parameters: fn() -> Parameters| {
-        rows.map(|(_, row)| merged_index_file(row, value, parameters()))
-    };
-    let typed = rows.map(|(_, row)| merged_index_file(row, |payload| payload, plain_file()));
-    let rkyv = measure(byte_string, plain_file);
-    let rkyv_elided = measure(byte_string, elided_file);
-    let packed_plain = measure(packed, plain_file);
-    let packed_elided = measure(packed, elided_file);
+    let measure =
+        |parameters: fn() -> Parameters| rows.map(|(_, row)| merged_index_file(row, parameters()));
+    let packed_plain = measure(plain_file);
+    let packed_elided = measure(elided_file);
     let native = native_lineitem_file();
 
     for (index, (source, _)) in rows.iter().enumerate() {
         eprintln!(
-            "{source}: value-level data bytes per row: typed {:.2}, rkyv {:.2}, \
-             rkyv elided {:.2}, packed {:.2}, packed elided {:.2}",
-            value_bytes_per_row(&typed[index]),
-            value_bytes_per_row(&rkyv[index]),
-            value_bytes_per_row(&rkyv_elided[index]),
+            "{source}: value-level data bytes per row: packed {:.2}, packed elided {:.2}",
             value_bytes_per_row(&packed_plain[index]),
             value_bytes_per_row(&packed_elided[index]),
         );
@@ -383,26 +213,16 @@ fn value_level_bytes_by_encoding() {
         "native lineitem: value-level data bytes per row {:.2}",
         value_bytes_per_row(&native)
     );
-    for (name, files) in [
-        ("typed", &typed),
-        ("rkyv", &rkyv),
-        ("rkyv elided", &rkyv_elided),
-        ("packed", &packed_plain),
-        ("packed elided", &packed_elided),
-    ] {
+    for (name, files) in [("packed", &packed_plain), ("packed elided", &packed_elided)] {
         eprintln!("{name}: {:?}", files.each_ref().map(data));
     }
     eprintln!("native: {}", data(&native));
 
     // Measured on aarch64, 2026-10-19 and 2026-10-20.
-    assert_eq!(typed.each_ref().map(data), [166_400, 166_400, 166_400]);
-    assert_eq!(rkyv.each_ref().map(data), [82_944, 66_560, 148_992]);
-    assert_eq!(rkyv_elided.each_ref().map(data), PIN_RKYV_ELIDED);
     assert_eq!(packed_plain.each_ref().map(data), PIN_PACKED);
     assert_eq!(packed_elided.each_ref().map(data), PIN_PACKED_ELIDED);
     assert_eq!(data(&native), 132_608);
 }
 
-const PIN_RKYV_ELIDED: [u64; 3] = [56_832, 37_376, 120_832];
 const PIN_PACKED: [u64; 3] = [82_944, 66_560, 82_944];
 const PIN_PACKED_ELIDED: [u64; 3] = [46_592, 37_376, 51_712];

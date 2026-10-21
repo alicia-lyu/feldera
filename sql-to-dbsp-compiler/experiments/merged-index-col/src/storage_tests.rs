@@ -12,18 +12,23 @@ use feldera_types::{
 };
 
 use super::{
-    decode_payload, encode_payload, CustomerOrdersLineitemIndex, CustomerPayload, Date,
-    LineitemPayload, OrdersPayload, SourceKey, SourcePayload, SqlDecimal, SqlString, StoredPayload,
+    build_batch, decode_payload, encode_payload, prefix_custkey, prefix_custkey_orderkey,
+    prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey, CustomerByCustkeyPayload,
+    CustomerOrdersLineitemDefinition, Key, LineitemByCustkeyOrderkeyLinenumberKey,
+    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyKey,
+    OrdersByCustkeyOrderkeyPayload, Payload, StoredPayload,
 };
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DowncastTrait, DynData, Erase},
+    trace::merged_index::MergedIndexDefinition,
     trace::{
         Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, OrdIndexedWSet,
         OrdIndexedWSetFactories, Spine, Trace, TraceRole, WithSnapshot,
     },
     DynZWeight, Runtime, ZWeight,
 };
+use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
 type IndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
 /// A folded key, its stored payload bytes, and a weight.
@@ -31,7 +36,7 @@ type Row = (Vec<u8>, StoredPayload, ZWeight);
 
 const BATCHES: usize = 16;
 const CUSTOMERS_PER_BATCH: usize = 10_000;
-type SourceRow = (SourceKey, SourcePayload, ZWeight);
+type SourceRow = (Key, Payload, ZWeight);
 
 fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
 where
@@ -52,9 +57,9 @@ fn customer_segment(id: i64) -> SqlString {
 
 fn customer_group(c: i64) -> Vec<SourceRow> {
     let mut rows = vec![(
-        SourceKey::Customer(c),
-        SourcePayload::Customer(CustomerPayload {
-            segment: customer_segment(c),
+        Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: c }),
+        Payload::CustomerByCustkey(CustomerByCustkeyPayload {
+            c_mktsegment: customer_segment(c),
         }),
         1,
     )];
@@ -62,25 +67,34 @@ fn customer_group(c: i64) -> Vec<SourceRow> {
     for j in 0..2 {
         let order_id = 1_000_000 + 2 * c + j;
         rows.push((
-            SourceKey::Orders(c, order_id),
-            SourcePayload::Orders(OrdersPayload {
-                order_date: Date::from_days(order_date as i32),
-                ship_priority: j as i32,
+            Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+                custkey: c,
+                orderkey: order_id,
+            }),
+            Payload::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyPayload {
+                o_orderdate: Date::from_days(order_date as i32),
+                o_shippriority: j as i32,
             }),
             1,
         ));
         for line_id in 1..=2 {
             rows.push((
-                SourceKey::Lineitem(c, order_id, line_id),
-                SourcePayload::Lineitem(LineitemPayload {
-                    ship_date: Date::from_days(order_date as i32 + line_id),
-                    extended_price: SqlDecimal::<15, 2>::new(
-                        i128::from(10_000 + order_id + i64::from(line_id)),
-                        2,
-                    )
-                    .unwrap(),
-                    discount: SqlDecimal::<4, 2>::new(i128::from(c % 101), 2).unwrap(),
+                Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
+                    custkey: c,
+                    orderkey: order_id,
+                    linenumber: line_id,
                 }),
+                Payload::LineitemByCustkeyOrderkeyLinenumber(
+                    LineitemByCustkeyOrderkeyLinenumberPayload {
+                        l_shipdate: Date::from_days(order_date as i32 + line_id),
+                        l_extendedprice: SqlDecimal::<15, 2>::new(
+                            i128::from(10_000 + order_id + i64::from(line_id)),
+                            2,
+                        )
+                        .unwrap(),
+                        l_discount: SqlDecimal::<4, 2>::new(i128::from(c % 101), 2).unwrap(),
+                    },
+                ),
                 1,
             ));
         }
@@ -89,16 +103,18 @@ fn customer_group(c: i64) -> Vec<SourceRow> {
 }
 
 // The signed oracle folds source rows independently of batch construction.
-fn encoded_row(index: &CustomerOrdersLineitemIndex, row: &SourceRow) -> Row {
+fn encoded_row(row: &SourceRow) -> Row {
     (
-        index.fold(&row.0).as_bytes().to_vec(),
+        CustomerOrdersLineitemDefinition::fold(&row.0)
+            .as_bytes()
+            .to_vec(),
         encode_payload(&row.1),
         row.2,
     )
 }
 
-fn typed_row(index: &CustomerOrdersLineitemIndex, row: &Row) -> SourceRow {
-    let key = index.unfold(&row.0).unwrap();
+fn typed_row(row: &Row) -> SourceRow {
+    let key = CustomerOrdersLineitemDefinition::unfold(&row.0).unwrap();
     let payload = decode_payload(&key, &row.1).unwrap();
     (key, payload, row.2)
 }
@@ -149,7 +165,6 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         .unwrap(),
     ));
     run_in_circuit_with_storage_config(config, || {
-        let index = CustomerOrdersLineitemIndex;
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
             StoredPayload,
@@ -172,11 +187,8 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
             let source_rows: Vec<_> = (first_id..first_id + CUSTOMERS_PER_BATCH as i64)
                 .flat_map(customer_group)
                 .collect();
-            let rows: Vec<_> = source_rows
-                .iter()
-                .map(|row| encoded_row(&index, row))
-                .collect();
-            let batch = index.build_batch(source_rows).unwrap();
+            let rows: Vec<_> = source_rows.iter().map(encoded_row).collect();
+            let batch = build_batch(source_rows).unwrap();
             assert_eq!(batch.location(), BatchLocation::Memory);
             assert_eq!(batch.len(), 7 * CUSTOMERS_PER_BATCH);
             if batch_number < 8 {
@@ -243,7 +255,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let mut oracle = BTreeMap::new();
         for id in 0..(BATCHES * CUSTOMERS_PER_BATCH) as i64 {
             for row in customer_group(id) {
-                apply(&mut oracle, &encoded_row(&index, &row));
+                apply(&mut oracle, &encoded_row(&row));
             }
         }
         let expected_before: Vec<_> = oracle
@@ -255,21 +267,18 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         let file_rows = read_rows(file_batch.as_ref());
         let reopened_rows = read_rows(&reopened);
         assert_eq!(reopened_rows, file_rows);
-        let typed_file: Vec<_> = file_rows.iter().map(|row| typed_row(&index, row)).collect();
+        let typed_file: Vec<_> = file_rows.iter().map(typed_row).collect();
         assert!(typed_file
             .iter()
-            .any(|row| matches!(row.0, SourceKey::Customer(_))));
+            .any(|row| matches!(row.0, Key::CustomerByCustkey(_))));
         assert!(typed_file
             .iter()
-            .any(|row| matches!(row.0, SourceKey::Orders(_, _))));
+            .any(|row| matches!(row.0, Key::OrdersByCustkeyOrderkey(_))));
         assert!(typed_file
             .iter()
-            .any(|row| matches!(row.0, SourceKey::Lineitem(_, _, _))));
+            .any(|row| matches!(row.0, Key::LineitemByCustkeyOrderkeyLinenumber(_))));
         assert_eq!(
-            reopened_rows
-                .iter()
-                .map(|row| typed_row(&index, row))
-                .collect::<Vec<_>>(),
+            reopened_rows.iter().map(typed_row).collect::<Vec<_>>(),
             typed_file
         );
         for row in &file_rows {
@@ -293,16 +302,18 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
                 .into_iter()
                 .map(|(key, mut payload, weight)| {
                     match &mut payload {
-                        SourcePayload::Customer(value) => value.segment = "replacement".into(),
-                        SourcePayload::Orders(value) => {
-                            value.order_date = Date::from_days(value.order_date.days() + 1);
-                            value.ship_priority += 2;
+                        Payload::CustomerByCustkey(value) => {
+                            value.c_mktsegment = "replacement".into()
                         }
-                        SourcePayload::Lineitem(value) => {
-                            value.ship_date = Date::from_days(value.ship_date.days() + 1);
-                            value.extended_price += SqlDecimal::<15, 2>::new(100, 2).unwrap();
-                            value.discount = SqlDecimal::<4, 2>::new(
-                                (value.discount.internal_representation() + 1) % 101,
+                        Payload::OrdersByCustkeyOrderkey(value) => {
+                            value.o_orderdate = Date::from_days(value.o_orderdate.days() + 1);
+                            value.o_shippriority += 2;
+                        }
+                        Payload::LineitemByCustkeyOrderkeyLinenumber(value) => {
+                            value.l_shipdate = Date::from_days(value.l_shipdate.days() + 1);
+                            value.l_extendedprice += SqlDecimal::<15, 2>::new(100, 2).unwrap();
+                            value.l_discount = SqlDecimal::<4, 2>::new(
+                                (value.l_discount.internal_representation() + 1) % 101,
                                 2,
                             )
                             .unwrap();
@@ -315,20 +326,22 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         updates.extend(
             customer_group(30)
                 .into_iter()
-                .map(|(key, payload, weight)| {
-                    let key = match key {
-                        SourceKey::Customer(_) => SourceKey::Customer(160_000),
-                        SourceKey::Orders(_, order) => {
-                            SourceKey::Orders(160_000, order + 2 * (160_000 - 30))
+                .map(|(mut key, payload, weight)| {
+                    match &mut key {
+                        Key::CustomerByCustkey(key) => key.custkey = 160_000,
+                        Key::OrdersByCustkeyOrderkey(key) => {
+                            key.custkey = 160_000;
+                            key.orderkey += 2 * (160_000 - 30);
                         }
-                        SourceKey::Lineitem(_, order, line) => {
-                            SourceKey::Lineitem(160_000, order + 2 * (160_000 - 30), line)
+                        Key::LineitemByCustkeyOrderkeyLinenumber(key) => {
+                            key.custkey = 160_000;
+                            key.orderkey += 2 * (160_000 - 30);
                         }
-                    };
+                    }
                     (key, payload, weight)
                 }),
         );
-        TOKIO.block_on(trace.insert(index.build_batch(updates.clone()).unwrap()));
+        TOKIO.block_on(trace.insert(build_batch(updates.clone()).unwrap()));
         let mixed = trace.ro_snapshot();
         assert!(mixed
             .batches()
@@ -339,7 +352,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
             .iter()
             .any(|batch| batch.location() == BatchLocation::Storage));
         for row in &updates {
-            apply(&mut oracle, &encoded_row(&index, row));
+            apply(&mut oracle, &encoded_row(row));
         }
         let expected: Vec<_> = oracle
             .into_iter()
@@ -354,7 +367,9 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         // Check exact and absent keys for every source, including the old moved keys.
         for c in [20, 160_000, 10, 30, 200_000] {
             for (key, _, _) in customer_group(c) {
-                let folded = index.fold(&key).as_bytes().to_vec();
+                let folded = CustomerOrdersLineitemDefinition::fold(&key)
+                    .as_bytes()
+                    .to_vec();
                 cursor.rewind_keys();
                 assert_eq!(
                     cursor.seek_key_exact(folded.erase(), None),
@@ -370,9 +385,9 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         for c in [20, 40, 160_000] {
             let order = 1_000_000 + 2 * c;
             for (prefix, count) in [
-                (index.prefix_custkey(c), 7),
-                (index.prefix_custkey_orderkey(c, order), 3),
-                (index.prefix_custkey_orderkey_then_linenumber(c, order), 2),
+                (prefix_custkey(c), 7),
+                (prefix_custkey_orderkey(c, order), 3),
+                (prefix_custkey_orderkey_then_linenumber(c, order), 2),
             ] {
                 cursor.rewind_keys();
                 cursor.seek_key(prefix.erase());
@@ -427,11 +442,10 @@ fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
     ));
     run_in_circuit_with_storage_config(config, || {
         assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
-        let index = CustomerOrdersLineitemIndex;
         for rows in [Vec::new(), customer_group(1)] {
-            let batch = index.build_batch(rows.clone()).unwrap();
+            let batch = build_batch(rows.clone()).unwrap();
             assert_eq!(batch.location(), BatchLocation::Memory);
-            let expected: Vec<_> = rows.iter().map(|row| encoded_row(&index, row)).collect();
+            let expected: Vec<_> = rows.iter().map(encoded_row).collect();
             assert_eq!(read_rows(&batch), expected);
         }
         // Confirm this runtime would place a generic nonempty builder on disk.

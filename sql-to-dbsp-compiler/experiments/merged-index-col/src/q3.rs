@@ -26,7 +26,13 @@ use dbsp::{
 };
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
-use super::{decode_payload, CustomerOrdersLineitemIndex, SourceKey, SourcePayload, StoredPayload};
+use dbsp::trace::merged_index::MergedIndexDefinition;
+
+use super::{
+    decode_payload, prefix_custkey, prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey,
+    CustomerOrdersLineitemDefinition, Key, LineitemByCustkeyOrderkeyLinenumberKey,
+    OrdersByCustkeyOrderkeyKey, Payload, StoredPayload,
+};
 
 pub type CustomerBatch = OrdIndexedZSet<Tup1<i64>, Tup1<SqlString>>;
 pub type OrdersBatch = OrdIndexedZSet<Tup1<i64>, Tup3<i64, Date, i32>>;
@@ -97,23 +103,21 @@ impl Q3State {
         delta: &SpineSnapshot<OrdersBatch>,
     ) -> Result<SpineSnapshot<CustomerBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for customer in requested_keys(delta) {
-            let key = index.fold(&SourceKey::Customer(customer));
-            scan(
-                &index,
-                &views.after,
-                key.as_bytes(),
-                |key, payload, weight| {
-                    if let (SourceKey::Customer(id), SourcePayload::Customer(payload)) =
-                        (key, payload)
-                    {
-                        output.push(Tup1(id), Tup1(payload.segment.clone()), weight);
-                    }
-                    Ok(())
-                },
-            )?;
+            let key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
+                CustomerByCustkeyKey { custkey: customer },
+            ));
+            scan(&views.after, key.as_bytes(), |key, payload, weight| {
+                if let (
+                    Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
+                    Payload::CustomerByCustkey(payload),
+                ) = (key, payload)
+                {
+                    output.push(Tup1(custkey), Tup1(payload.c_mktsegment), weight);
+                }
+                Ok(())
+            })?;
         }
         Ok(output.finish())
     }
@@ -123,20 +127,23 @@ impl Q3State {
         delta: &SpineSnapshot<CustomerBatch>,
     ) -> Result<SpineSnapshot<OrdersBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for customer in requested_keys(delta) {
             scan(
-                &index,
                 &views.before,
-                &index.prefix_custkey(customer),
+                &prefix_custkey(customer),
                 |key, payload, weight| {
-                    if let (SourceKey::Orders(c, order), SourcePayload::Orders(payload)) =
-                        (key, payload)
+                    if let (
+                        Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+                            custkey,
+                            orderkey,
+                        }),
+                        Payload::OrdersByCustkeyOrderkey(payload),
+                    ) = (key, payload)
                     {
                         output.push(
-                            Tup1(c),
-                            Tup3(order, payload.order_date, payload.ship_priority),
+                            Tup1(custkey),
+                            Tup3(orderkey, payload.o_orderdate, payload.o_shippriority),
                             weight,
                         );
                     }
@@ -152,33 +159,39 @@ impl Q3State {
         delta: &SpineSnapshot<LineitemBatch>,
     ) -> Result<SpineSnapshot<JoinedOrdersBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
             for &customer in placements(&views, order)? {
                 let mut customers = Vec::new();
-                let customer_key = index.fold(&SourceKey::Customer(customer));
+                let customer_key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
+                    CustomerByCustkeyKey { custkey: customer },
+                ));
                 scan(
-                    &index,
                     &views.after,
                     customer_key.as_bytes(),
                     |key, payload, weight| {
-                        if let (SourceKey::Customer(_), SourcePayload::Customer(payload)) =
+                        if let (Key::CustomerByCustkey(_), Payload::CustomerByCustkey(payload)) =
                             (key, payload)
                         {
-                            customers.push((payload.segment.clone(), weight));
+                            customers.push((payload.c_mktsegment, weight));
                         }
                         Ok(())
                     },
                 )?;
-                let order_key = index.fold(&SourceKey::Orders(customer, order));
+                let order_key = CustomerOrdersLineitemDefinition::fold(
+                    &Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+                        custkey: customer,
+                        orderkey: order,
+                    }),
+                );
                 scan(
-                    &index,
                     &views.after,
                     order_key.as_bytes(),
                     |key, payload, order_weight| {
-                        if let (SourceKey::Orders(_, _), SourcePayload::Orders(payload)) =
-                            (key, payload)
+                        if let (
+                            Key::OrdersByCustkeyOrderkey(_),
+                            Payload::OrdersByCustkeyOrderkey(payload),
+                        ) = (key, payload)
                         {
                             for (segment, customer_weight) in &customers {
                                 let weight = order_weight
@@ -189,8 +202,8 @@ impl Q3State {
                                     Tup4(
                                         customer,
                                         segment.clone(),
-                                        payload.order_date,
-                                        payload.ship_priority,
+                                        payload.o_orderdate,
+                                        payload.o_shippriority,
                                     ),
                                     weight,
                                 );
@@ -209,25 +222,31 @@ impl Q3State {
         delta: &SpineSnapshot<JoinedOrdersBatch>,
     ) -> Result<SpineSnapshot<LineitemBatch>, String> {
         let views = self.views()?;
-        let index = CustomerOrdersLineitemIndex;
         let mut output = RequestedRows::new();
         for order in requested_keys(delta) {
             for &customer in placements(&views, order)? {
                 scan(
-                    &index,
                     &views.before,
-                    &index.prefix_custkey_orderkey_then_linenumber(customer, order),
+                    &prefix_custkey_orderkey_then_linenumber(customer, order),
                     |key, payload, weight| {
-                        if let (SourceKey::Lineitem(_, o, line), SourcePayload::Lineitem(payload)) =
-                            (key, payload)
+                        if let (
+                            Key::LineitemByCustkeyOrderkeyLinenumber(
+                                LineitemByCustkeyOrderkeyLinenumberKey {
+                                    orderkey,
+                                    linenumber,
+                                    ..
+                                },
+                            ),
+                            Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
+                        ) = (key, payload)
                         {
                             output.push(
-                                Tup1(o),
+                                Tup1(orderkey),
                                 Tup4(
-                                    line,
-                                    payload.extended_price,
-                                    payload.discount,
-                                    payload.ship_date,
+                                    linenumber,
+                                    payload.l_extendedprice,
+                                    payload.l_discount,
+                                    payload.l_shipdate,
                                 ),
                                 weight,
                             );
@@ -260,10 +279,9 @@ fn requested_keys<V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<Tup1<i64>, V>>
 }
 
 fn scan(
-    index: &CustomerOrdersLineitemIndex,
     snapshot: &SourceSnapshot,
     prefix: &[u8],
-    mut visit: impl FnMut(SourceKey, SourcePayload, i64) -> Result<(), String>,
+    mut visit: impl FnMut(Key, Payload, i64) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut cursor = snapshot.cursor();
     let seek = prefix.to_vec();
@@ -273,7 +291,7 @@ fn scan(
         if !bytes.starts_with(prefix) {
             break;
         }
-        let key = index.unfold(bytes)?;
+        let key = CustomerOrdersLineitemDefinition::unfold(bytes)?;
         while cursor.val_valid() {
             let weight = **cursor.weight();
             // The stored bytes carry no tag: the key names the fields.
