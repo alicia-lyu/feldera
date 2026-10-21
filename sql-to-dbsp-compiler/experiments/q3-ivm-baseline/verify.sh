@@ -64,6 +64,8 @@ run_check col-tests cargo +1.96.1 test --manifest-path "${col_manifest}" --offli
 run_check col-clippy cargo +1.96.1 clippy --manifest-path "${col_manifest}" \
   --offline --locked --all-targets -j2 -- -D warnings
 run_check runner-tests python3 -m unittest discover -s "${experiment_dir}" -p test_measure.py -v
+run_check summarize-tests python3 -m unittest discover -s "${experiment_dir}" -p test_summarize.py -v
+run_check prepare-inputs-tests python3 -m unittest discover -s "${experiment_dir}" -p test_prepare_inputs.py -v
 # bash -n checks only its first file, so check each script separately.
 for script in "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh" "${col_dir}/generate.sh"; do
   run_check "shell-syntax-$(basename "$(dirname "${script}")")-$(basename "${script}" .sh)" bash -n "${script}"

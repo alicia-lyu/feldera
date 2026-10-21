@@ -28,6 +28,7 @@ every run configuration.
 | `src/reconstruction.rs` | `ManualIndex` and the auxiliary-thread index maintenance (Cargo feature `merged-index`). |
 | `src/verification.rs` | Shared R4 tests for both modes. |
 | `src/measurement.rs`, `measure.py` | R5 reporting and the runner. |
+| `summarize.py`, `prepare_inputs.py` | Median, minimum and maximum of `measure.py` manifests; RF1/RF2 inputs for the Linux SF 10 campaign (module docstrings give the CLIs and rules). |
 | `verify.sh` | The full verification gate. |
 | [CIRCUIT.md](CIRCUIT.md) | The generated circuit and its state reads. |
 | [RESULTS.md](RESULTS.md) | Dataset, correctness evidence, and historical measurements. |
