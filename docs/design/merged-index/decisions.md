@@ -157,7 +157,7 @@ At roadmap Step 5, `merged-index-col/src/lib.rs` re-exports the generated module
 
 ### 2026-10-22: The Linux measurement A/B tests key front coding
 
-The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
+The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers` and `--setup-full-compaction`, so the arms differ in the key encoding alone. The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
 
 ### 2026-09-28: Maintained views exclude selection predicates
 

@@ -369,7 +369,7 @@ Also:
   measure it with `du -shc "$DBGEN_OUT"/*.tbl "$DBGEN_OUT"/*.u* "$DBGEN_OUT"/delete.*` and
   adjust for the refresh files that `prepare_inputs.py` actually writes. Budget that figure times the run count, plus each
   run's maintained storage (`<run dir>/storage`). One campaign of `--runs N` makes `2N` runs
-  (native and reconstructed), so a pilot (`--runs 1`) makes two.
+  (native and reconstructed), so one pilot command (`--runs 1`) makes two, and the four pilots make eight.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
 
@@ -399,7 +399,7 @@ python3 measure.py \
   --elide-value-headers
 ```
 
-Repeat with `scattered`. Why each flag:
+This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, and give each run its own `--report` and `--storage-path` (see "Campaign and front-coding A/B" for naming). Run the four pilots in the order clustered A, clustered B, scattered A, scattered B. Why each flag:
 
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.
 - `--cache-bytes 134217728`: the 128 MiB worker cache (a whole number of MiB).
@@ -411,7 +411,7 @@ Repeat with `scattered`. Why each flag:
 - `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index.
   Native runs write the same files with or without them.
 
-**Pilot pass criterion.** For both runs in the report (`runs[].qualification`), `status` must be
+**Pilot pass criterion.** For each of the four pilots, and for both runs in its report (`runs[].qualification`), `status` must be
 `qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
 limit, the cgroup proof matched (`cgroup.enforced`), verification was off, and
 `load.observed_storage_bytes` exceeded the limit. Also check that the top-level `status` is
@@ -420,7 +420,7 @@ limit. It does not show memory pressure.
 
 ### Campaign and front-coding A/B
 
-Run the campaign only after both pilots pass and the pressure instrumentation exists
+Run the campaign only after all four pilots pass and the pressure instrumentation exists
 ([measurement.md](measurement.md#pending-linux-campaign)). It has two arms, each the pilot
 command with `--runs 3` and fresh `--report` and `--storage-path` values:
 
@@ -439,8 +439,9 @@ python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
 ```
 
 `summarize.py` labels each manifest by its parent directory, which is why each needs its own. The
-two arms double the campaign: 2 arms × 2 workloads × 3 repetitions × 2 modes = 24 runs, each
-with its own input copy, so budget the disk for 24 runs.
+two arms double both stages: the pilot is 2 arms × 2 workloads × 1 repetition × 2 modes = 8
+runs, and the campaign 2 × 2 × 3 × 2 = 24. Each run keeps its own input copy, so budget the disk
+for all 32, or for 24 if the pilot's run directories are moved off the disk before the campaign.
 
 ### Known limits
 
