@@ -63,6 +63,10 @@ Plan (not yet executed):
 3. **Settings.** Fresh process, storage directory, and cgroup per run. `memory.max` 1 GiB, swap 0, cache 128 MiB, runtime RSS target 512 MiB, one worker, 10,000-row loading target, three repetitions; identical across modes. Input hashes must match between modes.
 4. **Pilot first** (one repetition, per workload; the exact command is in the [Linux handoff](WORKFLOW.md#linux-handoff)). Require `load.observed_storage_bytes > memory.max` in both modes, aiming at roughly four times the limit. This checks stored-state scale only. Do not substitute transient peak disk size, and do not treat it as proof of memory pressure.
 5. **Campaign** (`--runs 3`, fresh destinations) only after both pilots pass and the pressure instrumentation below exists.
+6. **Front-coding A/B** (user decision of 2026-10-22). Arm A is the campaign above, with `--front-code-byte-keys`. Arm B repeats it without that flag: same inputs, settings, `--runs 3`, and fresh destinations, with `--elide-value-headers` and `--setup-full-compaction` still on, so the arms differ in the key encoding alone.
+   - Front coding applies only to byte-string keys, so it changes only the merged index. Native keys are not byte strings. Each arm still runs both modes, because `measure.py` always does, and native's storage must match across arms; a mismatch means the arms are not comparable.
+   - Compare the reconstructed mode across arms: the merged index's storage, writes by owner (`merged_index`), `index_ms`, `q3_ms`, and process CPU. On macOS, front coding changed only the key level (132,096 B to 33,280 B; see [history.md](history.md#2026-10-16-to-2026-10-19-record-size-typed-value-steps)) and wrote 17 front-coded blocks with no fallbacks. Its decoding cost has not been measured.
+   - Arm B doubles the campaign's runs and disk use. The arms alternate per workload (A then B for clustered, then for scattered), so slow drift on the machine does not fall on one arm.
 
 On Linux, storage files open with `O_DIRECT`, while input reads go through the page cache and count against the cgroup. This was checked against the code:
 

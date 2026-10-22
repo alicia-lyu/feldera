@@ -155,6 +155,10 @@ At roadmap Step 5, `merged-index-col/src/lib.rs` re-exports the generated module
 
 `generated_tests.rs` is retired with the hand-written definition it compared against. The golden-byte tests in `tests.rs`, whose expected bytes the switch left unchanged, are the regression guard for the byte format.
 
+### 2026-10-22: The Linux measurement A/B tests key front coding
+
+The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
+
 ### 2026-09-28: Maintained views exclude selection predicates
 
 The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.

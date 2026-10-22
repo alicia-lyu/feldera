@@ -418,6 +418,30 @@ limit, the cgroup proof matched (`cgroup.enforced`), verification was off, and
 `complete` and `errors` is empty. A qualifying pilot shows only that the loaded state exceeds the
 limit. It does not show memory pressure.
 
+### Campaign and front-coding A/B
+
+Run the campaign only after both pilots pass and the pressure instrumentation exists
+([measurement.md](measurement.md#pending-linux-campaign)). It has two arms, each the pilot
+command with `--runs 3` and fresh `--report` and `--storage-path` values:
+
+- **Arm A:** the pilot flags as above, with `--front-code-byte-keys`.
+- **Arm B:** the same command without `--front-code-byte-keys`. Keep every other flag.
+
+Run them in the order clustered A, clustered B, scattered A, scattered B. Give each run its own
+directory named by arm and workload, with `--report "$R5_OUT/campaign-A-clustered/manifest.json"`
+and `--storage-path "$R5_OUT/campaign-A-clustered/runs"`, and so on. Check
+each manifest's `configuration.front_code_byte_keys` against its arm, and check that the input
+hashes match across all four reports. Native storage must be equal across arms. Then summarize the
+four manifests together:
+
+```bash
+python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
+```
+
+`summarize.py` labels each manifest by its parent directory, which is why each needs its own. The
+two arms double the campaign: 2 arms × 2 workloads × 3 repetitions × 2 modes = 24 runs, each
+with its own input copy, so budget the disk for 24 runs.
+
 ### Known limits
 
 - Without `--cgroup-root`, a Linux run is `nonqualifying` (reason "no cgroup v2 total memory
