@@ -150,9 +150,38 @@ publication, and associated cleanup. `load.observed_storage_bytes` is the
 loaded storage observation used by the Linux size qualification check. Neither
 loading field is part of the refresh sequence.
 
-## R5 results in the current configuration (pending)
+## R5 results in the current configuration (macOS smoke, 2026-10-22)
 
-The macOS rerun in the current configuration is pending. It will be filled in after the Step 5 code lands, with raw artifacts. Its flags are `--setup-full-compaction --front-code-byte-keys --elide-value-headers`; see [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md#measure-r5) for the command.
+These runs follow roadmap Step 5, at revision `3b9948017` with a clean tree. They are smoke tests, not qualifying results: macOS enforces no memory limit, and each refresh sequence lasts milliseconds, so timing differences are within the range that scheduling noise can produce. They show what the current code does on these inputs, not how the two modes compare at scale.
+
+- **Command:** `measure.py --cache-bytes 33554432 --memory-target-bytes 536870912 --batch 512 --runs 3 --no-verify --setup-full-compaction --front-code-byte-keys --elide-value-headers`, once per workload, without `--diagnostics`.
+- **Inputs:** the three smoke workloads in `target/r5-smoke-inputs/` (see "Workload definitions").
+- **Artifacts:** `target/r5-step5-timing/<workload>/manifest.json` and the per-run directories beside it; `target/r5-step5-timing/summary/summary.{json,md}`, produced by `summarize.py`.
+
+Each cell is the median of three repetitions, with the minimum and maximum in brackets. Times are milliseconds and are summed over the six refreshes where the column is per refresh. `index` is zero in native mode, which has no merged index.
+
+| Workload | Mode | Sequence wall | Sequence CPU | `index` | `q3` | `index + q3` |
+| --- | --- | --- | --- | --- | --- | --- |
+| large-group | native | 127.5 [100.2, 137.6] | 121.0 [100.3, 128.5] | 0 | 23.1 [19.0, 23.6] | 23.1 [19.0, 23.6] |
+| large-group | reconstructed | 129.4 [107.4, 130.4] | 129.9 [103.8, 131.7] | 11.0 [9.5, 11.4] | 28.1 [22.8, 28.1] | 39.1 [32.3, 39.5] |
+| clustered | native | 2.39 [2.25, 3.23] | 2.56 [2.39, 3.04] | 0 | 1.21 [1.13, 1.38] | 1.21 [1.13, 1.38] |
+| clustered | reconstructed | 3.07 [2.82, 3.09] | 3.22 [3.00, 3.27] | 0.24 [0.17, 0.25] | 1.54 [1.44, 1.57] | 1.78 [1.61, 1.82] |
+| scattered | native | 2.43 [2.29, 2.77] | 2.63 [2.41, 2.65] | 0 | 1.22 [1.17, 1.23] | 1.22 [1.17, 1.23] |
+| scattered | reconstructed | 3.31 [3.28, 3.53] | 3.56 [3.43, 3.68] | 0.25 [0.25, 0.31] | 1.70 [1.68, 1.78] | 2.01 [1.93, 2.03] |
+
+| Workload | Mode | Writes in the window | Storage at window end | Peak RSS |
+| --- | --- | --- | --- | --- |
+| large-group | native | 0 | 678,400 B | 37,502,976 B |
+| large-group | reconstructed | 0 | 600,576 B | 47,005,696 B |
+| clustered | native | 0 | 678,400 B | 21,282,816 B |
+| clustered | reconstructed | 0 | 600,576 B | 25,280,512 B |
+| scattered | native | 0 | 678,400 B | 21,299,200 B |
+| scattered | reconstructed | 0 | 600,576 B | 25,280,512 B |
+
+- **Storage matches the earlier packed, elided campaign.** Every repetition gave the bytes of `target/r5-packed-elided/` (600,576 B reconstructed, 678,400 B native), so Step 5 left the stored state unchanged.
+- **No writes inside the window.** The six refreshes stay in memory in both modes, as before. No disk-traffic comparison follows from these runs.
+- **Peak RSS** is the process's high-water mark since start, so it includes loading and setup compaction. It is not a maintenance-only figure.
+- **Timing.** In these runs the reconstructed mode's `index + q3` was higher than native mode's in every workload. The runs are too short and too small to attribute that difference: the state fits in memory, no repetition lasted more than about 140 ms, and decoding CPU is not measured separately. Make no performance claim from this table.
 
 The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../../../docs/design/merged-index/history.md). They were measured before POSIX flush fix `f7fec2391`, with byte-string values, no setup compaction, and no front coding. They are not results for the current configuration.
 
