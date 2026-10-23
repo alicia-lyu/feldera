@@ -15,15 +15,18 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** The specialized runtime must never be bound to a different SQL query. */
+/**
+ * The specialized runtime must never be bound to a different SQL query. The tables are keyless:
+ * the view circuit receives the net delta of the base tables, which live in another circuit.
+ */
 public class Q3MergedIndexBindingTest {
     private static final String QUERY = """
             CREATE TABLE Customer (
-                c_custkey BIGINT NOT NULL PRIMARY KEY,
+                c_custkey BIGINT NOT NULL,
                 c_mktsegment VARCHAR NOT NULL
             );
             CREATE TABLE Orders (
-                o_orderkey BIGINT NOT NULL PRIMARY KEY,
+                o_orderkey BIGINT NOT NULL,
                 o_custkey BIGINT NOT NULL,
                 o_orderdate DATE NOT NULL,
                 o_shippriority INTEGER NOT NULL
@@ -33,8 +36,7 @@ public class Q3MergedIndexBindingTest {
                 l_linenumber INTEGER NOT NULL,
                 l_extendedprice DECIMAL(15, 2) NOT NULL,
                 l_discount DECIMAL(4, 2) NOT NULL,
-                l_shipdate DATE NOT NULL,
-                PRIMARY KEY (l_orderkey, l_linenumber)
+                l_shipdate DATE NOT NULL
             );
             CREATE MATERIALIZED VIEW V AS
             SELECT c.c_custkey, c.c_mktsegment,
@@ -85,6 +87,13 @@ public class Q3MergedIndexBindingTest {
         assertTrue(specializedRust.contains("merged_index_col::q3::join_lineitems_orders("));
         assertFalse(specializedRust.contains(".join_index_balanced("));
         assertFalse(specializedRust.contains(".join_balanced("));
+    }
+
+    @Test
+    public void rejectsKeyedBaseTables() {
+        // Keyed tables compile to input maps, whose projections differ from the supported ones.
+        String keyed = QUERY.replace("c_custkey BIGINT NOT NULL,", "c_custkey BIGINT NOT NULL PRIMARY KEY,");
+        assertThrows(InternalCompilerError.class, () -> Q3MergedIndexBinding.bind(compile(keyed)));
     }
 
     @Test
