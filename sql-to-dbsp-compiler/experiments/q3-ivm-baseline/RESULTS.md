@@ -112,7 +112,7 @@ zero `Reference` map bytes.
 
 | Column | Definition |
 | --- | --- |
-| **Foreground ms** | Sum of the six refresh wall times, including input reads/discovery, operational checks, input preparation, index maintenance, Q3, publication, and cleanup. |
+| **Foreground ms** | Sum of the six refresh wall times, including input reads/discovery, operational checks, input preparation, the base circuit, forwarding, index maintenance, the view circuit, publication, and cleanup. |
 | **Sequence ms** | Wall time from the start of the refresh sequence through the last refresh's publication/cleanup. Includes between-refresh measurement/logging overhead; excludes final reporting and any subsequent compaction. |
 | **Sequence CPU ms** | Process user + system CPU over the sequence, summed across driver, runtime, and auxiliary threads. Includes naturally scheduled background merge work executed inside that interval. |
 
@@ -122,14 +122,20 @@ zero `Reference` map bytes.
 | --- | --- |
 | **discovery_ms** | RF2 delete-ID reads, deduplication, maintained-state lookups, and assembly of complete current deletion rows, including decoding. |
 | **checks_input_preparation_ms** | RF1 input reads, operational checks, workload statistics, logical-row conversion, and circuit input serialization. |
-| **index_ms** | Reconstructed index batch construction and append, including folded-key/payload encoding, copying, sorting, and snapshot acquisition. Zero in native mode. |
-| **q3_ms** | Circuit transaction, including materialized `V`; reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. |
+| **index_ms** | Reconstructed index append and snapshot acquisition. In version 3 the index rows come from the base circuit's net delta; the conversion to rows (`reconstruction::prepare`) is in `checks_input_preparation_ms`, and the append includes folded-key/payload encoding, copying, and sorting. Zero in native mode. |
+| **base_ms** | The base circuit's transaction: the primary-key input maps and their delta accumulators. Measurement version 3 times it apart from the view circuit. Reported beside `combined_maintenance_ms` and never added to it. |
+| **forward_ms** | Reading the base circuit's net delta (`workload::net_delta`) and feeding it to the view circuit's inputs. Outside both circuits' timings. |
+| **q3_ms** | The view circuit's transaction alone, in version 3: delta accumulation, the joins (native traces or reconstructed readers), and materialized `V`. Reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. In version 2 it also covered base-relation maintenance. |
 | **publication_cleanup_ms** | Snapshot publication/release, refreshed Catalog snapshots, and foreground output/driver cleanup. |
-| **combined_maintenance_ms** | `index_ms + q3_ms`; excludes discovery, preparation, and publication/cleanup. |
+| **combined_maintenance_ms** | `index_ms + q3_ms`, the incremental view maintenance; excludes `base_ms`, `forward_ms`, discovery, preparation, and publication/cleanup. |
 
-**Final drainage ms is absent in v2.** The report records
-`measurement_version=2`, `completion_boundary=last_refresh_complete`, and zero
-sequence `snapshot_publication_transactions`.
+**Final drainage ms is absent in v2 and v3.** The report records
+`measurement_version=3`, `completion_boundary=last_refresh_complete`, and zero
+sequence `snapshot_publication_transactions`. Version 3 splits the transaction
+into the base circuit and the view circuit, each in its own runtime with its own
+storage directory and buffer cache. Version 2 results, such as the macOS rerun of
+2026-10-22, keep their label: their `q3_ms` includes base-relation maintenance, so
+they are not comparable with version 3.
 
 ### Resource definitions
 
