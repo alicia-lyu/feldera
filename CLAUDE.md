@@ -65,6 +65,8 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 - **Native:** ordinary Feldera state. The two joins keep four integrator traces.
 - **Reconstructed:** those four traces are not built. The join reads requested key ranges from a secondary "COL" merged index (folded keys: customer > order > line). The index is maintained outside the circuit on an auxiliary thread, and its before/after snapshots are published before each transaction.
 
+The harness runs two chained circuits in two DBSP runtimes (user decision of 2026-10-23). The base circuit (`base.sql`) holds the primary-key base tables. The view circuit (`q3.sql`, keyless Z-set tables plus `V`) maintains `V` from the base circuit's net delta. `--q3-merged-index` applies to the view circuit only.
+
 ### Where the code lives
 
 | Piece | Location |
@@ -81,7 +83,7 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 
 ### Experiment commands
 
-Run these from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline` with JDK 21. `src/lib.rs` is generated and git-ignored.
+Run these from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline` with JDK 21. `generate.sh` writes the git-ignored `q3-base-circuit/src/lib.rs` and `q3-view-circuit/src/lib.rs` (and each `stubs.rs`); the driver has no `src/lib.rs`.
 
 ```bash
 ./generate.sh                       # native circuit
@@ -98,12 +100,13 @@ The COL library tests with `cargo +1.96.1 test --offline --locked` in its own di
 
 - **One worker.** Maintenance and initial loading both use one DBSP worker; this is the user's decision of 2026-10-12. Reconstructed mode and R5 runs reject any other count in `main.rs`.
 - **Transactions.** A DBSP transaction is `start_transaction`, any number of `step()` calls, then `commit_transaction`. It is not an OLTP commit: outputs appear at commit and the logical clock advances once.
-  - Wrap each transaction in `Q3State::publish(before, after, placements)` and `finish()`.
+  - A transaction runs on the base circuit, then on the view circuit. Wrap the view circuit's transaction in `Q3State::publish(before, after, placements)` and `finish()`.
   - The join readers run once, at the commit flush. Steps inside one transaction share one publish, but separate transactions cannot share one.
-- **Placements and supported changes.** The placement map (order → customer) comes only from Orders rows in the same transaction. Changes outside RF1/RF2 are therefore unsupported by design, an accepted limitation.
+- **Placements and supported changes.** The placement map (order → customer) comes only from Orders rows in the same transaction's net delta. Changes outside RF1/RF2 are therefore unsupported by design, an accepted limitation.
   - The harness's `prepare` rejects such changes.
   - Reaching the circuit any other way hits `expect` in `merged-index-col/src/q3.rs` and panics the worker.
-- **Uniqueness.** Folded keys are unique because of the base tables' primary keys; no separate validator is needed. The merged index is fed the harness's own signed rows, so this holds only while `BaseState::validate` admits just the changes the base tables apply as given. A future workload with upserts must feed the index from the base tables' net delta.
+- **Uniqueness.** Folded keys are unique because of the base tables' primary keys; no separate validator is needed. The merged index is fed the base circuit's net delta (`workload::net_delta`, via `reconstruction::prepare`), not the driver's logical change, so an upsert reaches it as a deletion of the old row and an insertion of the new one.
+- **Net delta.** The base tables' delta streams stay idle until `workload::enable_net_delta` enables them, which `Pipeline::new` does. Reading `net_delta` drains them, and reading a snapshot through `BaseState::new` consumes it, so take one `BaseState` per transaction. Deletions in the view circuit need the complete row (`DeleteStyle::WholeRow`); the base circuit deletes by key.
 
 ### Trusting the docs
 

@@ -43,14 +43,14 @@ run_check native-format cargo +1.96.1 fmt --manifest-path "${manifest}" --all --
 run_check native-tests env Q3_VERIFICATION_TRANSCRIPT="${artifacts}/native.json" \
   cargo +1.96.1 test --manifest-path "${manifest}" --offline --locked -j2
 run_check native-clippy cargo +1.96.1 clippy --manifest-path "${manifest}" \
-  --offline --locked --all-targets -j2 -- -D warnings
+  --offline --locked --all-targets --workspace -j2 -- -D warnings
 
 run_check reconstructed-generation "${experiment_dir}/generate.sh" --q3-merged-index
 run_check reconstructed-format cargo +1.96.1 fmt --manifest-path "${manifest}" --all -- --check
 run_check reconstructed-tests env Q3_VERIFICATION_TRANSCRIPT="${artifacts}/reconstructed.json" \
   cargo +1.96.1 test --manifest-path "${manifest}" --offline --locked -j2 --features merged-index
 run_check reconstructed-clippy cargo +1.96.1 clippy --manifest-path "${manifest}" \
-  --offline --locked --all-targets -j2 --features merged-index -- -D warnings
+  --offline --locked --all-targets --workspace -j2 --features merged-index -- -D warnings
 
 test -s "${artifacts}/native.json"
 test -s "${artifacts}/reconstructed.json"

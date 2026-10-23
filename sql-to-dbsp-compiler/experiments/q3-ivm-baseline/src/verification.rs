@@ -410,8 +410,16 @@ fn rf1_rf2_transcript() -> Result<()> {
 
         let net_delta = run_base(&mut pipeline, &mut state, change.clone(), multi_step)?;
         assert_eq!(
-            (net_delta.customers.len(), net_delta.orders.len(), net_delta.lines.len()),
-            (change.customers.len(), change.orders.len(), change.lines.len()),
+            (
+                net_delta.customers.len(),
+                net_delta.orders.len(),
+                net_delta.lines.len()
+            ),
+            (
+                change.customers.len(),
+                change.orders.len(),
+                change.lines.len()
+            ),
             "{name}: the net delta has one entry per changed row"
         );
         assert!(

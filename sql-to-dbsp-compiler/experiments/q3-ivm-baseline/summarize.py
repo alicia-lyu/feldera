@@ -7,8 +7,11 @@ reports, over the repetitions:
 
 - `sequence_wall_ms` (`sequence.end_to_end_ms`), `sequence_cpu_ms`
   (`sequence.resources.cpu_microseconds` / 1000);
-- the sums over the refreshes of `foreground_ms`, `index_ms`, `q3_ms` and
-  `combined_maintenance_ms`;
+- the sums over the refreshes of `foreground_ms` and the measurement-version-3 phases:
+  `base_ms` (the base tables' circuit), `forward_ms` (reading the base net delta and feeding
+  the view circuit), `index_ms` (the merged index), `q3_ms` (the view circuit alone) and
+  `combined_maintenance_ms` (`index_ms + q3_ms`, the IVM figure, which does not include
+  `base_ms`);
 - `sequence.resources.backend_write_by_owner`: write operations and bytes of
   `query`, `base_relation` and `merged_index`, plus the totals
   `backend_write_operations` and `backend_write_bytes`;
@@ -16,9 +19,9 @@ reports, over the repetitions:
   (the process high-water mark, not a cgroup peak).
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
-writes nothing if a campaign or run did not complete, a field is missing or not
-a finite non-negative number, a mode has no runs, or the modes' repetitions
-differ. It never substitutes a zero for a missing value.
+writes nothing if a campaign or run did not complete, a driver report is not
+measurement version 3, a field is missing or not a finite non-negative number, a
+mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
 from __future__ import annotations
@@ -33,7 +36,9 @@ from typing import Any
 
 from measure import MODES, WRITE_OWNERS, owner_write_problems
 
-REFRESH_SUMS = ("foreground_ms", "index_ms", "q3_ms", "combined_maintenance_ms")
+MEASUREMENT_VERSION = 3
+REFRESH_SUMS = ("foreground_ms", "base_ms", "forward_ms", "index_ms", "q3_ms",
+                "combined_maintenance_ms")
 STATISTICS = ("median", "min", "max")
 
 
@@ -60,6 +65,10 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     driver = run.get("driver")
     if not isinstance(driver, dict):
         raise SummaryError(f"{where}: no driver report")
+    if driver.get("measurement_version") != MEASUREMENT_VERSION:
+        # Version 2 timed base-table maintenance inside q3_ms, so its sums are not comparable.
+        raise SummaryError(f"{where}: measurement_version is "
+                           f"{driver.get('measurement_version')!r}, not {MEASUREMENT_VERSION}")
     problems = owner_write_problems(driver)
     if problems:
         raise SummaryError(f"{where}: inconsistent write attribution: " + "; ".join(problems))

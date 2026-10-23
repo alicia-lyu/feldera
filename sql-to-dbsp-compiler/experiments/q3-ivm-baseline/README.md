@@ -7,6 +7,29 @@ identities and payloads Q3 needs before its residual filters, revenue aggregatio
 and projection. [query.sql](query.sql) has one predicate-free materialized view and no intermediate
 view or join hint.
 
+## Two chained circuits
+
+Base-table maintenance and view maintenance are separate generated circuits, each in its own DBSP
+runtime (user decision of 2026-10-23):
+
+- **Base circuit** ([base.sql](base.sql), crate `q3-base-circuit`). The three tables with primary
+  keys and no view. The driver applies each transaction here first. Its net delta, read from the
+  delta stream that the catalog registers for each input map, is exactly the change to the base
+  relations, with complete rows for deletions.
+- **View circuit** ([q3.sql](q3.sql), crate `q3-view-circuit`). The same tables without keys (Z-set
+  inputs) and `V`. The driver feeds it the net delta, so it maintains `V` and nothing else.
+  `--q3-merged-index` applies to this circuit only.
+
+[query.sql](query.sql) remains the logical definition: keyed tables plus `V`. The merged-index
+module is generated from its schema.
+
+Each runtime has one worker, its own storage directory (`run-N/base` and `run-N/q3`), and its own
+buffer cache. The driver splits `--cache-bytes` between them (the base circuit gets half the MiB,
+rounded down) and gives both the same `--memory-target-bytes`, because RSS is process-wide. The
+report records both. Phases are timed per circuit: `base_ms`, `forward_ms`, `index_ms` and `q3_ms`,
+where `q3_ms` is the view circuit alone. Only `index_ms + q3_ms` (`combined_maintenance_ms`) is
+incremental view maintenance; `base_ms` is reported beside it and never added to it.
+
 All commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). The
 architecture and R1–R5 status are in the
 [design README](../../../docs/design/merged-index/README.md).
@@ -22,9 +45,11 @@ every run configuration.
 
 | Path | Role |
 | --- | --- |
-| `query.sql`, `generate.sh` | The SQL and the script that generates `src/lib.rs`, `src/stubs.rs`, and `plan.json` (git-ignored). `generate.sh --q3-merged-index` generates the reconstructed circuit. |
-| `src/main.rs`, `src/data.rs`, `src/udf.rs` | Handwritten driver, `.tbl` parser, and UDF scaffolding. |
-| `src/workload.rs` | `BaseState` and the workload checks, including `BaseState::validate`. |
+| `base.sql`, `q3.sql`, `query.sql` | The base circuit's SQL, the view circuit's SQL, and the logical definition (keyed tables plus `V`) from which the merged-index module is generated. |
+| `generate.sh` | Generates `q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and `plan.json` (the view circuit's plan), all git-ignored. `generate.sh --q3-merged-index` generates the reconstructed view circuit. It strips the generated allocator, which `src/main.rs` defines once. |
+| `q3-base-circuit/`, `q3-view-circuit/` | Library crates around the generated circuits. The view crate has the Cargo feature `merged-index`, which the driver's feature of the same name enables. |
+| `src/main.rs`, `src/data.rs` | Handwritten driver (`Pipeline` holds both circuits) and `.tbl` parser. |
+| `src/workload.rs` | `BaseState`, the workload checks including `BaseState::validate`, and `net_delta`, which reads the base circuit's delta streams. |
 | `src/reconstruction.rs` | `ManualIndex` and the auxiliary-thread index maintenance (Cargo feature `merged-index`). |
 | `src/verification.rs` | Shared R4 tests for both modes. |
 | `src/measurement.rs`, `measure.py` | R5 reporting and the runner. |
@@ -40,11 +65,13 @@ reconstructed path needs the compiler option `--q3-merged-index` and the Cargo f
 The concrete COL codecs and storage tests live in the standalone
 [`merged-index-col`](../merged-index-col/README.md) library, which the native path does not use.
 
-In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside the Q3
-circuit, on a DBSP auxiliary thread. Per transaction it appends the signed index rows, then
-publishes the before and after snapshots to Q3, which keeps them until its consumers finish.
-The placement map (order → customer) is built from the Orders rows of that transaction's delta,
-so only RF1 and RF2 are supported. The contract and its limits are in
+In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside the view
+circuit, on an auxiliary thread of the view circuit's runtime. Per transaction it converts the
+base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
+publishes the before and after snapshots to the view circuit, which keeps them until its
+consumers finish. The placement map (order → customer) is built from the Orders rows of that net
+delta, so only RF1 and RF2 are supported. The index is fed from the net delta and not from the
+driver's logical change, so a workload with upserts would feed it correctly too. The contract and its limits are in
 [reconstruction.md](../../../docs/design/merged-index/reconstruction.md).
 
 Reconstruction decodes the requested key ranges and copies them into temporary native batches for

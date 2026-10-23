@@ -650,11 +650,7 @@ fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result
 /// base circuit takes the change, and the view circuit takes the net delta in the same steps.
 /// The merged index is published once, and every step of the view transaction shares it.
 #[cfg(all(test, feature = "merged-index"))]
-fn transact_in_steps(
-    pipeline: &mut Pipeline,
-    state: &mut Reference,
-    change: Change,
-) -> Result<()> {
+fn transact_in_steps(pipeline: &mut Pipeline, state: &mut Reference, change: Change) -> Result<()> {
     let net_delta = run_base(pipeline, state, change, true)?;
     publish_net_delta(pipeline, &net_delta)?;
     run_view(pipeline, net_delta, true)
@@ -1155,7 +1151,10 @@ fn finish_loading(
         .transpose()?;
     let setup_compaction_elapsed = setup_compaction_started.elapsed();
     for (stage, names) in [
-        (&pipeline.base, ["CUSTOMER", "ORDERS", "LINEITEM"].as_slice()),
+        (
+            &pipeline.base,
+            ["CUSTOMER", "ORDERS", "LINEITEM"].as_slice(),
+        ),
         (&pipeline.view, ["V"].as_slice()),
     ] {
         for name in names {
@@ -1312,8 +1311,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         std::fs::create_dir_all(path)?;
     }
     // Each circuit has its own runtime, and a storage directory is locked by one runtime.
-    let base_storage = storage_root.as_ref().map(|root| root.join(BASE_STORAGE_DIRECTORY));
-    let q3_storage = storage_root.as_ref().map(|root| root.join(Q3_STORAGE_DIRECTORY));
+    let base_storage = storage_root
+        .as_ref()
+        .map(|root| root.join(BASE_STORAGE_DIRECTORY));
+    let q3_storage = storage_root
+        .as_ref()
+        .map(|root| root.join(Q3_STORAGE_DIRECTORY));
     let (base_cache_mib, q3_cache_mib) = split_cache_mib(config.cache_bytes);
     let base_config = circuit_config(config, base_storage.as_deref(), base_cache_mib)?;
     let q3_config = circuit_config(config, q3_storage.as_deref(), q3_cache_mib)?;
@@ -1749,15 +1752,7 @@ mod tests {
         let mut pipeline = Pipeline::with_workers(1)?;
         let mut state = Reference::default();
         let mut stats = Measurements::default();
-        let mut step = |change| {
-            transact(
-&mut pipeline,
-&mut state,
-                change,
-                true,
-                &mut stats,
-            )
-        };
+        let mut step = |change| transact(&mut pipeline, &mut state, change, true, &mut stats);
 
         // Orphan lines and unmatched orders produce no joined row.
         step(Change {
@@ -1918,8 +1913,8 @@ mod tests {
             let mut state = Reference::default();
             let mut stats = Measurements::default();
             transact(
-&mut pipeline,
-&mut state,
+                &mut pipeline,
+                &mut state,
                 Change {
                     customers: vec![(customer(2, "BUILDING"), true)],
                     orders: vec![(order(20, 2), true)],
@@ -1975,8 +1970,8 @@ mod tests {
         let mut state = Reference::default();
         let mut stats = Measurements::default();
         transact(
-&mut pipeline,
-&mut state,
+            &mut pipeline,
+            &mut state,
             Change {
                 customers: vec![(customer(2, "BUILDING"), true)],
                 orders: vec![(order(20, 2), true)],
@@ -1999,8 +1994,8 @@ mod tests {
             let base_order = order(20, 2);
             let base_line = line(20, 1);
             transact(
-&mut pipeline,
-&mut state,
+                &mut pipeline,
+                &mut state,
                 Change {
                     customers: vec![(base_customer.clone(), true)],
                     orders: vec![(base_order.clone(), true)],
@@ -2016,8 +2011,8 @@ mod tests {
             let mut changed_line = base_line.clone();
             changed_line.price_cents = 275;
             transact(
-&mut pipeline,
-&mut state,
+                &mut pipeline,
+                &mut state,
                 Change {
                     customers: vec![(base_customer, false), (changed_customer, true)],
                     orders: vec![(base_order, false), (changed_order, true)],
@@ -2068,18 +2063,18 @@ mod reconstructed_tests {
         let mut state = Reference::default();
         let mut stats = Measurements::default();
         transact(
-&mut pipeline,
-&mut state,
+            &mut pipeline,
+            &mut state,
             Change {
                 customers: vec![(customer(2), true), (customer(3), true)],
                 ..Change::default()
             },
             true,
             &mut stats,
-)?;
+        )?;
         transact(
-&mut pipeline,
-&mut state,
+            &mut pipeline,
+            &mut state,
             Change {
                 orders: vec![(order(20, 2), true)],
                 lines: vec![(line(20, 1), true), (line(20, 2), true)],
@@ -2087,10 +2082,10 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-)?;
+        )?;
         transact(
-&mut pipeline,
-&mut state,
+            &mut pipeline,
+            &mut state,
             Change {
                 orders: vec![(order(30, 3), true)],
                 lines: vec![(line(30, 1), true)],
@@ -2098,23 +2093,17 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-)?;
+        )?;
         let keys = HashSet::from([20]);
         let deletion = rf2_changes(&state, &keys);
+        transact(&mut pipeline, &mut state, deletion, true, &mut stats)?;
         transact(
-&mut pipeline,
-&mut state,
-            deletion,
-            true,
-            &mut stats,
-)?;
-        transact(
-&mut pipeline,
-&mut state,
+            &mut pipeline,
+            &mut state,
             Change::default(),
             true,
             &mut stats,
-)?;
+        )?;
         assert_eq!(stats.view_rows, Some(1));
         assert_eq!(stats.transactions, 5);
         // The view circuit has no historical join traces, and the base circuit has no joins.
@@ -2138,8 +2127,8 @@ mod reconstructed_tests {
             .validate(&no_order)
             .is_err());
         transact(
-&mut pipeline,
-&mut reference,
+            &mut pipeline,
+            &mut reference,
             Change {
                 customers: vec![(customer(2), true)],
                 orders: vec![(order(20, 2), true)],
@@ -2147,7 +2136,7 @@ mod reconstructed_tests {
             },
             true,
             &mut Measurements::default(),
-)?;
+        )?;
         let missing_line = Change {
             orders: vec![(order(20, 2), false)],
             ..Change::default()
@@ -2185,15 +2174,15 @@ mod reconstructed_tests {
         let mut reference = Reference::default();
         let mut stats = Measurements::default();
         transact(
-&mut pipeline,
-&mut reference,
+            &mut pipeline,
+            &mut reference,
             Change {
                 customers: vec![(customer(2), true)],
                 ..Change::default()
             },
             true,
             &mut stats,
-)?;
+        )?;
 
         let complete = Change {
             orders: vec![(order(20, 2), true)],
@@ -2249,17 +2238,13 @@ mod reconstructed_tests {
                 min_storage_bytes: Some(0),
                 ..StorageOptions::default()
             };
-            Ok(
-                CircuitConfig::with_workers(1).with_storage(Some(
-                    CircuitStorageConfig::for_config(storage, options)?
-                        .with_init_checkpoint(checkpoint),
-                )),
-            )
+            Ok(CircuitConfig::with_workers(1).with_storage(Some(
+                CircuitStorageConfig::for_config(storage, options)?
+                    .with_init_checkpoint(checkpoint),
+            )))
         };
-        let mut pipeline = Pipeline::new(
-            config(&base_directory, None)?,
-            config(&q3_directory, None)?,
-        )?;
+        let mut pipeline =
+            Pipeline::new(config(&base_directory, None)?, config(&q3_directory, None)?)?;
         let mut reference = Reference::default();
         let mut stats = Measurements::default();
         transact(
@@ -2417,9 +2402,10 @@ mod measurement_tests {
             assert!(phase("base_ms") > 0.0, "{refresh}");
             assert!(phase("q3_ms") > 0.0, "{refresh}");
             assert!(phase("forward_ms") >= 0.0, "{refresh}");
-            assert_eq!(
-                phase("combined_maintenance_ms"),
-                phase("index_ms") + phase("q3_ms")
+            assert!(
+                (phase("combined_maintenance_ms") - (phase("index_ms") + phase("q3_ms"))).abs()
+                    < 1e-6,
+                "{refresh}"
             );
             if !cfg!(feature = "merged-index") {
                 assert_eq!(phase("index_ms"), 0.0);
@@ -2432,9 +2418,17 @@ mod measurement_tests {
                 + circuits["q3"]["cache_mib"].as_u64().unwrap(),
             8
         );
-        assert_ne!(circuits["base"]["storage_path"], circuits["q3"]["storage_path"]);
+        assert_ne!(
+            circuits["base"]["storage_path"],
+            circuits["q3"]["storage_path"]
+        );
         let by_circuit = &output["sequence"]["circuits"];
-        assert!(by_circuit["base"]["observed_storage_bytes"].as_u64().unwrap() > 0);
+        assert!(
+            by_circuit["base"]["observed_storage_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert!(by_circuit["q3"]["observed_storage_bytes"].as_u64().unwrap() > 0);
         assert_eq!(
             output["sequence"]["cache_capacity_bytes"].as_u64().unwrap(),
@@ -2614,6 +2608,21 @@ mod measurement_tests {
         let elided: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
         assert_eq!(elided["configuration"]["elide_value_headers"], true);
         assert_eq!(elided["value_header_elision"]["layout_fallbacks"], 0);
+
+        // The diagnostics scan finds each run's file in the storage directory of the circuit
+        // that wrote it, whichever of the two that is.
+        let config = Config {
+            storage_path: Some(directory.join("diagnosed-storage")),
+            report: Some(directory.join("diagnosed-report.json")),
+            diagnostics: Some(directory.join("diagnostics")),
+            elide_value_headers: false,
+            ..config
+        };
+        run(&config, 1)?;
+        let contents: Value = serde_json::from_reader(File::open(
+            directory.join("diagnostics").join("run-contents.json"),
+        )?)?;
+        assert!(!contents["spines"].as_array().unwrap().is_empty());
         Ok(())
     }
 }
