@@ -197,7 +197,7 @@ The user decided how `prepare_inputs.py` chooses refreshes:
 - Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block.
 - Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders.
 
-The `prepare_inputs.py` change lands in a parallel commit.
+`prepare_inputs.py` implements this.
 
 ## Superseded and withdrawn
 
