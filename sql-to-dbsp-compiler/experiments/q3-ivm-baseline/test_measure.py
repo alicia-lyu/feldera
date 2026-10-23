@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -168,6 +169,70 @@ class MeasureTest(unittest.TestCase):
                 "input_hashes": {"customer": "0" * 64}, "refreshes": []}
         with self.assertRaisesRegex(RuntimeError, "differs from recorded input hash"):
             measure.private_inputs(spec)
+
+    def test_eviction_advises_dontneed_on_every_file_after_flushing(self) -> None:
+        paths = [self.root / "customer", self.root / "orders", self.root / "customer"]
+        events: list[tuple[str, int]] = []
+        with patch.object(measure.os, "posix_fadvise", create=True,
+                          side_effect=lambda fd, offset, length, advice:
+                          events.append(("fadvise", advice))) as advise, \
+             patch.object(measure.os, "POSIX_FADV_DONTNEED", 4, create=True), \
+             patch.object(measure.os, "fsync",
+                          side_effect=lambda fd: events.append(("fsync", fd))):
+            result = measure.evict_from_page_cache(paths)
+        self.assertEqual(advise.call_count, 2, "duplicates are advised once")
+        self.assertTrue(all(call.args[1:] == (0, 0, 4) for call in advise.call_args_list))
+        self.assertEqual([kind for kind, _ in events], ["fsync", "fadvise"] * 2)
+        self.assertTrue(result["evicted"])
+        self.assertEqual(len(result["files"]), 2)
+        self.assertEqual(result["failures"], [])
+
+    def test_eviction_records_a_failing_file_without_raising(self) -> None:
+        with patch.object(measure.os, "posix_fadvise", create=True), \
+             patch.object(measure.os, "POSIX_FADV_DONTNEED", 4, create=True), \
+             patch.object(measure.os, "fsync"):
+            result = measure.evict_from_page_cache(
+                [self.root / "customer", self.root / "missing"])
+        self.assertFalse(result["evicted"])
+        self.assertEqual(result["files"], [str(self.root / "customer")])
+        self.assertEqual([item["path"] for item in result["failures"]],
+                         [str(self.root / "missing")])
+
+    def test_eviction_is_a_noop_without_posix_fadvise(self) -> None:
+        with patch.object(measure, "os", types.SimpleNamespace()):
+            result = measure.evict_from_page_cache([self.root / "customer"])
+        self.assertFalse(result["evicted"])
+        self.assertIn("unavailable", result["reason"])
+
+    def test_cgroup_child_evicts_sources_and_copies(self) -> None:
+        refreshes, files = measure.refresh_inputs(self.refresh)
+        group = self.root / "cgroup-evict"
+        group.mkdir()
+        (group / "memory.max").write_text("4096")
+        spec = {"run_dir": str(self.root / "evict-run"), "cgroup": str(group),
+                "total_memory_bytes": 4096, "executable": "/bin/driver",
+                "refreshes": refreshes,
+                "inputs": {**{key: str(self.root / key)
+                               for key in ("customer", "orders", "lineitem")},
+                           **{key: str(path) for key, path in files.items()}},
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True}}
+        spec["input_hashes"] = {key: measure.sha256(Path(path))
+                                for key, path in spec["inputs"].items()}
+        spec_path = self.root / "evict-spec.json"
+        spec_path.write_text(json.dumps(spec))
+        with patch.object(measure, "verify_membership"), \
+             patch.object(measure.os, "execv", side_effect=RuntimeError("stop")), \
+             patch.object(measure, "evict_from_page_cache",
+                          return_value={"evicted": True}) as evict:
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                measure.run_inside_cgroup(spec_path)
+        evicted = {str(path) for path in evict.call_args.args[0]}
+        run_input = self.root / "evict-run" / "input"
+        self.assertIn(str(self.root / "customer"), evicted)
+        self.assertIn(str(run_input / "customer"), evicted)
+        self.assertIn(str(run_input / "refreshes.json"), evicted)
+        self.assertTrue((self.root / "evict-run" / "input-eviction.json").is_file())
 
     def test_cgroup_limit_and_swap_are_checked(self) -> None:
         group = measure.configure_cgroup(self.root, "run", 1024)

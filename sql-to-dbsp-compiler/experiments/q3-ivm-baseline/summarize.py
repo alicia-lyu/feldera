@@ -16,7 +16,15 @@ reports, over the repetitions:
   `query`, `base_relation` and `merged_index`, plus the totals
   `backend_write_operations` and `backend_write_bytes`;
 - `sequence.observed_storage_bytes`, and `sequence.resources.peak_rss_bytes`
-  (the process high-water mark, not a cgroup peak).
+  (the process-lifetime high-water mark, which includes loading);
+- the maintenance-window memory evidence, which is evidence of memory use and not proof
+  of memory pressure: `window_peak_rss_bytes` and `window_end_rss_bytes`
+  (`sequence.window_peak_rss_bytes`, `sequence.window_end_rss_bytes`; `null` is accepted only
+  when the report's `os` is not `linux`, and then the two metrics are left out), and, when
+  the driver ran in a cgroup v2 group, the window deltas of `sequence.cgroup` that the kernel
+  provides (`cgroup_delta_*`: `pgscan`, `pgsteal`, the workingset refaults, the memory events
+  and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
+  reset worked) and the maximum sampled `memory.current`.
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
@@ -40,6 +48,11 @@ MEASUREMENT_VERSION = 3
 REFRESH_SUMS = ("foreground_ms", "base_ms", "forward_ms", "index_ms", "q3_ms",
                 "combined_maintenance_ms")
 STATISTICS = ("median", "min", "max")
+# `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
+# the window's cgroup delta has them.
+CGROUP_STAT_DELTAS = ("pgscan", "pgsteal", "workingset_refault", "workingset_refault_anon",
+                      "workingset_refault_file")
+CGROUP_EVENT_DELTAS = ("high", "max", "oom", "oom_kill")
 
 
 class SummaryError(ValueError):
@@ -94,6 +107,51 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     metrics["write_bytes_total"] = number(driver, (*resources, "backend_write_bytes"), where)
     metrics["observed_storage_bytes"] = number(driver, ("sequence", "observed_storage_bytes"), where)
     metrics["peak_rss_bytes"] = number(driver, (*resources, "peak_rss_bytes"), where)
+    metrics.update(window_memory_metrics(driver, where))
+    return metrics
+
+
+def window_memory_metrics(driver: dict[str, Any], where: str) -> dict[str, float]:
+    """The maintenance-window memory metrics of one driver report.
+
+    The RSS figures are required on Linux and left out elsewhere. The cgroup figures are
+    taken from whatever the report's `sequence.cgroup` provides; a missing cgroup or a
+    missing kernel counter contributes no metric, and a present one must be valid.
+    """
+    operating_system = driver.get("os")
+    if not isinstance(operating_system, str):
+        raise SummaryError(f"{where}: the report does not name its os")
+    sequence = driver.get("sequence", {})
+    metrics: dict[str, float] = {}
+    for field in ("window_peak_rss_bytes", "window_end_rss_bytes"):
+        if operating_system != "linux" and sequence.get(field) is None:
+            continue
+        metrics[field] = number(driver, ("sequence", field), where)
+    cgroup = sequence.get("cgroup")
+    if cgroup is None:
+        return metrics
+    if not isinstance(cgroup, dict):
+        raise SummaryError(f"{where}: sequence.cgroup is {cgroup!r}, not an object")
+    delta = cgroup.get("delta") or {}
+    for name in CGROUP_STAT_DELTAS:
+        if (delta.get("memory_stat") or {}).get(name) is not None:
+            metrics[f"cgroup_delta_{name}"] = number(
+                cgroup, ("delta", "memory_stat", name), where + " sequence.cgroup")
+    for name in CGROUP_EVENT_DELTAS:
+        if (delta.get("memory_events") or {}).get(name) is not None:
+            metrics[f"cgroup_delta_memory_events_{name}"] = number(
+                cgroup, ("delta", "memory_events", name), where + " sequence.cgroup")
+    for kind in ("some", "full"):
+        if (delta.get("memory_pressure_total_microseconds") or {}).get(kind) is not None:
+            metrics[f"cgroup_delta_pressure_{kind}_microseconds"] = number(
+                cgroup, ("delta", "memory_pressure_total_microseconds", kind),
+                where + " sequence.cgroup")
+    peak = cgroup.get("peak") or {}
+    for field, name in (("window_peak_bytes", "cgroup_window_peak_bytes"),
+                        ("max_sampled_memory_current_bytes",
+                         "cgroup_max_sampled_memory_current_bytes")):
+        if peak.get(field) is not None:
+            metrics[name] = number(cgroup, ("peak", field), where + " sequence.cgroup")
     return metrics
 
 
@@ -121,6 +179,11 @@ def summarize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any]:
         if not isinstance(repetition, int) or repetition in by_mode[mode]:
             raise SummaryError(f"{where}: repetition is missing or repeated")
         by_mode[mode][repetition] = run_metrics(run, where)
+    names_by_run = {tuple(metrics) for found in by_mode.values() for metrics in found.values()}
+    if len(names_by_run) > 1:
+        raise SummaryError(f"{label}: runs report different sets of metrics (for example, a "
+                           "kernel without some cgroup counters, or a non-Linux run among "
+                           "Linux runs)")
     repetitions = {mode: sorted(found) for mode, found in by_mode.items()}
     if any(not found for found in repetitions.values()) \
             or len({tuple(found) for found in repetitions.values()}) != 1:
