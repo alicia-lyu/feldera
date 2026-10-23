@@ -29,6 +29,23 @@ use dbsp::storage::write_attribution::{write_snapshot, WriteOwner};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+/// The path of `file`, which a spine names relative to the storage directory of its circuit.
+/// A name that exists under more than one directory cannot be attributed, so it is an error.
+fn locate(storage_roots: &[&Path], file: &str) -> Result<PathBuf> {
+    let mut found = storage_roots
+        .iter()
+        .map(|root| root.join(file))
+        .filter(|path| path.exists());
+    let path = found
+        .next()
+        .with_context(|| format!("{file} is in no storage directory"))?;
+    ensure!(
+        found.next().is_none(),
+        "{file} exists in more than one storage directory"
+    );
+    Ok(path)
+}
+
 /// The measured window, in microseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
@@ -60,9 +77,9 @@ impl Diagnostics {
     }
 
     /// Writes `run-contents.json`: the runs of every live spine, with the
-    /// bytes each file spends on each block type. `storage_root` is the
-    /// backend's directory.
-    pub fn write_run_contents(&self, storage_root: &Path) -> Result<()> {
+    /// bytes each file spends on each block type. `storage_roots` are the
+    /// backends' directories, one per circuit.
+    pub fn write_run_contents(&self, storage_roots: &[&Path]) -> Result<()> {
         let mut spines = Vec::new();
         for spine in dbsp_diagnostics::spine_contents() {
             let mut runs = Vec::new();
@@ -72,7 +89,7 @@ impl Diagnostics {
             for run in &spine.runs {
                 let mut value = serde_json::to_value(run)?;
                 if let Some(file) = &run.file {
-                    let blocks = layer_file_block_bytes(&storage_root.join(file))?;
+                    let blocks = layer_file_block_bytes(&locate(storage_roots, file)?)?;
                     ensure!(
                         Some(blocks.total()) == run.file_bytes,
                         "{file}: block bytes sum to {} but the file has {:?} bytes",

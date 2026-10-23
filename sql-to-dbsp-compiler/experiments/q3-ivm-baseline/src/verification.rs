@@ -324,33 +324,26 @@ fn verify_output(
     }))
 }
 
+/// Publishes the net delta to the merged index and checks the readers against the references
+/// before and after the change.
 #[cfg(feature = "merged-index")]
 fn publish(
-    index: &ManualIndex,
-    q3: &Q3State,
-    change: &Change,
+    pipeline: &Pipeline,
+    net_delta: &Change,
     before: &Reference,
     after: &Reference,
 ) -> Result<()> {
-    let (placements, rows) = reconstruction::prepare(change)?;
-    let (old, new) = index.append(rows)?;
-    q3.publish(old, new, placements)
-        .map_err(anyhow::Error::msg)?;
-    check_readers(q3, before, after, change)
+    publish_net_delta(pipeline, net_delta)?;
+    check_readers(&pipeline.q3_state, before, after, net_delta)
 }
 
+/// The V transcript of the two-circuit pipeline must stay byte-identical to the transcript
+/// that the one-circuit program produced, and to the other mode's transcript. Each fixture is
+/// also checked against the base relations, which the base circuit maintains.
 #[test]
 fn rf1_rf2_transcript() -> Result<()> {
-    let config = CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
-    #[cfg(feature = "merged-index")]
-    let q3 = Q3State::default();
-    #[cfg(feature = "merged-index")]
-    let (mut circuit, catalog) = q3_ivm_baseline::circuit(config, q3.clone())?;
-    #[cfg(not(feature = "merged-index"))]
-    let (mut circuit, catalog) = q3_ivm_baseline::circuit(config)?;
-    #[cfg(feature = "merged-index")]
-    let index = ManualIndex::new(circuit.runtime());
-    let mut input = Inputs::new(&catalog)?;
+    let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
+    let mut pipeline = Pipeline::new(config(), config())?;
     let mut state = Reference::default();
     let mut transcript = Vec::new();
 
@@ -414,35 +407,28 @@ fn rf1_rf2_transcript() -> Result<()> {
         let mut expected_after = before.clone();
         apply_reference(&mut expected_after, &change);
         let after_view = expected_after.evaluate();
+
+        let net_delta = run_base(&mut pipeline, &mut state, change.clone(), multi_step)?;
+        assert_eq!(
+            (net_delta.customers.len(), net_delta.orders.len(), net_delta.lines.len()),
+            (change.customers.len(), change.orders.len(), change.lines.len()),
+            "{name}: the net delta has one entry per changed row"
+        );
+        assert!(
+            workload::BaseState::new(&pipeline.base.catalog)?.matches(&state)?,
+            "{name}: base relations"
+        );
         #[cfg(feature = "merged-index")]
-        publish(&index, &q3, &change, &before, &expected_after)?;
-        if multi_step {
-            circuit.start_transaction()?;
-            Change {
-                orders: change.orders.clone(),
-                customers: change.customers.clone(),
-                ..Change::default()
-            }
-            .apply(&mut state, &mut input)?;
-            assert!(!circuit.step()?);
-            let middle = change.lines.len() / 2;
-            for lines in [&change.lines[..middle], &change.lines[middle..]] {
-                Change {
-                    lines: lines.to_vec(),
-                    ..Change::default()
-                }
-                .apply(&mut state, &mut input)?;
-                assert!(!circuit.step()?);
-            }
-            circuit.commit_transaction()?;
-        } else {
-            change.apply(&mut state, &mut input)?;
-            circuit.transaction()?;
-        }
-        #[cfg(feature = "merged-index")]
-        q3.finish().map_err(anyhow::Error::msg)?;
+        publish(&pipeline, &net_delta, &before, &expected_after)?;
+        run_view(&mut pipeline, net_delta, multi_step)?;
+
         assert_eq!(state.evaluate(), after_view, "{name}: fixture state");
-        transcript.push(verify_output(&catalog, &before_view, &after_view, name)?);
+        transcript.push(verify_output(
+            &pipeline.view.catalog,
+            &before_view,
+            &after_view,
+            name,
+        )?);
     }
     assert_eq!(transcript.len(), 13);
     if let Some(path) = std::env::var_os("Q3_VERIFICATION_TRANSCRIPT") {
