@@ -28,7 +28,7 @@ An open question remains; see [Open questions](#open-questions).
 Folded keys are unique because the base tables have primary keys:
 
 - **Keys.** `query.sql` declares the primary keys `c_custkey`, `o_orderkey`, and `(l_orderkey, l_linenumber)`. The folded keys are `C(c)`, `O(c, o)`, and `L(c, o, l)`. An order's customer never changes inside the workload.
-- **Harness condition.** The merged index is fed the harness's own signed rows, not the base tables' net delta after upserts. Uniqueness therefore holds only because `BaseState::validate` in `q3-ivm-baseline/src/workload.rs` admits just the changes that the base tables apply as given: no duplicate, replacement, or key-moving deltas.
+- **Harness condition.** The merged index is fed the harness's own signed rows, not the base tables' net delta after upserts. Uniqueness therefore holds only because `BaseState::validate` in `q3-ivm-baseline/src/workload.rs` admits just the changes that the base tables apply as given: no duplicate, replacement, or key-moving deltas. Superseded on 2026-10-23: the index is now fed the base circuit's net delta (see "Separate base-table maintenance from IVM"), so the condition no longer applies.
 - **Future workloads.** A workload with upserts must derive the merged-index rows from the base tables' net delta.
 
 This supersedes the 2026-09-28 requirement of a transaction-level uniqueness check (see [Superseded](#superseded-and-withdrawn)).
@@ -187,6 +187,12 @@ These directions apply to the 2026-10-08 advisor deck; they do not set research 
 - Explain an already-loaded primary-key table before IVM mechanics; call its spine an LSM-like trace.
 - Use Orders–Lineitem first for the explanatory program, but describe the experiment's Orders–Customer-first circuit as it actually is.
 - Make no measured-savings, update-cost, or comparative performance claims.
+
+### 2026-10-23: Separate base-table maintenance from IVM
+
+Time base-table maintenance and view maintenance directly and apart, without subtracting one figure from another. The R5 driver runs two chained circuits in separate runtimes: a base circuit of the keyed tables, and a view circuit of keyless tables plus V that consumes the base circuit's net delta. The merged index is fed from the same net delta. This is measurement version 3.
+
+The agent chose three settings, which are not yet confirmed: `--cache-bytes` is split evenly between the two runtimes (base takes the lower half when the MiB count is odd); both runtimes get the same `--memory-target-bytes`, because RSS is process-wide; and `ManualIndex` binds to the view runtime, since it replaces the view circuit's join traces.
 
 ### 2026-10-23: Linux campaign refresh selection
 

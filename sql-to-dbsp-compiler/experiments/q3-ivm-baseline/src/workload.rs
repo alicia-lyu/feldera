@@ -15,6 +15,8 @@ use feldera_types::program_schema::SqlIdentifier;
 use serde_json::Value;
 
 use crate::data::{Customer, Line, Order};
+#[cfg(test)]
+use crate::Reference;
 use crate::{cents, integer, string, Change};
 
 pub(crate) struct BaseState {
@@ -51,6 +53,34 @@ impl BaseState {
         .into_iter()
         .map(|(name, reader)| (name.to_owned(), batch_storage_evidence(&**reader)))
         .collect()
+    }
+
+    /// Whether the base relations hold exactly the rows of `reference`, each with weight one.
+    #[cfg(test)]
+    pub(crate) fn matches(&self, reference: &Reference) -> Result<bool> {
+        fn rows<T>(
+            reader: &dyn SerBatchReader,
+            parse: impl Fn(&Value) -> Result<T>,
+            order_by: impl Fn(&T) -> (i64, i32),
+        ) -> Result<Vec<T>> {
+            let mut weighted = weighted_rows(reader, parse)?;
+            weighted.sort_by_key(|(row, _)| order_by(row));
+            if weighted.iter().any(|(_, weight)| *weight != 1) {
+                bail!("base relation has a weight other than one");
+            }
+            Ok(weighted.into_iter().map(|(row, _)| row).collect())
+        }
+        let mut customers: Vec<_> = reference.customers.values().cloned().collect();
+        customers.sort_by_key(|row| row.key);
+        let mut orders: Vec<_> = reference.orders.values().cloned().collect();
+        orders.sort_by_key(|row| row.key);
+        let mut lines: Vec<_> = reference.lines.values().cloned().collect();
+        lines.sort_by_key(|row| (row.order_key, row.number));
+        Ok(
+            rows(&*self.customers, parse_customer, |row| (row.key, 0))? == customers
+                && rows(&*self.orders, parse_order, |row| (row.key, 0))? == orders
+                && rows(&*self.lines, parse_line, |row| (row.order_key, row.number))? == lines,
+        )
     }
 
     fn keyed_row(
@@ -258,6 +288,97 @@ pub(crate) fn rf2_changes(
     Ok((change, absent))
 }
 
+/// Switches on the delta streams of the base relations. A primary-key table's delta accumulator
+/// stays idle until an output connector attaches, so without this call `net_delta` reads
+/// nothing. Call it before the first transaction.
+pub(crate) fn enable_net_delta(catalog: &impl CircuitCatalog) -> Result<()> {
+    for name in ["CUSTOMER", "ORDERS", "LINEITEM"] {
+        catalog
+            .output_handles(&SqlIdentifier::from(name))
+            .with_context(|| format!("missing base relation {name}"))?
+            .enable_count
+            .enable();
+    }
+    Ok(())
+}
+
+/// Reads, and so drains, the base circuit's delta streams: the net change that the last base
+/// transaction made to each base relation. The base relations are primary-key input maps, so
+/// an upsert that replaces a row shows as a deletion of the old row and an insertion of the new
+/// one, and a deletion carries the complete old row.
+pub(crate) fn net_delta(catalog: &impl CircuitCatalog) -> Result<Change> {
+    Ok(Change {
+        customers: delta_rows(catalog, "CUSTOMER", parse_customer)?,
+        orders: delta_rows(catalog, "ORDERS", parse_order)?,
+        lines: delta_rows(catalog, "LINEITEM", parse_line)?,
+    })
+}
+
+fn parse_customer(row: &Value) -> Result<Customer> {
+    Ok(Customer {
+        key: integer(row, "c_custkey")?,
+        segment: string(row, "c_mktsegment")?,
+    })
+}
+
+fn parse_order(row: &Value) -> Result<Order> {
+    Ok(Order {
+        key: integer(row, "o_orderkey")?,
+        customer_key: integer(row, "o_custkey")?,
+        date: string(row, "o_orderdate")?,
+        ship_priority: i32::try_from(integer(row, "o_shippriority")?)?,
+    })
+}
+
+fn parse_line(row: &Value) -> Result<Line> {
+    Ok(Line {
+        order_key: integer(row, "l_orderkey")?,
+        number: i32::try_from(integer(row, "l_linenumber")?)?,
+        price_cents: cents(row, "l_extendedprice")?,
+        discount_hundredths: cents(row, "l_discount")?,
+        ship_date: string(row, "l_shipdate")?,
+    })
+}
+
+/// Every (value, weight) pair of a batch, in key order.
+fn weighted_rows<T>(
+    reader: &dyn SerBatchReader,
+    parse: impl Fn(&Value) -> Result<T>,
+) -> Result<Vec<(T, i64)>> {
+    let mut cursor = reader.cursor(RecordFormat::Json(Default::default()))?;
+    let mut rows = Vec::new();
+    while cursor.key_valid() {
+        while cursor.val_valid() {
+            rows.push((parse(&cursor.val_to_json()?)?, cursor.weight()));
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    Ok(rows)
+}
+
+/// The rows of one relation's delta stream, each with `true` for an insertion and `false` for a
+/// deletion. Primary keys make every weight `+1` or `-1`; any other weight is an error.
+fn delta_rows<T>(
+    catalog: &impl CircuitCatalog,
+    name: &str,
+    parse: impl Fn(&Value) -> Result<T>,
+) -> Result<Vec<(T, bool)>> {
+    let reader = catalog
+        .output_handles(&SqlIdentifier::from(name))
+        .with_context(|| format!("missing base relation {name}"))?
+        .delta_handle
+        .concat();
+    weighted_rows(&*reader, parse)?
+        .into_iter()
+        .map(|(row, weight)| match weight {
+            1 => Ok((row, true)),
+            -1 => Ok((row, false)),
+            _ => bail!("{name} delta has weight {weight}; primary keys allow only +1 and -1"),
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LoadStats {
     pub(crate) customer_rows: usize,
@@ -375,39 +496,18 @@ pub(crate) fn load_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "merged-index")]
-    use crate::{reconstruction, ManualIndex, Q3State};
-    use crate::{Inputs, Reference};
-    use dbsp::circuit::CircuitConfig;
+    use crate::{run_base, run_view, Pipeline, Reference};
 
-    #[cfg(feature = "merged-index")]
+    /// Runs `change` through both circuits and, in reconstructed mode, the merged index.
     fn submit_test_change(
-        circuit: &mut dbsp::DBSPHandle,
-        input: &mut Inputs,
-        reference: &mut Reference,
-        change: Change,
-        index: &ManualIndex,
-        q3: &Q3State,
-    ) -> Result<()> {
-        let (placements, rows) = reconstruction::prepare(&change)?;
-        let (before, after) = index.append(rows)?;
-        q3.publish(before, after, placements)
-            .map_err(anyhow::Error::msg)?;
-        change.apply(reference, input)?;
-        circuit.transaction()?;
-        q3.finish().map_err(anyhow::Error::msg)
-    }
-
-    #[cfg(not(feature = "merged-index"))]
-    fn submit_test_change(
-        circuit: &mut dbsp::DBSPHandle,
-        input: &mut Inputs,
+        pipeline: &mut Pipeline,
         reference: &mut Reference,
         change: Change,
     ) -> Result<()> {
-        change.apply(reference, input)?;
-        circuit.transaction()?;
-        Ok(())
+        let net_delta = run_base(pipeline, reference, change, false)?;
+        #[cfg(feature = "merged-index")]
+        crate::publish_net_delta(pipeline, &net_delta)?;
+        run_view(pipeline, net_delta, false)
     }
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -500,16 +600,7 @@ mod tests {
 
     #[test]
     fn base_snapshot_supports_current_deletion_and_rejects_stale_rows() -> Result<()> {
-        #[cfg(feature = "merged-index")]
-        let q3 = Q3State::default();
-        #[cfg(feature = "merged-index")]
-        let (mut circuit, catalog) =
-            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3.clone())?;
-        #[cfg(not(feature = "merged-index"))]
-        let (mut circuit, catalog) = q3_ivm_baseline::circuit(CircuitConfig::with_workers(1))?;
-        #[cfg(feature = "merged-index")]
-        let index = ManualIndex::new(circuit.runtime());
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(1)?;
         let mut reference = Reference::default();
         let customer = Customer {
             key: 1,
@@ -536,19 +627,11 @@ mod tests {
             customers: vec![(customer, true)],
             ..Change::default()
         };
-        BaseState::new(&catalog)?.validate(&customers)?;
-        #[cfg(feature = "merged-index")]
-        submit_test_change(
-            &mut circuit,
-            &mut input,
-            &mut reference,
-            customers,
-            &index,
-            &q3,
-        )?;
-        #[cfg(not(feature = "merged-index"))]
-        submit_test_change(&mut circuit, &mut input, &mut reference, customers)?;
-        let state = BaseState::new(&catalog)?;
+        BaseState::new(&pipeline.base.catalog)?.validate(&customers)?;
+        submit_test_change(&mut pipeline, &mut reference, customers)?;
+        // Reading a snapshot consumes it, so each transaction gets one `BaseState`.
+        let state = BaseState::new(&pipeline.base.catalog)?;
+        assert!(state.matches(&reference)?);
         assert_eq!(state.storage_evidence()["CUSTOMER"]["file_backed"], false);
         let load = Change {
             orders: vec![(order.clone(), true)],
@@ -556,11 +639,10 @@ mod tests {
             ..Change::default()
         };
         state.validate(&load)?;
-        #[cfg(feature = "merged-index")]
-        submit_test_change(&mut circuit, &mut input, &mut reference, load, &index, &q3)?;
-        #[cfg(not(feature = "merged-index"))]
-        submit_test_change(&mut circuit, &mut input, &mut reference, load)?;
-        let state = BaseState::new(&catalog)?;
+        submit_test_change(&mut pipeline, &mut reference, load)?;
+        // Reading a snapshot consumes it, so each transaction gets one `BaseState`.
+        let state = BaseState::new(&pipeline.base.catalog)?;
+        assert!(state.matches(&reference)?);
         assert_eq!(state.order(7)?, Some(order.clone()));
         assert_eq!(state.native_lines(7)?, vec![first.clone(), second.clone()]);
         assert!(state.validate(&Change::default()).is_ok());
@@ -620,18 +702,10 @@ mod tests {
         let mut stale = delete.clone();
         stale.lines[0].0.price_cents += 1;
         assert!(state.validate(&stale).is_err());
-        #[cfg(feature = "merged-index")]
-        submit_test_change(
-            &mut circuit,
-            &mut input,
-            &mut reference,
-            delete,
-            &index,
-            &q3,
-        )?;
-        #[cfg(not(feature = "merged-index"))]
-        submit_test_change(&mut circuit, &mut input, &mut reference, delete)?;
-        let state = BaseState::new(&catalog)?;
+        submit_test_change(&mut pipeline, &mut reference, delete)?;
+        // Reading a snapshot consumes it, so each transaction gets one `BaseState`.
+        let state = BaseState::new(&pipeline.base.catalog)?;
+        assert!(state.matches(&reference)?);
         assert!(state.order(7)?.is_none());
         assert!(state.native_lines(7)?.is_empty());
         let (repeat, absent) = rf2_changes(&state, &HashSet::from([7]), |row| {

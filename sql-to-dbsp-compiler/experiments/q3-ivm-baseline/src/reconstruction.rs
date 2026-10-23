@@ -243,7 +243,9 @@ fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
     ))
 }
 
-/// Convert checked logical deltas; physical folding/encoding stays in batch construction.
+/// Convert the base tables' net delta (`workload::net_delta`); physical folding/encoding stays
+/// in batch construction. Every Lineitem needs its Orders row in the same delta, for the
+/// customer that places it, and deletions carry complete rows.
 pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>)> {
     let mut placements = OrderLocations::new();
     let orders: BTreeMap<_, _> = change

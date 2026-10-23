@@ -125,7 +125,7 @@ The value level has a separate disk-only transform. Every `Vec<u8>` value carrie
 At a completed transaction boundary each folded K has at most one active payload. The argument ([decisions.md](decisions.md#2026-10-12-no-folded-key-uniqueness-validator)):
 
 - The base tables have primary keys `c_custkey`, `o_orderkey`, and `(l_orderkey, l_linenumber)`. The folded keys `C(c)`, `O(c, o)`, and `L(c, o, l)` extend them, and an order's customer never changes inside the workload. Source-index tags keep the three relations' keys apart.
-- The merged index is fed the harness's own signed rows, not the base tables' net delta. The argument therefore holds only while `BaseState::validate` in `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/workload.rs` admits just the changes the base tables apply as given: no duplicate, replacement, or key-moving deltas.
+- The merged index is fed the base circuit's net delta (`workload::net_delta`, converted by `reconstruction::prepare`), not the harness's logical change, since measurement version 3. An upsert therefore reaches it as a deletion of the old row and an insertion of the new one, and the primary keys keep folded keys unique without relying on `BaseState::validate`.
 - A workload with upserts must derive the merged-index rows from the base tables' net delta.
 
 No runtime validator exists. `Writer2` checks K and payload uniqueness within one file group; it cannot see across runs. If a transaction inserts `(K, P120, +1)` without retracting `(K, P100, +1)`, a read returns both payloads. Storage never picks a winner or repairs invalid source state.

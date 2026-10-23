@@ -1,0 +1,27 @@
+[package]
+name = "q3-view-circuit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The Q3 view circuit. ../generate.sh generates src/lib.rs and src/stubs.rs (git-ignored) from ../q3.sql."
+
+[features]
+# The circuit was generated with --q3-merged-index and calls merged_index_col::q3.
+merged-index = ["dep:merged-index-col"]
+
+[dependencies]
+arcstr = "1"
+compare = "0.1"
+dbsp = { path = "../../../../crates/dbsp", features = ["backend-mode"] }
+dbsp_adapters = { path = "../../../../crates/adapters", default-features = false }
+derive_more = { version = "1", features = ["add", "not", "from"] }
+erased-serde = "0.3"
+feldera-sqllib = { path = "../../../../crates/sqllib" }
+feldera-types = { path = "../../../../crates/feldera-types" }
+feldera-macros = { path = "../../../../crates/feldera-macros" }
+merged-index-col = { path = "../../merged-index-col", optional = true }
+paste = "1"
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+size-of = { version = "0.1", package = "feldera-size-of" }

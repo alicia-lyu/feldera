@@ -61,3 +61,5 @@ target/r5-typed-values.clustered.log - moved to TRASH/r5-typed-values-killed/ - 
 git-index.lock-2026-10-20 - moved to TRASH/ - stale empty .git/index.lock left when the disk filled at 16:02; no git process was running
 sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs (hand-written definition) - copied to TRASH/ before lib.rs was rewritten - roadmap Step 5: COL now uses the generated module
 sql-to-dbsp-compiler/experiments/merged-index-col/src/generated_tests.rs - moved to TRASH/ - Step 4 generated-vs-hand-written checks; their reference moved to TRASH/ in Step 5
+
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/udf.rs - moved to TRASH/q3-ivm-baseline-src-udf.rs - the root package no longer has a library; each generated circuit crate has its own empty udf.rs.

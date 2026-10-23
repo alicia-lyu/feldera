@@ -4,7 +4,7 @@ Inspected on 2026-10-06 at Feldera revision
 `308950de73a28bb014c8ad002365d2aa64f1f152`; symbol names were rechecked on
 2026-10-12. Code is cited by symbol and file path, not by line, because line
 anchors drift. Stream names such as `s3` to `s7` come from the generated
-`q3-ivm-baseline/src/lib.rs`, which is git-ignored and may change between
+`q3-ivm-baseline/q3-view-circuit/src/lib.rs`, which is git-ignored and may change between
 compiler versions; run
 [generate.sh](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/generate.sh)
 and read the generator (`ToRustVisitor.java`) to confirm them. The

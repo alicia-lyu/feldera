@@ -1,5 +1,28 @@
 # Generated native circuit for `V`
 
+## Two chained circuits
+
+The experiment runs two generated circuits, each in its own DBSP runtime:
+
+- **Base circuit** (`q3-base-circuit/`, from [base.sql](base.sql)). It has the three
+  tables with their primary keys and no view. Each table is an input map
+  (`add_input_map_persistent`) that retains the base relation. The driver applies every
+  transaction here first. Because the catalog registers inputs as outputs, each
+  relation's delta stream is the net change of that transaction: an upsert that
+  replaces a row is a `-1` of the old row and a `+1` of the new one, and a deletion
+  carries the complete old row.
+- **View circuit** (`q3-view-circuit/`, from [q3.sql](q3.sql)). It has the same tables
+  without keys, so they are Z-set inputs (`add_input_zset`), and it has `V`. The
+  driver feeds it the base circuit's net delta, with complete rows for deletions.
+  `--q3-merged-index` applies to this circuit only. Everything below, from the
+  compiler-expanded graph to the generated joins, describes this circuit.
+
+The driver times the two circuits separately, so `q3_ms` is the view circuit alone;
+[measurement.md](../../../docs/design/merged-index/measurement.md) defines the phases.
+The runtime graphs captured before the split (under `target/q3-circuit-exports/`) show
+the earlier single-circuit program, which also held the primary-key input maps. They
+remain valid for the join regions and `V`'s integral, and not for the base maps.
+
 This note describes the compiler-expanded logical graph and the actual runtime
 graphs captured for the native Q3 baseline. Artifacts and capture logs are stored under the repository’s
 `target/q3-circuit-exports/` directory. They are local-only: `target/` is git-ignored, so the links to them below work only after a local capture. The graph files preserve the node
@@ -7,9 +30,9 @@ IDs, edges, ports, and clusters emitted by their source graph. The source code
 and runtime operator behavior referenced below explain how to read those
 graphs; they do not reconstruct the topology.
 
-Run [generate.sh](generate.sh) before following local `src/lib.rs` and
-`plan.json` links below. Those compiler outputs and `src/stubs.rs` are
-Git-ignored; the [workflow](../../../docs/design/merged-index/WORKFLOW.md#generate-and-test)
+Run [generate.sh](generate.sh) before following local `q3-view-circuit/src/lib.rs` and
+`plan.json` links below. Those compiler outputs, `q3-base-circuit/src/lib.rs`, and both
+`src/stubs.rs` files are Git-ignored; the [workflow](../../../docs/design/merged-index/WORKFLOW.md#generate-and-test)
 describes their regeneration.
 
 ## Compiler-expanded logical graph
@@ -130,7 +153,7 @@ It performs keyed cursor and range access inside the operator; the graph does
 not contain separate index-access nodes. The other-state category can include
 buffered join work and does not mean the operator accumulates a trace. Read the
 `JoinTrace` and `JointKeyCursor` in `crates/dbsp/src/operator/dynamic/join.rs`.
-The generated `src/lib.rs` instantiates the joins; it is git-ignored, so read the
+The generated `q3-view-circuit/src/lib.rs` instantiates the joins; it is git-ignored, so read the
 generator (`ToRustVisitor.java`) or run [generate.sh](generate.sh).
 
 ## Reading the generated program
@@ -138,16 +161,18 @@ generator (`ToRustVisitor.java`) or run [generate.sh](generate.sh).
 The optimized relational plan scans Orders and Customer, joins them on
 customer key, projects their needed fields, and joins the result with Lineitem
 on order key. The logical Lineitem input has `(l_orderkey, l_linenumber)`
-identity and no customer key. It then projects the nine fields of `V`. These
+identity (a primary key in the base circuit; the view circuit has no keys) and no
+customer key. It then projects the nine fields of `V`. These
 are plan nodes 2, 3, 4, 5, 1, 6, 7, and 8 in [plan.json](plan.json). The SQL
 starts with `Customer JOIN Orders`; in the plan generated locally, the first
 join has Orders on the left. Unverified in git: `plan.json` is git-ignored, so
 rerun [generate.sh](generate.sh) and read the plan to confirm the orientation.
 
 `B = Orders ⋈ Customer` names the first generated join's output for
-discussion; it is not a SQL view. In the generated `src/lib.rs` (git-ignored;
-the generator is `ToRustVisitor.java`), the compiler rekeys Orders by customer
-key (`s3`), Customer by customer key (`s4`), and Lineitem by order key (`s5`).
+discussion; it is not a SQL view. In the generated `q3-view-circuit/src/lib.rs`
+(git-ignored; the generator is `ToRustVisitor.java`), the compiler rekeys Orders by
+customer key (`s3`), Customer by customer key (`s4`), and Lineitem by order key (`s5`),
+each straight from its Z-set input (`s1`, `s0`, `s2`).
 It computes `s6` (`B`) with `s3.join_index_balanced(&s4)` and `s7` with
 `s5.join_balanced(&s6)`. The latter produces the nine-column delta of `V`. The
 materialized output registration exposes both a signed delta handle and an
@@ -171,7 +196,8 @@ at the branch unions, so inserts, deletes, replacements, and concurrent
 changes use the same circuit. In the default solo layout, Catalog's
 integration path (`crates/adapters/src/static_compile/catalog.rs`) uses
 `shard_accumulate_integrate_trace_legacy`, and the snapshot handle reads
-that integral through `ro_snapshot()`. Primary-key input maps retain base storage too. Native
+that integral through `ro_snapshot()`. The primary-key input maps that retain the base
+relations are in the base circuit. Native
 trace sharing and extra indexes mean there is no universal one-index-per-
 integrator allocation count.
 

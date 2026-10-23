@@ -41,24 +41,27 @@ final class Q3MergedIndexBinding {
         if (!circuit.incremental)
             throw unsupported("an incremental circuit is required");
 
+        // The view circuit reads keyless tables (Z-set inputs): the base tables live in a
+        // separate circuit, which forwards its net delta here. No column is a primary key.
         DBSPSourceBaseOperator customer = source(circuit, "customer",
-                "c_custkey:i64:true", "c_mktsegment:s:false");
+                "c_custkey:i64:false", "c_mktsegment:s:false");
         DBSPSourceBaseOperator orders = source(circuit, "orders",
-                "o_orderkey:i64:true", "o_custkey:i64:false", "o_orderdate:Date:false",
+                "o_orderkey:i64:false", "o_custkey:i64:false", "o_orderdate:Date:false",
                 "o_shippriority:i32:false");
         DBSPSourceBaseOperator lineitem = source(circuit, "lineitem",
-                "l_orderkey:i64:true", "l_linenumber:i32:true",
+                "l_orderkey:i64:false", "l_linenumber:i32:false",
                 "l_extendedprice:DECIMAL(15, 2):false",
                 "l_discount:DECIMAL(4, 2):false", "l_shipdate:Date:false");
         if (circuit.sourceOperators.size() != 3)
             throw unsupported("exactly three base sources are required");
 
+        // Each index closure takes the whole row, `p0: &TupN`, so a path is (0, field).
         DBSPMapIndexOperator customerIndex = index(circuit, customer,
-                new int[][][] {{{0, 0, 0}}, {{0, 1, 1}}});
+                new int[][][] {{{0, 0}}, {{0, 1}}});
         DBSPMapIndexOperator ordersIndex = index(circuit, orders,
-                new int[][][] {{{0, 1, 1}}, {{0, 0, 0}, {0, 1, 2}, {0, 1, 3}}});
+                new int[][][] {{{0, 1}}, {{0, 0}, {0, 2}, {0, 3}}});
         DBSPMapIndexOperator lineIndex = index(circuit, lineitem,
-                new int[][][] {{{0, 0, 0}}, {{0, 0, 1}, {0, 1, 2}, {0, 1, 3}, {0, 1, 4}}});
+                new int[][][] {{{0, 0}}, {{0, 1}, {0, 2}, {0, 3}, {0, 4}}});
 
         List<DBSPJoinBaseOperator> joins = new ArrayList<>();
         for (DBSPOperator operator : circuit.getAllOperators()) {

@@ -34,8 +34,10 @@ configuration. No multiworker extension is planned.
 ## Generate and test
 
 Run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`. `generate.sh` writes the git-ignored
-`src/lib.rs`, `src/stubs.rs`, and `plan.json` from `query.sql` (Catalog mode, default optimization
-level 2). Run it before building or testing a fresh checkout.
+`q3-base-circuit/src/{lib,stubs}.rs` from `base.sql`, and `q3-view-circuit/src/{lib,stubs}.rs` and
+`plan.json` from `q3.sql` (Catalog mode, default optimization level 2). The two circuits are the
+base tables and the view; `query.sql` stays the logical definition. Run it before building or
+testing a fresh checkout.
 
 ```bash
 # Native circuit (the default)
@@ -237,8 +239,8 @@ rather than corrupting results. Run them before building anything.
 
 - Branch `docs/merged-index-tidy-up`, or any commit that contains this section. The branch is not
   pushed: the user must push it or supply it (for example as a `git bundle`).
-- `q3-ivm-baseline/src/lib.rs`, `src/stubs.rs`, and `plan.json` are generated and git-ignored.
-  `measure.py` runs `generate.sh` itself.
+- `q3-ivm-baseline/q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and
+  `plan.json` are generated and git-ignored. `measure.py` runs `generate.sh` itself.
 - Raw artifacts (reports, run directories) are git-ignored and local to the machine.
 
 ### Toolchain

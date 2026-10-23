@@ -25,11 +25,13 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
     """A driver report with two refreshes; `scale` multiplies every timing."""
     split = owners(*writes)
     refreshes = [{"refresh": number, "foreground_ms": 10.0 * scale * number,
+                  "base_ms": 4.0 * scale * number, "forward_ms": 0.5 * scale * number,
                   "index_ms": 1.0 * scale * number, "q3_ms": 2.0 * scale * number,
                   "combined_maintenance_ms": 3.0 * scale * number}
                  for number in (1, 2)]
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
+        "measurement_version": 3,
         "refreshes": refreshes,
         "sequence": {
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
@@ -79,6 +81,10 @@ class SummarizeTest(unittest.TestCase):
         # Sum over the two refreshes of foreground_ms: 10 * scale * (1 + 2).
         self.assertEqual(native["metrics"]["refresh_foreground_ms"]["median"], 60.0)
         self.assertEqual(native["metrics"]["refresh_combined_maintenance_ms"]["max"], 27.0)
+        # The base circuit and the forwarding are summed apart from the IVM figure:
+        # base_ms is 4 * scale * (1 + 2), forward_ms is 0.5 * scale * (1 + 2).
+        self.assertEqual(native["metrics"]["refresh_base_ms"]["median"], 24.0)
+        self.assertEqual(native["metrics"]["refresh_forward_ms"]["median"], 3.0)
         self.assertEqual(native["metrics"]["write_operations_base_relation"]["median"], 2)
         self.assertEqual(native["metrics"]["write_bytes_total"]["median"], 300)
         self.assertEqual(native["metrics"]["observed_storage_bytes"]["max"], 1003)
@@ -149,6 +155,18 @@ class SummarizeTest(unittest.TestCase):
         content = copy.deepcopy(base)
         content["runs"][0]["driver"]["refreshes"] = []
         self.failing(content, "no refreshes")
+
+    def test_older_measurement_versions_are_an_error(self) -> None:
+        # Version 2 timed the base tables' maintenance inside q3_ms.
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][0]["driver"]["measurement_version"] = 2
+        self.failing(content, "native run 1: measurement_version is 2, not 3")
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        del content["runs"][1]["driver"]["measurement_version"]
+        self.failing(content, "merged-index run 1: measurement_version is None, not 3")
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
+        self.failing(content, "native run 1 refresh 1: missing field base_ms")
 
     def test_inconsistent_write_attribution_is_an_error(self) -> None:
         content = manifest({"native": [1.0], "merged-index": [1.0]})

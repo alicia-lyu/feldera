@@ -25,7 +25,7 @@ use dbsp::storage::file::writer::{
     ELIDED_VALUE_HEADER_BLOCKS, FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS,
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
-use dbsp_adapters::{CircuitCatalog, RecordFormat};
+use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
 use merged_index_col::q3::Q3State;
@@ -33,6 +33,15 @@ use merged_index_col::q3::Q3State;
 use reconstruction::ManualIndex;
 use serde_json::{json, Value};
 use size_of::SizeOf;
+
+// The generated circuit crates define no allocator, because a binary links only one. These
+// are the definitions that the compiler emits at the top of every generated circuit.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
 struct Joined {
@@ -142,11 +151,6 @@ impl Change {
         self.customers.len() + self.orders.len() + self.lines.len()
     }
 
-    #[cfg(test)]
-    fn apply(self, state: &mut Reference, input: &mut Inputs) -> Result<()> {
-        self.apply_optional(Some(state), input)
-    }
-
     fn apply_optional(self, mut state: Option<&mut Reference>, input: &mut Inputs) -> Result<()> {
         for (row, insert) in self.customers {
             input.customer(&row, insert)?;
@@ -184,14 +188,26 @@ impl Change {
     }
 }
 
+/// How a deletion names its row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteStyle {
+    /// A primary-key table needs only the key (the base circuit's input maps).
+    ByKey,
+    /// A keyless Z-set needs the whole row, because the delete is a `-1` of that row
+    /// (the view circuit's inputs).
+    WholeRow,
+}
+
+/// The JSON input streams of one circuit's three tables.
 struct Inputs {
     customers: Box<dyn dbsp_adapters::DeCollectionStream>,
     orders: Box<dyn dbsp_adapters::DeCollectionStream>,
     lines: Box<dyn dbsp_adapters::DeCollectionStream>,
+    deletes: DeleteStyle,
 }
 
 impl Inputs {
-    fn new(catalog: &impl CircuitCatalog) -> Result<Self> {
+    fn new(catalog: &impl CircuitCatalog, deletes: DeleteStyle) -> Result<Self> {
         let input = |name: &str| -> Result<Box<dyn dbsp_adapters::DeCollectionStream>> {
             Ok(catalog
                 .input_collection_handle(&SqlIdentifier::from(name))
@@ -203,6 +219,7 @@ impl Inputs {
             customers: input("CUSTOMER")?,
             orders: input("ORDERS")?,
             lines: input("LINEITEM")?,
+            deletes,
         })
     }
 
@@ -220,43 +237,112 @@ impl Inputs {
         Ok(())
     }
 
+    fn whole_row(&self, insert: bool) -> bool {
+        insert || self.deletes == DeleteStyle::WholeRow
+    }
+
     fn customer(&mut self, row: &Customer, insert: bool) -> Result<()> {
-        Self::submit(
-            &mut *self.customers,
-            if insert {
-                row.json()
-            } else {
-                json!({"c_custkey": row.key})
-            },
-            insert,
-        )
+        let json = if self.whole_row(insert) {
+            row.json()
+        } else {
+            json!({"c_custkey": row.key})
+        };
+        Self::submit(&mut *self.customers, json, insert)
     }
     fn order(&mut self, row: &Order, insert: bool) -> Result<()> {
-        Self::submit(
-            &mut *self.orders,
-            if insert {
-                row.json()
-            } else {
-                json!({"o_orderkey": row.key})
-            },
-            insert,
-        )
+        let json = if self.whole_row(insert) {
+            row.json()
+        } else {
+            json!({"o_orderkey": row.key})
+        };
+        Self::submit(&mut *self.orders, json, insert)
     }
     fn line(&mut self, row: &Line, insert: bool) -> Result<()> {
-        Self::submit(
-            &mut *self.lines,
-            if insert {
-                row.json()
-            } else {
-                json!({"l_orderkey": row.order_key, "l_linenumber": row.number})
-            },
-            insert,
-        )
+        let json = if self.whole_row(insert) {
+            row.json()
+        } else {
+            json!({"l_orderkey": row.order_key, "l_linenumber": row.number})
+        };
+        Self::submit(&mut *self.lines, json, insert)
     }
     fn flush(&mut self) {
         self.customers.flush();
         self.orders.flush();
         self.lines.flush();
+    }
+}
+
+/// One circuit with its catalog and the input streams of its tables.
+struct Stage {
+    circuit: dbsp::DBSPHandle,
+    catalog: Catalog,
+    inputs: Inputs,
+}
+
+impl Stage {
+    fn new((circuit, catalog): (dbsp::DBSPHandle, Catalog), deletes: DeleteStyle) -> Result<Self> {
+        let inputs = Inputs::new(&catalog, deletes)?;
+        Ok(Self {
+            circuit,
+            catalog,
+            inputs,
+        })
+    }
+
+    /// Runs `f` with this stage's buffer cache bound to the calling thread, so that reads of
+    /// this circuit's files are charged to its cache and not to the other circuit's.
+    fn in_cache<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.circuit.runtime().with_buffer_cache(0, f)
+    }
+}
+
+/// The two chained circuits, each timed on its own.
+///
+/// A transaction runs first on `base`, which holds the base relations in primary-key input
+/// maps. The net change of those relations is then forwarded to `view`, which maintains `V`.
+/// In reconstructed mode the forwarded change also feeds the merged index, which stands in for
+/// the view circuit's join traces.
+struct Pipeline {
+    base: Stage,
+    view: Stage,
+    #[cfg(feature = "merged-index")]
+    index: ManualIndex,
+    #[cfg(feature = "merged-index")]
+    q3_state: Q3State,
+}
+
+impl Pipeline {
+    /// Builds both circuits; each has its own runtime, and so its own storage and buffer cache.
+    fn new(base_config: CircuitConfig, view_config: CircuitConfig) -> Result<Self> {
+        let base = Stage::new(q3_base_circuit::circuit(base_config)?, DeleteStyle::ByKey)?;
+        workload::enable_net_delta(&base.catalog)?;
+        #[cfg(feature = "merged-index")]
+        let q3_state = Q3State::default();
+        #[cfg(feature = "merged-index")]
+        let view_circuit = q3_view_circuit::circuit(view_config, q3_state.clone())?;
+        #[cfg(not(feature = "merged-index"))]
+        let view_circuit = q3_view_circuit::circuit(view_config)?;
+        let view = Stage::new(view_circuit, DeleteStyle::WholeRow)?;
+        // The index replaces the view circuit's join traces, so it belongs to its runtime.
+        #[cfg(feature = "merged-index")]
+        let index = ManualIndex::new(view.circuit.runtime());
+        Ok(Self {
+            base,
+            view,
+            #[cfg(feature = "merged-index")]
+            index,
+            #[cfg(feature = "merged-index")]
+            q3_state,
+        })
+    }
+
+    /// Both circuits with `workers` workers and memory-backed state.
+    #[cfg(test)]
+    fn with_workers(workers: usize) -> Result<Self> {
+        Self::new(
+            CircuitConfig::with_workers(workers),
+            CircuitConfig::with_workers(workers),
+        )
     }
 }
 
@@ -293,9 +379,16 @@ fn difference(
 
 #[derive(Default)]
 struct Measurements {
+    /// Reading refresh files, validating, and loading the change into the base circuit.
     preparation: Duration,
-    native: Duration,
+    /// The base circuit's transaction.
+    base: Duration,
+    /// Reading the base tables' net delta and feeding it to the view circuit's inputs.
+    forward: Duration,
+    /// Appending the net delta to the merged index (reconstructed mode).
     index: Duration,
+    /// The view circuit's transaction: delta accumulation, joins and `V`.
+    view_circuit: Duration,
     discovery: Duration,
     publication_cleanup: Duration,
     foreground: Duration,
@@ -308,25 +401,15 @@ struct Measurements {
     view_rows: Option<i64>,
 }
 
-#[cfg_attr(
-    feature = "merged-index",
-    expect(
-        clippy::too_many_arguments,
-        reason = "coordinates the circuit, optional validation, and external index owners"
-    )
-)]
+/// Applies `change` to the base circuit, forwards the base tables' net delta to the view
+/// circuit (and, in reconstructed mode, to the merged index), and runs the view circuit.
 fn transact_inner(
-    circuit: &mut dbsp::DBSPHandle,
-    catalog: &impl CircuitCatalog,
-    input: &mut Inputs,
+    pipeline: &mut Pipeline,
     mut state: Option<&mut Reference>,
     change: Change,
     check: Option<(&workload::BaseState, bool)>,
     stats: &mut Measurements,
-    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
 ) -> Result<()> {
-    #[cfg(feature = "merged-index")]
-    let (index, q3_state) = reconstruction;
     let verification_started = Instant::now();
     let before = state
         .as_ref()
@@ -336,6 +419,8 @@ fn transact_inner(
     stats.verification += verification_started.elapsed();
     let foreground_started = Instant::now();
     stats.rows += change.len();
+
+    // Check the change, then load it into the base circuit's input maps.
     let preparation_started = Instant::now();
     if let Some((base, discovered)) = check {
         if discovered {
@@ -344,41 +429,53 @@ fn transact_inner(
             base.validate(&change)?;
         }
     }
-    #[cfg(feature = "merged-index")]
-    let (placements, index_rows) = reconstruction::prepare(&change)?;
+    change.apply_optional(None, &mut pipeline.base.inputs)?;
+    stats.preparation += preparation_started.elapsed();
+
+    let base_started = Instant::now();
+    pipeline.base.circuit.transaction()?;
+    stats.base += base_started.elapsed();
+
+    // The base circuit's delta streams hold the net change of each base table: an upsert that
+    // replaces a row appears as a deletion of the old row and an insertion of the new one.
+    let forward_started = Instant::now();
+    let net_delta = workload::net_delta(&pipeline.base.catalog)?;
+    stats.forward += forward_started.elapsed();
+
+    // The index and the view circuit's joins see the same net delta.
     #[cfg(feature = "merged-index")]
     {
+        let preparation_started = Instant::now();
+        let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
         stats.preparation += preparation_started.elapsed();
-    }
-    #[cfg(feature = "merged-index")]
-    {
         let index_started = Instant::now();
-        let (before_index, after_index) = index.append(index_rows)?;
+        let (before_index, after_index) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         let publish_started = Instant::now();
-        q3_state
+        pipeline
+            .q3_state
             .publish(before_index, after_index, placements)
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
-    #[cfg(feature = "merged-index")]
-    let preparation_started = Instant::now();
-    change.apply_optional(None, input)?;
-    stats.preparation += preparation_started.elapsed();
-    let native_started = Instant::now();
-    let transaction_result = circuit.transaction();
-    let latency = native_started.elapsed();
+    let feed_started = Instant::now();
+    net_delta.apply_optional(None, &mut pipeline.view.inputs)?;
+    stats.forward += feed_started.elapsed();
+
+    let view_started = Instant::now();
+    let transaction_result = pipeline.view.circuit.transaction();
+    let latency = view_started.elapsed();
     #[cfg(feature = "merged-index")]
     let finish_result = {
         let cleanup_started = Instant::now();
-        let result = q3_state.finish().map_err(anyhow::Error::msg);
+        let result = pipeline.q3_state.finish().map_err(anyhow::Error::msg);
         stats.publication_cleanup += cleanup_started.elapsed();
         result
     };
     transaction_result?;
     #[cfg(feature = "merged-index")]
     finish_result?;
-    stats.native += latency;
+    stats.view_circuit += latency;
     stats.latencies.push(latency);
     stats.transactions += 1;
     stats.foreground += foreground_started.elapsed();
@@ -387,10 +484,14 @@ fn transact_inner(
         // Reference maintenance belongs exclusively to independent validation.
         update_reference(state, change);
         let after = state.evaluate();
-        let output = catalog
+        let output = pipeline
+            .view
+            .catalog
             .output_handles(&SqlIdentifier::from("V"))
             .context("missing V output")?;
-        let actual_delta = read_output(&*output.delta_handle)?;
+        let actual_delta = pipeline
+            .view
+            .in_cache(|| read_output(&*output.delta_handle))?;
         let expected_delta = difference(&before, &after);
         if actual_delta != expected_delta {
             bail!("emitted delta differs from independent full join: actual {actual_delta:?}, expected {expected_delta:?}");
@@ -399,7 +500,7 @@ fn transact_inner(
             .integrate_handle
             .as_ref()
             .context("V has no materialized snapshot")?;
-        let actual_state = read_output(&**snapshot)?;
+        let actual_state = pipeline.view.in_cache(|| read_output(&**snapshot))?;
         if actual_state != after {
             bail!("materialized V differs from independent full join: actual {actual_state:?}, expected {after:?}");
         }
@@ -415,7 +516,9 @@ fn transact_inner(
         stats.view_rows = Some(after.values().sum());
     } else {
         let cleanup_started = Instant::now();
-        let output = catalog
+        let output = pipeline
+            .view
+            .catalog
             .output_handles(&SqlIdentifier::from("V"))
             .context("missing V output")?;
         let _ = output.delta_handle.concat();
@@ -455,34 +558,102 @@ fn update_reference(state: &mut Reference, change: Change) {
 }
 
 #[cfg(test)]
-#[cfg_attr(
-    feature = "merged-index",
-    expect(
-        clippy::too_many_arguments,
-        reason = "test helper preserves existing circuit transaction fixtures"
-    )
-)]
 fn transact(
-    circuit: &mut dbsp::DBSPHandle,
-    catalog: &impl CircuitCatalog,
-    input: &mut Inputs,
+    pipeline: &mut Pipeline,
     state: &mut Reference,
     change: Change,
     verify: bool,
     stats: &mut Measurements,
-    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
 ) -> Result<()> {
-    transact_inner(
-        circuit,
-        catalog,
-        input,
-        verify.then_some(state),
-        change,
-        None,
-        stats,
-        #[cfg(feature = "merged-index")]
-        reconstruction,
-    )
+    transact_inner(pipeline, verify.then_some(state), change, None, stats)
+}
+
+/// Splits a change into the three steps of a multi-step transaction: customers and orders,
+/// then each half of the lines.
+#[cfg(test)]
+fn steps_of(change: &Change) -> [Change; 3] {
+    let middle = change.lines.len() / 2;
+    [
+        Change {
+            customers: change.customers.clone(),
+            orders: change.orders.clone(),
+            ..Change::default()
+        },
+        Change {
+            lines: change.lines[..middle].to_vec(),
+            ..Change::default()
+        },
+        Change {
+            lines: change.lines[middle..].to_vec(),
+            ..Change::default()
+        },
+    ]
+}
+
+/// Runs `change` on the base circuit, as one transaction of three steps when `stepped`, and
+/// returns the base tables' net delta.
+#[cfg(test)]
+fn run_base(
+    pipeline: &mut Pipeline,
+    state: &mut Reference,
+    change: Change,
+    stepped: bool,
+) -> Result<Change> {
+    if stepped {
+        pipeline.base.circuit.start_transaction()?;
+        for step in steps_of(&change) {
+            step.apply_optional(Some(state), &mut pipeline.base.inputs)?;
+            assert!(!pipeline.base.circuit.step()?);
+        }
+        pipeline.base.circuit.commit_transaction()?;
+    } else {
+        change.apply_optional(Some(state), &mut pipeline.base.inputs)?;
+        pipeline.base.circuit.transaction()?;
+    }
+    workload::net_delta(&pipeline.base.catalog)
+}
+
+/// Appends the net delta to the merged index and publishes the before and after snapshots,
+/// as `transact_inner` does before the view circuit runs.
+#[cfg(all(test, feature = "merged-index"))]
+fn publish_net_delta(pipeline: &Pipeline, net_delta: &Change) -> Result<()> {
+    let (placements, index_rows) = reconstruction::prepare(net_delta)?;
+    let (before, after) = pipeline.index.append(index_rows)?;
+    pipeline
+        .q3_state
+        .publish(before, after, placements)
+        .map_err(anyhow::Error::msg)
+}
+
+/// Runs the net delta on the view circuit, as one transaction of three steps when `stepped`.
+/// In reconstructed mode the caller has published the delta, and the publication is finished
+/// here.
+#[cfg(test)]
+fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result<()> {
+    if stepped {
+        pipeline.view.circuit.start_transaction()?;
+        for step in steps_of(&net_delta) {
+            step.apply_optional(None, &mut pipeline.view.inputs)?;
+            assert!(!pipeline.view.circuit.step()?);
+        }
+        pipeline.view.circuit.commit_transaction()?;
+    } else {
+        net_delta.apply_optional(None, &mut pipeline.view.inputs)?;
+        pipeline.view.circuit.transaction()?;
+    }
+    #[cfg(feature = "merged-index")]
+    pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// Like `transact`, but each circuit runs the change as one transaction of three steps: the
+/// base circuit takes the change, and the view circuit takes the net delta in the same steps.
+/// The merged index is published once, and every step of the view transaction shares it.
+#[cfg(all(test, feature = "merged-index"))]
+fn transact_in_steps(pipeline: &mut Pipeline, state: &mut Reference, change: Change) -> Result<()> {
+    let net_delta = run_base(pipeline, state, change, true)?;
+    publish_net_delta(pipeline, &net_delta)?;
+    run_view(pipeline, net_delta, true)
 }
 
 fn latency_summary(latencies: &[Duration]) -> String {
@@ -700,6 +871,9 @@ impl Config {
             .is_some_and(|n| n == 0 || n % (1024 * 1024) != 0)
         {
             bail!("cache capacity must be a positive whole number of MiB");
+        }
+        if config.cache_bytes.is_some_and(|n| n < 2 * 1024 * 1024) {
+            bail!("cache capacity must be at least 2 MiB: each of the two circuits gets a share");
         }
         if config.memory_target_bytes == Some(0) {
             bail!("memory pressure target must be positive");
@@ -921,37 +1095,32 @@ fn dump_runtime_circuit(circuit: &mut dbsp::DBSPHandle, directory: &Path) -> Res
     Ok(())
 }
 
-fn wait_for_loading_merges(
-    circuit: &mut dbsp::DBSPHandle,
-    timeout: Duration,
-    #[cfg(feature = "merged-index")] index: &ManualIndex,
-) -> Result<Duration> {
+fn wait_for_loading_merges(pipeline: &mut Pipeline, timeout: Duration) -> Result<Duration> {
     let started = Instant::now();
     measurement::drain_until(timeout.saturating_sub(started.elapsed()), || {
-        let complete = circuit.is_background_merge_idle()?;
+        let complete = pipeline.base.circuit.is_background_merge_idle()?
+            && pipeline.view.circuit.is_background_merge_idle()?;
         #[cfg(feature = "merged-index")]
-        let complete = complete && index.is_background_merge_idle()?;
+        let complete = complete && pipeline.index.is_background_merge_idle()?;
         Ok(complete)
     })?;
     Ok(started.elapsed())
 }
 
-/// Requests full compaction of the circuit and the merged index, waits for
-/// compaction to finish, and reports what that setup cost.
-fn setup_full_compaction(
-    circuit: &mut dbsp::DBSPHandle,
-    timeout: Duration,
-    #[cfg(feature = "merged-index")] index: &ManualIndex,
-) -> Result<Value> {
+/// Requests full compaction of both circuits and the merged index, waits for compaction to
+/// finish, and reports what that setup cost.
+fn setup_full_compaction(pipeline: &mut Pipeline, timeout: Duration) -> Result<Value> {
     let before = measurement::ResourceSnapshot::capture()?;
     let started = Instant::now();
-    circuit.start_compaction()?;
+    pipeline.base.circuit.start_compaction()?;
+    pipeline.view.circuit.start_compaction()?;
     #[cfg(feature = "merged-index")]
-    index.start_compaction()?;
+    pipeline.index.start_compaction()?;
     let wait = measurement::drain_until(timeout, || {
-        let complete = circuit.is_compaction_complete()?;
+        let complete = pipeline.base.circuit.is_compaction_complete()?
+            && pipeline.view.circuit.is_compaction_complete()?;
         #[cfg(feature = "merged-index")]
-        let complete = complete && index.is_compaction_complete()?;
+        let complete = complete && pipeline.index.is_compaction_complete()?;
         Ok(complete)
     })?;
     let elapsed = started.elapsed();
@@ -963,78 +1132,78 @@ fn setup_full_compaction(
     }))
 }
 
-/// Publish current batches to Catalog without changing logical input.
-/// Loading waits for normally scheduled merges. It requests full compaction
-/// only when `full_compaction` is set, and then before publication, so the
-/// published snapshots hold the compacted runs. Returns the time spent
-/// outside setup compaction and the setup compaction's cost, if any.
+/// Publishes the current batches of both circuits to their catalogs without changing the
+/// logical input. Loading waits for normally scheduled merges. It requests full compaction
+/// only when `full_compaction` is set, and then before publication, so the published snapshots
+/// hold the compacted runs. Returns the time spent outside setup compaction and the setup
+/// compaction's cost, if any.
 fn finish_loading(
-    circuit: &mut dbsp::DBSPHandle,
-    catalog: &impl CircuitCatalog,
+    pipeline: &mut Pipeline,
     base: &mut workload::BaseState,
     timeout: Duration,
     full_compaction: bool,
-    #[cfg(feature = "merged-index")] reconstruction: (&ManualIndex, &Q3State),
 ) -> Result<(Duration, Option<Value>)> {
     let started = Instant::now();
-    #[cfg(feature = "merged-index")]
-    let (index, q3_state) = reconstruction;
-    wait_for_loading_merges(
-        circuit,
-        timeout,
-        #[cfg(feature = "merged-index")]
-        index,
-    )?;
+    wait_for_loading_merges(pipeline, timeout)?;
     let setup_compaction_started = Instant::now();
     let setup_compaction = full_compaction
-        .then(|| {
-            setup_full_compaction(
-                circuit,
-                timeout.saturating_sub(started.elapsed()),
-                #[cfg(feature = "merged-index")]
-                index,
-            )
-        })
+        .then(|| setup_full_compaction(pipeline, timeout.saturating_sub(started.elapsed())))
         .transpose()?;
     let setup_compaction_elapsed = setup_compaction_started.elapsed();
-    for name in ["CUSTOMER", "ORDERS", "LINEITEM", "V"] {
-        let output = catalog
-            .output_handles(&SqlIdentifier::from(name))
-            .context("missing output")?;
-        drop(
-            output
-                .integrate_handle
-                .as_ref()
-                .context("missing integrated output")?
-                .take_from_all(),
-        );
+    for (stage, names) in [
+        (
+            &pipeline.base,
+            ["CUSTOMER", "ORDERS", "LINEITEM"].as_slice(),
+        ),
+        (&pipeline.view, ["V"].as_slice()),
+    ] {
+        for name in names {
+            let output = stage
+                .catalog
+                .output_handles(&SqlIdentifier::from(*name))
+                .context("missing output")?;
+            drop(
+                output
+                    .integrate_handle
+                    .as_ref()
+                    .context("missing integrated output")?
+                    .take_from_all(),
+            );
+        }
     }
     #[cfg(feature = "merged-index")]
     {
-        let snapshot = index.snapshot()?;
-        q3_state
+        let snapshot = pipeline.index.snapshot()?;
+        pipeline
+            .q3_state
             .publish(snapshot.clone(), snapshot, BTreeMap::new())
             .map_err(anyhow::Error::msg)?;
     }
-    let transaction = circuit.transaction();
+    let base_transaction = pipeline.base.circuit.transaction();
+    let view_transaction = pipeline.view.circuit.transaction();
     #[cfg(feature = "merged-index")]
-    let finish = q3_state.finish().map_err(anyhow::Error::msg);
-    transaction?;
+    let finish = pipeline.q3_state.finish().map_err(anyhow::Error::msg);
+    base_transaction?;
+    view_transaction?;
     #[cfg(feature = "merged-index")]
     finish?;
-    *base = workload::BaseState::new(catalog)?;
-    for name in ["CUSTOMER", "ORDERS", "LINEITEM", "V", "ERROR_VIEW"] {
-        let output = catalog
-            .output_handles(&SqlIdentifier::from(name))
-            .context("missing output")?;
-        drop(output.delta_handle.concat());
+    *base = workload::BaseState::new(&pipeline.base.catalog)?;
+    for (stage, names) in [
+        (
+            &pipeline.base,
+            ["CUSTOMER", "ORDERS", "LINEITEM", "ERROR_VIEW"].as_slice(),
+        ),
+        (&pipeline.view, ["V", "ERROR_VIEW"].as_slice()),
+    ] {
+        for name in names {
+            let output = stage
+                .catalog
+                .output_handles(&SqlIdentifier::from(*name))
+                .context("missing output")?;
+            drop(output.delta_handle.concat());
+        }
     }
-    wait_for_loading_merges(
-        circuit,
-        timeout.saturating_sub(started.elapsed()),
-        #[cfg(feature = "merged-index")]
-        index,
-    )?;
+    wait_for_loading_merges(pipeline, timeout.saturating_sub(started.elapsed()))?;
     // Setup compaction is reported on its own, not as background merge wait.
     Ok((
         started.elapsed().saturating_sub(setup_compaction_elapsed),
@@ -1042,26 +1211,36 @@ fn finish_loading(
     ))
 }
 
+/// The phases of a refresh (measurement version 3).
+///
+/// `base_ms`, `forward_ms`, `index_ms` and `q3_ms` are disjoint intervals of the transaction.
+/// `combined_maintenance_ms` is the incremental view maintenance: the merged index and the
+/// view circuit. Base-table maintenance is reported beside it and is not part of it.
 fn phase_json(stats: &Measurements) -> Value {
     json!({
         "rows": stats.rows,
         "transactions": stats.transactions,
         "discovery_ms": milliseconds(stats.discovery),
         "checks_input_preparation_ms": milliseconds(stats.preparation),
+        "base_ms": milliseconds(stats.base),
+        "forward_ms": milliseconds(stats.forward),
         "index_ms": milliseconds(stats.index),
-        "q3_ms": milliseconds(stats.native),
+        "q3_ms": milliseconds(stats.view_circuit),
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
-        "combined_maintenance_ms": milliseconds(stats.index + stats.native),
-        "combined_maintenance_note": "index_ms + q3_ms excludes discovery, preparation and publication/cleanup",
+        "combined_maintenance_ms": milliseconds(stats.index + stats.view_circuit),
+        "combined_maintenance_note": "index_ms + q3_ms; q3_ms is the view circuit alone. base_ms (the base tables' circuit) and forward_ms (net delta read and feed) are reported beside it and not added. Discovery, preparation and publication/cleanup are excluded.",
         "verification_ms_excluded": milliseconds(stats.verification),
     })
 }
 
-/// Inspect the actual batches behind Catalog snapshots, without scanning rows.
-fn storage_evidence(base: &workload::BaseState, catalog: &impl CircuitCatalog) -> Result<Value> {
+/// Inspects the actual batches behind the catalogs' snapshots, without scanning rows: the base
+/// relations from the base circuit and `V` from the view circuit.
+fn storage_evidence(base: &workload::BaseState, pipeline: &Pipeline) -> Result<Value> {
     let mut evidence = base.storage_evidence();
-    let reader = catalog
+    let reader = pipeline
+        .view
+        .catalog
         .output_handles(&SqlIdentifier::from("V"))
         .context("missing V materialization")?
         .integrate_handle
@@ -1072,22 +1251,31 @@ fn storage_evidence(base: &workload::BaseState, catalog: &impl CircuitCatalog) -
     Ok(Value::Object(evidence))
 }
 
-fn run(config: &Config, run_number: usize) -> Result<()> {
-    let started = Instant::now();
-    let timeout = Duration::from_secs_f64(config.compaction_timeout_secs);
+/// Splits the buffer cache between the two circuits' runtimes: the base circuit takes half the
+/// MiB rounded down, the view circuit the rest.
+fn split_cache_mib(cache_bytes: Option<usize>) -> (Option<usize>, Option<usize>) {
+    match cache_bytes {
+        Some(bytes) => {
+            let mib = bytes / (1024 * 1024);
+            (Some(mib / 2), Some(mib - mib / 2))
+        }
+        None => (None, None),
+    }
+}
+
+/// The configuration of one circuit. Both circuits get the same worker count and memory-pressure
+/// target; they differ in storage directory and buffer cache.
+fn circuit_config(
+    config: &Config,
+    storage_path: Option<&Path>,
+    cache_mib: Option<usize>,
+) -> Result<CircuitConfig> {
     let mut circuit_config =
         CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
     circuit_config.dev_tweaks.fetch_join = Some(config.r5);
     circuit_config.dev_tweaks.front_code_byte_keys = Some(config.front_code_byte_keys);
     circuit_config.dev_tweaks.elide_value_headers = Some(config.elide_value_headers);
-    let storage_path = config
-        .storage_path
-        .as_ref()
-        .map(|root| root.join(format!("run-{run_number}")));
-    if let Some(path) = &storage_path {
-        if path.exists() {
-            bail!("storage directory already exists: {}", path.display());
-        }
+    if let Some(path) = storage_path {
         std::fs::create_dir_all(path)?;
         circuit_config = circuit_config.with_storage(Some(CircuitStorageConfig::for_config(
             StorageConfig {
@@ -1096,12 +1284,42 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
             StorageOptions {
                 min_storage_bytes: Some(0),
-                cache_mib: config.cache_bytes.map(|bytes| bytes / (1024 * 1024)),
+                cache_mib,
                 compression: feldera_types::config::StorageCompression::None,
                 ..StorageOptions::default()
             },
         )?));
     }
+    Ok(circuit_config)
+}
+
+/// The two circuits' storage directories under one run's storage root.
+const BASE_STORAGE_DIRECTORY: &str = "base";
+const Q3_STORAGE_DIRECTORY: &str = "q3";
+
+fn run(config: &Config, run_number: usize) -> Result<()> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs_f64(config.compaction_timeout_secs);
+    let storage_root = config
+        .storage_path
+        .as_ref()
+        .map(|root| root.join(format!("run-{run_number}")));
+    if let Some(path) = &storage_root {
+        if path.exists() {
+            bail!("storage directory already exists: {}", path.display());
+        }
+        std::fs::create_dir_all(path)?;
+    }
+    // Each circuit has its own runtime, and a storage directory is locked by one runtime.
+    let base_storage = storage_root
+        .as_ref()
+        .map(|root| root.join(BASE_STORAGE_DIRECTORY));
+    let q3_storage = storage_root
+        .as_ref()
+        .map(|root| root.join(Q3_STORAGE_DIRECTORY));
+    let (base_cache_mib, q3_cache_mib) = split_cache_mib(config.cache_bytes);
+    let base_config = circuit_config(config, base_storage.as_deref(), base_cache_mib)?;
+    let q3_config = circuit_config(config, q3_storage.as_deref(), q3_cache_mib)?;
     // Diagnostics must be on before any spine exists, so that all are registered.
     let diagnostics = config
         .diagnostics
@@ -1117,24 +1335,17 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             )
         })
         .transpose()?;
-    #[cfg(feature = "merged-index")]
-    let q3_state = Q3State::default();
-    #[cfg(feature = "merged-index")]
-    let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config, q3_state.clone())?;
-    #[cfg(not(feature = "merged-index"))]
-    let (mut circuit, catalog) = q3_ivm_baseline::circuit(circuit_config)?;
-    let runtime = circuit.runtime().clone();
-    runtime.with_buffer_cache(0, || {
-    #[cfg(feature = "merged-index")]
-    let index = ManualIndex::new(circuit.runtime());
-    let sampler = storage_path
+    let mut pipeline = Pipeline::new(base_config, q3_config)?;
+    let base_runtime = pipeline.base.circuit.runtime().clone();
+    // The driver thread reads base state; reads of the view circuit's state bind its cache.
+    base_runtime.with_buffer_cache(0, || {
+    let sampler = storage_root
         .clone()
         .map(measurement::StorageSampler::start)
         .transpose()?;
-    let mut inputs = Inputs::new(&catalog)?;
     let mut state = config.verify.then(Reference::default);
     let mut stats = Measurements::default();
-    let mut base = workload::BaseState::new(&catalog)?;
+    let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
     let load = workload::load_batches(
         config.customer.as_deref().context("--customer required")?,
         config.orders.as_deref().context("--orders required")?,
@@ -1142,43 +1353,37 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         config.batch,
         |batch| {
             transact_inner(
-                &mut circuit,
-                &catalog,
-                &mut inputs,
+                &mut pipeline,
                 state.as_mut(),
                 batch,
                 Some((&base, false)),
                 &mut stats,
-                #[cfg(feature = "merged-index")]
-                (&index, &q3_state),
             )?;
-            base = workload::BaseState::new(&catalog)?;
+            base = workload::BaseState::new(&pipeline.base.catalog)?;
             Ok(())
         },
     )?;
     let (load_drain, setup_compaction) = finish_loading(
-        &mut circuit,
-        &catalog,
+        &mut pipeline,
         &mut base,
         timeout,
         config.setup_full_compaction,
-        #[cfg(feature = "merged-index")]
-        (&index, &q3_state),
     )?;
-    let load_storage = storage_evidence(&base, &catalog)?;
-    let load_observed_storage_bytes = storage_path
+    let load_storage = storage_evidence(&base, &pipeline)?;
+    let load_observed_storage_bytes = storage_root
         .as_deref()
         .map(measurement::storage_size_bytes)
         .transpose()?;
     let load_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
     let load_elapsed = started.elapsed();
     let load_rows = load.customer_rows + load.order_rows + load.line_rows;
-    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
-        stats.transactions, config.verify, milliseconds(stats.native), milliseconds(stats.preparation),
+    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} base_ms={:.3} forward_ms={:.3} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
+        stats.transactions, config.verify, milliseconds(stats.base), milliseconds(stats.forward),
+        milliseconds(stats.view_circuit), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
     let refresh_list = refreshes(config)?;
-    let sampler = storage_path
+    let sampler = storage_root
         .clone()
         .map(measurement::StorageSampler::start)
         .transpose()?;
@@ -1198,11 +1403,13 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let (change, absent, phase, discovered) = if let Some(path) = refresh.rf2 {
             let keys: HashSet<_> = rows(&path, data::delete_order_key)?.into_iter().collect();
             #[cfg(feature = "merged-index")]
-            let snapshot = index.snapshot()?;
+            let snapshot = pipeline.index.snapshot()?;
             let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
                 #[cfg(feature = "merged-index")]
                 {
-                    reconstruction::lines(&snapshot, order)
+                    pipeline
+                        .view
+                        .in_cache(|| reconstruction::lines(&snapshot, order))
                 }
                 #[cfg(not(feature = "merged-index"))]
                 {
@@ -1254,18 +1461,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let maximum_fanout = fanout.values().max().copied().unwrap_or(0);
         measurement.preparation += workload_stats_started.elapsed();
         transact_inner(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
+            &mut pipeline,
             state.as_mut(),
             change,
             Some((&base, discovered)),
             &mut measurement,
-            #[cfg(feature = "merged-index")]
-            (&index, &q3_state),
         )?;
         let cleanup_started = Instant::now();
-        base = workload::BaseState::new(&catalog)?;
+        base = workload::BaseState::new(&pipeline.base.catalog)?;
         drop(customers);
         drop(fanout);
         measurement.publication_cleanup += cleanup_started.elapsed();
@@ -1308,45 +1511,58 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let sequence_elapsed = sequence_finished
         .duration_since(sequence_started)
         .saturating_sub(verification_time);
-    let observed_storage_bytes = storage_path
+    let observed_storage_bytes = storage_root
         .as_deref()
         .map(measurement::storage_size_bytes)
         .transpose()?;
+    let observed = |path: &Option<PathBuf>| {
+        path.as_deref()
+            .map(measurement::storage_size_bytes)
+            .transpose()
+    };
+    let base_storage_bytes = observed(&base_storage)?;
+    let q3_storage_bytes = observed(&q3_storage)?;
     let sampled_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
-    let (cache_occupancy, cache_capacity) = circuit.runtime().cache_occupancy();
+    let (base_cache_occupancy, base_cache_capacity) = pipeline.base.circuit.runtime().cache_occupancy();
+    let (q3_cache_occupancy, q3_cache_capacity) = pipeline.view.circuit.runtime().cache_occupancy();
     #[cfg(feature = "merged-index")]
-    let manual_storage = Some(index.storage_evidence()?);
+    let manual_storage = Some(pipeline.index.storage_evidence()?);
     #[cfg(not(feature = "merged-index"))]
     let manual_storage: Option<Value> = None;
     let manual_file_backed = manual_storage.as_ref().map(|evidence| &evidence["file_backed"]);
-    let profile = circuit.retrieve_profile()?;
-    let graph = circuit.graph_profile()?.worker_graphs[0].to_json();
-    if cfg!(feature = "merged-index") && graph.contains("shard_accumulate_trace") {
+    let base_profile = pipeline.base.circuit.retrieve_profile()?;
+    let q3_profile = pipeline.view.circuit.retrieve_profile()?;
+    let base_graph = pipeline.base.circuit.graph_profile()?.worker_graphs[0].to_json();
+    let q3_graph = pipeline.view.circuit.graph_profile()?.worker_graphs[0].to_json();
+    if cfg!(feature = "merged-index") && q3_graph.contains("shard_accumulate_trace") {
         bail!("replaced historical join trace remains in reconstructed circuit");
     }
     if let Some(path) = &config.report {
-        std::fs::write(path.with_extension("profile.json"), profile.as_json())?;
-        std::fs::write(path.with_extension("graph.json"), &graph)?;
+        std::fs::write(path.with_extension("base.profile.json"), base_profile.as_json())?;
+        std::fs::write(path.with_extension("q3.profile.json"), q3_profile.as_json())?;
+        std::fs::write(path.with_extension("base.graph.json"), &base_graph)?;
+        std::fs::write(path.with_extension("q3.graph.json"), &q3_graph)?;
     }
     let storage_evidence = if config.verify {
         let mut evidence = base.storage_evidence();
         evidence.insert("V".into(), json!({"unavailable": "validation consumed the V output snapshot"}));
         Value::Object(evidence)
     } else {
-        storage_evidence(&base, &catalog)?
+        storage_evidence(&base, &pipeline)?
     };
     // The scan reads storage but writes none. It runs after the window's
     // counters, the disk usage and the cache occupancy have been read.
     if let Some(diagnostics) = &diagnostics {
         diagnostics.write_run_contents(
-            storage_path
-                .as_deref()
+            &[base_storage.as_deref(), q3_storage.as_deref()]
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
                 .context("--diagnostics requires file storage")?,
         )?;
     }
     let report = json!({
         "status": "complete",
-        "measurement_version": 2,
+        "measurement_version": 3,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
         "configuration": {
@@ -1354,6 +1570,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "driver_reference_bytes": state.as_ref().map_or(0, |s| s.size_of().total_bytes()),
             "rf2_discovery_full_scans": 0,
             "cache_bytes": config.cache_bytes, "memory_pressure_target_bytes": config.memory_target_bytes,
+            "circuits": {
+                "base": {"storage_path": base_storage, "cache_mib": base_cache_mib},
+                "q3": {"storage_path": q3_storage, "cache_mib": q3_cache_mib},
+                "note": "Two runtimes, each with one storage directory and one buffer cache. cache_bytes is split between them; both get the same memory_pressure_target_bytes, because RSS is process-wide.",
+            },
             "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
             "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
@@ -1390,7 +1611,22 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "foreground_ms": milliseconds(foreground_total),
             "end_to_end_ms": milliseconds(sequence_elapsed), "observed_storage_bytes": observed_storage_bytes,
             "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
-            "cache_occupancy_bytes": cache_occupancy, "snapshot_publication_transactions": 0, "cache_capacity_bytes": cache_capacity,
+            // The sums over both runtimes; the breakdown is under `circuits`.
+            "cache_occupancy_bytes": base_cache_occupancy + q3_cache_occupancy,
+            "snapshot_publication_transactions": 0,
+            "cache_capacity_bytes": base_cache_capacity + q3_cache_capacity,
+            "circuits": {
+                "base": {
+                    "observed_storage_bytes": base_storage_bytes,
+                    "cache_occupancy_bytes": base_cache_occupancy,
+                    "cache_capacity_bytes": base_cache_capacity,
+                },
+                "q3": {
+                    "observed_storage_bytes": q3_storage_bytes,
+                    "cache_occupancy_bytes": q3_cache_occupancy,
+                    "cache_capacity_bytes": q3_cache_capacity,
+                },
+            },
             "window_started_micros": window_started_micros, "window_finished_micros": window_finished_micros,
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
@@ -1398,7 +1634,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "completion_boundary": "last_refresh_complete",
             "catalog_storage": storage_evidence,
             "replaced_historical_join_traces_absent": if cfg!(feature = "merged-index") { Some(true) } else { None },
-            "circuit_profile": serde_json::to_value(profile)?,
+            "circuit_profile": {
+                "base": serde_json::to_value(base_profile)?,
+                "q3": serde_json::to_value(q3_profile)?,
+            },
         },
     });
     if let Some(path) = &config.report {
@@ -1447,13 +1686,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "capture_stage": "after final refresh report and outside phase timers",
             "run": run_number,
         });
-        let capture_result = dump_runtime_circuit(&mut circuit, &directory);
-        if directory.is_dir() {
-            std::fs::write(
-                directory.join("manifest.json"),
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-        }
+        // One capture per circuit: `run-N/base` and `run-N/q3`.
+        std::fs::create_dir_all(&directory)?;
+        let capture_result = dump_runtime_circuit(&mut pipeline.base.circuit, &directory.join("base"))
+            .and_then(|()| dump_runtime_circuit(&mut pipeline.view.circuit, &directory.join("q3")));
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
         capture_result?;
     }
     Ok(())
@@ -1509,21 +1749,10 @@ mod tests {
 
     #[test]
     fn native_deltas_match_full_join_across_updates() -> Result<()> {
-        let (mut circuit, catalog) = q3_ivm_baseline::circuit(CircuitConfig::with_workers(1))?;
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(1)?;
         let mut state = Reference::default();
         let mut stats = Measurements::default();
-        let mut step = |change| {
-            transact(
-                &mut circuit,
-                &catalog,
-                &mut input,
-                &mut state,
-                change,
-                true,
-                &mut stats,
-            )
-        };
+        let mut step = |change| transact(&mut pipeline, &mut state, change, true, &mut stats);
 
         // Orphan lines and unmatched orders produce no joined row.
         step(Change {
@@ -1680,15 +1909,11 @@ mod tests {
     #[test]
     fn runtime_capture_writes_each_worker_without_overwriting() -> Result<()> {
         for workers in [1, 2] {
-            let (mut circuit, catalog) =
-                q3_ivm_baseline::circuit(CircuitConfig::with_workers(workers))?;
-            let mut input = Inputs::new(&catalog)?;
+            let mut pipeline = Pipeline::with_workers(workers)?;
             let mut state = Reference::default();
             let mut stats = Measurements::default();
             transact(
-                &mut circuit,
-                &catalog,
-                &mut input,
+                &mut pipeline,
                 &mut state,
                 Change {
                     customers: vec![(customer(2, "BUILDING"), true)],
@@ -1705,7 +1930,8 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_nanos()
             ));
-            dump_runtime_circuit(&mut circuit, &directory)?;
+            dump_runtime_circuit(&mut pipeline.view.circuit, &directory)?;
+            dump_runtime_circuit(&mut pipeline.base.circuit, &directory.join("base"))?;
             for worker in 0..workers {
                 for extension in ["dot", "json", "svg"] {
                     assert!(directory
@@ -1719,7 +1945,7 @@ mod tests {
                     .join(format!("worker-{worker}-styled.svg"))
                     .exists());
             }
-            assert!(dump_runtime_circuit(&mut circuit, &directory).is_err());
+            assert!(dump_runtime_circuit(&mut pipeline.view.circuit, &directory).is_err());
         }
         Ok(())
     }
@@ -1740,14 +1966,11 @@ mod tests {
 
     #[test]
     fn two_worker_circuit_matches_reference() -> Result<()> {
-        let (mut circuit, catalog) = q3_ivm_baseline::circuit(CircuitConfig::with_workers(2))?;
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(2)?;
         let mut state = Reference::default();
         let mut stats = Measurements::default();
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut state,
             Change {
                 customers: vec![(customer(2, "BUILDING"), true)],
@@ -1764,18 +1987,14 @@ mod tests {
     #[test]
     fn simultaneous_three_source_changes_match_reference() -> Result<()> {
         for workers in [1, 2] {
-            let (mut circuit, catalog) =
-                q3_ivm_baseline::circuit(CircuitConfig::with_workers(workers))?;
-            let mut input = Inputs::new(&catalog)?;
+            let mut pipeline = Pipeline::with_workers(workers)?;
             let mut state = Reference::default();
             let mut stats = Measurements::default();
             let base_customer = customer(2, "BUILDING");
             let base_order = order(20, 2);
             let base_line = line(20, 1);
             transact(
-                &mut circuit,
-                &catalog,
-                &mut input,
+                &mut pipeline,
                 &mut state,
                 Change {
                     customers: vec![(base_customer.clone(), true)],
@@ -1792,9 +2011,7 @@ mod tests {
             let mut changed_line = base_line.clone();
             changed_line.price_cents = 275;
             transact(
-                &mut circuit,
-                &catalog,
-                &mut input,
+                &mut pipeline,
                 &mut state,
                 Change {
                     customers: vec![(base_customer, false), (changed_customer, true)],
@@ -1842,17 +2059,11 @@ mod reconstructed_tests {
 
     #[test]
     fn rf1_rf2_match_full_join() -> Result<()> {
-        let q3_state = Q3State::default();
-        let (mut circuit, catalog) =
-            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
-        let index = ManualIndex::new(circuit.runtime());
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(1)?;
         let mut state = Reference::default();
         let mut stats = Measurements::default();
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut state,
             Change {
                 customers: vec![(customer(2), true), (customer(3), true)],
@@ -1860,12 +2071,9 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut state,
             Change {
                 orders: vec![(order(20, 2), true)],
@@ -1874,12 +2082,9 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut state,
             Change {
                 orders: vec![(order(30, 3), true)],
@@ -1888,58 +2093,41 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         let keys = HashSet::from([20]);
         let deletion = rf2_changes(&state, &keys);
+        transact(&mut pipeline, &mut state, deletion, true, &mut stats)?;
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
-            &mut state,
-            deletion,
-            true,
-            &mut stats,
-            (&index, &q3_state),
-        )?;
-        transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut state,
             Change::default(),
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         assert_eq!(stats.view_rows, Some(1));
         assert_eq!(stats.transactions, 5);
-        let profile = circuit.graph_profile()?;
-        let graph = profile.worker_graphs[0].to_json();
+        // The view circuit has no historical join traces, and the base circuit has no joins.
+        let graph = pipeline.view.circuit.graph_profile()?.worker_graphs[0].to_json();
         assert!(!graph.contains("shard_accumulate_trace"));
         assert!(graph.contains("JoinTrace"));
+        let base_graph = pipeline.base.circuit.graph_profile()?.worker_graphs[0].to_json();
+        assert!(!base_graph.contains("JoinTrace"));
         Ok(())
     }
 
     #[test]
     fn rejects_missing_placement_and_incomplete_rf2() -> Result<()> {
-        let q3_state = Q3State::default();
-        let (mut circuit, catalog) =
-            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
-        let index = ManualIndex::new(circuit.runtime());
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(1)?;
         let mut reference = Reference::default();
         let no_order = Change {
             lines: vec![(line(20, 1), true)],
             ..Change::default()
         };
-        assert!(workload::BaseState::new(&catalog)?
+        assert!(workload::BaseState::new(&pipeline.base.catalog)?
             .validate(&no_order)
             .is_err());
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut reference,
             Change {
                 customers: vec![(customer(2), true)],
@@ -1948,13 +2136,12 @@ mod reconstructed_tests {
             },
             true,
             &mut Measurements::default(),
-            (&index, &q3_state),
         )?;
         let missing_line = Change {
             orders: vec![(order(20, 2), false)],
             ..Change::default()
         };
-        assert!(workload::BaseState::new(&catalog)?
+        assert!(workload::BaseState::new(&pipeline.base.catalog)?
             .validate(&missing_line)
             .is_err());
         Ok(())
@@ -1983,17 +2170,11 @@ mod reconstructed_tests {
 
     #[test]
     fn published_views_cover_multiple_transaction_steps() -> Result<()> {
-        let q3_state = Q3State::default();
-        let (mut circuit, catalog) =
-            q3_ivm_baseline::circuit(CircuitConfig::with_workers(1), q3_state.clone())?;
-        let index = ManualIndex::new(circuit.runtime());
-        let mut input = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::with_workers(1)?;
         let mut reference = Reference::default();
         let mut stats = Measurements::default();
         transact(
-            &mut circuit,
-            &catalog,
-            &mut input,
+            &mut pipeline,
             &mut reference,
             Change {
                 customers: vec![(customer(2), true)],
@@ -2001,7 +2182,6 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
 
         let complete = Change {
@@ -2010,28 +2190,12 @@ mod reconstructed_tests {
             ..Change::default()
         };
         let before = reference.evaluate();
-        let (placements, rows) = reconstruction::prepare(&complete)?;
-        let (before_index, after_index) = index.append(rows)?;
-        q3_state
-            .publish(before_index, after_index, placements)
-            .map_err(anyhow::Error::msg)?;
-        circuit.start_transaction()?;
-        Change {
-            orders: complete.orders,
-            ..Change::default()
-        }
-        .apply(&mut reference, &mut input)?;
-        assert!(!circuit.step()?);
-        Change {
-            lines: complete.lines,
-            ..Change::default()
-        }
-        .apply(&mut reference, &mut input)?;
-        assert!(!circuit.step()?);
-        circuit.commit_transaction()?;
-        q3_state.finish().map_err(anyhow::Error::msg)?;
+        // One publication covers the steps of the view circuit's transaction.
+        transact_in_steps(&mut pipeline, &mut reference, complete)?;
 
-        let output = catalog
+        let output = pipeline
+            .view
+            .catalog
             .output_handles(&SqlIdentifier::from("V"))
             .context("missing V output")?;
         let expected = reference.evaluate();
@@ -2060,28 +2224,31 @@ mod reconstructed_tests {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
-        std::fs::create_dir(&path)?;
-        let storage = || StorageConfig {
-            path: path.to_string_lossy().into_owned(),
-            cache: StorageCacheConfig::default(),
+        // A storage directory belongs to one runtime, so each circuit gets its own.
+        let base_directory = path.join("base");
+        let q3_directory = path.join("q3");
+        std::fs::create_dir_all(&base_directory)?;
+        std::fs::create_dir_all(&q3_directory)?;
+        let config = |directory: &Path, checkpoint| -> Result<CircuitConfig> {
+            let storage = StorageConfig {
+                path: directory.to_string_lossy().into_owned(),
+                cache: StorageCacheConfig::default(),
+            };
+            let options = StorageOptions {
+                min_storage_bytes: Some(0),
+                ..StorageOptions::default()
+            };
+            Ok(CircuitConfig::with_workers(1).with_storage(Some(
+                CircuitStorageConfig::for_config(storage, options)?
+                    .with_init_checkpoint(checkpoint),
+            )))
         };
-        let options = || StorageOptions {
-            min_storage_bytes: Some(0),
-            ..StorageOptions::default()
-        };
-        let initial = CircuitConfig::with_workers(1).with_storage(Some(
-            CircuitStorageConfig::for_config(storage(), options())?,
-        ));
-        let q3_state = Q3State::default();
-        let (mut circuit, catalog) = q3_ivm_baseline::circuit(initial, q3_state.clone())?;
-        let index = ManualIndex::new(circuit.runtime());
-        let mut inputs = Inputs::new(&catalog)?;
+        let mut pipeline =
+            Pipeline::new(config(&base_directory, None)?, config(&q3_directory, None)?)?;
         let mut reference = Reference::default();
         let mut stats = Measurements::default();
         transact(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
+            &mut pipeline,
             &mut reference,
             Change {
                 customers: vec![(customer(2), true)],
@@ -2089,12 +2256,9 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         transact(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
+            &mut pipeline,
             &mut reference,
             Change {
                 orders: vec![(order(20, 2), true), (order(30, 2), true)],
@@ -2103,41 +2267,25 @@ mod reconstructed_tests {
             },
             true,
             &mut stats,
-            (&index, &q3_state),
         )?;
         let restored_reference = reference.clone();
-        let committer = circuit.checkpoint().prepare()?;
-        let checkpoint_id = committer.uuid();
-        index.save(checkpoint_id.to_string().into())?;
-        let publisher = committer.commit()?;
-        publisher.publish()?;
-        drop(inputs);
-        drop(catalog);
-        drop(index);
-        drop(circuit);
+        let base_committer = pipeline.base.circuit.checkpoint().prepare()?;
+        let q3_committer = pipeline.view.circuit.checkpoint().prepare()?;
+        let (base_checkpoint, q3_checkpoint) = (base_committer.uuid(), q3_committer.uuid());
+        pipeline.index.save(q3_checkpoint.to_string().into())?;
+        base_committer.commit()?.publish()?;
+        q3_committer.commit()?.publish()?;
+        drop(pipeline);
 
-        let restored = CircuitConfig::with_workers(1).with_storage(Some(
-            CircuitStorageConfig::for_config(storage(), options())?
-                .with_init_checkpoint(Some(checkpoint_id)),
-        ));
-        let restored_q3 = Q3State::default();
-        let (mut circuit, catalog) = q3_ivm_baseline::circuit(restored, restored_q3.clone())?;
-        let restored_index = ManualIndex::new(circuit.runtime());
-        restored_index.restore(checkpoint_id.to_string().into())?;
-        let mut inputs = Inputs::new(&catalog)?;
+        let mut pipeline = Pipeline::new(
+            config(&base_directory, Some(base_checkpoint))?,
+            config(&q3_directory, Some(q3_checkpoint))?,
+        )?;
+        pipeline.index.restore(q3_checkpoint.to_string().into())?;
         let mut reference = restored_reference;
         let mut stats = Measurements::default();
         let deletion = rf2_changes(&reference, &HashSet::from([20]));
-        transact(
-            &mut circuit,
-            &catalog,
-            &mut inputs,
-            &mut reference,
-            deletion,
-            true,
-            &mut stats,
-            (&restored_index, &restored_q3),
-        )?;
+        transact(&mut pipeline, &mut reference, deletion, true, &mut stats)?;
         assert_eq!(stats.view_rows, Some(1));
         Ok(())
     }
@@ -2247,13 +2395,53 @@ mod measurement_tests {
         assert_eq!(refreshes[1]["absent_orders"], 1);
         assert_eq!(refreshes[2]["absent_orders"], 2);
         assert_eq!(refreshes[5]["rows"], 0);
+        // Measurement version 3 times the base circuit, the forwarding, the merged index and
+        // the view circuit separately; the IVM figure leaves the base circuit out.
+        for refresh in refreshes {
+            let phase = |name: &str| refresh[name].as_f64().unwrap();
+            assert!(phase("base_ms") > 0.0, "{refresh}");
+            assert!(phase("q3_ms") > 0.0, "{refresh}");
+            assert!(phase("forward_ms") >= 0.0, "{refresh}");
+            assert!(
+                (phase("combined_maintenance_ms") - (phase("index_ms") + phase("q3_ms"))).abs()
+                    < 1e-6,
+                "{refresh}"
+            );
+            if !cfg!(feature = "merged-index") {
+                assert_eq!(phase("index_ms"), 0.0);
+            }
+        }
+        // Two runtimes, each with its own storage directory and its share of the cache.
+        let circuits = &output["configuration"]["circuits"];
+        assert_eq!(
+            circuits["base"]["cache_mib"].as_u64().unwrap()
+                + circuits["q3"]["cache_mib"].as_u64().unwrap(),
+            8
+        );
+        assert_ne!(
+            circuits["base"]["storage_path"],
+            circuits["q3"]["storage_path"]
+        );
+        let by_circuit = &output["sequence"]["circuits"];
+        assert!(
+            by_circuit["base"]["observed_storage_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(by_circuit["q3"]["observed_storage_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            output["sequence"]["cache_capacity_bytes"].as_u64().unwrap(),
+            by_circuit["base"]["cache_capacity_bytes"].as_u64().unwrap()
+                + by_circuit["q3"]["cache_capacity_bytes"].as_u64().unwrap()
+        );
         assert!(
             output["sequence"]["observed_storage_bytes"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 2);
+        assert_eq!(output["measurement_version"], 3);
         assert_eq!(
             output["sequence"]["completion_boundary"],
             "last_refresh_complete"
@@ -2287,6 +2475,22 @@ mod measurement_tests {
         assert_eq!(measured["configuration"]["driver_reference_bytes"], 0);
         assert!(measured["sequence"]["resources"]["backend_read_operations"].is_u64());
         assert!(measured["sequence"]["resources"]["cpu_microseconds"].is_u64());
+        // Each file is attributed to one owner, so the owners add up to the totals; the native
+        // program has no merged index, and so no merged-index writes.
+        let owners = measured["sequence"]["resources"]["backend_write_by_owner"]
+            .as_object()
+            .unwrap();
+        let owner_bytes: u64 = owners.values().map(|o| o["bytes"].as_u64().unwrap()).sum();
+        assert_eq!(
+            owner_bytes,
+            measured["sequence"]["resources"]["backend_write_bytes"]
+                .as_u64()
+                .unwrap()
+        );
+        if !cfg!(feature = "merged-index") {
+            assert_eq!(owners["merged_index"]["bytes"], 0);
+            assert_eq!(owners["merged_index"]["operations"], 0);
+        }
         assert!(
             measured["sequence"]["sampled_peak_storage_bytes"]
                 .as_u64()
@@ -2404,6 +2608,136 @@ mod measurement_tests {
         let elided: Value = serde_json::from_reader(File::open(config.report.unwrap())?)?;
         assert_eq!(elided["configuration"]["elide_value_headers"], true);
         assert_eq!(elided["value_header_elision"]["layout_fallbacks"], 0);
+
+        // The diagnostics scan finds each run's file in the storage directory of the circuit
+        // that wrote it, whichever of the two that is.
+        let config = Config {
+            storage_path: Some(directory.join("diagnosed-storage")),
+            report: Some(directory.join("diagnosed-report.json")),
+            diagnostics: Some(directory.join("diagnostics")),
+            elide_value_headers: false,
+            ..config
+        };
+        run(&config, 1)?;
+        let contents: Value = serde_json::from_reader(File::open(
+            directory.join("diagnostics").join("run-contents.json"),
+        )?)?;
+        assert!(!contents["spines"].as_array().unwrap().is_empty());
+        Ok(())
+    }
+}
+
+/// The base circuit's net delta, which the view circuit and the merged index consume.
+#[cfg(test)]
+mod net_delta_tests {
+    use super::*;
+
+    fn customer(key: i64, segment: &str) -> Customer {
+        Customer {
+            key,
+            segment: segment.to_owned(),
+        }
+    }
+
+    fn order(key: i64, customer_key: i64) -> Order {
+        Order {
+            key,
+            customer_key,
+            date: "1996-01-02".to_owned(),
+            ship_priority: 3,
+        }
+    }
+
+    fn line(order_key: i64, number: i32) -> Line {
+        Line {
+            order_key,
+            number,
+            price_cents: 12345,
+            discount_hundredths: 4,
+            ship_date: "1996-03-13".to_owned(),
+        }
+    }
+
+    /// Applies `change` to the base circuit alone and returns its net delta.
+    fn base_delta(pipeline: &mut Pipeline, change: Change) -> Result<Change> {
+        change.apply_optional(None, &mut pipeline.base.inputs)?;
+        pipeline.base.circuit.transaction()?;
+        workload::net_delta(&pipeline.base.catalog)
+    }
+
+    #[test]
+    fn net_delta_carries_complete_rows_for_inserts_and_deletes() -> Result<()> {
+        let mut pipeline = Pipeline::with_workers(1)?;
+        let inserted = Change {
+            customers: vec![(customer(2, "BUILDING"), true)],
+            orders: vec![(order(20, 2), true)],
+            lines: vec![(line(20, 1), true), (line(20, 2), true)],
+        };
+        let delta = base_delta(&mut pipeline, inserted.clone())?;
+        assert_eq!(delta.customers, inserted.customers);
+        assert_eq!(delta.orders, inserted.orders);
+        assert_eq!(delta.lines, inserted.lines);
+
+        // The driver deletes by key, but the delta carries the complete rows that went away.
+        let deleted = Change {
+            orders: vec![(order(20, 2), false)],
+            lines: vec![(line(20, 1), false), (line(20, 2), false)],
+            ..Change::default()
+        };
+        let delta = base_delta(&mut pipeline, deleted.clone())?;
+        assert_eq!(delta.orders, deleted.orders);
+        assert_eq!(delta.lines, deleted.lines);
+        assert!(delta.customers.is_empty());
+
+        // Reading drains the delta streams.
+        assert_eq!(workload::net_delta(&pipeline.base.catalog)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn net_delta_reports_a_replaced_row_as_a_deletion_and_an_insertion() -> Result<()> {
+        let mut pipeline = Pipeline::with_workers(1)?;
+        base_delta(
+            &mut pipeline,
+            Change {
+                customers: vec![(customer(2, "BUILDING"), true)],
+                ..Change::default()
+            },
+        )?;
+        let delta = base_delta(
+            &mut pipeline,
+            Change {
+                customers: vec![(customer(2, "AUTOMOBILE"), true)],
+                ..Change::default()
+            },
+        )?;
+        assert_eq!(delta.customers.len(), 2);
+        assert!(delta.customers.contains(&(customer(2, "BUILDING"), false)));
+        assert!(delta.customers.contains(&(customer(2, "AUTOMOBILE"), true)));
+        Ok(())
+    }
+
+    #[test]
+    fn repeating_an_upsert_leaves_no_net_delta() -> Result<()> {
+        let mut pipeline = Pipeline::with_workers(1)?;
+        let row = Change {
+            customers: vec![(customer(2, "BUILDING"), true)],
+            ..Change::default()
+        };
+        base_delta(&mut pipeline, row.clone())?;
+        // The same upsert changes nothing, so nothing is forwarded.
+        assert_eq!(base_delta(&mut pipeline, row)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn view_inputs_delete_by_whole_row_and_base_inputs_by_key() -> Result<()> {
+        let pipeline = Pipeline::with_workers(1)?;
+        assert_eq!(pipeline.base.inputs.deletes, DeleteStyle::ByKey);
+        assert_eq!(pipeline.view.inputs.deletes, DeleteStyle::WholeRow);
+        assert!(!pipeline.base.inputs.whole_row(false));
+        assert!(pipeline.base.inputs.whole_row(true));
+        assert!(pipeline.view.inputs.whole_row(false));
         Ok(())
     }
 }
