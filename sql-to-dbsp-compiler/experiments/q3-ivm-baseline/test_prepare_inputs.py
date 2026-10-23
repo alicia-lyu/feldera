@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import io
 import json
 from pathlib import Path
+import random
 import sys
 import tempfile
 import unittest
@@ -131,17 +133,90 @@ class PrepareInputsTest(unittest.TestCase):
         self.assertLess(len(below), needed)
         self.assertTrue(set(below) <= set(deleted))
         self.assertLessEqual(max(self.base_orders[key] for key in deleted), bound)
-        for number in range(1, PAIRS + 1):
-            pair = manifest["workloads"]["clustered"]["pairs"][number - 1]
-            rf1_customers = read_customers(out / "clustered" / f"rf1-orders-{number}.tbl")
-            self.assertEqual(min(rf1_customers), pair["rf2_customer_min"])
-            self.assertEqual(max(rf1_customers), pair["rf2_customer_max"])
-            self.assertEqual(rf1_customers, sorted(rf1_customers))
-            self.assertLessEqual(pair["rf1_customer_max"], bound)
         # Scattered sets spread far wider than the clustered prefix.
         scattered = [self.base_orders[key] for keys in self.rf2_sets(out, "scattered")
                      for key in keys]
         self.assertGreater(max(scattered), bound)
+
+    def test_clustered_rf1_customers_do_not_depend_on_the_rf2_sets(self) -> None:
+        before = self.prepare("before")
+        # Rotate which Customer owns which base Order: the lowest-keyed Customers, and so the
+        # clustered RF2 sets, change; the Customer keys and the seed stay the same.
+        rows = (self.base / "orders.tbl").read_text().splitlines()
+        rotated = [order_row(int(row.split("|")[0]), CUSTOMERS - int(row.split("|")[1]) + 1)
+                   for row in rows]
+        write_lines(self.base / "orders.tbl", rotated)
+        after = self.prepare("after")
+        self.assertNotEqual(self.rf2_sets(before, "clustered"), self.rf2_sets(after, "clustered"))
+        for number in range(1, PAIRS + 1):
+            name = Path("clustered") / f"rf1-orders-{number}.tbl"
+            self.assertEqual((before / name).read_bytes(), (after / name).read_bytes())
+
+    def test_clustered_rf1_customers_are_valid_unsorted_and_seeded(self) -> None:
+        out = self.prepare()
+        manifest = json.loads((out / "prepare-manifest.json").read_text())
+        valid = set(range(1, CUSTOMERS + 1))
+        for number in range(1, PAIRS + 1):
+            customers = read_customers(out / "clustered" / f"rf1-orders-{number}.tbl")
+            self.assertEqual(len(customers), UPDATE_ORDERS)
+            self.assertTrue(set(customers) <= valid)
+        # The permutation is shared by the pairs, and the seed changes it.
+        other = self.prepare("other", seed=12)
+        pooled = [read_customers(directory / "clustered" / f"rf1-orders-{n}.tbl")
+                  for directory in (out, other) for n in range(1, PAIRS + 1)]
+        self.assertNotEqual(pooled[:PAIRS], pooled[PAIRS:])
+        self.assertIn("rf1_top_customer_orders", manifest["workloads"]["clustered"]["pairs"][0])
+
+    def test_zipf_draw_favors_the_top_rank_and_skew_grows_with_the_exponent(self) -> None:
+        permutation = list(range(100, 0, -1))  # rank 0 is Customer 100
+        draws = 20000
+
+        def counts(exponent: float) -> list[int]:
+            cumulative = prepare_inputs.zipf_cumulative_weights(len(permutation), exponent)
+            drawn = prepare_inputs.draw_zipf_customers(
+                permutation, cumulative, random.Random("zipf-test"), draws)
+            tally = collections.Counter(drawn)
+            self.assertEqual(sum(tally.values()), draws)
+            return [tally[customer] for customer in permutation]
+
+        mild, steep = counts(0.5), counts(1.5)
+        for tally in (mild, steep):
+            self.assertEqual(tally[0], max(tally))
+            self.assertGreater(tally[0], tally[9])
+        self.assertGreater(steep[0], mild[0])
+        # Rank 0 has weight 1 of the total, so its share is the reciprocal of that total.
+        expected = 1 / sum(1 / (rank + 1) ** 1.5 for rank in range(len(permutation)))
+        self.assertAlmostEqual(steep[0] / draws, expected, delta=0.02)
+
+    def test_top_customer_orders_counts_the_most_popular_customers(self) -> None:
+        customers = [5] * 7 + [6] * 3 + [7, 8]
+        self.assertEqual(prepare_inputs.top_customer_orders(customers),
+                         {"1": 7, "10": 12, "100": 12})
+
+    def test_manifest_records_the_exponent_and_the_rf1_skew(self) -> None:
+        out = self.prepare()
+        manifest = json.loads((out / "prepare-manifest.json").read_text())
+        self.assertEqual(manifest["zipf_exponent"], 1.0)
+        for workload in prepare_inputs.WORKLOADS:
+            for number, pair in enumerate(manifest["workloads"][workload]["pairs"], start=1):
+                customers = read_customers(out / workload / f"rf1-orders-{number}.tbl")
+                self.assertEqual(pair["rf1_distinct_customers"], len(set(customers)))
+                self.assertEqual(pair["rf1_customer_min"], min(customers))
+                self.assertEqual(pair["rf1_customer_max"], max(customers))
+                top = pair["rf1_top_customer_orders"]
+                self.assertEqual(sorted(top), ["1", "10", "100"])
+                self.assertEqual(top["100"], UPDATE_ORDERS)
+                self.assertLessEqual(top["1"], top["10"])
+        steep = prepare_inputs.prepare(self.base, self.updates, self.root / "steep", 11,
+                                       PAIRS, zipf_exponent=3.0)
+        self.assertEqual(steep["zipf_exponent"], 3.0)
+
+    def test_invalid_zipf_exponents_are_rejected(self) -> None:
+        for index, exponent in enumerate((0.0, -1.0, float("nan"), float("inf"))):
+            with self.assertRaisesRegex(prepare_inputs.InputError, "zipf-exponent"):
+                prepare_inputs.prepare(self.base, self.updates, self.root / f"bad{index}", 11,
+                                       PAIRS, zipf_exponent=exponent)
+            self.assertFalse((self.root / f"bad{index}").exists())
 
     def test_same_seed_gives_identical_bytes_and_other_seed_differs(self) -> None:
         first, second = self.prepare("first"), self.prepare("second")
@@ -226,6 +301,14 @@ class PrepareInputsTest(unittest.TestCase):
         self.assertIn("already exists", stderr.getvalue())
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             prepare_inputs.parse_args(["--base", "a", "--updates", "b", "--out", "c"])
+        self.assertEqual(prepare_inputs.parse_args(
+            argv + ["--zipf-exponent", "1.5"]).zipf_exponent, 1.5)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(prepare_inputs.main(
+                argv[:-4] + ["--out", str(self.root / "cli-bad"), "--seed", "3",
+                             "--zipf-exponent", "0"]), 1)
+        self.assertIn("zipf-exponent", stderr.getvalue())
 
 
 if __name__ == "__main__":
