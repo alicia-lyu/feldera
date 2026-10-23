@@ -39,6 +39,11 @@ Run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`. `generate.sh` write
 base tables and the view; `query.sql` stays the logical definition. Run it before building or
 testing a fresh checkout.
 
+`generate.sh` stops with a message if `src/lib.rs` or `src/stubs.rs` exists in the experiment.
+Those are stale files from before the base/view split. They are untracked and no longer
+git-ignored, and Cargo would take `src/lib.rs` for a library target, so `verify.sh` would fail in
+`native-format` with "failed to resolve mod `udf`". Move them to `TRASH/` and rerun.
+
 ```bash
 # Native circuit (the default)
 ./generate.sh
