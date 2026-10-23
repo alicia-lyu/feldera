@@ -5,6 +5,7 @@ mod measurement;
 mod reconstruction;
 #[cfg(test)]
 mod verification;
+mod window_memory;
 mod workload;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -909,6 +910,75 @@ struct Refresh {
     rf2: Option<PathBuf>,
 }
 
+impl Refresh {
+    /// The files that this refresh reads.
+    fn files(&self) -> impl Iterator<Item = &Path> {
+        [&self.rf1_orders, &self.rf1_lines, &self.rf2]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::as_path)
+    }
+}
+
+/// A refresh's input files, parsed into memory before the measurement window opens, so that
+/// the window times neither file reads nor parsing.
+enum PreparedRefresh {
+    /// RF1: the inserted rows, as the `Change` that the loop applies.
+    Rf1(Change),
+    /// RF2: the order keys to delete. The rows to delete are still discovered inside the
+    /// window, by looking these keys up.
+    Rf2(HashSet<i64>),
+}
+
+impl PreparedRefresh {
+    fn read(refresh: &Refresh) -> Result<Self> {
+        if let Some(path) = &refresh.rf2 {
+            return Ok(Self::Rf2(
+                rows(path, data::delete_order_key)?.into_iter().collect(),
+            ));
+        }
+        let orders = refresh
+            .rf1_orders
+            .as_deref()
+            .context("RF1 Orders required")?;
+        let lines = refresh
+            .rf1_lines
+            .as_deref()
+            .context("RF1 Lineitem required")?;
+        Ok(Self::Rf1(Change {
+            orders: rows(orders, Order::parse)?
+                .into_iter()
+                .map(|row| (row, true))
+                .collect(),
+            lines: rows(lines, Line::parse)?
+                .into_iter()
+                .map(|row| (row, true))
+                .collect(),
+            ..Change::default()
+        }))
+    }
+
+    /// The row counts of this refresh's input, for the report.
+    fn summary(&self, number: usize) -> Value {
+        match self {
+            Self::Rf1(change) => json!({
+                "refresh": number, "phase": "rf1",
+                "orders": change.orders.len(), "lines": change.lines.len(),
+            }),
+            Self::Rf2(keys) => json!({"refresh": number, "phase": "rf2", "order_keys": keys.len()}),
+        }
+    }
+}
+
+/// The current memory-pressure level of each circuit's runtime. The level comes from the
+/// process's RSS against the memory target, not from cgroup memory.
+fn memory_pressure_levels(pipeline: &Pipeline) -> Result<Value> {
+    Ok(json!({
+        "base_runtime": serde_json::to_value(pipeline.base.circuit.runtime().current_memory_pressure())?,
+        "q3_runtime": serde_json::to_value(pipeline.view.circuit.runtime().current_memory_pressure())?,
+    }))
+}
+
 fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
     let mut refreshes = if let Some(path) = &config.refresh_list {
         let mut list: Vec<Refresh> = serde_json::from_reader(File::open(path)?)?;
@@ -1382,13 +1452,51 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         milliseconds(stats.view_circuit), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
+    // Parse every refresh file now, so that the window reads no input file. The loop consumes
+    // each prepared refresh by value and drops it once applied.
     let refresh_list = refreshes(config)?;
+    let rss_before_pre_read = window_memory::current_rss_bytes();
+    let prepared_refreshes = refresh_list
+        .iter()
+        .map(PreparedRefresh::read)
+        .collect::<Result<Vec<_>>>()?;
+    let refresh_inputs = json!({
+        "per_refresh": prepared_refreshes
+            .iter()
+            .enumerate()
+            .map(|(index, prepared)| prepared.summary(index + 1))
+            .collect::<Vec<_>>(),
+        "vm_rss_before_pre_read_bytes": rss_before_pre_read,
+        "vm_rss_after_pre_read_bytes": window_memory::current_rss_bytes(),
+        "note": "Every refresh file is parsed into memory before the window; the loop drops each refresh's rows after applying it. VmRSS is Linux only (null elsewhere). The memory is ordinary process memory, equal in both modes; it counts toward the RSS-based pressure level and the window peak.",
+    });
+    // Evict the page cache of every input file the driver read, so that the window starts
+    // without them cached.
+    let input_paths: Vec<PathBuf> = [&config.customer, &config.orders, &config.lineitem]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain(
+            refresh_list
+                .iter()
+                .flat_map(Refresh::files)
+                .map(Path::to_path_buf),
+        )
+        .collect();
+    let inputs_evicted = window_memory::evict_inputs(&input_paths);
+    drop(refresh_list);
     let sampler = storage_root
         .clone()
         .map(measurement::StorageSampler::start)
         .transpose()?;
     let sequence_resources = measurement::ResourceSnapshot::capture()?;
     let window_started_micros = dbsp::storage::diagnostics::now_micros();
+    let mut window_evidence = window_memory::WindowMemory::start();
+    // The buffer cache is left warm (there is no API to clear it); its state at the start of
+    // the window is recorded beside its state at the end.
+    let (base_cache_occupancy_at_start, _) = pipeline.base.circuit.runtime().cache_occupancy();
+    let (q3_cache_occupancy_at_start, _) = pipeline.view.circuit.runtime().cache_occupancy();
+    let mut memory_pressure_before = memory_pressure_levels(&pipeline)?;
     let sequence_started = Instant::now();
     let mut sequence_finished = sequence_started;
     let mut resources_after = sequence_resources;
@@ -1396,54 +1504,31 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut reports = Vec::new();
     let mut verification_time = Duration::ZERO;
     let mut foreground_total = Duration::ZERO;
-    for (number, refresh) in refresh_list.into_iter().enumerate() {
+    for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
         let mut measurement = Measurements::default();
-        let (change, absent, phase, discovered) = if let Some(path) = refresh.rf2 {
-            let keys: HashSet<_> = rows(&path, data::delete_order_key)?.into_iter().collect();
-            #[cfg(feature = "merged-index")]
-            let snapshot = pipeline.index.snapshot()?;
-            let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
+        let (change, absent, phase, discovered) = match prepared {
+            PreparedRefresh::Rf2(keys) => {
                 #[cfg(feature = "merged-index")]
-                {
-                    pipeline
-                        .view
-                        .in_cache(|| reconstruction::lines(&snapshot, order))
-                }
-                #[cfg(not(feature = "merged-index"))]
-                {
-                    base.native_lines(order.key)
-                }
-            })?;
-            measurement.discovery += phase_started.elapsed();
-            (change, absent, "rf2", true)
-        } else {
-            let change = Change {
-                orders: rows(
-                    refresh
-                        .rf1_orders
-                        .as_deref()
-                        .context("RF1 Orders required")?,
-                    Order::parse,
-                )?
-                .into_iter()
-                .map(|row| (row, true))
-                .collect(),
-                lines: rows(
-                    refresh
-                        .rf1_lines
-                        .as_deref()
-                        .context("RF1 Lineitem required")?,
-                    Line::parse,
-                )?
-                .into_iter()
-                .map(|row| (row, true))
-                .collect(),
-                ..Change::default()
-            };
-            measurement.preparation += phase_started.elapsed();
-            (change, 0, "rf1", false)
+                let snapshot = pipeline.index.snapshot()?;
+                // Discovery is the lookup alone: the keys were read before the window.
+                let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
+                    #[cfg(feature = "merged-index")]
+                    {
+                        pipeline
+                            .view
+                            .in_cache(|| reconstruction::lines(&snapshot, order))
+                    }
+                    #[cfg(not(feature = "merged-index"))]
+                    {
+                        base.native_lines(order.key)
+                    }
+                })?;
+                measurement.discovery += phase_started.elapsed();
+                (change, absent, "rf2", true)
+            }
+            PreparedRefresh::Rf1(change) => (change, 0, "rf1", false),
         };
         let workload_stats_started = Instant::now();
         let customers: HashSet<_> = change
@@ -1472,7 +1557,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         drop(customers);
         drop(fanout);
         measurement.publication_cleanup += cleanup_started.elapsed();
-        // Wall time covers file reads, discovery and all foreground cleanup.
+        // Wall time covers discovery, the transaction and all foreground cleanup; the refresh
+        // files were read before the window.
         let phase_finished = Instant::now();
         measurement.foreground = phase_finished
             .duration_since(phase_started)
@@ -1482,10 +1568,16 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         sequence_finished = phase_finished;
         resources_after = measurement::ResourceSnapshot::capture()?;
         window_finished_micros = dbsp::storage::diagnostics::now_micros();
+        window_evidence.sample_boundary();
+        let memory_pressure_after = memory_pressure_levels(&pipeline)?;
         let resource_delta = resources_before.delta(&resources_after);
         let mut report = phase_json(&measurement);
         report["refresh"] = json!(number + 1);
         report["phase"] = json!(phase);
+        report["memory_pressure"] = json!({
+            "before": std::mem::replace(&mut memory_pressure_before, memory_pressure_after.clone()),
+            "after": memory_pressure_after,
+        });
         report["absent_orders"] = json!(absent);
         report["affected_customers"] = json!(customer_count);
         report["affected_orders"] = json!(order_count);
@@ -1508,6 +1600,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         );
         reports.push(report);
     }
+    // The window ends with the last refresh; read its memory figures before anything else runs.
+    let window_memory_fields = window_evidence.finish();
     let sequence_elapsed = sequence_finished
         .duration_since(sequence_started)
         .saturating_sub(verification_time);
@@ -1560,9 +1654,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 .context("--diagnostics requires file storage")?,
         )?;
     }
-    let report = json!({
+    let mut report = json!({
         "status": "complete",
         "measurement_version": 3,
+        "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
         "configuration": {
@@ -1606,6 +1701,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "observed_storage_bytes": load_observed_storage_bytes,
             "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed),
             "setup_full_compaction": setup_compaction},
+        "refresh_inputs": refresh_inputs,
+        "inputs_evicted": inputs_evicted,
         "refreshes": reports,
         "sequence": {
             "foreground_ms": milliseconds(foreground_total),
@@ -1613,17 +1710,20 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
             // The sums over both runtimes; the breakdown is under `circuits`.
             "cache_occupancy_bytes": base_cache_occupancy + q3_cache_occupancy,
+            "cache_occupancy_at_window_start_bytes": base_cache_occupancy_at_start + q3_cache_occupancy_at_start,
             "snapshot_publication_transactions": 0,
             "cache_capacity_bytes": base_cache_capacity + q3_cache_capacity,
             "circuits": {
                 "base": {
                     "observed_storage_bytes": base_storage_bytes,
                     "cache_occupancy_bytes": base_cache_occupancy,
+                    "cache_occupancy_at_window_start_bytes": base_cache_occupancy_at_start,
                     "cache_capacity_bytes": base_cache_capacity,
                 },
                 "q3": {
                     "observed_storage_bytes": q3_storage_bytes,
                     "cache_occupancy_bytes": q3_cache_occupancy,
+                    "cache_occupancy_at_window_start_bytes": q3_cache_occupancy_at_start,
                     "cache_capacity_bytes": q3_cache_capacity,
                 },
             },
@@ -1640,6 +1740,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
         },
     });
+    report["sequence"]
+        .as_object_mut()
+        .context("sequence is an object")?
+        .extend(window_memory_fields);
     if let Some(path) = &config.report {
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
@@ -2461,6 +2565,50 @@ mod measurement_tests {
         let foreground = output["sequence"]["foreground_ms"].as_f64().unwrap();
         let total = output["sequence"]["end_to_end_ms"].as_f64().unwrap();
         assert!(total >= foreground);
+        // The refresh files are parsed before the window, and each refresh's row counts are
+        // reported.
+        let inputs = output["refresh_inputs"]["per_refresh"].as_array().unwrap();
+        assert_eq!(inputs.len(), refreshes.len());
+        assert_eq!(inputs[0]["phase"], "rf1");
+        assert!(inputs[0]["orders"].as_u64().unwrap() > 0);
+        assert_eq!(inputs[1]["phase"], "rf2");
+        assert!(inputs[1]["order_keys"].as_u64().unwrap() > 0);
+        // The window figures are Linux readings: present there, `null` elsewhere. Pressure is
+        // sampled for both runtimes around every refresh.
+        let sequence = &output["sequence"];
+        assert_eq!(output["os"], std::env::consts::OS);
+        assert_eq!(
+            sequence["window_peak_rss_bytes"].is_u64(),
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(
+            sequence["window_end_rss_bytes"].is_u64(),
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(
+            output["refresh_inputs"]["vm_rss_after_pre_read_bytes"].is_u64(),
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(
+            output["inputs_evicted"]["evicted"],
+            cfg!(target_os = "linux")
+        );
+        if !cfg!(target_os = "linux") {
+            assert!(sequence["cgroup"].is_null());
+        }
+        for refresh in refreshes {
+            for side in ["before", "after"] {
+                for runtime in ["base_runtime", "q3_runtime"] {
+                    assert!(
+                        refresh["memory_pressure"][side][runtime].is_string(),
+                        "{refresh}"
+                    );
+                }
+            }
+        }
+        assert!(sequence["cache_occupancy_at_window_start_bytes"]
+            .as_u64()
+            .is_some());
         // Verification I/O and CPU counters are omitted from performance data.
         assert!(output["sequence"]["resources"]["unavailable"].is_string());
         let config = Config {

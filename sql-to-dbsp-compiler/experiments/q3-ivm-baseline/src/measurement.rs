@@ -84,7 +84,7 @@ impl ResourceSnapshot {
                 "backend_operations": "Counts from storage read/write latency histograms; process-global.",
                 "backend_bytes": "Exact sums of storage read/write block-size histograms; process-global.",
                 "os_physical_bytes": "Linux /proc/self/io read_bytes/write_bytes; unavailable on other platforms. These differ from rchar/wchar syscall bytes.",
-                "peak_rss_bytes": "getrusage process high-water mark since process start, including driver and runtime."
+                "peak_rss_bytes": "getrusage process-lifetime high-water mark since process start: it includes loading, setup compaction, the refresh pre-read, the driver and the runtime. It is not a maintenance-window figure; see sequence.window_peak_rss_bytes (Linux only)."
             }
         })
     }
