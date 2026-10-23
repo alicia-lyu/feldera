@@ -85,6 +85,17 @@ The runner records cgroup limits, peak, events, and I/O. It does not sample runt
 - Keep cgroup peak and `io.stat` as run-level evidence. The enforced limit covers the driver, runtime, auxiliary threads, configured cache, and cgroup-charged input page cache together.
 - As a probe, repeat a pilot with a 192 MiB runtime target and check that the samples show the intended levels. An optional delta stress case concatenates eight complete RF1 sets in RAM; a run that exceeds its budget must fail as one complete refresh.
 
+### Two pressure signals
+
+DBSP's pressure level and the cgroup limit measure different things:
+
+- **DBSP's signal.** The `rss-monitor` thread (`crates/dbsp/src/circuit/runtime.rs`) calls `process_rss_bytes` (`crates/dbsp/src/utils.rs`, `memory_stats().physical_mem`) once a second. This is process RSS only.
+  - **Thresholds.** The levels are fractions of `max_rss`, which the driver sets from `--memory-target-bytes` through `CircuitConfig::with_max_rss_bytes` (`main.rs`). Moderate is 0.85, High 0.90, and Critical 0.95 (`crates/feldera-types/src/memory_pressure.rs`). Without a target, the level is always Low.
+  - **Hysteresis.** After High, the level falls back only when the raw level reaches Low. After Critical, it falls back only when the raw level reaches Moderate or Low.
+- **The cgroup limit.** `memory.max` charges anonymous memory and page cache together. The cache includes the runner's input copies (`private_inputs` in `measure.py`), the driver's `BufReader` input reads, and the refresh-file reads. State files are opened with `O_DIRECT` (`StorageCacheConfig::to_custom_open_flags` for `FelderaCache`), so state I/O adds no page cache.
+- **Consequence.** The cgroup can approach `memory.max`, and the kernel can reclaim page cache, while DBSP still reports Low pressure and does not spill. Kernel reclaim in a pilot is therefore not evidence of DBSP memory pressure, and DBSP's level says nothing about cgroup headroom. Report the two signals apart.
+- **Planned mitigations (not yet implemented).** Evicting the input page cache after loading, and reading the refresh files into memory before the measured window, would narrow the gap. Page cache charged inside the window would stay invisible to DBSP's signal, and pre-read rows would count as process memory and so toward DBSP's signal.
+
 Until these are recorded in RESULTS.md, with raw artifacts, make no memory-pressure, reclaim, or beyond-memory claim.
 
 ## Setup compaction and the compaction threshold

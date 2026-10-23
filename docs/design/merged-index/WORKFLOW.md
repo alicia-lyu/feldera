@@ -452,6 +452,10 @@ for all 32, or for 24 if the pilot's run directories are moved off the disk befo
   The driver's `/proc/self/io` counters are per interval, but they are process-wide.
 - Pressure sampling and the before and after maintenance snapshots are not implemented
   ([measurement.md](measurement.md#pending-pressure-evidence)).
+- DBSP's pressure level follows process RSS only, while `memory.max` also charges page cache, so
+  the cgroup can near its limit while DBSP reports Low pressure
+  ([measurement.md](measurement.md#two-pressure-signals)). Input-cache eviction and refresh-file
+  pre-reading, which would narrow the gap, are planned and not implemented.
 - Until those exist, make none of these claims: runtime memory pressure, reclaim or refault
   behavior, beyond-memory behavior, equal-memory performance, a disk saving at SF 10, or a
   maintenance-only I/O figure. No SF 10 run has been measured.
