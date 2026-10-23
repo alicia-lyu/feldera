@@ -63,3 +63,5 @@ sql-to-dbsp-compiler/experiments/merged-index-col/src/lib.rs (hand-written defin
 sql-to-dbsp-compiler/experiments/merged-index-col/src/generated_tests.rs - moved to TRASH/ - Step 4 generated-vs-hand-written checks; their reference moved to TRASH/ in Step 5
 
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/udf.rs - moved to TRASH/q3-ivm-baseline-src-udf.rs - the root package no longer has a library; each generated circuit crate has its own empty udf.rs.
+q3-ivm-baseline/src/lib.rs - moved to TRASH/q3-ivm-baseline-pre-split/ - stale generated single-circuit file left in the main checkout after the base/view split; Cargo picked it up as a library target and broke verify.sh
+q3-ivm-baseline/src/stubs.rs - moved to TRASH/q3-ivm-baseline-pre-split/ - stale generated stubs for the removed single circuit
