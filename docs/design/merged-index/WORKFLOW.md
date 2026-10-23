@@ -311,8 +311,8 @@ python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_
 It writes, for each of `clustered/` and `scattered/`, the files `rf1-orders-K.tbl`,
 `rf1-lines-K.tbl`, and `rf2-delete-K.tbl` for each pair K, and a `refreshes.json` ordered RF1 1,
 RF2 1, RF1 2, and so on. `$R5_INPUTS/prepare-manifest.json` records the seed, the base and per-pair
-counts, each pair's Customer range, and the SHA-256 of every input and output. The script refuses
-an `--out` that already holds either workload. The selection rules are in its module docstring and
+counts, each pair's distinct Customers and the Order counts of its top 1, 10, and 100 Customers, and the SHA-256 of every input and output. The script refuses
+an `--out` that already holds either workload. Clustered RF1 draws Customers from a Zipf distribution (`--zipf-exponent`, default 1.0) independent of the RF2 sets (this change to `prepare_inputs.py` lands in a parallel commit). The selection rules are in its module docstring and
 summarized in [measurement.md](measurement.md#pending-linux-campaign). The whole path (dbgen,
 `prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01.
 
