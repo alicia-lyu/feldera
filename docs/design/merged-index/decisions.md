@@ -188,6 +188,17 @@ These directions apply to the 2026-10-08 advisor deck; they do not set research 
 - Use Orders–Lineitem first for the explanatory program, but describe the experiment's Orders–Customer-first circuit as it actually is.
 - Make no measured-savings, update-cost, or comparative performance claims.
 
+### 2026-10-23: Linux campaign refresh selection
+
+The user decided how `prepare_inputs.py` chooses refreshes:
+
+- RF1 inserts and RF2 deletes are chosen independently and never deliberately correlated.
+- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0; the default is the agent's choice and is unconfirmed.
+- Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block.
+- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders.
+
+The `prepare_inputs.py` change lands in a parallel commit.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

@@ -123,7 +123,7 @@ zero `Reference` map bytes.
 | **discovery_ms** | RF2 delete-ID reads, deduplication, maintained-state lookups, and assembly of complete current deletion rows, including decoding. |
 | **checks_input_preparation_ms** | RF1 input reads, operational checks, workload statistics, logical-row conversion, and circuit input serialization. |
 | **index_ms** | Reconstructed index batch construction and append, including folded-key/payload encoding, copying, sorting, and snapshot acquisition. Zero in native mode. |
-| **q3_ms** | Circuit transaction, including materialized `V`; reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. |
+| **q3_ms** | The single `circuit.transaction()` (`stats.native` in `transact_inner`). It covers base-relation state maintenance (`add_input_map_persistent` in the generated `src/lib.rs`, owner `base_relation`), the delta accumulators, both joins, and materialized `V`, in both modes; reconstructed execution adds its temporary reconstruction, decoding, copying, and sorting. The base maintenance is common to both modes and dilutes any native-to-reconstructed ratio. A planned measurement version 3 splits it into its own circuit and phase. |
 | **publication_cleanup_ms** | Snapshot publication/release, refreshed Catalog snapshots, and foreground output/driver cleanup. |
 | **combined_maintenance_ms** | `index_ms + q3_ms`; excludes discovery, preparation, and publication/cleanup. |
 
@@ -181,7 +181,7 @@ Each cell is the median of three repetitions, with the minimum and maximum in br
 - **Storage matches the earlier packed, elided campaign.** Every repetition gave the bytes of `target/r5-packed-elided/` (600,576 B reconstructed, 678,400 B native), so Step 5 left the stored state unchanged.
 - **No writes inside the window.** The six refreshes stay in memory in both modes, as before. No disk-traffic comparison follows from these runs.
 - **Peak RSS** is the process's high-water mark since start, so it includes loading and setup compaction. It is not a maintenance-only figure.
-- **Timing.** In these runs the reconstructed mode's `index + q3` was higher than native mode's in every workload. The runs are too short and too small to attribute that difference: the state fits in memory, no repetition lasted more than about 140 ms, and decoding CPU is not measured separately. Make no performance claim from this table.
+- **Timing.** In these runs the reconstructed mode's `index + q3` was higher than native mode's in every workload. The runs are too short and too small to attribute that difference: the state fits in memory, no repetition lasted more than about 140 ms, and decoding CPU is not measured separately. Make no performance claim from this table. The `q3` column includes base-relation maintenance, which both modes share (see "Timing definitions"). These runs remain measurement version 2.
 
 The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../../../docs/design/merged-index/history.md). They were measured before POSIX flush fix `f7fec2391`, with byte-string values, no setup compaction, and no front coding. They are not results for the current configuration.
 
