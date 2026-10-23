@@ -46,6 +46,8 @@ The JSON report (`q3-ivm-baseline/src/main.rs`) records:
 - `backend_write_by_owner` in every `resources` block (each refresh and the sequence): write operations and bytes per owner, keyed `query`, `base_relation` and `merged_index`. The owners sum to `backend_write_operations` and `backend_write_bytes`, which are unchanged. A file's owner is fixed when its writer is created, and a spine's owner when the spine is created; a background compaction runs under its spine's owner. `query` covers join traces, V and query execution; `base_relation` covers the input-map state and the base tables' delta accumulators; `merged_index` covers `ManualIndex`. A native run reports no `merged_index` writes. `measure.py` rejects a report whose owners do not sum to the totals;
 - `sequence.window_started_micros` and `sequence.window_finished_micros` (Unix-epoch microseconds), which place the flush and compaction logs of `--diagnostics` runs inside or outside the window; and `configuration.diagnostics`, the diagnostics directory or `null`.
 
+`q3_ms` is the single `circuit.transaction()` (`stats.native` in `transact_inner`). In both modes it covers base-relation state maintenance (`add_input_map_persistent` in the generated `src/lib.rs`, owner `base_relation`), the delta accumulators, both joins, and materialized `V`. The base maintenance is common to both modes and dilutes any ratio between them. A planned measurement version 3 splits it into its own circuit and phase; the 2026-10-22 rerun stays labelled version 2.
+
 Process CPU includes natural background merges inside the interval. Reconstruction's temporary-batch decoding, copying, and sorting are charged to `q3_ms`.
 
 ## Workloads
