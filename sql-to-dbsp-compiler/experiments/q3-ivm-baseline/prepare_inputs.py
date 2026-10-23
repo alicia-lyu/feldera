@@ -27,7 +27,7 @@ one workload. The base Order keys must be strictly ascending (what the driver's
 loader requires), and every RF1 Order key must be absent from the base Orders
 and from the other RF1 sets; the script fails otherwise.
 
-RF2 selection:
+RF2 selection (inserts and deletes are chosen independently):
 
 - clustered: order the base Orders by (o_custkey, o_orderkey). Let T be the sum
   of the N(K). The Orders of the lowest-keyed Customers, taken until they hold
@@ -39,15 +39,25 @@ RF2 selection:
   pairs. It samples existing rows, not integers in the sparse key range.
 
 RF1 remapping. Only o_custkey of each RF1 Order changes. Let C be the sorted
-list of all Customer keys in `customer.tbl`:
+list of all Customer keys in `customer.tbl`. Neither rule looks at the RF2
+sets. Orders stay in ascending Order-key order whatever Customer they get, so
+the Customer keys of a file are not sorted:
 
-- clustered: pair K covers the Customers from the lowest to the highest
-  o_custkey of its own RF2 set, which is the contiguous slice C[a..b] of width
-  W = b - a + 1. The j-th Order of the file (0-based, ascending Order key) gets
-  C[a + (j * W) // N(K)], so Orders sit on consecutive Customers in ascending
-  order, and the RF1 and RF2 sets of a pair touch the same Customers.
+- clustered: popularity skew without key locality. Shuffle C once into the
+  permutation P with `random.Random(f"{seed}:clustered-rf1-permutation")`; all
+  pairs share P, so the same Customers stay popular across pairs. Each Order
+  draws a rank r in 0..len(C)-1 with probability proportional to
+  1 / (r + 1)^s (Zipf with exponent s, `--zipf-exponent`, default 1.0) and gets
+  Customer P[r]. The draws of pair K come from
+  `random.Random(f"{seed}:clustered-rf1:{K}")`, one per Order in file order,
+  by binary search over the cumulative weights.
 - scattered: every Order gets an independent uniform draw from all of C, from
   `random.Random(f"{seed}:scattered-rf1")` consumed in pair and file order.
+
+The manifest records s, and for every pair the distinct RF1 Customers, the
+lowest and highest RF1 Customer key (plain observations, which say nothing
+about the clustered rule), and the number of RF1 Orders held by the 1, 10 and
+100 most popular Customers of that pair (`rf1_top_customer_orders`).
 
 Equal seeds and inputs give byte-identical outputs on one Python version.
 """
@@ -56,7 +66,10 @@ from __future__ import annotations
 
 import argparse
 from array import array
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from collections import Counter
+from itertools import accumulate
+import math
 from pathlib import Path
 import json
 import random
@@ -215,14 +228,26 @@ def file_record(path: Path) -> dict[str, Any]:
     return {"sha256": sha256(path), "bytes": path.stat().st_size}
 
 
-def customer_slice(customers: list[int], low: int, high: int) -> list[int]:
-    return customers[bisect_left(customers, low):bisect_left(customers, high) + 1]
+def zipf_cumulative_weights(count: int, exponent: float) -> list[float]:
+    """Cumulative weights of rank r = 0..count-1 with weight 1 / (r + 1)^exponent."""
+    return list(accumulate(1.0 / (rank + 1) ** exponent for rank in range(count)))
 
 
-def remap_clustered(orders: list[bytes], slice_: list[int]) -> list[int]:
-    """Assign consecutive Orders to consecutive Customers of `slice_`."""
-    width = len(slice_)
-    return [slice_[(index * width) // len(orders)] for index in range(len(orders))]
+def draw_zipf_customers(permutation: list[int], cumulative: list[float],
+                        generator: random.Random, count: int) -> list[int]:
+    """Draw `count` Customers: rank by Zipf weight, then look the rank up in `permutation`."""
+    total = cumulative[-1]
+    last_rank = len(permutation) - 1
+    # min() guards the float edge where u * total rounds up to the total.
+    return [permutation[min(bisect_right(cumulative, generator.random() * total), last_rank)]
+            for _ in range(count)]
+
+
+def top_customer_orders(customers: list[int], tops: tuple[int, ...] = (1, 10, 100)
+                        ) -> dict[str, int]:
+    """Orders held by the `n` most popular Customers of `customers`, for each n in `tops`."""
+    counts = sorted(Counter(customers).values(), reverse=True)
+    return {str(n): sum(counts[:n]) for n in tops}
 
 
 def write_workload(directory: Path, pairs: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -254,6 +279,7 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
         "rf1_customer_min": min(pair["rf1_customers"]),
         "rf1_customer_max": max(pair["rf1_customers"]),
         "rf1_distinct_customers": len(set(pair["rf1_customers"])),
+        "rf1_top_customer_orders": top_customer_orders(pair["rf1_customers"]),
         "rf2_orders": len(pair["rf2_keys"]),
         "rf2_customer_min": min(pair["rf2_customers"]),
         "rf2_customer_max": max(pair["rf2_customers"]),
@@ -261,9 +287,12 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int) -> dict[str, Any]:
+def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
+            zipf_exponent: float = 1.0) -> dict[str, Any]:
     if pair_count < 1:
         raise InputError("--pairs must be at least 1")
+    if not (math.isfinite(zipf_exponent) and zipf_exponent > 0):
+        raise InputError(f"--zipf-exponent must be finite and positive, got {zipf_exponent}")
     base_paths = {name: base / file for name, file in BASE_FILES.items()}
     for path in base_paths.values():
         if not path.is_file():
@@ -300,19 +329,22 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int) ->
                                            owner_of_position)
 
     scattered_rf1 = random.Random(f"{seed}:scattered-rf1")
+    popularity = customers.copy()
+    random.Random(f"{seed}:clustered-rf1-permutation").shuffle(popularity)
+    cumulative = zipf_cumulative_weights(len(popularity), zipf_exponent)
     workloads: dict[str, list[dict[str, Any]]] = {name: [] for name in WORKLOADS}
     cursor = 0
     for index, (size, (orders, lines)) in enumerate(zip(sizes, update_sets)):
         number = index + 1
         block = prefix[cursor:cursor + size]
         cursor += size
-        clustered_slice = customer_slice(customers, min(c for c, _ in block),
-                                         max(c for c, _ in block))
         workloads["clustered"].append({
             "number": number, "orders": orders, "lines": lines,
             "rf2_keys": [key for _, key in block],
             "rf2_customers": [customer for customer, _ in block],
-            "rf1_customers": remap_clustered(orders, clustered_slice),
+            "rf1_customers": draw_zipf_customers(
+                popularity, cumulative,
+                random.Random(f"{seed}:clustered-rf1:{number}"), len(orders)),
         })
         scattered = [pair for position, pair in sorted(picked.items())
                      if owner_of_position[position] == index]
@@ -325,7 +357,7 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int) ->
         })
 
     manifest: dict[str, Any] = {
-        "seed": seed, "pairs": pair_count,
+        "seed": seed, "pairs": pair_count, "zipf_exponent": zipf_exponent,
         "base": {"customers": len(customers), "orders": order_count,
                  "clustered_rf2_customer_prefix_bound": prefix_bound},
         "inputs": {}, "workloads": {},
@@ -357,15 +389,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", type=Path, required=True,
                         help="new directory for clustered/, scattered/ and prepare-manifest.json")
     parser.add_argument("--seed", type=int, required=True,
-                        help="seed of the scattered RF2 sample and the scattered RF1 remapping")
+                        help="seed of the scattered RF2 sample and of both RF1 remappings")
     parser.add_argument("--pairs", type=int, default=3, help="RF1/RF2 pairs per workload")
+    parser.add_argument("--zipf-exponent", type=float, default=1.0,
+                        help="Zipf exponent s of the clustered RF1 Customer draw (finite, > 0)")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        manifest = prepare(args.base, args.updates, args.out, args.seed, args.pairs)
+        manifest = prepare(args.base, args.updates, args.out, args.seed, args.pairs,
+                           args.zipf_exponent)
     except (InputError, OSError) as error:
         print(f"prepare_inputs: {error}", file=sys.stderr)
         return 1
