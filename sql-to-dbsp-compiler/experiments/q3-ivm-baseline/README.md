@@ -26,9 +26,11 @@ module is generated from its schema.
 Each runtime has one worker, its own storage directory (`run-N/base` and `run-N/q3`), and its own
 buffer cache. The driver splits `--cache-bytes` between them (the base circuit gets half the MiB,
 rounded down) and gives both the same `--memory-target-bytes`, because RSS is process-wide. The
-report records both. Phases are timed per circuit: `base_ms`, `forward_ms`, `index_ms` and `q3_ms`,
-where `q3_ms` is the view circuit alone. Only `index_ms + q3_ms` (`combined_maintenance_ms`) is
-incremental view maintenance; `base_ms` is reported beside it and never added to it.
+report records both. In reconstructed mode the merged index lives in the base runtime (storage
+under `run-N/base`), because its upkeep is base maintenance. The phases are `base_ms` (the base
+circuit's transaction plus the index append), `index_ms` (the append alone, a sub-phase of
+`base_ms` and never added to it again), `forward_ms`, and `q3_ms`, the view circuit alone, which
+is also reported as `ivm_ms`. Base and IVM are always reported side by side.
 
 All commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). The
 architecture and R1–R5 status are in the
@@ -65,9 +67,9 @@ reconstructed path needs the compiler option `--q3-merged-index` and the Cargo f
 The concrete COL codecs and storage tests live in the standalone
 [`merged-index-col`](../merged-index-col/README.md) library, which the native path does not use.
 
-In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside the view
-circuit, on an auxiliary thread of the view circuit's runtime. Per transaction it converts the
-base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
+In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside both
+circuits, on an auxiliary thread of the base circuit's runtime (measurement version 4). Per
+transaction it converts the base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
 publishes the before and after snapshots to the view circuit, which keeps them until its
 consumers finish. The placement map (order → customer) is built from the Orders rows of that net
 delta, so only RF1 and RF2 are supported. The index is fed from the net delta and not from the

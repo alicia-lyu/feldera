@@ -100,8 +100,8 @@ Order and every current Line belonging to it. Requested duplicate IDs are
 removed and absent Orders counted. Both modes receive the same inputs.
 
 **Native** uses the generated native Q3 circuit and its traces.
-**Reconstructed** maintains the merged index in an auxiliary thread and uses
-it alongside the remaining circuit traces. The index uses the ordinary DBSP
+**Reconstructed** maintains the merged index in an auxiliary thread of the base
+runtime, beside the base tables, and the view circuit reads published snapshots of it. The index uses the ordinary DBSP
 Spine background merger; its compaction can continue across transactions.
 
 ### Timing definitions
@@ -122,20 +122,30 @@ zero `Reference` map bytes.
 | --- | --- |
 | **discovery_ms** | RF2 maintained-state lookups and assembly of complete current deletion rows, including decoding. The delete-ID file is parsed into a key set before the window opens, so its read is not included (version 2 included it). |
 | **checks_input_preparation_ms** | Operational checks, workload statistics, logical-row conversion, and circuit input serialization. RF1 input files are parsed before the window and are not included. |
-| **index_ms** | Reconstructed index append and snapshot acquisition. In version 3 the index rows come from the base circuit's net delta; the conversion to rows (`reconstruction::prepare`) is in `checks_input_preparation_ms`, and the append includes folded-key/payload encoding, copying, and sorting. Zero in native mode. |
-| **base_ms** | The base circuit's transaction: the primary-key input maps and their delta accumulators. Measurement version 3 times it apart from the view circuit. Reported beside `combined_maintenance_ms` and never added to it. |
+| **index_ms** | A sub-phase of `base_ms`; never add it to `base_ms` again. Reconstructed index append and snapshot acquisition. The index rows come from the base circuit's net delta; the conversion to rows (`reconstruction::prepare`) stays in `checks_input_preparation_ms`, and the append includes folded-key/payload encoding, copying, and sorting. The index runs in the base runtime: its auxiliary thread, buffer cache and storage directory (`run-N/base`). Zero in native mode. |
+| **base_ms** | Base maintenance, in version 4: the base circuit's transaction (the primary-key input maps and their delta accumulators) plus, in reconstructed mode, the merged index's upkeep (`index_ms`). The merged index is secondary storage of the base relations, so its upkeep is base maintenance and not IVM. The two parts are separate intervals of the transaction: the forward read and the row conversion fall between them. |
 | **forward_ms** | Reading the base circuit's net delta (`workload::net_delta`) and feeding it to the view circuit's inputs. Harness overhead: a single DBSP circuit passes deltas between views as in-memory streams, so the JSON hop has no counterpart in a deployed pipeline. Excluded from the base and IVM figures, but inside the sequence totals. |
-| **q3_ms** | The view circuit's transaction alone, in version 3: delta accumulation, the joins (native traces or reconstructed readers), and materialized `V`. Reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. In version 2 it was the single `circuit.transaction()` and also covered base-relation maintenance (`add_input_map_persistent`, owner `base_relation`), common to both modes, which dilutes any version 2 native-to-reconstructed ratio. |
+| **q3_ms** | The view circuit's transaction alone: delta accumulation, the joins (native traces or reconstructed readers), and materialized `V`. Reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. In version 2 it was the single `circuit.transaction()` and also covered base-relation maintenance (`add_input_map_persistent`, owner `base_relation`), common to both modes, which dilutes any version 2 native-to-reconstructed ratio. |
 | **publication_cleanup_ms** | Snapshot publication/release, refreshed Catalog snapshots, and foreground output/driver cleanup. |
-| **combined_maintenance_ms** | `index_ms + q3_ms`, the incremental view maintenance; excludes `base_ms`, `forward_ms`, discovery, preparation, and publication/cleanup. |
+| **ivm_ms** | Incremental view maintenance, in version 4: equal to `q3_ms`, the view circuit's transaction. Native mode counts its join traces here; reconstructed mode counts its snapshot readers here, and not the merged index's upkeep. It replaces version 3's `combined_maintenance_ms` (`index_ms + q3_ms`). Excludes `base_ms`, `forward_ms`, discovery, preparation, and publication/cleanup. |
 
-**Final drainage ms is absent in v2 and v3.** The report records
-`measurement_version=3`, `completion_boundary=last_refresh_complete`, and zero
+**Reporting rule: base and IVM are always reported side by side.** Native against
+reconstructed is compared in two parts: base maintenance (`base_ms`: native base tables, against
+base tables plus the merged index) and IVM (`ivm_ms`: native join traces, against snapshot
+readers). An IVM figure alone is never quoted as a saving, because the merged index's upkeep is
+booked in the base phase. `index_ms` is shown only as a part of `base_ms`.
+
+**Final drainage ms is absent in v2, v3 and v4.** The report records
+`measurement_version=4`, `completion_boundary=last_refresh_complete`, and zero
 sequence `snapshot_publication_transactions`. Version 3 splits the transaction
 into the base circuit and the view circuit, each in its own runtime with its own
-storage directory and buffer cache. Version 2 results, such as the macOS rerun of
+storage directory and buffer cache. Version 4 moves the merged index into the base
+runtime and phase: `base_ms` includes `index_ms`, and `combined_maintenance_ms` is renamed
+`ivm_ms` and equals `q3_ms`. Version 2 results, such as the macOS rerun of
 2026-10-22, keep their label: their `q3_ms` includes base-relation maintenance, so
-they are not comparable with version 3.
+they are not comparable with version 3 or 4. Version 3 results keep their label too: their
+`base_ms` leaves out the merged index and their `combined_maintenance_ms` includes it, so
+their phase figures are not comparable with version 4.
 
 ### Resource definitions
 
@@ -164,7 +174,7 @@ loading field is part of the refresh sequence.
 
 ## R5 results, measurement version 3 (macOS smoke, 2026-10-25)
 
-These runs use the two chained circuits, the refresh files read before the window, and the input page cache evicted after loading. The revision is `4d558a222`. Like the 2026-10-22 runs, they are smoke tests, not qualifying results: macOS enforces no memory limit, and most sequences last a few milliseconds. The Linux-only window memory and cgroup fields are `null` here by design.
+These runs use the two chained circuits, the refresh files read before the window, and the input page cache evicted after loading. The revision is `4d558a222`. Like the 2026-10-22 runs, they are smoke tests, not qualifying results: macOS enforces no memory limit, and most sequences last a few milliseconds. The Linux-only window memory and cgroup fields are `null` here by design. The phases are version 3's: `base_ms` leaves out the merged index and `combined_maintenance_ms` (`index_ms + q3_ms`) includes it. Version 4 reverses this (see "Timing definitions").
 
 - **Command:** the same as on 2026-10-22: `measure.py --cache-bytes 33554432 --memory-target-bytes 536870912 --batch 512 --runs 3 --no-verify --setup-full-compaction --front-code-byte-keys --elide-value-headers`, once per workload, without `--diagnostics`.
 - **Artifacts:** `target/r5-v3-timing/<workload>/manifest.json` and `target/r5-v3-timing/summary/summary.{json,md}`.

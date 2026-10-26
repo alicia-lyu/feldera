@@ -7,11 +7,11 @@ reports, over the repetitions:
 
 - `sequence_wall_ms` (`sequence.end_to_end_ms`), `sequence_cpu_ms`
   (`sequence.resources.cpu_microseconds` / 1000);
-- the sums over the refreshes of `foreground_ms` and the measurement-version-3 phases:
-  `base_ms` (the base tables' circuit), `forward_ms` (reading the base net delta and feeding
-  the view circuit), `index_ms` (the merged index), `q3_ms` (the view circuit alone) and
-  `combined_maintenance_ms` (`index_ms + q3_ms`, the IVM figure, which does not include
-  `base_ms`);
+- the sums over the refreshes of `foreground_ms` and the measurement-version-4 phases:
+  `base_ms` (the base circuit plus the merged index's upkeep), `index_ms` (that upkeep, a
+  sub-phase of `base_ms` that is never added to it again), `forward_ms` (reading the base net
+  delta and feeding the view circuit), `q3_ms` (the view circuit alone) and `ivm_ms` (equal to
+  `q3_ms`, the IVM figure). Base and IVM are always reported side by side;
 - `sequence.resources.backend_write_by_owner`: write operations and bytes of
   `query`, `base_relation` and `merged_index`, plus the totals
   `backend_write_operations` and `backend_write_bytes`;
@@ -28,7 +28,7 @@ reports, over the repetitions:
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 3, a field is missing or not a finite non-negative number, a
+measurement version 4, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -44,9 +44,8 @@ from typing import Any
 
 from measure import MODES, WRITE_OWNERS, owner_write_problems
 
-MEASUREMENT_VERSION = 3
-REFRESH_SUMS = ("foreground_ms", "base_ms", "forward_ms", "index_ms", "q3_ms",
-                "combined_maintenance_ms")
+MEASUREMENT_VERSION = 4
+REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
 # the window's cgroup delta has them.
@@ -79,7 +78,8 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     if not isinstance(driver, dict):
         raise SummaryError(f"{where}: no driver report")
     if driver.get("measurement_version") != MEASUREMENT_VERSION:
-        # Version 2 timed base-table maintenance inside q3_ms, so its sums are not comparable.
+        # Version 2 timed base-table maintenance inside q3_ms, and version 3 booked the merged
+        # index in combined_maintenance_ms instead of base_ms, so their sums are not comparable.
         raise SummaryError(f"{where}: measurement_version is "
                            f"{driver.get('measurement_version')!r}, not {MEASUREMENT_VERSION}")
     problems = owner_write_problems(driver)

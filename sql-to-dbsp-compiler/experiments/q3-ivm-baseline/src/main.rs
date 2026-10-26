@@ -301,8 +301,9 @@ impl Stage {
 ///
 /// A transaction runs first on `base`, which holds the base relations in primary-key input
 /// maps. The net change of those relations is then forwarded to `view`, which maintains `V`.
-/// In reconstructed mode the forwarded change also feeds the merged index, which stands in for
-/// the view circuit's join traces.
+/// In reconstructed mode the same net change also feeds the merged index, which lives in the
+/// base runtime and stands in for the view circuit's join traces; the view circuit reads it
+/// through published snapshots.
 struct Pipeline {
     base: Stage,
     view: Stage,
@@ -324,9 +325,11 @@ impl Pipeline {
         #[cfg(not(feature = "merged-index"))]
         let view_circuit = q3_view_circuit::circuit(view_config)?;
         let view = Stage::new(view_circuit, DeleteStyle::WholeRow)?;
-        // The index replaces the view circuit's join traces, so it belongs to its runtime.
+        // The index is secondary storage of the base relations, so it belongs to the base
+        // runtime (thread, buffer cache, storage directory) and its upkeep is base maintenance.
+        // The view circuit reads it only through the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
-        let index = ManualIndex::new(view.circuit.runtime());
+        let index = ManualIndex::new(base.circuit.runtime());
         Ok(Self {
             base,
             view,
@@ -382,11 +385,12 @@ fn difference(
 struct Measurements {
     /// Reading refresh files, validating, and loading the change into the base circuit.
     preparation: Duration,
-    /// The base circuit's transaction.
-    base: Duration,
+    /// The base circuit's transaction alone. Reported inside `base_ms`; see `base_phase`.
+    base_circuit: Duration,
     /// Reading the base tables' net delta and feeding it to the view circuit's inputs.
     forward: Duration,
-    /// Appending the net delta to the merged index (reconstructed mode).
+    /// Appending the net delta to the merged index and acquiring its snapshots (reconstructed
+    /// mode). The index is base storage, so this is a part of `base_ms`.
     index: Duration,
     /// The view circuit's transaction: delta accumulation, joins and `V`.
     view_circuit: Duration,
@@ -400,6 +404,21 @@ struct Measurements {
     delta_positive: Option<i64>,
     delta_negative: Option<i64>,
     view_rows: Option<i64>,
+}
+
+impl Measurements {
+    /// Base maintenance: the base circuit's transaction plus the merged index's upkeep. The
+    /// two are separate intervals of the transaction (the net-delta read and the row
+    /// conversion fall between them), so this is their sum.
+    fn base_phase(&self) -> Duration {
+        self.base_circuit + self.index
+    }
+
+    /// Incremental view maintenance: the view circuit's transaction. The merged index's upkeep
+    /// is not part of it.
+    fn ivm_phase(&self) -> Duration {
+        self.view_circuit
+    }
 }
 
 /// Applies `change` to the base circuit, forwards the base tables' net delta to the view
@@ -435,7 +454,7 @@ fn transact_inner(
 
     let base_started = Instant::now();
     pipeline.base.circuit.transaction()?;
-    stats.base += base_started.elapsed();
+    stats.base_circuit += base_started.elapsed();
 
     // The base circuit's delta streams hold the net change of each base table: an upsert that
     // replaces a row appears as a deletion of the old row and an insertion of the new one.
@@ -443,7 +462,8 @@ fn transact_inner(
     let net_delta = workload::net_delta(&pipeline.base.catalog)?;
     stats.forward += forward_started.elapsed();
 
-    // The index and the view circuit's joins see the same net delta.
+    // The index and the view circuit's joins see the same net delta. The index append is base
+    // maintenance (`index`, a part of `base_ms`); the row conversion stays in preparation.
     #[cfg(feature = "merged-index")]
     {
         let preparation_started = Instant::now();
@@ -1281,25 +1301,27 @@ fn finish_loading(
     ))
 }
 
-/// The phases of a refresh (measurement version 3).
+/// The phases of a refresh (measurement version 4).
 ///
-/// `base_ms`, `forward_ms`, `index_ms` and `q3_ms` are disjoint intervals of the transaction.
-/// `combined_maintenance_ms` is the incremental view maintenance: the merged index and the
-/// view circuit. Base-table maintenance is reported beside it and is not part of it.
+/// `base_ms` is base maintenance: the base circuit's transaction plus the merged index's
+/// upkeep. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `ivm_ms` is
+/// incremental view maintenance and equals `q3_ms`, the view circuit's transaction. The
+/// base circuit, `forward_ms`, the index append and `q3_ms` are disjoint intervals of the
+/// transaction; the base and IVM phases are always reported side by side.
 fn phase_json(stats: &Measurements) -> Value {
     json!({
         "rows": stats.rows,
         "transactions": stats.transactions,
         "discovery_ms": milliseconds(stats.discovery),
         "checks_input_preparation_ms": milliseconds(stats.preparation),
-        "base_ms": milliseconds(stats.base),
+        "base_ms": milliseconds(stats.base_phase()),
         "forward_ms": milliseconds(stats.forward),
         "index_ms": milliseconds(stats.index),
         "q3_ms": milliseconds(stats.view_circuit),
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
-        "combined_maintenance_ms": milliseconds(stats.index + stats.view_circuit),
-        "combined_maintenance_note": "index_ms + q3_ms; q3_ms is the view circuit alone. base_ms (the base tables' circuit) and forward_ms (net delta read and feed) are reported beside it and not added. Discovery, preparation and publication/cleanup are excluded.",
+        "ivm_ms": milliseconds(stats.ivm_phase()),
+        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction. Report base_ms and ivm_ms side by side. forward_ms (net delta read and feed), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
     })
 }
@@ -1448,7 +1470,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let load_elapsed = started.elapsed();
     let load_rows = load.customer_rows + load.order_rows + load.line_rows;
     println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} base_ms={:.3} forward_ms={:.3} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
-        stats.transactions, config.verify, milliseconds(stats.base), milliseconds(stats.forward),
+        stats.transactions, config.verify, milliseconds(stats.base_phase()), milliseconds(stats.forward),
         milliseconds(stats.view_circuit), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
@@ -1516,8 +1538,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
                     #[cfg(feature = "merged-index")]
                     {
+                        // The index belongs to the base runtime, so its files are read
+                        // through the base buffer cache.
                         pipeline
-                            .view
+                            .base
                             .in_cache(|| reconstruction::lines(&snapshot, order))
                     }
                     #[cfg(not(feature = "merged-index"))]
@@ -1656,7 +1680,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 3,
+        "measurement_version": 4,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2376,7 +2400,8 @@ mod reconstructed_tests {
         let base_committer = pipeline.base.circuit.checkpoint().prepare()?;
         let q3_committer = pipeline.view.circuit.checkpoint().prepare()?;
         let (base_checkpoint, q3_checkpoint) = (base_committer.uuid(), q3_committer.uuid());
-        pipeline.index.save(q3_checkpoint.to_string().into())?;
+        // The index lives in the base runtime, so its files belong to the base checkpoint.
+        pipeline.index.save(base_checkpoint.to_string().into())?;
         base_committer.commit()?.publish()?;
         q3_committer.commit()?.publish()?;
         drop(pipeline);
@@ -2385,7 +2410,7 @@ mod reconstructed_tests {
             config(&base_directory, Some(base_checkpoint))?,
             config(&q3_directory, Some(q3_checkpoint))?,
         )?;
-        pipeline.index.restore(q3_checkpoint.to_string().into())?;
+        pipeline.index.restore(base_checkpoint.to_string().into())?;
         let mut reference = restored_reference;
         let mut stats = Measurements::default();
         let deletion = rf2_changes(&reference, &HashSet::from([20]));
@@ -2401,6 +2426,26 @@ mod measurement_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_RUN: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn index_upkeep_is_a_part_of_the_base_phase_and_not_of_ivm() {
+        let stats = Measurements {
+            base_circuit: Duration::from_millis(4),
+            index: Duration::from_millis(1),
+            forward: Duration::from_millis(7),
+            view_circuit: Duration::from_millis(2),
+            ..Measurements::default()
+        };
+        let phases = phase_json(&stats);
+        let phase = |name: &str| phases[name].as_f64().unwrap();
+        // base_ms = 4 + 1, with index_ms reported as its sub-phase and not added again.
+        assert!((phase("base_ms") - 5.0).abs() < 1e-9);
+        assert!((phase("index_ms") - 1.0).abs() < 1e-9);
+        assert!((phase("q3_ms") - 2.0).abs() < 1e-9);
+        assert_eq!(phase("ivm_ms"), phase("q3_ms"));
+        assert!((phase("forward_ms") - 7.0).abs() < 1e-9);
+        assert!(phases.get("combined_maintenance_ms").is_none());
+    }
 
     fn directory() -> Result<PathBuf> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2499,16 +2544,17 @@ mod measurement_tests {
         assert_eq!(refreshes[1]["absent_orders"], 1);
         assert_eq!(refreshes[2]["absent_orders"], 2);
         assert_eq!(refreshes[5]["rows"], 0);
-        // Measurement version 3 times the base circuit, the forwarding, the merged index and
-        // the view circuit separately; the IVM figure leaves the base circuit out.
+        // Measurement version 4 books the merged index's upkeep in the base phase: `index_ms`
+        // is a part of `base_ms`, and the IVM figure is the view circuit alone.
         for refresh in refreshes {
             let phase = |name: &str| refresh[name].as_f64().unwrap();
             assert!(phase("base_ms") > 0.0, "{refresh}");
             assert!(phase("q3_ms") > 0.0, "{refresh}");
             assert!(phase("forward_ms") >= 0.0, "{refresh}");
+            assert!(phase("index_ms") <= phase("base_ms"), "{refresh}");
+            assert!((phase("ivm_ms") - phase("q3_ms")).abs() < 1e-6, "{refresh}");
             assert!(
-                (phase("combined_maintenance_ms") - (phase("index_ms") + phase("q3_ms"))).abs()
-                    < 1e-6,
+                refresh.get("combined_maintenance_ms").is_none(),
                 "{refresh}"
             );
             if !cfg!(feature = "merged-index") {
@@ -2545,7 +2591,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 3);
+        assert_eq!(output["measurement_version"], 4);
         assert_eq!(
             output["sequence"]["completion_boundary"],
             "last_refresh_complete"

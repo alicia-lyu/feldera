@@ -20,7 +20,8 @@ The experiment runs two generated circuits, each in its own DBSP runtime:
   `--q3-merged-index` applies to this circuit only. Everything below, from the
   compiler-expanded graph to the generated joins, describes this circuit.
 
-The driver times the two circuits separately, so `q3_ms` is the view circuit alone;
+The driver times the two circuits separately, so `q3_ms` (also `ivm_ms`) is the view circuit
+alone and `base_ms` is the base circuit plus, in reconstructed mode, the merged index's upkeep;
 [measurement.md](../../../docs/design/merged-index/measurement.md) defines the phases.
 The runtime graphs captured before the split (under `target/q3-circuit-exports/`) show
 the earlier single-circuit program, which also held the primary-key input maps. They
