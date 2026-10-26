@@ -194,16 +194,39 @@ Time base-table maintenance and view maintenance directly and apart, without sub
 
 The agent chose three settings, which are not yet confirmed: `--cache-bytes` is split evenly between the two runtimes (base takes the lower half when the MiB count is odd); both runtimes get the same `--memory-target-bytes`, because RSS is process-wide; and `ManualIndex` binds to the view runtime, since it replaces the view circuit's join traces.
 
+Amended on 2026-10-26: the user confirmed the even cache split and the same memory target. The user rejected the `ManualIndex` binding; see "Merged-index maintenance in the base phase".
+
 ### 2026-10-23: Linux campaign refresh selection
 
 The user decided how `prepare_inputs.py` chooses refreshes:
 
 - RF1 inserts and RF2 deletes are chosen independently and never deliberately correlated.
-- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0; the default is the agent's choice and is unconfirmed.
+- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0, which the user confirmed on 2026-10-26.
 - Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block.
 - Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders.
 
 `prepare_inputs.py` implements this.
+
+### 2026-10-26: Logical views and physical merged indexes
+
+The user stated the principle that separates what the system exposes from what it stores:
+
+- Views, including intermediate views, are logical relations, visible across the whole system.
+- Merged indexes and join traces are physical structures. A join trace is specific to one IVM program. A merged index is a middle ground between base tables and program-specific traces: it can serve many queries and IVM programs, and it could replace one table's primary storage (deferred; see "Secondary storage only").
+- Merged indexes are created at intermediate-view boundaries, chosen by the order-preserving-pipeline rule. The advisor deck shows this in the frame "Query execution with merged index": the index replaces `V` for one compatible pipeline, and crossing an order-destroying boundary requires materializing `V` inside another merged index. (The deck's `figures/mi-boundary.tex` does not exist; the frame draws `\querytimepipeline` from `bridge-defs.tex`. The deck is outside the repository, so it is cited by name.)
+- Merged-index maintenance belongs with the base relations it covers.
+
+Reporting rule: results always report the base and IVM phases side by side. An IVM figure alone is never quoted as a saving, because the merged index's upkeep is booked in the base phase.
+
+### 2026-10-26: Merged-index maintenance in the base phase
+
+`ManualIndex` binds to the base runtime. Its append and snapshot acquisition count in `base_ms`. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `combined_maintenance_ms` is renamed `ivm_ms` and equals `q3_ms`. The change alters what the phase means, so it is measurement version 4.
+
+This supersedes the choice in "Separate base-table maintenance from IVM" that `ManualIndex` binds to the view runtime.
+
+### 2026-10-26: Feldera's buffer cache stays warm at window start
+
+The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded per runtime (`cache_occupancy_at_window_start_bytes` in the `main.rs` report, under both the base and the view runtime). Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
 
 ## Superseded and withdrawn
 

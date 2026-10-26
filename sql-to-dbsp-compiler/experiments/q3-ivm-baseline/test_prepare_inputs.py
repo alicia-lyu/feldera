@@ -201,8 +201,6 @@ class PrepareInputsTest(unittest.TestCase):
             for number, pair in enumerate(manifest["workloads"][workload]["pairs"], start=1):
                 customers = read_customers(out / workload / f"rf1-orders-{number}.tbl")
                 self.assertEqual(pair["rf1_distinct_customers"], len(set(customers)))
-                self.assertEqual(pair["rf1_customer_min"], min(customers))
-                self.assertEqual(pair["rf1_customer_max"], max(customers))
                 top = pair["rf1_top_customer_orders"]
                 self.assertEqual(sorted(top), ["1", "10", "100"])
                 self.assertEqual(top["100"], UPDATE_ORDERS)

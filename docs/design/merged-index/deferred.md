@@ -266,6 +266,43 @@ These items lie outside the roadmap in [general-definition.md](general-definitio
 - **Nullable and other payload types.** A payload column must be NOT NULL and have a packed encoding: an integer, BOOLEAN, DATE, TIME, TIMESTAMP, DECIMAL, or VARCHAR. Nullable columns need a packed `Option` encoding; floats, binary strings, and the other SQL types need their own.
 - **Quoted identifiers in specs.** Relation and column names are unquoted SQL identifiers, matched in the compiler's canonical casing. A table whose name needs quotes cannot be named yet.
 
+## Single circuit with merged indexes (open question, 2026-10-26)
+
+Can one circuit maintain the base relations, the intermediate views, and the final view when merged indexes are included? The harness keeps two circuits and the JSON hop for now; this entry records what a study must settle.
+
+### Why the prototype cannot
+
+`ManualIndex` is maintained outside the circuit and read through snapshots published before each transaction (`Q3State::publish`). Its update must therefore be computed before the step starts, from data the driver already has.
+
+### Why stacking needs more
+
+In a stacked tree, merged index MI_A feeds an intermediate view V, and V is held in MI_B. V's delta exists only inside the step, so an index maintained outside the circuit cannot consume it within the same step.
+
+### Candidates
+
+- Merged-index maintenance at step time inside the runtime, with the index still a physical structure owned by the merged-index pass.
+- One transaction per stage, which changes when outputs commit.
+
+### Reference: typed edge between separate circuits
+
+This applies if the study chooses separate circuits.
+
+Today each forwarded row passes through five conversions:
+
+1. typed tuple to JSON value (`val_to_json`);
+2. to a `Customer`, `Order` or `Line` struct (`parse_*`);
+3. to a JSON value (`row.json()`);
+4. to bytes (`to_vec`);
+5. parsed back into the view input's struct and tuple (`DeCollectionStream::insert`).
+
+The Catalog has no batch insert, and its input handles hide the typed `ZSetHandle`. Either option below should begin by splitting the `forward` timer into read (`net_delta`) and feed (`apply_optional`), so the cost breaks down by measurement.
+
+- **Option 1: driver only, one JSON hop kept.** Read the base delta by downcasting `cursor.val()` to the `Tup*` types (precedent: `verification.rs`). Feed the view with `cursor.serialize_val` bytes straight into `insert` and `delete`. This touches `workload::net_delta`, `main.rs` `Inputs` and `apply_optional`, and a few test helpers.
+- **Option 2: no JSON.** Return the view circuit's existing typed input handles (`handle_s0` to `handle_s2`, already created in Catalog-mode generated code) beside its Catalog. Generation needs either a post-process step in `generate.sh` or a "Catalog plus input handles" mode in `ToRustVisitor.preorder(DBSPCircuit)` with a `CompilerOptions` flag and a test. The driver gets a typed view feeder (`ZSetHandle::push(tuple, ±1)`), and `DeleteStyle::WholeRow` goes away. The base circuit stays in Catalog mode, and the view keeps its Catalog for V verification, `storage_evidence`, `finish_loading` and the checkpoint test.
+- **Not recommended: plain `--handles` with `--q3-merged-index`.** It drops the Catalog, which breaks V verification, storage evidence, loading and the checkpoint test, and it drops the base circuit's tables-as-outputs.
+
+Unaffected under both options: `reconstruction::prepare`, `merged-index-col` `q3.rs`, `Q3State`, the `verify.sh` transcript comparison, `measure.py`, `summarize.py` (which keeps `forward_ms`), and the COL `generated.rs`. The "as JSON" wording in RESULTS.md, measurement.md, CIRCUIT.md and WORKFLOW.md would need updating.
+
 ## Native packing
 
 Native packing (packed tuples, narrowed decimals) is not planned. Two barriers stand in order:

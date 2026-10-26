@@ -14,6 +14,9 @@ The experiment runs two generated circuits, each in its own DBSP runtime:
 - **View circuit** (`q3-view-circuit/`, from [q3.sql](q3.sql)). It has the same tables
   without keys, so they are Z-set inputs (`add_input_zset`), and it has `V`. The
   driver feeds it the base circuit's net delta, with complete rows for deletions.
+  This forwarding is harness overhead: a single DBSP circuit passes deltas between
+  views as in-memory streams, so the JSON hop has no counterpart in a deployed
+  pipeline. It is excluded from the base and IVM figures but inside the sequence totals.
   `--q3-merged-index` applies to this circuit only. Everything below, from the
   compiler-expanded graph to the generated joins, describes this circuit.
 

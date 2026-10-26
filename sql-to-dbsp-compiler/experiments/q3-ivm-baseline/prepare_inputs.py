@@ -54,9 +54,8 @@ the Customer keys of a file are not sorted:
 - scattered: every Order gets an independent uniform draw from all of C, from
   `random.Random(f"{seed}:scattered-rf1")` consumed in pair and file order.
 
-The manifest records s, and for every pair the distinct RF1 Customers, the
-lowest and highest RF1 Customer key (plain observations, which say nothing
-about the clustered rule), and the number of RF1 Orders held by the 1, 10 and
+The manifest records s, and for every pair the distinct RF1 Customers
+(`rf1_distinct_customers`) and the number of RF1 Orders held by the 1, 10 and
 100 most popular Customers of that pair (`rf1_top_customer_orders`).
 
 Equal seeds and inputs give byte-identical outputs on one Python version.
@@ -276,8 +275,6 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
         "pair": pair["number"],
         "rf1_orders": len(pair["orders"]),
         "rf1_lines": len(pair["lines"]),
-        "rf1_customer_min": min(pair["rf1_customers"]),
-        "rf1_customer_max": max(pair["rf1_customers"]),
         "rf1_distinct_customers": len(set(pair["rf1_customers"])),
         "rf1_top_customer_orders": top_customer_orders(pair["rf1_customers"]),
         "rf2_orders": len(pair["rf2_keys"]),
