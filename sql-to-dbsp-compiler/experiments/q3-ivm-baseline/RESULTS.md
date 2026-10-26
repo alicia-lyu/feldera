@@ -172,6 +172,40 @@ publication, and associated cleanup. `load.observed_storage_bytes` is the
 loaded storage observation used by the Linux size qualification check. Neither
 loading field is part of the refresh sequence.
 
+## R5 results, measurement version 4 (macOS smoke, 2026-10-26)
+
+Version 4 maintains the merged index in the base runtime and books its upkeep in `base_ms`; `ivm_ms` is the view circuit alone. Everything else matches version 3. The revision is `572bd97a0`. These are smoke tests, not qualifying results, and the Linux-only window memory and cgroup fields are `null` by design.
+
+- **Command:** the same as on 2026-10-22 and 2026-10-25.
+- **Artifacts:** `target/r5-v4-timing/<workload>/manifest.json` and `target/r5-v4-timing/summary/summary.{json,md}`.
+- **Correctness:** `verify.sh` passed at this revision, and the V transcripts are byte-identical to those from before the circuit split (SHA-256 `826d6d3f…` in both modes).
+
+Each cell is the median of three repetitions, with the minimum and maximum in brackets. Times are milliseconds summed over the six refreshes. Base and IVM are reported side by side, as the reporting rule requires. `index` is part of `base` and is shown only as its breakdown. `forward` is harness overhead and belongs to neither.
+
+| Workload | Mode | `base` | of which `index` | `ivm` | `forward` | Sequence wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| large-group | native | 7.4 [7.2, 7.5] | 0 | 15.2 [14.8, 15.2] | 109.9 [109.0, 110.0] | 208.1 [204.4, 208.3] |
+| large-group | reconstructed | 16.3 [16.2, 16.4] | 9.0 [8.9, 9.1] | 17.6 [17.0, 17.7] | 107.8 [107.6, 108.1] | 205.8 [205.2, 206.1] |
+| clustered | native | 0.56 [0.53, 0.59] | 0 | 0.93 [0.90, 0.97] | 0.82 [0.80, 0.82] | 3.24 [3.18, 3.25] |
+| clustered | reconstructed | 0.63 [0.63, 0.64] | 0.16 [0.16, 0.17] | 1.14 [1.14, 1.20] | 0.78 [0.78, 0.78] | 3.46 [3.45, 3.56] |
+| scattered | native | 0.57 [0.56, 0.79] | 0 | 1.04 [1.03, 1.44] | 0.99 [0.99, 1.02] | 3.68 [3.67, 4.48] |
+| scattered | reconstructed | 0.82 [0.82, 1.01] | 0.23 [0.21, 0.33] | 1.76 [1.73, 2.35] | 0.98 [0.97, 1.01] | 4.76 [4.64, 5.72] |
+
+| Workload | Mode | Writes in the window | Storage at window end | Peak RSS (process lifetime) |
+| --- | --- | --- | --- | --- |
+| large-group | native | 0 | 678,400 B | 45,432,832 B |
+| large-group | reconstructed | 0 | 600,576 B | 55,607,296 B |
+| clustered | native | 0 | 678,400 B | 26,673,152 B |
+| clustered | reconstructed | 0 | 600,576 B | 30,720,000 B |
+| scattered | native | 0 | 678,400 B | 26,591,232 B |
+| scattered | reconstructed | 0 | 600,576 B | 30,982,144 B |
+
+- **Base.** Reconstructed `base` exceeds native `base` by about the index upkeep in every workload. In large-group, `base` minus `index` is 7.3 ms against native's 7.4 ms. That subtraction compares two measured figures from the same runs; it is not a new quantity.
+- **IVM.** Reconstructed `ivm` was higher than native `ivm` in every workload. Reconstructed IVM reads the index through snapshot readers and does no index upkeep, so no part of its time is maintenance of its own state.
+- **Forwarding** still dominates large-group (about 108 to 110 ms of a 206 to 208 ms sequence). It is harness overhead.
+- **Storage** matches versions 2 and 3 byte for byte. No writes fall inside the window.
+- **No performance claim.** The runs are too short and too small to attribute the differences.
+
 ## R5 results, measurement version 3 (macOS smoke, 2026-10-25)
 
 These runs use the two chained circuits, the refresh files read before the window, and the input page cache evicted after loading. The revision is `4d558a222`. Like the 2026-10-22 runs, they are smoke tests, not qualifying results: macOS enforces no memory limit, and most sequences last a few milliseconds. The Linux-only window memory and cgroup fields are `null` here by design. The phases are version 3's: `base_ms` leaves out the merged index and `combined_maintenance_ms` (`index_ms + q3_ms`) includes it. Version 4 reverses this (see "Timing definitions").
