@@ -200,7 +200,7 @@ Each cell is the median of three repetitions, with the minimum and maximum in br
 | scattered | native | 0 | 678,400 B | 26,591,232 B |
 | scattered | reconstructed | 0 | 600,576 B | 30,982,144 B |
 
-- **Base.** Reconstructed `base` exceeds native `base` by about the index upkeep in every workload. In large-group, `base` minus `index` is 7.3 ms against native's 7.4 ms. That subtraction compares two measured figures from the same runs; it is not a new quantity.
+- **Base.** Reconstructed `base` was higher than native `base` in every workload, and its `index` sub-phase is shown beside it. The base circuit's own time is not reported separately from the index here.
 - **IVM.** Reconstructed `ivm` was higher than native `ivm` in every workload. Reconstructed IVM reads the index through snapshot readers and does no index upkeep, so no part of its time is maintenance of its own state.
 - **Forwarding** still dominates large-group (about 108 to 110 ms of a 206 to 208 ms sequence). It is harness overhead.
 - **Storage** matches versions 2 and 3 byte for byte. No writes fall inside the window.
