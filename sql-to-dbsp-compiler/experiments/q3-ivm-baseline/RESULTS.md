@@ -162,7 +162,41 @@ publication, and associated cleanup. `load.observed_storage_bytes` is the
 loaded storage observation used by the Linux size qualification check. Neither
 loading field is part of the refresh sequence.
 
-## R5 results in the current configuration (macOS smoke, 2026-10-22)
+## R5 results, measurement version 3 (macOS smoke, 2026-10-25)
+
+These runs use the two chained circuits, the refresh files read before the window, and the input page cache evicted after loading. The revision is `4d558a222`. Like the 2026-10-22 runs, they are smoke tests, not qualifying results: macOS enforces no memory limit, and most sequences last a few milliseconds. The Linux-only window memory and cgroup fields are `null` here by design.
+
+- **Command:** the same as on 2026-10-22: `measure.py --cache-bytes 33554432 --memory-target-bytes 536870912 --batch 512 --runs 3 --no-verify --setup-full-compaction --front-code-byte-keys --elide-value-headers`, once per workload, without `--diagnostics`.
+- **Artifacts:** `target/r5-v3-timing/<workload>/manifest.json` and `target/r5-v3-timing/summary/summary.{json,md}`.
+- **Correctness:** `verify.sh` passed at this revision. Its V transcripts are byte-identical to those from before the split (SHA-256 `826d6d3f…` in both modes).
+
+Each cell is the median of three repetitions, with the minimum and maximum in brackets. Times are milliseconds; the phase columns are summed over the six refreshes. `index` is zero in native mode. `base` is reported beside `index + q3`, not added to it.
+
+| Workload | Mode | Sequence wall | Sequence CPU | `base` | `forward` | `index` | `q3` | `index + q3` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| large-group | native | 187.7 [185.3, 190.8] | 189.6 [187.4, 192.9] | 6.6 [6.5, 7.0] | 100.5 [98.5, 102.5] | 0 | 13.7 [13.3, 14.3] | 13.7 [13.3, 14.3] |
+| large-group | reconstructed | 186.7 [185.3, 197.6] | 188.9 [188.0, 199.5] | 6.6 [6.5, 8.5] | 97.8 [96.5, 101.2] | 8.2 [8.1, 9.2] | 16.1 [16.0, 17.4] | 24.3 [24.1, 26.7] |
+| clustered | native | 3.30 [3.12, 3.93] | 3.75 [3.29, 4.22] | 0.56 [0.52, 0.74] | 0.81 [0.81, 0.83] | 0 | 1.01 [0.91, 1.36] | 1.01 [0.91, 1.36] |
+| clustered | reconstructed | 4.12 [3.76, 4.63] | 4.37 [3.86, 4.65] | 0.60 [0.55, 0.80] | 0.81 [0.81, 0.83] | 0.22 [0.21, 0.40] | 1.34 [1.23, 1.41] | 1.55 [1.44, 1.81] |
+| scattered | native | 4.71 [3.73, 4.74] | 5.09 [4.17, 5.22] | 0.84 [0.65, 1.06] | 0.94 [0.86, 0.98] | 0 | 1.52 [1.23, 1.77] | 1.52 [1.23, 1.77] |
+| scattered | reconstructed | 4.67 [4.17, 7.22] | 5.10 [4.39, 7.40] | 0.72 [0.62, 1.17] | 0.85 [0.83, 1.06] | 0.37 [0.30, 0.49] | 1.61 [1.33, 2.44] | 1.98 [1.63, 2.94] |
+
+| Workload | Mode | Writes in the window | Storage at window end | Peak RSS (process lifetime) |
+| --- | --- | --- | --- | --- |
+| large-group | native | 0 | 678,400 B | 45,465,600 B |
+| large-group | reconstructed | 0 | 600,576 B | 54,591,488 B |
+| clustered | native | 0 | 678,400 B | 26,656,768 B |
+| clustered | reconstructed | 0 | 600,576 B | 30,654,464 B |
+| scattered | native | 0 | 678,400 B | 26,705,920 B |
+| scattered | reconstructed | 0 | 600,576 B | 30,621,696 B |
+
+- **Forwarding dominates large-group.** Moving the base circuit's net delta into the view circuit as JSON (`forward`) took about 100 ms of the roughly 187 ms sequence in both modes, more than `base` and `index + q3` together. It is harness overhead, outside both circuits' timings, but it sits inside the sequence wall and CPU columns. Compare sequence totals across versions only with this in mind.
+- **Base maintenance is now apart.** `base` is about equal in the two modes, as expected, since both run the same base circuit. `q3` no longer includes it: large-group native `q3` was 23.1 ms in version 2 and is 13.7 ms here. The two versions differ in more than this split (pre-read, eviction, two runtimes), so the difference is not attributed to base maintenance alone.
+- **Storage** matches the 2026-10-22 runs byte for byte in every repetition: 600,576 B reconstructed and 678,400 B native, summed over both circuits' directories. No writes fall inside the window.
+- **Peak RSS** is higher than on 2026-10-22 in every row. It is the process-lifetime high-water mark, and version 3 adds a second runtime and holds the pre-read refresh rows. The window-only peak exists only on Linux.
+- **Timing.** The reconstructed mode's `index + q3` was higher than native mode's in every workload, as in version 2. The runs are too short and too small to attribute that difference. Make no performance claim from this table.
+
+## R5 results, measurement version 2 (macOS smoke, 2026-10-22)
 
 These runs follow roadmap Step 5, at revision `3b9948017` with a clean tree. They are smoke tests, not qualifying results: macOS enforces no memory limit, and each refresh sequence lasts milliseconds, so timing differences are within the range that scheduling noise can produce. They show what the current code does on these inputs, not how the two modes compare at scale.
 
