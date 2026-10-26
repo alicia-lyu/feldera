@@ -112,7 +112,7 @@ zero `Reference` map bytes.
 
 | Column | Definition |
 | --- | --- |
-| **Foreground ms** | Sum of the six refresh wall times, including input reads/discovery, operational checks, input preparation, the base circuit, forwarding, index maintenance, the view circuit, publication, and cleanup. |
+| **Foreground ms** | Sum of the six refresh wall times, including discovery (the lookup; the refresh files are read before the window), operational checks, input preparation, the base circuit, forwarding, index maintenance, the view circuit, publication, and cleanup. |
 | **Sequence ms** | Wall time from the start of the refresh sequence through the last refresh's publication/cleanup. Includes between-refresh measurement/logging overhead; excludes final reporting and any subsequent compaction. |
 | **Sequence CPU ms** | Process user + system CPU over the sequence, summed across driver, runtime, and auxiliary threads. Includes naturally scheduled background merge work executed inside that interval. |
 
@@ -120,8 +120,8 @@ zero `Reference` map bytes.
 
 | Field | Definition |
 | --- | --- |
-| **discovery_ms** | RF2 delete-ID reads, deduplication, maintained-state lookups, and assembly of complete current deletion rows, including decoding. |
-| **checks_input_preparation_ms** | RF1 input reads, operational checks, workload statistics, logical-row conversion, and circuit input serialization. |
+| **discovery_ms** | RF2 maintained-state lookups and assembly of complete current deletion rows, including decoding. The delete-ID file is parsed into a key set before the window opens, so its read is not included (version 2 included it). |
+| **checks_input_preparation_ms** | Operational checks, workload statistics, logical-row conversion, and circuit input serialization. RF1 input files are parsed before the window and are not included. |
 | **index_ms** | Reconstructed index append and snapshot acquisition. In version 3 the index rows come from the base circuit's net delta; the conversion to rows (`reconstruction::prepare`) is in `checks_input_preparation_ms`, and the append includes folded-key/payload encoding, copying, and sorting. Zero in native mode. |
 | **base_ms** | The base circuit's transaction: the primary-key input maps and their delta accumulators. Measurement version 3 times it apart from the view circuit. Reported beside `combined_maintenance_ms` and never added to it. |
 | **forward_ms** | Reading the base circuit's net delta (`workload::net_delta`) and feeding it to the view circuit's inputs. Outside both circuits' timings. |
@@ -147,8 +147,14 @@ are bytes.** Storage observations do not require compaction to finish.
 | **Read/write ops and bytes** | Storage-backend operation counts and bytes submitted during the sequence; distinct from OS physical I/O. |
 | **Observed storage** | Regular-file lengths in the storage directory observed after the last refresh without a compaction wait; background merges can still be active. |
 | **Sampled peak storage** | Largest directory size sampled during the sequence and its final storage observation, every 10 ms and once at the end. Shorter peaks may be missed. |
-| **Peak RSS** | Process resident-memory high-water mark since process start, including loading, driver, runtime, and auxiliary threads. |
-| **Cache occupancy** | Configured worker-cache occupancy observed after the last refresh; capacity is 32 MiB. |
+| **Peak RSS** | Process-lifetime resident-memory high-water mark since process start (`getrusage`), including loading, setup compaction, the refresh pre-read, driver, runtime, and auxiliary threads. Not a maintenance-window figure. |
+| **Window peak RSS** | `sequence.window_peak_rss_bytes`. Linux only (`null` elsewhere): `VmHWM` at the end of the window, after `echo 5 > /proc/self/clear_refs` reset it at the window's start. It includes the pre-read refresh rows still held. `window_peak_rss_error` explains a failed reset (the peak is then `null`). |
+| **Window end RSS** | `sequence.window_end_rss_bytes`. Linux only: `VmRSS` at the end of the window. |
+| **Cgroup window block** | `sequence.cgroup`. Linux with cgroup v2 only (`null` elsewhere). `before`, `after` and `delta` of `memory.current`, `memory.events`, a named subset of `memory.stat` (`pgscan`, `pgsteal`, `workingset_refault*` and others the kernel has) and `memory.pressure`, taken before the first refresh and after the last. `peak`: `window_peak_bytes` from resetting and re-reading `memory.peak` (kernel 6.12 or later; unverified, null with `window_peak_supported: false` if it fails), `lifetime_peak_at_end_bytes`, and `max_sampled_memory_current_bytes` (the fallback, sampled at the window start, each refresh end and the window end). Evidence of memory use, not proof of pressure. |
+| **Memory pressure (per refresh)** | `memory_pressure.before` and `.after`: DBSP's level for the base and view runtimes, sampled at the refresh's boundaries. The level comes from process RSS against the memory target, not from cgroup memory. |
+| **Refresh inputs** | `refresh_inputs`: per-refresh row counts of the pre-read refresh files, and `VmRSS` before and after the pre-read (Linux), which measure its fixed overhead. |
+| **Inputs evicted** | `inputs_evicted`: whether `posix_fadvise(DONTNEED)` was applied to every base and refresh input file after the pre-read (Linux only; false on macOS), with the cgroup's `memory.current` before and after. |
+| **Cache occupancy** | Configured worker-cache occupancy observed after the last refresh (`cache_occupancy_bytes`) and at the start of the window (`cache_occupancy_at_window_start_bytes`), per runtime under `circuits`; total capacity is 32 MiB. |
 | **Memory/storage batches** | Counts of nonempty RAM and disk batches in the retained Catalog snapshots; the auxiliary index reports its current batches separately. File-backed configuration permits RAM batches. |
 
 `load.background_merge_wait_ms` includes the loading wait, its snapshot

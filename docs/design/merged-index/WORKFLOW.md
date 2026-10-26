@@ -238,6 +238,8 @@ rather than corrupting results. Run them before building anything.
 | Swap accounting on | After the recipe below, `ls /sys/fs/cgroup/r5/driver/memory.swap.max` | `configure_cgroup` fails on the first run. Enable swap accounting or report. |
 | Delegation works | The recipe below, then `cat /proc/self/cgroup` prints `0::/r5/driver` | Adapt the recipe; do not run without `--cgroup-root`. |
 | Storage path accepts 512-byte `O_DIRECT` | `df -T <storage dir>` shows ext4 or xfs; `sudo blockdev --getss <device>` prints 512 | Use another filesystem or disk. A 4 KiB logical sector, tmpfs, or overlay may fail with "Invalid argument" on the first state write (untested). |
+| `clear_refs` resets the peak (Linux 4.0 or later) | `grep VmHWM /proc/self/status; echo 5 > /proc/self/clear_refs; grep VmHWM /proc/self/status` | `sequence.window_peak_rss_bytes` is `null` with `window_peak_rss_error` set. Report the kernel. (Unverified on the host.) |
+| `memory.peak` resets by writing to it (kernel 6.12 or later; unverified) | In the cgroup: `exec 3<>/sys/fs/cgroup/r5/driver/memory.peak; echo reset >&3; cat /proc/self/fd/3` | `peak.window_peak_supported` is false and the report falls back to the sampled `memory.current` maximum. Not a failure. |
 | Disk room | `df -h <storage dir>` against the budget below | Free space or lower `--runs`. |
 
 ### State a clone needs
@@ -425,6 +427,21 @@ limit, the cgroup proof matched (`cgroup.enforced`), verification was off, and
 `complete` and `errors` is empty. A qualifying pilot shows only that the loaded state exceeds the
 limit. It does not show memory pressure.
 
+Also read the window evidence in each run's `driver` report, as evidence and not as proof of
+pressure:
+
+- `sequence.window_peak_rss_bytes` and `sequence.window_end_rss_bytes` must be numbers, and
+  `sequence.window_peak_rss_error` must be `null`. Otherwise the `clear_refs` reset failed.
+- `sequence.cgroup` must not be `null`. Check `peak.window_peak_supported`: if it is false, read
+  `peak.window_peak_error` and use `max_sampled_memory_current_bytes` (a boundary sample, a lower
+  bound on the true peak).
+- `inputs_evicted.evicted` should be true, and `cgroup_memory_current_after_bytes` should be
+  below `..._before_bytes` if the page cache held the inputs.
+- `refresh_inputs.vm_rss_after_pre_read_bytes` minus `vm_rss_before_pre_read_bytes` is the
+  pre-read's fixed overhead, equal in both modes.
+- `refreshes[].memory_pressure` shows what DBSP's level was; `cgroup.delta` (`pgscan`, `pgsteal`,
+  `workingset_refault_*`, `memory_events.max`) shows what the kernel did. Report the two apart.
+
 ### Campaign and front-coding A/B
 
 Run the campaign only after all four pilots pass and the pressure instrumentation exists
@@ -457,15 +474,24 @@ for all 32, or for 24 if the pilot's run directories are moved off the disk befo
 - `memory.peak`, `memory.events`, and `io.stat` are read once, after the run exits. They cover the
   whole run, including the input-copy phase, loading, and setup compaction, not only maintenance.
   The driver's `/proc/self/io` counters are per interval, but they are process-wide.
-- Pressure sampling and the before and after maintenance snapshots are not implemented
-  ([measurement.md](measurement.md#pending-pressure-evidence)).
+- The driver now records maintenance-window memory evidence: per-refresh pressure levels
+  (`refreshes[].memory_pressure`), `sequence.window_peak_rss_bytes`,
+  `sequence.window_end_rss_bytes`, and the `sequence.cgroup` before, after and delta snapshot
+  ([measurement.md](measurement.md#pending-pressure-evidence)). The Linux paths have never run.
+  The resets they depend on (`clear_refs`, `memory.peak`) are unverified; see the pre-flight rows.
 - DBSP's pressure level follows process RSS only, while `memory.max` also charges page cache, so
   the cgroup can near its limit while DBSP reports Low pressure
   ([measurement.md](measurement.md#two-pressure-signals)). Input-cache eviction and refresh-file
-  pre-reading, which would narrow the gap, are planned and not implemented.
-- Until those exist, make none of these claims: runtime memory pressure, reclaim or refault
+  pre-reading narrow the gap and do not close it.
+- The jemalloc global allocator moved from the generated circuits into the driver's `main.rs`
+  in step D (the base/view split), because a binary can link one allocator. Its `malloc_conf`
+  (`prof:true,prof_active:true,lg_prof_sample:19`) is the symbol the compiler emitted before. Whether
+  the symbol takes effect from the driver on Linux (it changes allocator behavior and RSS) is
+  unverified.
+- Make none of these claims without raw artifacts: runtime memory pressure, reclaim or refault
   behavior, beyond-memory behavior, equal-memory performance, a disk saving at SF 10, or a
-  maintenance-only I/O figure. No SF 10 run has been measured.
+  maintenance-only I/O figure. The window fields are evidence, not proof. No SF 10 run has been
+  measured.
 
 ## Inspect the compiler pipeline
 

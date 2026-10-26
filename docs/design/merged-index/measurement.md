@@ -10,7 +10,7 @@ This file defines what is measured and what remains pending. Commands (the runne
 - The macOS smoke runs were repeated in the current configuration after Step 5 (2026-10-22, in RESULTS.md); storage matched the packed, elided campaign byte for byte.
 - macOS runs are smoke tests only. Their highest RSS (47.0 MiB in the 2026-10-22 rerun) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
 - The smoke runs' write and storage gap is explained down to record size; see [the investigation](history.md#2026-10-14-write-and-storage-investigation). With the packed payloads of [Packed, untagged values](#packed-untagged-values-2026-10-19-to-2026-10-20), the merged index's file is smaller than the four join traces' files in these runs.
-- Pending: the Linux pilot, pressure instrumentation, and the three-repetition campaign, all below. Input preparation (`prepare_inputs.py`) exists and ran end to end on macOS at SF 0.01; no SF 10 input has been generated.
+- Pressure instrumentation is implemented, with Linux paths not yet run (see [Pending: pressure evidence](#pending-pressure-evidence)). Pending: the Linux pilot and the three-repetition campaign, all below. Input preparation (`prepare_inputs.py`) exists and ran end to end on macOS at SF 0.01; no SF 10 input has been generated.
 
 ## Definitions
 
@@ -18,6 +18,9 @@ This file defines what is measured and what remains pending. Commands (the runne
 - **Completion boundary** (version 2). `completion_boundary=last_refresh_complete`. There is no forced compaction, no final compaction wait, and no extra publication transaction. Loading waits only for naturally eligible background merges, then publishes once with an empty transaction. Version 1 forced a final compaction; its results are historical and not comparable (see [history.md](history.md#2026-10-08-r5-version-1-smoke-runs)).
 - **Two circuits** (version 3). The base tables and the view are separate circuits in separate runtimes, chained by the base circuit's net delta; `q3_ms` is the view circuit alone, and `base_ms` is reported beside `combined_maintenance_ms`, not added to it. The report records both circuits' storage directories, cache shares (`configuration.circuits`) and per-circuit storage and cache occupancy (`sequence.circuits`). `measurement_version` 2 results timed base-relation maintenance inside `q3_ms` and are not comparable.
 - **Refresh deltas stay whole.** Each refresh is complete in RAM. An oversized legitimate refresh must fail rather than be split to fit a budget.
+- **Refresh files are pre-read** (version 3, before any smoke run at that version). After loading and setup compaction, and before the window opens, the driver parses every refresh file into memory: RF1 into the `Change` the loop applies, RF2 into its key set. The loop consumes each by value and drops it once applied. The window therefore times no file read or parse: RF1 `checks_input_preparation_ms` no longer includes them, and RF2 `discovery_ms` is the key lookup alone. Version 2 timed them inside the window, so those two columns are not comparable. The pre-read memory is ordinary process memory, equal in both modes; it counts toward DBSP's RSS-based pressure level and the window peak. `refresh_inputs` reports the row counts and `VmRSS` before and after the pre-read (Linux).
+- **Input page cache evicted.** On Linux the driver calls `posix_fadvise(DONTNEED)` on every base input and refresh file it read, after the pre-read and before the window; inside the cgroup, `measure.py` does the same for each source and private copy (after an `fsync`, because fresh copies are dirty). The driver reports `inputs_evicted` with the cgroup's `memory.current` before and after. The DBSP buffer cache is left warm, since clearing it would need a new DBSP API; its occupancy is recorded at window start and end (`sequence.cache_occupancy_at_window_start_bytes`).
+- **Window versus lifetime.** `resources.peak_rss_bytes` is the process-lifetime high-water mark and includes loading. The window figures below cover the refreshes only.
 - **Durability.** Refresh completion implies none. Checkpoint costs are deferred.
 - **Equality of inputs.** Both modes receive the same logical refreshes; the runner records input and executable SHA-256 hashes in a manifest (`measure.py`).
 - **Excluded.** Independent full-join validation runs only on request (`--no-verify` omits it) and is outside the measured interval. Reconstruction decoding, copying, sorting, spill, and output cleanup remain inside their real intervals.
@@ -45,6 +48,12 @@ The JSON report (`q3-ivm-baseline/src/main.rs`) records:
 - per Catalog relation: `snapshot_batch_count`, `memory_batch_count`, `storage_batch_count`, `file_backed`; and `manual_index_storage` for the auxiliary index. Memory batches are permitted, so `file_backed` does not mean every batch is on disk;
 - OS I/O counters, `null` where unavailable (macOS);
 - `backend_write_by_owner` in every `resources` block (each refresh and the sequence): write operations and bytes per owner, keyed `query`, `base_relation` and `merged_index`. The owners sum to `backend_write_operations` and `backend_write_bytes`, which are unchanged. A file's owner is fixed when its writer is created, and a spine's owner when the spine is created; a background compaction runs under its spine's owner. `query` covers join traces, V and query execution; `base_relation` covers the input-map state and the base tables' delta accumulators; `merged_index` covers `ManualIndex`. A native run reports no `merged_index` writes. `measure.py` rejects a report whose owners do not sum to the totals;
+- `os` (`std::env::consts::OS`), which the summarizer uses to decide whether Linux-only fields may be `null`;
+- `refresh_inputs`: `per_refresh` row counts (RF1 `orders` and `lines`; RF2 `order_keys`), and `vm_rss_before_pre_read_bytes` and `vm_rss_after_pre_read_bytes` (Linux; `null` elsewhere), which measure the pre-read's fixed overhead;
+- `inputs_evicted`: `evicted` (true only on Linux with every file advised), `files`, `failures`, and `cgroup_memory_current_before_bytes` and `..._after_bytes` (`null` outside cgroup v2). `evicted` is false on macOS;
+- per refresh, `memory_pressure.before` and `memory_pressure.after`: the level (`low`, `moderate`, `high`, `critical`) of `base_runtime` and `q3_runtime`, sampled at the refresh's boundaries. DBSP updates its level about once a second from RSS, so a sample can lag;
+- `sequence.window_peak_rss_bytes` and `sequence.window_end_rss_bytes` (Linux only, `null` elsewhere): `VmHWM` after `clear_refs` reset it at window start, and `VmRSS`, at window end. `window_peak_rss_error` holds the reason the reset failed, in which case the peak is `null`;
+- `sequence.cgroup` (Linux with cgroup v2; `null` otherwise): `path`; `before`, `after` and `delta` of `memory.current`, `memory.events`, the named subset of `memory.stat` that the kernel has (`anon`, `file`, `pgfault`, `pgmajfault`, `pgscan`, `pgsteal`, `workingset_refault[_anon|_file]`) and `memory.pressure` (`delta` gives total stall microseconds); and `peak` with `window_peak_supported`, `window_peak_bytes` (from resetting `memory.peak` by writing to it and reading it through the same open file, kernel 6.12 and later; UNVERIFIED on the project's Linux host), `lifetime_peak_at_end_bytes`, and `max_sampled_memory_current_bytes` (the fallback: the maximum over the window start, each refresh end and the window end). A missing file gives `null` for its fields. These are evidence of memory use, not proof of pressure;
 - `sequence.window_started_micros` and `sequence.window_finished_micros` (Unix-epoch microseconds), which place the flush and compaction logs of `--diagnostics` runs inside or outside the window; and `configuration.diagnostics`, the diagnostics directory or `null`.
 
 In version 3, `q3_ms` is the view circuit's transaction alone, and `base_ms` times the base circuit's transaction: the primary-key input maps (`add_input_map_persistent`, owner `base_relation`) and their delta accumulators. In version 2, including the 2026-10-22 macOS rerun, `q3_ms` was the single `circuit.transaction()` and covered both; that base maintenance is common to both modes and dilutes any version 2 ratio between them.
@@ -81,12 +90,19 @@ On Linux, storage files open with `O_DIRECT`, while input reads go through the p
 
 ## Pending: pressure evidence
 
-The runner records cgroup limits, peak, events, and I/O. It does not sample runtime memory-pressure levels or maintenance-only reclaim and refault counters (no such code in `measure.py` or `main.rs`). Before any claim of pressure or reclaim:
+The instrumentation is implemented (Linux paths unrun and untested on Linux; macOS records `null`) but has produced no Linux data. Implemented:
 
-- Sample `Runtime::current_memory_pressure()` through the refresh sequence and keep each level with its interval.
-- Snapshot cgroup `memory.current`, `memory.events`, `memory.stat` reclaim and refault counters, and `memory.pressure` immediately before and after the measured maintenance. Report the deltas apart from loading and input preparation.
-- Keep cgroup peak and `io.stat` as run-level evidence. The enforced limit covers the driver, runtime, auxiliary threads, configured cache, and cgroup-charged input page cache together.
+- Per-refresh `Runtime::current_memory_pressure()` levels for both runtimes (`refreshes[].memory_pressure`).
+- A cgroup snapshot of `memory.current`, `memory.events`, `memory.stat` reclaim and refault counters, and `memory.pressure` before the first refresh and after the last, with deltas (`sequence.cgroup`), apart from loading and input preparation.
+- A window peak: `VmHWM` reset through `clear_refs` (`sequence.window_peak_rss_bytes`), and `memory.peak` reset by writing to it, with the sampled `memory.current` maximum as the fallback.
+- Pre-reading of the refresh files and eviction of the input page cache (see [Definitions](#definitions)).
+
+Still pending:
+
+- The first Linux pilot, which shows whether the `clear_refs` and `memory.peak` resets work on the host.
+- Keeping the runner's run-level cgroup peak and `io.stat` as run-level evidence (unchanged). The enforced limit covers the driver, runtime, auxiliary threads, configured cache, and cgroup-charged input page cache together.
 - As a probe, repeat a pilot with a 192 MiB runtime target and check that the samples show the intended levels. An optional delta stress case concatenates eight complete RF1 sets in RAM; a run that exceeds its budget must fail as one complete refresh.
+- Any claim of pressure or reclaim. The new fields are evidence to read, not proof.
 
 ### Two pressure signals
 
@@ -97,7 +113,7 @@ DBSP's pressure level and the cgroup limit measure different things:
   - **Hysteresis.** After High, the level falls back only when the raw level reaches Low. After Critical, it falls back only when the raw level reaches Moderate or Low.
 - **The cgroup limit.** `memory.max` charges anonymous memory and page cache together. The cache includes the runner's input copies (`private_inputs` in `measure.py`), the driver's `BufReader` input reads, and the refresh-file reads. State files are opened with `O_DIRECT` (`StorageCacheConfig::to_custom_open_flags` for `FelderaCache`), so state I/O adds no page cache.
 - **Consequence.** The cgroup can approach `memory.max`, and the kernel can reclaim page cache, while DBSP still reports Low pressure and does not spill. Kernel reclaim in a pilot is therefore not evidence of DBSP memory pressure, and DBSP's level says nothing about cgroup headroom. Report the two signals apart.
-- **Planned mitigations (not yet implemented).** Evicting the input page cache after loading, and reading the refresh files into memory before the measured window, would narrow the gap. Page cache charged inside the window would stay invisible to DBSP's signal, and pre-read rows would count as process memory and so toward DBSP's signal.
+- **Mitigations (implemented).** The driver and the runner evict the input page cache after loading, and the driver reads the refresh files into memory before the window. This narrows the gap but does not close it: page cache charged inside the window would stay invisible to DBSP's signal, and pre-read rows count as process memory and so toward DBSP's signal (their size is `refresh_inputs`). The cgroup and the DBSP levels are reported apart (`sequence.cgroup` and `refreshes[].memory_pressure`).
 
 Until these are recorded in RESULTS.md, with raw artifacts, make no memory-pressure, reclaim, or beyond-memory claim.
 
