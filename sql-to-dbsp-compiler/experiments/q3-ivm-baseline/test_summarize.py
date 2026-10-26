@@ -31,10 +31,12 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                  for number in (1, 2)]
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 3,
+        "measurement_version": 3, "os": "linux",
         "refreshes": refreshes,
         "sequence": {
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
+            "window_peak_rss_bytes": 7_000_000 + int(scale),
+            "window_end_rss_bytes": 6_000_000 + int(scale), "cgroup": None,
             "resources": {
                 "cpu_microseconds": 90_000 * scale, "peak_rss_bytes": 5_000_000 + int(scale),
                 "backend_write_operations": sum(writes),
@@ -89,6 +91,9 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(native["metrics"]["write_bytes_total"]["median"], 300)
         self.assertEqual(native["metrics"]["observed_storage_bytes"]["max"], 1003)
         self.assertEqual(native["metrics"]["peak_rss_bytes"]["min"], 5_000_001)
+        self.assertEqual(native["metrics"]["window_peak_rss_bytes"]["max"], 7_000_003)
+        self.assertEqual(native["metrics"]["window_end_rss_bytes"]["min"], 6_000_001)
+        self.assertNotIn("cgroup_delta_pgscan", native["metrics"])
         self.assertEqual(set(summary["workloads"]), {"clustered", "scattered"})
         markdown = (out / "summary.md").read_text()
         self.assertIn("## clustered", markdown)
@@ -155,6 +160,79 @@ class SummarizeTest(unittest.TestCase):
         content = copy.deepcopy(base)
         content["runs"][0]["driver"]["refreshes"] = []
         self.failing(content, "no refreshes")
+
+    def test_window_rss_may_be_null_only_off_linux(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        for run in content["runs"]:
+            run["driver"]["os"] = "macos"
+            run["driver"]["sequence"]["window_peak_rss_bytes"] = None
+            run["driver"]["sequence"]["window_end_rss_bytes"] = None
+        summary = summarize.summarize([self.write_manifest("mac", content)])
+        metrics = summary["workloads"]["mac"]["modes"]["native"]["metrics"]
+        self.assertIn("peak_rss_bytes", metrics)
+        self.assertNotIn("window_peak_rss_bytes", metrics)
+        self.assertNotIn("window_end_rss_bytes", metrics)
+        # The same nulls on Linux (for example a failed clear_refs write) are an error.
+        for run in content["runs"]:
+            run["driver"]["os"] = "linux"
+        self.failing(content, "native run 1: field sequence.window_peak_rss_bytes is None")
+
+    def test_report_must_name_its_os(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        del content["runs"][0]["driver"]["os"]
+        self.failing(content, "native run 1: the report does not name its os")
+
+    @staticmethod
+    def with_cgroup(run: dict, **changes: object) -> None:
+        cgroup = {
+            "delta": {
+                "memory_events": {"high": 0, "max": 4, "oom": 0, "oom_kill": 0},
+                "memory_stat": {"pgscan": 600, "pgsteal": 70, "anon": -5,
+                                "workingset_refault_anon": 8, "workingset_refault_file": 9},
+                "memory_pressure_total_microseconds": {"some": 1234, "full": 0}},
+            "peak": {"window_peak_supported": True, "window_peak_bytes": 9_000_000,
+                     "max_sampled_memory_current_bytes": 8_000_000}}
+        cgroup.update(changes)
+        run["driver"]["sequence"]["cgroup"] = cgroup
+
+    def test_cgroup_deltas_become_metrics_when_present(self) -> None:
+        content = manifest({"native": [1.0, 2.0], "merged-index": [1.0, 2.0]})
+        for run in content["runs"]:
+            self.with_cgroup(run)
+        summary = summarize.summarize([self.write_manifest("cg", content)])
+        metrics = summary["workloads"]["cg"]["modes"]["native"]["metrics"]
+        self.assertEqual(metrics["cgroup_delta_pgscan"]["median"], 600)
+        self.assertEqual(metrics["cgroup_delta_workingset_refault_file"]["max"], 9)
+        self.assertEqual(metrics["cgroup_delta_memory_events_max"]["min"], 4)
+        self.assertEqual(metrics["cgroup_delta_pressure_some_microseconds"]["median"], 1234)
+        self.assertEqual(metrics["cgroup_window_peak_bytes"]["median"], 9_000_000)
+        self.assertEqual(metrics["cgroup_max_sampled_memory_current_bytes"]["max"], 8_000_000)
+        # A gauge's signed delta and a counter the kernel lacks contribute nothing.
+        self.assertNotIn("cgroup_delta_anon", metrics)
+        self.assertNotIn("cgroup_delta_workingset_refault", metrics)
+
+    def test_unsupported_window_peak_leaves_only_the_sampled_maximum(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        for run in content["runs"]:
+            self.with_cgroup(run, peak={"window_peak_supported": False,
+                                        "window_peak_bytes": None,
+                                        "max_sampled_memory_current_bytes": 5})
+        metrics = summarize.summarize([self.write_manifest("np", content)])[
+            "workloads"]["np"]["modes"]["native"]["metrics"]
+        self.assertNotIn("cgroup_window_peak_bytes", metrics)
+        self.assertEqual(metrics["cgroup_max_sampled_memory_current_bytes"]["median"], 5)
+
+    def test_invalid_present_cgroup_delta_is_an_error(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        for run in content["runs"]:
+            self.with_cgroup(run)
+        content["runs"][0]["driver"]["sequence"]["cgroup"]["delta"]["memory_stat"]["pgscan"] = -1
+        self.failing(content, "native run 1 sequence.cgroup: field delta.memory_stat.pgscan is -1")
+
+    def test_runs_with_different_metric_sets_are_an_error(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        self.with_cgroup(content["runs"][0])
+        self.failing(content, "different sets of metrics")
 
     def test_older_measurement_versions_are_an_error(self) -> None:
         # Version 2 timed the base tables' maintenance inside q3_ms.

@@ -163,6 +163,31 @@ def private_inputs(spec: dict[str, Any]) -> dict[str, str]:
     return copied
 
 
+def evict_from_page_cache(paths: list[Path]) -> dict[str, Any]:
+    """Drop the page-cache pages of `paths` (Linux `posix_fadvise(DONTNEED)`).
+
+    Each file is first flushed with `fsync`, because dirty pages (the private copies,
+    just written) are not dropped. Failures are recorded per file, not raised, so
+    that an unsupported filesystem cannot abort a campaign. Where `os.posix_fadvise`
+    does not exist (macOS), nothing is done and `evicted` is false.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        return {"evicted": False, "reason": "os.posix_fadvise is unavailable on this platform",
+                "files": [], "failures": []}
+    evicted: list[str] = []
+    failures: list[dict[str, str]] = []
+    for path in sorted(set(paths)):
+        try:
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+                os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            evicted.append(str(path))
+        except OSError as error:
+            failures.append({"path": str(path), "error": str(error)})
+    return {"evicted": bool(evicted) and not failures, "reason": None,
+            "files": evicted, "failures": failures}
+
+
 def run_inside_cgroup(spec_path: Path) -> None:
     spec = json.loads(spec_path.read_text())
     group = Path(spec["cgroup"])
@@ -170,6 +195,9 @@ def run_inside_cgroup(spec_path: Path) -> None:
     if (group / "memory.max").read_text().strip() != str(spec["total_memory_bytes"]):
         raise RuntimeError("run cgroup has an unexpected total memory limit")
     copied = private_inputs(spec)
+    # Start the driver with neither the sources nor their copies in the page cache.
+    write_json(Path(spec["run_dir"]) / "input-eviction.json", evict_from_page_cache(
+        [Path(raw) for raw in spec["inputs"].values()] + [Path(raw) for raw in copied.values()]))
     write_json(Path(spec["run_dir"]) / "cgroup-proof.json", {
         "cgroup": str(group), "memory_max": spec["total_memory_bytes"],
         "memory_swap_max": 0, "membership_verified": True,

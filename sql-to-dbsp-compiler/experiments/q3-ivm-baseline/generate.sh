@@ -7,6 +7,17 @@ set -euo pipefail
 
 experiment_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 compiler="${experiment_dir}/../../SQL-compiler/sql-to-dbsp"
+# Before the base/view split, the generator wrote src/lib.rs and src/stubs.rs here. They are
+# untracked and no longer ignored. In an old checkout Cargo takes src/lib.rs for a library
+# target, and the build fails with "failed to resolve mod `udf`". Stop early instead.
+for stale in "${experiment_dir}/src/lib.rs" "${experiment_dir}/src/stubs.rs"; do
+  if [[ -e "${stale}" ]]; then
+    echo "$0: stale pre-split generated file ${stale}" >&2
+    echo "Move it to TRASH/ (it is not used any more; the circuits are generated into q3-base-circuit/ and q3-view-circuit/), then rerun." >&2
+    exit 1
+  fi
+done
+
 if [[ -n "${JAVA_HOME:-}" ]]; then
   export PATH="${JAVA_HOME}/bin:${PATH}"
 fi
