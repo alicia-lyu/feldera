@@ -65,7 +65,7 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 - **Native:** ordinary Feldera state. The two joins keep four integrator traces.
 - **Reconstructed:** those four traces are not built. The join reads requested key ranges from a secondary "COL" merged index (folded keys: customer > order > line). The index is maintained outside the circuit on an auxiliary thread, and its before/after snapshots are published before each transaction.
 
-The harness runs two chained circuits in two DBSP runtimes (user decision of 2026-10-23). The base circuit (`base.sql`) holds the primary-key base tables. The view circuit (`q3.sql`, keyless Z-set tables plus `V`) maintains `V` from the base circuit's net delta. `--q3-merged-index` applies to the view circuit only.
+The harness runs two chained circuits in two DBSP runtimes (user decision of 2026-10-23). The base circuit (`base.sql`) holds the primary-key base tables. The view circuit (`q3.sql`, keyless Z-set tables plus `V`) maintains `V` from the base circuit's net delta. `--q3-merged-index` applies to the view circuit only. `ManualIndex` binds to the base runtime (auxiliary thread, buffer cache, storage), not the view runtime, so its upkeep is base maintenance (user decision of 2026-10-26): `base_ms` includes `index_ms`, and `ivm_ms` equals `q3_ms`. Always report the base and IVM phases side by side.
 
 ### Where the code lives
 

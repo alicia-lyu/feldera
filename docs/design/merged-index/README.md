@@ -12,7 +12,8 @@ The prototype compares two modes:
 - **Reconstructed.** Those four traces are not built. Each join instead reads the key ranges it
   needs from a secondary Customer–Orders–Lineitem (COL) merged index, whose keys fold the
   customer, order, and line identifiers (11, 20, and 25 bytes). A harness-side owner,
-  `ManualIndex`, appends to the index outside the circuit on an auxiliary thread. Before each
+  `ManualIndex`, appends to the index outside the circuit on an auxiliary thread of the base
+  runtime (measurement version 4 books this upkeep as base maintenance). Before each
   transaction it publishes before and after snapshots of the index. The join that consumes them is
   the supplied-snapshot join, `dyn_join_generic_with_snapshot_readers` in
   `crates/dbsp/src/operator/dynamic/join.rs`; it builds no integrate or delay traces.
