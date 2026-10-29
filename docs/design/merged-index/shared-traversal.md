@@ -188,6 +188,15 @@ The session interprets a join plan: the hand-written circuit. It is not code wri
 
 The thesis text and this document must settle these points first.
 
+> [!NOTE]
+> **Status (2026-10-29):** worked out in the thesis write-up (`docs/key-trie-laminar-ranges.tex`).
+>
+> - **Shared core:** Section 2.1.2 ("One scan session") now holds the core shared with query processing: `Advance`, `Skip`, `AtRangeEnd`, demands, and Theorem "One scan session".
+> - **IVM side:** Section 2.2.3 adds the join plan, static and dynamic requests, and Lemma "Requests". Its condition is *forward requests*: when a request arises, every entry it targets is on the path or not yet passed. (A4) implies it.
+> - **Logical operators:** the joins stay separate logical operators, which the session interleaves per instance node (Lemma "Interleaving is exact", with a worked coordination table).
+> - **(A3):** it is split into (A3a) interleaved and (A3b) available. DBSP fails (A3a) for base deltas too.
+> - **Notation:** a derived row is named by its instance node, `((custkey, orderkey) = (c5, o5))`, never `ΔJ(o)`. The pseudocode below predates this.
+
 1. **The join plan.**
    - Define the session's input: a tree of joins whose keys are trie keys, each with its delta rules and the reader of each term (stream, version, path or range).
    - Define the turn order of the readers at one key.
