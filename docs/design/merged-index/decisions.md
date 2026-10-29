@@ -228,13 +228,25 @@ This supersedes the choice in "Separate base-table maintenance from IVM" that `M
 
 The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded per runtime (`cache_occupancy_at_window_start_bytes` in the `main.rs` report, under both the base and the view runtime). Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
 
+### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
+
+For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives A1, and the author is responsible for turn order (A4). The compiler hook stays for the existing reconstructed mode.
+
+### 2026-10-29: Merged-index deltas come from the base transaction
+
+The merged index is base structure, not a view. Its transaction delta `Dlt`, with every entry at its full folded key, is computed in the base phase before view maintenance, so view-side rows carry their trie path (A2). An owner-key change is a moved subtree inside `Dlt`.
+
+### 2026-10-29: Derived deltas are computed inside one scan session
+
+A3 is met by one scan session per transaction that receives every base delta up front, computes derived deltas such as `ΔJ` at the instance node where they arise, and adds the requests they make. Rejected: a second traversal for downstream readers (too costly), a fused operator hard-coded to Q3 (not general), and DBSP scheduler changes that pipeline separate join operators (they deviate from the algorithm). The algorithm work in [shared-traversal.md](shared-traversal.md) precedes coding.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |
-| 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. |
+| 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. 2026-10-29: hand-written again, for the shared-traversal mode only. |
 | 2026-09-28 | Require a transaction-level folded-key uniqueness check before a delta is incorporated. | 2026-10-12: no validator; uniqueness follows from the base tables' primary keys. |
 | 2026-09-28 | A physical old/new bit, or base/pending bit, in each stored record. | 2026-09-28: before/after read handles. |
 | 2026-09-28 | Reuse Feldera's grouped key/value batches unchanged for the merged index. | 2026-09-28: flat folded keys with an adapter over the same LSM machinery. |

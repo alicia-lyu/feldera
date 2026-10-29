@@ -74,6 +74,9 @@ existing batches; they create no tuple copies, historical-version catalog, or ex
 
 ## Shared scan sessions
 
+> [!NOTE]
+> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward pre-order scan session per transaction that computes derived deltas during the scan. The material below remains background for full-query execution.
+
 Shared scan sessions are a **deferred, optional abstraction** for either full-query execution or IVM.
 The current experiments use direct reconstruction. The design below applies only if later workloads
 justify coordinating multiple readers over the same ranges; it is not a prerequisite for reconstruction
