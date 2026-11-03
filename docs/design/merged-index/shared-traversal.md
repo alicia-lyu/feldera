@@ -218,7 +218,7 @@ Wording only:
 
 Noted here only, not yet in `BUFFER.md`:
 
-1. **`alg:session` reads every entry of a group.** Q3's invoices are read but buffered nowhere. A storage engine that decodes on landing then decodes them. The collection could seek past domains no reader uses, as `Visit` already does. In this doc's [scan session](#the-scan-session), buffered execution makes one group request per touched root, which passes by seeking the domains the plan never reads, so the invoices are not decoded.
+1. **`alg:session` reads every entry of a group.** Q3's invoices are read but buffered nowhere. A storage engine that decodes on landing then decodes them. The collection could seek past domains no reader uses, as `Visit` already does. In this doc's [scan session](#the-scan-session), buffered execution passes one group reader, with one request per touched root, which passes by seeking the domains the plan never reads, so the invoices are not decoded.
 
 None of these points changes the algorithm.
 
@@ -299,9 +299,9 @@ Buffered and selective execution share one scan session, which each execution us
 
 - `Old`, one pinned snapshot.
 - `Dlt`, the transaction's sorted run.
-- The requests, in record order of their nodes, supplied up front by the execution.
+- The readers, supplied by the execution. Each reader has a kind, a version, the index streams it takes, and its own queue of requests.
 
-A selective request is a pair: a reader and an instance node, given by its key prefix. `O⁻`'s request at `c5` is `(O⁻, (custkey = c5))`. The plan fixes the rest for each reader:
+A request is an instance node, given by its key prefix. It sits in its reader's queue, which keeps it in record order, so it does not name its reader. `O⁻`'s request at `c5` is `(custkey = c5)` in `O⁻`'s queue. The reader fixes everything else:
 
 | Fixed by the reader | `O⁻` | `C⁺` |
 | --- | --- | --- |
@@ -309,20 +309,20 @@ A selective request is a pair: a reader and an instance node, given by its key p
 | version: before or after | before | after |
 | streams: the index streams the read takes | Orders | Customer |
 
-The kind alone does not suffice: readers of the same kind can differ in version and streams.
+The kind alone does not suffice: readers of the same kind can differ in version and streams. No reference runs both ways: a reader owns its queue, and the session reads only the queues' heads. The session merges the heads by prefix, which is the merge across readers of [Ordered requests](#ordered-requests). Each reader's static requests already arrive sorted, and the readers are few (four in Q3), so the merge costs one comparison per reader per request. A dynamic request may fall between pending requests of its reader, so it enters its queue by a sorted insert.
 
-A request carries no rows. The driving rows of a static request stay in `Dlt`, which the session reads through its own forward cursor. The driving rows of a dynamic request stay with the driver that derived them. The requests tell the session what to read and what to pass. Each reader's streams are known, so a domain that no pending request's reader takes is passed by seeking. No separate list of participating domains is needed.
+A request carries no rows. The driving rows of a static request stay in `Dlt`, which the session reads through its own forward cursor. The driving rows of a dynamic request stay with the driver that derived them. The requests tell the session what to read and what to pass. Each reader's streams are known, so a domain that no reader with a pending request takes is passed by seeking. No separate list of participating domains is needed.
 
 ### Requests per execution
 
-- **Selective execution** supplies the static requests, merged across readers, and adds a dynamic request whenever it derives a row.
-- **Buffered execution** buffers each touched customer's whole group, so its readers do not matter to the session. It supplies one *group request* per touched root, such as `(custkey = c5)`, taken from `Dlt`'s roots. A group request reads the root's subtree in `Old` and its delta entries in `Dlt`. It passes by seeking only the domains whose streams the plan never reads, such as Q3's invoices, so that they are not decoded (rule 5).
+- **Selective execution** supplies the plan's readers, each queue filled with its static requests. It adds a dynamic request to a reader's queue whenever it derives a row.
+- **Buffered execution** buffers each touched customer's whole group, so the plan's readers do not matter to the session. It supplies one *group reader*: a range read of both versions, taking every stream the plan reads. Its queue holds one request per touched root, such as `(custkey = c5)`, taken from `Dlt`'s roots. The group reader passes by seeking only the domains whose streams the plan never reads, such as Q3's invoices, so that they are not decoded (rule 5).
 
 No request of buffered execution can be late, since the group buffer keeps the whole group (compare `ex:coarse-request`).
 
 ### The logical overlay
 
-The session never merges `Old` and `Dlt` into a run. It keeps three sorted forward streams: the cursor over `Old`, a cursor over `Dlt`, and the request queue. It compares them by key bytes. Nothing is consolidated between `Old` and `Dlt` either, since the tagged overlay `Old ⊎ Dlt` stays unconsolidated (`prop:overlay`). Each step costs one key comparison, on keys the cursors have already read.
+The session never merges `Old` and `Dlt` into a run. It keeps sorted forward streams: the cursor over `Old`, a cursor over `Dlt`, and the readers' request queues. It compares them by key bytes. Nothing is consolidated between `Old` and `Dlt` either, since the tagged overlay `Old ⊎ Dlt` stays unconsolidated (`prop:overlay`). Each step costs one key comparison, on keys the cursors have already read.
 
 In Q3, `Old`'s children never interleave with `Dlt`'s:
 
@@ -335,22 +335,21 @@ Only an after-version range read steps the two cursors together within a range. 
 ### Operations
 
 ```text
-ScanSession(Old, Dlt, requests):         requests in record order of their nodes
-  next():        the first pending request
+ScanSession(Old, Dlt, readers):          each reader with its queue, in record order
+  next():        the reader ρ and request n with the smallest head prefix
   enter(n):      seek the cursors over Old and Dlt forward to prefix(n), if behind;
                  one logical seek
   entries(n):    n's attached entries from both cursors, as key bytes,
                  each tagged with its version and weight
   decode(e):     decode e's payload at its first take; later takes reuse it;
                  one payload decode
-  range(n, r):   step through Range(n) for request r: in Old, and in Dlt if r reads
-                 the after version or is a group request; seek past the domains whose
-                 streams r's reader does not take (for a group request, that the plan never reads)
+  range(n, ρ):   step through Range(n) in Old, and in Dlt if ρ reads the after version;
+                 seek past the domains whose streams ρ does not take
   skip(n):       seek past Range(n), to prefix(n)'s successor
-  add(r):        insert a dynamic request in record order
+  add(ρ, n):     insert a dynamic request n into ρ's queue, in record order
 
-Buffered(session):
-  for each group request at a touched root a, in record order:
+Buffered(session):                       readers = { the group reader }
+  for each request a in the group reader's queue, in record order:
     enter(a); read a's subtree through entries and range, filling one buffer per stream
     add a's delta rows; evaluate the delta rules over the buffers; emit
     release a's buffers
@@ -365,7 +364,7 @@ Selective(session):
 
 | Owner | Holds |
 | --- | --- |
-| The session | The cursors over `Old` and `Dlt`, the request queue, the decoded entries of the current node, and the logical counters: cursor opens, logical seeks, and payload decodes |
+| The session | The cursors over `Old` and `Dlt`, the readers with their request queues, the decoded entries of the current node, and the logical counters: cursor opens, logical seeks, and payload decodes |
 | The buffered driver | The group buffers |
 | The selective driver | The kept path, the ready pairs, and the derivation of dynamic requests |
 | DBSP's run cursors | The run counters: per-run seeks, key reads, value reads, and weight reads |
@@ -408,7 +407,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - Lazy value positioning in `FileIndexedWSetCursor` (rule 2 of [No extra decoding](#no-extra-decoding)).
    - A merging cursor over `Old`'s runs that consolidates only taken entries (rule 3).
    - A prefix successor, and a width per domain.
-   - The [scan session](#the-scan-session): requests in record order, the logical overlay of `Old` and `Dlt`, the operations `enter`, `entries`, `decode`, `range`, `skip`, and `add`, and the logical counters. It passes children and subtrees by seeking (rule 1).
+   - The [scan session](#the-scan-session): requests in record order, the logical overlay of `Old` and `Dlt`, the readers with their request queues, the operations `enter`, `entries`, `decode`, `range`, `skip`, and `add`, and the logical counters. It passes children and subtrees by seeking (rule 1).
    - *Exit:* property tests against brute-force prefix scans, over random tries, data, multi-run snapshots, and request sets, including carry and an all-`0xFF` prefix. Counter tests show no value read and no payload decode for any passed entry. The existing trace tests pass.
 3. **Publish `(Old, Dlt)`, and read the after state as the overlay.**
    - Rewrite the four readers to read `Old ⊎ Dlt` for the after state.
@@ -420,7 +419,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - *Exit:* the transcript comparison with native mode passes.
 5. **Buffered-execution session.**
    - The join-plan type, plus one operator that drives the scan session: it collects each touched customer once and evaluates the plan's delta terms over its buffers, the joins taking turns per group. Each group is released before the next is collected. It replaces step 4's two joins.
-   - It supplies one group request per touched root ([Requests per execution](#requests-per-execution)).
+   - It passes the session one group reader, with one request per touched root ([Requests per execution](#requests-per-execution)).
    - It is exact for any plan with path or range reads, and it remains the fallback when (A3) has not been shown.
    - Collection seeks past domains no request names, and decodes only taken entries (rules 4 and 5).
    - *Exit:* the counters show each taken old entry read and decoded once, and none of Q3's invoices decoded. The transcript comparison passes.
