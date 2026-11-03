@@ -210,7 +210,10 @@ Wording only:
 1. **Cost wording.** Applies to `thm:shared`(iii), the worked traversal, and its "Two seeks". Say that a seek is logical: on a snapshot of k runs it costs k physical seeks. Say also that ending a range reads the next key without decoding it; `c6`'s key is read. A storage-agnostic footnote suffices.
 2. **The algorithm note of `alg:session-requests`.** "Even after the cursor over `Old` has passed its key" is ambiguous. A delta-only node has no old entries, so the cursor over `Old` may already stand past its prefix.
 3. **(A2)'s last clause.** "Every derived row keeps the key values at which its consumers read it" is a requirement on the circuit, not on the inputs. Consider stating it beside (A1).
-4. **Buffered execution and the DBSP boundary.** "Boundary with DBSP" appears only in `sec:ivm-interleave`. Buffered execution also needs `J` and `V` in one operator. Otherwise `V` collects each touched customer a second time, against `prop:group-delta`'s "each collected old entry is read once".
+4. **Buffered execution and the DBSP boundary.** *Applied on 2026-11-03,* in a revised form: `sec:ivm-buffered` now has the paragraph "Buffers shared across operators", after `prop:group-delta`'s sketch.
+   - `J` and `V` can stay separate DBSP operators that hold references to the same group buffers, so each old entry is still read once.
+   - DBSP flushes `V` only after `J` has passed every touched customer, so the buffers of all touched groups stay until `V` finishes.
+   - Releasing each group before the next is collected needs the two joins to take turns per group, as the session does.
 
 Noted here only, not yet in `BUFFER.md`:
 
@@ -235,11 +238,19 @@ The facts were checked against the code on 2026-11-03.
 | readers and terms | The four functions in `merged-index-col/src/q3.rs`. Each opens its own cursor for every requested key; no two readers share a cursor. | Readers driven by requests. |
 | session operator | `add_ternary_operator` and `add_quaternary_operator` (`circuit_builder.rs`). Existing users include `GroupTransform` (ternary) and `AsofJoin` (quaternary). Accumulators in front supply each whole delta at the flush. Output is chunked by `splitter_output_chunk_size`. | A new operator. |
 | snapshot input | Before each transaction the harness puts the snapshots in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush. | The same pattern, holding `(Old, Dlt)`. |
-| joins in one operator | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. | Both executions need `J` and `V` in one operator. |
+| joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. | Selective execution needs `J` and `V` in one session. Buffered execution can keep them as separate operators that share the group buffers, but then it holds every touched group until `V` finishes. |
 | `Dlt` complete under (A2) | The base transaction runs first. `prepare` folds its net delta, and `ManualIndex::append` builds the run before the view transaction starts. For RF1/RF2 each line item finds its customer through its order's row in the same transaction. | The run is not published, and the view circuit reads the SQL net delta instead. Feed the view side from `Dlt`; no extra owner lookup is needed. |
 | counters | Buffer-cache hits and misses, and Bloom and range filter statistics. No seek, step, or decode counters. | Add them. |
 
-The "joins in one operator" row also explains why DBSP's own operators cannot deliver deltas per instance node. The companion note `key-trie-execution-refinements.tex` develops that point as condition (P), for a circuit that would pipeline its own joins. Chapter 3 applies the same flush rule to the session. Buffered execution needs it too: `prop:group-delta` reads each old entry once only if both joins process a group while its buffers are held.
+The flush rule in the "joins taking turns" row also explains why DBSP's own operators cannot deliver deltas per instance node. The companion note `key-trie-execution-refinements.tex` develops that point as condition (P), for a circuit that would pipeline its own joins. Chapter 3 applies the rule twice:
+
+- for selective execution, in "Boundary with DBSP";
+- for buffered execution, in "Buffers shared across operators".
+
+The two cases differ:
+
+- **Buffered execution.** Separate operators still read each old entry once. What they lose is the memory bound of one group.
+- **Selective execution.** Separate operators lose the traversal itself, since `V`'s requests arise only after `J` has passed the touched ranges.
 
 ## No extra decoding
 
@@ -325,7 +336,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - The placement map is dropped.
    - *Exit:* the transcript comparison with native mode passes.
 5. **Buffered-execution session.**
-   - The join-plan type, plus one operator that collects each touched customer once and evaluates the plan's delta terms over its buffers. It replaces step 4's two joins.
+   - The join-plan type, plus one operator that collects each touched customer once and evaluates the plan's delta terms over its buffers, the joins taking turns per group. Each group is released before the next is collected. It replaces step 4's two joins.
    - It is exact for any plan with path or range reads, and it remains the fallback when (A3) has not been shown.
    - Collection seeks past domains no reader uses, and decodes only participating entries (rules 4 and 5).
    - *Exit:* the counters show each participating old entry read and decoded once, and none of Q3's invoices decoded. The transcript comparison passes.
@@ -352,3 +363,4 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - Lazy value positioning as a change to DBSP's file-batch cursor, not a merged-index-only cursor over the file format.
 - Consolidating `Old` only at taken entries, through a merging cursor of the session's own, rather than reading `Old` through `CursorList`.
 - Changes beyond RF1/RF2 kept out of scope until step 8.
+- Step 5 as one operator with the joins taking turns per group, holding one group at a time. The alternative is separate operators sharing the group buffers: simpler, but holding every touched group until `V` finishes.
