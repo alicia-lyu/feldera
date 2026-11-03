@@ -88,6 +88,8 @@ MaintainGroup(a):
 
 Under (A1) and (A2), this computes the view change exactly, and it reads each collected old entry once (Proposition `prop:group-delta`). The same holds for any circuit of joins whose partner reads are path or range reads. Buffered execution therefore needs no (A3), and it is the fallback wherever (A3) has not been shown.
 
+Buffered execution needs no order of requests. It needs only the delta grouped by touched customer; within a group, the buffers serve reads in any order.
+
 ### Selective execution
 
 Selective execution visits only the instance nodes that requests need, and keeps only the entries that later requests can still name.
@@ -95,7 +97,7 @@ Selective execution visits only the instance nodes that requests need, and keeps
 - **Requests.** A driving row makes a *request* to a reader, anchored at the instance node of the row's values cut to the reader's key.
   - A base delta row makes a *static* request, known before the scan.
   - A derived row makes a *dynamic* request when it is computed.
-- **Order of requests.** The session keeps pending requests ordered by their nodes' folded-key prefixes, which is record order. Each reader's static requests arrive sorted, because `Dlt` is sorted; the readers' requests are then merged. Deciding whether a child is needed is a prefix lookup among the pending requests.
+- **Order of requests.** Pending requests are kept in record order of their nodes (see [Ordered requests](#ordered-requests)).
 - **Ready pairs.** A pair of a delta term is *ready* when all its rows have been read. At each node, the session computes every ready pair and makes the requests its rows produce, before choosing a child. It repeats while new rows make further pairs ready.
 - **Delivery.** A derived row is delivered at the node where its next consumer reads it, and it waits there until the cursor arrives. That node need not be at the producing join's key. `J` joins on `(custkey)`, but its rows carry the `orderkey` at which `L⁻` reads them.
 - **Steering.** Reader `ρ'` *steers* reader `ρ` when entries `ρ'` returns are combined into a derived row that requests `ρ`. In Q3, `C⁺` and `O⁻` steer `L⁻` through `ΔJ`. A request is *late* if an entry it needs was already passed and not kept; otherwise it is *in time*.
@@ -135,6 +137,32 @@ The chapter's results:
   - A range that no request needs is passed by one forward seek.
   - The output is exact.
   - For Q3, the kept old entries are those on the current path. Deltas, waiting rows, and output are kept besides.
+
+#### Ordered requests
+
+Only selective execution orders its requests (`fig:q3-requests`, drawn in `figures/deck/q3_ordered_requests.tex`). The session keeps its pending requests ordered by their nodes' folded-key prefixes, which is record order with ancestors first. The first request gives the first seek. Deciding whether a child is needed is then a prefix lookup among the pending requests.
+
+A request's node anchors what it reads, but it is not always where the reads lie:
+
+- a path read takes the node's entries and its ancestors', decoded on the way down and kept on the path;
+- a range read takes the node's subtree, restricted to its own streams. So `O⁻`'s request at `(c5)` reads `o3` and `o4`, not `c5`.
+
+The worked transaction's requests, in record order:
+
+| Node | Reader | Reads | From |
+| --- | --- | --- | --- |
+| `(c5)` | `C⁺` | path: `c5` | `+o5` in `ΔO` |
+| `(c5)` | `O⁻` | range: `o3`, `o4` | `−c5`, `+c5'` in `ΔC` |
+| `(c5, o3)` | `L⁻` | range: `l7`, `l8` | `ΔJ` at `o3` (dynamic) |
+| `(c5, o4)` | `L⁻` | range: `l9` | `ΔJ` at `o4` (dynamic) |
+| `(c5, o5)` | `J⁺` | path: `c5`, `o5` | `+l10`, `+l11` in `ΔL` |
+| `(c5, o5)` | `L⁻` | range: none | `ΔJ` at `o5` (dynamic) |
+
+Each reader's static requests arrive sorted, since cutting sorted folded keys at one key keeps their order. Readers cut at different keys, though, so a later delta row can request an earlier node. A `ΔL` row at `(c5, o3, l7)` requests `J⁺` at `(c5, o3)`, while a later `ΔO` row at `(c5, o4)` requests `C⁺` at `(c5)`. The session therefore merges the readers' static requests.
+
+Dynamic requests join the same order when their rows are derived. Under (A3), a dynamic request at or below the current node lies at or ahead of the cursor. A path request at an ancestor is served at once from the kept path.
+
+The delta's own order is a convenience, not a requirement. A sorted `Dlt` gives each reader's static requests in order, so the session merges them instead of sorting. It also lets `Visit` merge `Old`'s children with `Dlt`'s in one forward pass. An unsorted delta would only need one sort up front. In Feldera, `build_batch` already sorts and consolidates the run, so `Dlt` arrives sorted at no extra cost.
 
 ### Why Q3 satisfies (A3)
 
