@@ -301,18 +301,17 @@ Buffered and selective execution share one scan session, which each execution us
 - `Dlt`, the transaction's sorted run.
 - The requests, in record order of their nodes. Each execution supplies its static requests up front, already merged across readers.
 
-A request names:
+A request is a pair: a reader and an instance node, given by its key prefix. `O⁻`'s request at `c5` is `(O⁻, (custkey = c5))`. The plan fixes the rest for each reader:
 
-| Field | Example (`O⁻` at `c5`) |
-| --- | --- |
-| its node's prefix | `(custkey = c5)` |
-| its reader | `O⁻` |
-| its kind: path or range | range |
-| for a range read, its streams | Orders |
-| its version: before or after | before |
-| its driving rows | `−c5`, `+c5'` |
+| Fixed by the reader | `O⁻` | `C⁺` |
+| --- | --- | --- |
+| kind: path or range | range | path |
+| version: before or after | before | after |
+| streams: the index streams the read takes | Orders | Customer |
 
-The requests tell the session what to read and what to pass. A range request names its streams, so a domain that no request names is passed by seeking. No separate list of participating domains is needed.
+The reader is needed beside the kind, because two requests at the same node can share a kind but differ in version or streams. In buffered execution, for instance, `O⁻` and `L⁻` both make range requests at `(custkey = c5)`, one for Orders and one for Lineitem.
+
+A request carries no rows. The driving rows of a static request stay in `Dlt`, which the session reads through its own forward cursor. The driving rows of a dynamic request stay with the driver that derived them. The requests tell the session what to read and what to pass. Each reader's streams are known, so a domain that no pending request's reader takes is passed by seeking. No separate list of participating domains is needed.
 
 ### Requests per execution
 
@@ -344,9 +343,8 @@ ScanSession(Old, Dlt, requests):         requests in record order of their nodes
                  each tagged with its version and weight
   decode(e):     decode e's payload at its first take; later takes reuse it;
                  one payload decode
-  range(n, S, version):
-                 step through Range(n) in Old (and in Dlt for the after version),
-                 seeking past the domains not in S
+  range(n, ρ):   step through Range(n) in Old (and in Dlt if ρ reads the after version),
+                 seeking past the domains whose streams ρ does not take
   skip(n):       seek past Range(n), to prefix(n)'s successor
   add(r):        insert a dynamic request in record order
 
@@ -449,8 +447,4 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - Consolidating `Old` only at taken entries, through a merging cursor of the session's own, rather than reading `Old` through `CursorList`.
 - Changes beyond RF1/RF2 kept out of scope until step 8.
 - Step 5 as one operator with the joins taking turns per group, holding one group at a time. The alternative is separate operators sharing the group buffers: simpler, but holding every touched group until `V` finishes.
-- In buffered execution, one coarse range request per touched root for each reader with only dynamic requests.
-- Requests that carry their stream sets and driving rows.
-- `Dlt` read through its own forward cursor, rather than through the rows the requests carry.
-- A separate `weight_reads` run counter.
-- Run counters always on, as thread-local totals, not behind a cargo feature.
+- A separate `weight_reads` run counter. The file format stores a value and its weight apart: landing on a value deserializes the value, and the weight is deserialized only when `weight`, `map_times`, or `map_values` asks for it. `CursorList`'s zero-weight skip reads weights at entries that no reader takes (rule 3), so a separate counter shows that cost. Folding weights into value reads would hide it.

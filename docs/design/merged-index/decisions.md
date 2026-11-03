@@ -260,6 +260,8 @@ The scan session counts the write-up's units: cursor opens, logical seeks, and p
 
 Buffered and selective execution share one scan session, which each execution uses or extends. The session owns the cursors over `Old` and `Dlt`, the request queue, the decoded entries of the current node, and the logical counters. Each execution supplies its static requests to the session in record order. The requests, which name their streams for range reads, tell the session what to read and what to pass, so no separate list of participating domains exists. `Old` and `Dlt` are merged only logically: the session compares forward cursors by key bytes and builds no merged run.
 
+A request is a reader and an instance node (its key prefix). The plan fixes each reader's kind, version, and streams. A request carries no rows, since that would duplicate `Dlt`, which the session reads through its own cursor. Buffered execution adds one range request at each touched root for each reader that has only dynamic requests (Q3's `L⁻`), so that its group buffers are complete. The run counters are always on, as per-thread running totals, with no build flag.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
