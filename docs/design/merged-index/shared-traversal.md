@@ -281,7 +281,7 @@ These are implementation questions, not algorithm questions:
 The steps are ordered. Each has an exit check and updates its docs. They are not R-numbered, since R1–R5 is the only numbering scheme.
 
 1. **Counters on today's readers.**
-   - Count cursor opens, logical seeks, per-run seeks, key reads, value reads, and payload decodes. Key reads and value reads need hooks in `crates/dbsp` storage cursors.
+   - Count cursor opens, logical seeks, per-run seeks, key reads, value reads, and payload decodes. Logical seeks and payload decodes are counted in the instance-node cursor. Per-run seeks, key reads, and value reads are counted in DBSP's file-batch cursor.
    - *Exit:* a test pins the counts on the worked transaction. They become the baseline.
 2. **Decode-free passing in storage and in `merged_index`.**
    - Lazy value positioning in `FileIndexedWSetCursor` (rule 2 of [No extra decoding](#no-extra-decoding)).
@@ -320,7 +320,6 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
 - The session as one DBSP operator over the ternary streaming interface, or the quaternary one for wider plans.
 - `ΔJ` internal to the session unless a plan exports it.
-- Counters in the instance-node cursor, not in the generic `Cursor`.
 - Step 4 as an intermediate milestone before the session.
 - Lazy value positioning as a change to DBSP's file-batch cursor, not a merged-index-only cursor over the file format.
 - Consolidating `Old` only at taken entries, through a merging cursor of the session's own, rather than reading `Old` through `CursorList`.

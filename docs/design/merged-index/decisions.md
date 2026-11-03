@@ -252,6 +252,10 @@ The counters count per-run seeks, key reads, and value reads in storage, besides
 
 Fixes found by auditing the write-up against the code are recorded as dated entries in the thesis repository's `BUFFER.md`, not edited into the `.tex`, until the user has audited the chapter.
 
+### 2026-11-03: Counters live at two levels
+
+The instance-node cursor counts the write-up's units: logical seeks and payload decodes. DBSP's file-batch cursor (`FileIndexedWSetCursor`) counts the storage costs: per-run seeks, key reads, and value reads. The generic `Cursor` trait gains no counters.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
