@@ -184,6 +184,10 @@ Wording only:
 3. **(A2)'s last clause.** "Every derived row keeps the key values at which its consumers read it" is a requirement on the circuit, not on the inputs. Consider stating it beside (A1).
 4. **Buffered execution and the DBSP boundary.** "Boundary with DBSP" appears only in `sec:ivm-interleave`. Buffered execution also needs `J` and `V` in one operator. Otherwise `V` collects each touched customer a second time, against `prop:group-delta`'s "each collected old entry is read once".
 
+Noted here only, not yet in `BUFFER.md`:
+
+1. **`alg:session` reads every entry of a group.** Q3's invoices are read but buffered nowhere. A storage engine that decodes on landing then decodes them. The collection could seek past domains no reader uses, as `Visit` already does.
+
 None of these points changes the algorithm.
 
 ## The write-up's concepts in Feldera code
@@ -199,7 +203,7 @@ The facts were checked against the code on 2026-11-03.
 | a child's prefix length | Value widths exist only as `OrderedKey::WIDTH` on Rust types. `Domain` has a name and columns only. | A width per domain in `KeyTrie` and `MergedIndexRustEmitter`. |
 | `Advance` (seek) | `CursorList::seek_key` seeks every run, then re-merges. Zero-weight skipping reads each run's weight. | Count logical seeks and per-run seeks. |
 | `AtRangeEnd` | `key().starts_with(prefix)` after `step_key`, as in `scan` and the merged-index tests. | None. |
-| decode | `unfold` and `decode_payload` in the client crate. A file batch's `move_key` also deserializes the key and its first value on every key move. Only a seek compares archived bytes without deserializing. | "Never decoded" holds only for entries passed by a seek. Count key visits, payload decodes, and storage deserializations separately. |
+| decode | `unfold` and `decode_payload` in the client crate. `FileIndexedWSetCursor::move_key` also positions the value cursor, which deserializes the first value, every time the cursor lands on a key. A seek compares archived bytes while it searches, but it still lands on a key. | See [No extra decoding](#no-extra-decoding). |
 | readers and terms | The four functions in `merged-index-col/src/q3.rs`. Each opens its own cursor for every requested key; no two readers share a cursor. | Readers driven by requests. |
 | session operator | `add_ternary_operator` and `add_quaternary_operator` (`circuit_builder.rs`). Existing users include `GroupTransform` (ternary) and `AsofJoin` (quaternary). Accumulators in front supply each whole delta at the flush. Output is chunked by `splitter_output_chunk_size`. | A new operator. |
 | snapshot input | Before each transaction the harness puts the snapshots in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush. | The same pattern, holding `(Old, Dlt)`. |
@@ -208,6 +212,43 @@ The facts were checked against the code on 2026-11-03.
 | counters | Buffer-cache hits and misses, and Bloom and range filter statistics. No seek, step, or decode counters. | Add them. |
 
 The "joins in one operator" row also explains why DBSP's own operators cannot deliver deltas per instance node. The companion note `key-trie-execution-refinements.tex` develops that point as condition (P), for a circuit that would pipeline its own joins. Chapter 3 applies the same flush rule to the session. Buffered execution needs it too: `prop:group-delta` reads each old entry once only if both joins process a group while its buffers are held.
+
+## No extra decoding
+
+`thm:shared` promises that each old entry reached is decoded once, and that a range no request needs is not decoded at all. Feldera's storage keeps that promise only if the session obeys the rules below. Otherwise the storage layer decodes entries that no reader takes.
+
+### What counts as a decode
+
+| Level | Where | Allowed for |
+| --- | --- | --- |
+| Key read | Storage deserializes a key when the cursor lands on it. | The keys the cursor must land on: taken entries, the first key at or past each seek target in each run, and one key past each range's end. |
+| Value read | Storage deserializes a value, today on every landing (`move_key`). | Taken entries only, once each. |
+| Payload decode | The client's `decode_payload`, plus `unfold` if the full key is parsed. | Taken entries only, once each, shared by every reader that takes the entry. |
+
+An entry is *taken* when some reader with a request delivers it to its delta term. In the worked transaction, the taken old entries are `c5`, `o3`, `l7`, `l8`, `o4`, and `l9`. `v2`, `v8`, and `c6` get no value read and no payload decode. Only `c6`'s key is read, to end `c5`'s range.
+
+### Rules
+
+1. **Pass by seeking, never by stepping.** The session steps from one key to the next only when the next entry will be taken. It steps through a node's children one by one only while a reader takes every child, as `O⁻` does once it opens. Otherwise it computes the next position it needs and seeks straight to it:
+   - a child domain's prefix (`then_tag`), which passes earlier domains: from `c5`, a seek to the orders passes `v2` and `v8`;
+   - a pending request's node prefix;
+   - the prefix successor past the current node, which passes a subtree no request needs and lands on the next sibling.
+
+   `Visit` uses these seeks to pass children it does not enter; it never steps through them.
+2. **Read values lazily in storage.** `FileIndexedWSetCursor::move_key` must stop positioning the value cursor on every landing. It should position the value cursor the first time `val`, `weight`, or `map_times` is called. Without this, every landing that is not a take costs a value read: each range-end key, and the run heads past each seek. This is a change in `crates/dbsp`. It must keep the `Cursor` contract and pass the existing trace tests.
+3. **Consolidate only taken entries.** `CursorList` reads every run's weight at each landing in order to skip zero-weight keys, which positions values (`is_zero_weight`, `skip_zero_weight_keys_forward`). The session needs a merging cursor over `Old`'s runs that exposes keys at a landing and sums weights only when it takes the entry. An entry whose weights cancel across runs, such as a deletion not yet compacted, is read once and dropped. This is an inherent cost of reading an uncompacted run set, and it is counted, not hidden.
+4. **Decode payloads once, and only for taken entries.** Route an entry to its readers from its key bytes: the prefix, the tag, and the placement id. Do this without `unfold` or `decode_payload`, and decode only when some reader takes the entry. Hand the one decoded entry to every reader that takes it: `C⁺` and `J⁺` share `c5`. Today's `scan` unfolds and decodes every entry under its prefix and then filters, which breaks this rule.
+5. **Buffered collection seeks too.** `alg:session` reads every entry of a group, including streams no reader uses, such as Q3's invoices. In Feldera, that decodes them. Buffered execution must seek past the subtrees of domains that no reader uses (rule 1), and collect only the participating streams.
+6. **Read `Dlt` once.** `Dlt` is an in-memory batch, so its values are already deserialized. Its payloads are decoded once, at the node where the session reaches them.
+
+### How the counters check the rules
+
+The counters of roadmap step 1 count each level separately, together with logical seeks and per-run seeks. The exit checks of steps 2, 5, and 6 then assert two things:
+
+- value reads and payload decodes from `Old` equal the number of distinct old entries taken, plus the counted cancelled entries of rule 3;
+- key reads are at most the taken entries, plus one per run per seek, plus one per range end.
+
+On the worked transaction this means exactly six value reads and six payload decodes from `Old`.
 
 ## Current implementation against Chapter 3
 
@@ -229,7 +270,7 @@ The "joins in one operator" row also explains why DBSP's own operators cannot de
 These are implementation questions, not algorithm questions:
 
 - **Publishing `Dlt`.** Keep the run that the base phase already builds, publish it with `Old`, and feed the view side from it.
-- **The cost model.** A logical seek costs one seek per run of the snapshot, and a key move on a file batch deserializes a value. The counters must separate the chapter's units from storage costs.
+- **The cost model.** A logical seek costs one seek per run of the snapshot. Decoding has three levels: key reads, value reads, and payload decodes. [No extra decoding](#no-extra-decoding) sets the rules and the counters that check them.
 - **Delta-only nodes.** Merge `Old`'s children with `Dlt`'s and the requests' keys in record order.
 - **The join-plan type.** Both executions interpret it: the joins with their keys and delta terms, each term's reader (stream, version, path or range), and any selections and projections between them.
 - **Output.** Emit chunks of the size DBSP expects, and leave consolidation to DBSP's batcher.
@@ -240,11 +281,13 @@ These are implementation questions, not algorithm questions:
 The steps are ordered. Each has an exit check and updates its docs. They are not R-numbered, since R1–R5 is the only numbering scheme.
 
 1. **Counters on today's readers.**
-   - Count cursor opens, logical seeks, per-run seeks, key visits, and payload decodes.
+   - Count cursor opens, logical seeks, per-run seeks, key reads, value reads, and payload decodes. Key reads and value reads need hooks in `crates/dbsp` storage cursors.
    - *Exit:* a test pins the counts on the worked transaction. They become the baseline.
-2. **Instance-node cursor in `merged_index`.**
-   - Add a prefix successor, a width per domain, and a cursor that enters a node, lists its attached entries, steps through its children, and skips a subtree, counting as it goes.
-   - *Exit:* property tests against brute-force prefix scans over random tries, data, and multi-run snapshots, including carry and an all-`0xFF` prefix.
+2. **Decode-free passing in storage and in `merged_index`.**
+   - Lazy value positioning in `FileIndexedWSetCursor` (rule 2 of [No extra decoding](#no-extra-decoding)).
+   - A merging cursor over `Old`'s runs that consolidates only taken entries (rule 3).
+   - A prefix successor, a width per domain, and an instance-node cursor that enters a node, lists its attached entries, and passes children and subtrees by seeking (rule 1), counting as it goes.
+   - *Exit:* property tests against brute-force prefix scans over random tries, data, and multi-run snapshots, including carry and an all-`0xFF` prefix. Counter tests show no value read and no payload decode for any passed entry. The existing trace tests pass.
 3. **Publish `(Old, Dlt)`, and read the after state as the overlay.**
    - Rewrite the four readers to read `Old ⊎ Dlt` for the after state.
    - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone.
@@ -256,10 +299,11 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 5. **Buffered-execution session.**
    - The join-plan type, plus one operator that collects each touched customer once and evaluates the plan's delta terms over its buffers. It replaces step 4's two joins.
    - It is exact for any plan with path or range reads, and it remains the fallback when (A3) has not been shown.
-   - *Exit:* the counters show each old entry read once; the transcript comparison passes.
+   - Collection seeks past domains no reader uses, and decodes only participating entries (rules 4 and 5).
+   - *Exit:* the counters show each participating old entry read and decoded once, and none of Q3's invoices decoded. The transcript comparison passes.
 6. **Selective-execution session.**
    - Requests, ready pairs, and `Visit`, over step 5's plan type, for plans that satisfy (A3).
-   - *Exit:* on the worked transaction, the counters show two forward seeks and the decodes of `thm:shared`. A property test over random RF1/RF2 sequences matches native mode, and the transcript comparison passes.
+   - *Exit:* on the worked transaction, the counters show two forward logical seeks, and exactly six value reads and six payload decodes from `Old`. A property test over random RF1/RF2 sequences matches native mode, and the transcript comparison passes.
 7. **Measurement, new version.**
    - Add the counters to `measure.py`, and run the native, buffered, and selective modes on Linux.
    - *Exit:* raw artifacts under `target/`; [measurement.md](measurement.md) reports base and IVM side by side.
@@ -279,7 +323,9 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - Counters in the instance-node cursor, not in the generic `Cursor`.
 - Step 4 as an intermediate milestone before the session.
 - Buffered execution (step 5) before selective execution.
-- Counting per-run seeks and storage deserializations, besides the chapter's logical seeks and decodes.
+- Counting per-run seeks, key reads, and value reads, besides the chapter's logical seeks and decodes.
+- Lazy value positioning as a change to DBSP's file-batch cursor, not a merged-index-only cursor over the file format.
+- Consolidating `Old` only at taken entries, through a merging cursor of the session's own, rather than reading `Old` through `CursorList`.
 - Proposing the write-up fixes in the thesis `BUFFER.md`, rather than editing the `.tex`.
 - [decisions.md](decisions.md) (2026-10-29) still names A3 and A4 in the write-up's earlier sense. Rewording those entries to (A1)–(A3) is proposed, not done.
 - Changes beyond RF1/RF2 kept out of scope until step 8.
