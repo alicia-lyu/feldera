@@ -254,7 +254,11 @@ Fixes found by auditing the write-up against the code are recorded as dated entr
 
 ### 2026-11-03: Counters live at two levels
 
-The instance-node cursor counts the write-up's units: logical seeks and payload decodes. DBSP's file-batch cursor (`FileIndexedWSetCursor`) counts the storage costs: per-run seeks, key reads, and value reads. The generic `Cursor` trait gains no counters.
+The scan session counts the write-up's units: cursor opens, logical seeks, and payload decodes. DBSP's run cursors count the storage costs. Both the in-memory cursor (`VecIndexedWSetCursor`) and the file cursor (`FileIndexedWSetCursor`) count per-run seeks. Only the file cursor counts key reads and value reads, since only file runs deserialize. The generic `Cursor` trait gains no counters. (Amended on 2026-11-03: per-run seeks were first counted in the file cursor only, and the logical counters were first placed in an instance-node cursor.)
+
+### 2026-11-03: One scan session serves both executions
+
+Buffered and selective execution share one scan session, which each execution uses or extends. The session owns the cursors over `Old` and `Dlt`, the request queue, the decoded entries of the current node, and the logical counters. Each execution supplies its static requests to the session in record order. The requests, which name their streams for range reads, tell the session what to read and what to pass, so no separate list of participating domains exists. `Old` and `Dlt` are merged only logically: the session compares forward cursors by key bytes and builds no merged run.
 
 ## Superseded and withdrawn
 

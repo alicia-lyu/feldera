@@ -76,7 +76,7 @@ The harness runs two chained circuits in two DBSP runtimes (user decision of 202
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | Q3 readers, `Q3State`, and the COL storage tests | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Design and roadmap for declaring merged indexes as key-trie specs | `docs/design/merged-index/general-definition.md` |
-| Meta plan for shared partner reads (thesis Chapter 3): the algorithm, its audit, its mapping onto Feldera code, coding roadmap | `docs/design/merged-index/shared-traversal.md` |
+| Meta plan for shared partner reads (thesis Chapter 3): the algorithm, its audit, its mapping onto Feldera code, the scan session both executions share, coding roadmap | `docs/design/merged-index/shared-traversal.md` |
 | Spec parser and schema validator (roadmap Step 3) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
 | Rust emitter for a spec (Step 4), selected by `--merged-index` and `--merged-index-output` | `MergedIndexRustEmitter.java` (`backend/rust`), `CompilerMain.emitMergedIndex` |
 | COL spec and its generated module, which COL re-exports as its definition (`lib.rs` adds only `build_batch`) | `merged-index-col/col.mi`, `generate.sh`, `src/generated.rs` |
