@@ -5,7 +5,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up; nothing below is implemented. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29.
+> **Status:** the algorithm is settled in the write-up; nothing below is implemented. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29 and 2026-11-03.
 
 This doc covers:
 
@@ -322,10 +322,6 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `ΔJ` internal to the session unless a plan exports it.
 - Counters in the instance-node cursor, not in the generic `Cursor`.
 - Step 4 as an intermediate milestone before the session.
-- Buffered execution (step 5) before selective execution.
-- Counting per-run seeks, key reads, and value reads, besides the chapter's logical seeks and decodes.
 - Lazy value positioning as a change to DBSP's file-batch cursor, not a merged-index-only cursor over the file format.
 - Consolidating `Old` only at taken entries, through a merging cursor of the session's own, rather than reading `Old` through `CursorList`.
-- Proposing the write-up fixes in the thesis `BUFFER.md`, rather than editing the `.tex`.
-- [decisions.md](decisions.md) (2026-10-29) still names A3 and A4 in the write-up's earlier sense. Rewording those entries to (A1)–(A3) is proposed, not done.
 - Changes beyond RF1/RF2 kept out of scope until step 8.

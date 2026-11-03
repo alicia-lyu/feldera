@@ -230,15 +230,27 @@ The harness does not clear Feldera's buffer cache after loading and setup compac
 
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
 
-For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives A1, and the author is responsible for turn order (A4). The compiler hook stays for the existing reconstructed mode.
+For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. The compiler hook stays for the existing reconstructed mode. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
 
 ### 2026-10-29: Merged-index deltas come from the base transaction
 
-The merged index is base structure, not a view. Its transaction delta `Dlt`, with every entry at its full folded key, is computed in the base phase before view maintenance, so view-side rows carry their trie path (A2). An owner-key change is a moved subtree inside `Dlt`.
+The merged index is base structure, not a view. Its transaction delta `Dlt`, with every entry at its full folded key, is computed in the base phase before view maintenance, so view maintenance receives `Old` and `Dlt` and every view-side row carries its trie path (A2). When an order changes customer, `Dlt` deletes the entries of its subtree under the old customer and inserts them under the new one. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
 
 ### 2026-10-29: Derived deltas are computed inside one scan session
 
-A3 is met by one scan session per transaction that receives every base delta up front, computes derived deltas such as `ΔJ` at the instance node where they arise, and adds the requests they make. Rejected: a second traversal for downstream readers (too costly), a fused operator hard-coded to Q3 (not general), and DBSP scheduler changes that pipeline separate join operators (they deviate from the algorithm). The algorithm work in [shared-traversal.md](shared-traversal.md) precedes coding.
+The joins whose partner reads share one traversal run inside one scan session per transaction. The session receives every base delta up front, computes derived deltas such as `ΔJ` at the instance node where they arise, and adds the requests they make. Selective execution in the session also needs (A3), available requests. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3; the write-up's earlier A3 and A4 are gone.) Rejected: a second traversal for downstream readers (too costly), a fused operator hard-coded to Q3 (not general), and DBSP scheduler changes that pipeline separate join operators (they deviate from the algorithm). The algorithm work in [shared-traversal.md](shared-traversal.md) precedes coding.
+
+### 2026-11-03: Buffered execution comes before selective execution
+
+The roadmap of [shared-traversal.md](shared-traversal.md) builds the buffered-execution session first: one collection per touched customer, with the delta rules evaluated over its buffers. It is exact under (A1) and (A2), gives the baseline that selective execution is checked against, and stays the fallback for circuits for which (A3) has not been shown.
+
+### 2026-11-03: Counters measure Feldera's costs as well as the write-up's
+
+The counters count per-run seeks, key reads, and value reads in storage, besides the write-up's logical seeks and payload decodes. In Feldera a logical seek costs one seek per run, and a key move on a file batch reads a value, so the write-up's units alone do not show the cost.
+
+### 2026-11-03: Write-up fixes go to the thesis BUFFER.md first
+
+Fixes found by auditing the write-up against the code are recorded as dated entries in the thesis repository's `BUFFER.md`, not edited into the `.tex`, until the user has audited the chapter.
 
 ## Superseded and withdrawn
 
