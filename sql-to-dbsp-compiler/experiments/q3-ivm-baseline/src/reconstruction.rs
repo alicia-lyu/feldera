@@ -196,6 +196,34 @@ impl ManualIndex {
     }
 }
 
+/// Where a snapshot's nonempty runs are: how many, and their approximate
+/// bytes, in files and in memory. Only file runs count key, value, and weight
+/// reads, so this qualifies every index read count.
+pub(crate) fn snapshot_layout(snapshot: &Snapshot) -> serde_json::Value {
+    let mut layout = BTreeMap::from([("file", (0_usize, 0_usize)), ("memory", (0, 0))]);
+    for batch in snapshot.batches().iter().filter(|batch| !batch.is_empty()) {
+        let location = match batch.location() {
+            BatchLocation::Storage => "file",
+            BatchLocation::Memory => "memory",
+        };
+        let (runs, bytes) = layout
+            .get_mut(location)
+            .expect("both locations are present");
+        *runs += 1;
+        *bytes += batch.approximate_byte_size();
+    }
+    layout
+        .into_iter()
+        .map(|(location, (runs, bytes))| {
+            (
+                location.to_owned(),
+                serde_json::json!({"runs": runs, "bytes": bytes}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 fn sql_date(text: &str) -> Result<Date> {
     serde_json::from_value(serde_json::Value::String(text.to_owned()))
         .context("invalid source date")
@@ -372,4 +400,38 @@ pub(crate) fn grouped_load(load: Change, target: usize) -> Result<Vec<Change>> {
         batches.push(batch);
     }
     Ok(batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_layout_counts_nonempty_runs_by_location() {
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            merged_index_col::StoredPayload,
+            ZWeight,
+        >();
+        let run = Arc::new(
+            build_batch(vec![(
+                Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: 1 }),
+                Payload::CustomerByCustkey(CustomerByCustkeyPayload {
+                    c_mktsegment: "BUILDING".into(),
+                }),
+                1,
+            )])
+            .unwrap(),
+        );
+        let empty = Arc::new(build_batch(Vec::new()).unwrap());
+        let bytes = run.approximate_byte_size();
+        let layout = snapshot_layout(&Snapshot::with_batches(&factories, vec![run, empty]));
+        assert_eq!(
+            layout,
+            serde_json::json!({
+                "file": {"runs": 0, "bytes": 0},
+                "memory": {"runs": 1, "bytes": bytes},
+            })
+        );
+    }
 }

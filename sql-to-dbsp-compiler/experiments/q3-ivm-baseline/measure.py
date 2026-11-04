@@ -20,6 +20,9 @@ from typing import Any
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
 WRITE_OWNERS = ("query", "base_relation", "merged_index")
+# The merged index's readers, and the run counts reported for each (measurement version 5).
+INDEX_READERS = ("customers_after", "orders_before", "joined_orders_after", "lineitems_before")
+RUN_READ_FIELDS = ("seeks", "key_reads", "value_reads", "weight_reads")
 
 
 def sha256(path: Path) -> str:
@@ -52,6 +55,60 @@ def refresh_inputs(path: Path) -> tuple[list[dict[str, str]], dict[str, Path]]:
             inputs[f"refresh_{number}_{field}"] = source
         resolved.append(item)
     return resolved, inputs
+
+
+def index_read_problems(report: dict[str, Any]) -> list[str]:
+    """List where a driver report's merged-index run reads are malformed.
+
+    A reconstructed report gives, for each refresh and for the sequence, every
+    reader's `RUN_READ_FIELDS` as non-negative integers, and each refresh's
+    index layout; the sequence's counts are the sums of the refreshes'. A
+    native report has no merged index, so all of these are `null`. A report that
+    names neither mode is not checked here.
+    """
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    refreshes = report.get("refreshes", [])
+    sequence = report.get("sequence", {}).get("index_run_reads")
+    problems: list[str] = []
+    if report.get("mode") == "native":
+        places = [("sequence", sequence)]
+        places += [(f"refresh {item.get('refresh')}", item.get("index_run_reads"))
+                   for item in refreshes]
+        places += [(f"refresh {item.get('refresh')} layout", item.get("index_layout"))
+                   for item in refreshes]
+        return [f"{place}: a native run reports merged-index reads"
+                for place, value in places if value is not None]
+
+    def counts(place: str, reads: Any) -> dict[tuple[str, str], int] | None:
+        found = {}
+        for reader in INDEX_READERS:
+            for field in RUN_READ_FIELDS:
+                value = reads.get(reader, {}).get(field) if isinstance(reads, dict) else None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    problems.append(f"{place}: index_run_reads.{reader}.{field} is {value!r}")
+                    return None
+                found[(reader, field)] = value
+        return found
+
+    total: dict[tuple[str, str], int] = {}
+    for item in refreshes:
+        place = f"refresh {item.get('refresh')}"
+        found = counts(place, item.get("index_run_reads"))
+        for key, value in (found or {}).items():
+            total[key] = total.get(key, 0) + value
+        layout = item.get("index_layout")
+        for snapshot in ("before", "after"):
+            for location in ("file", "memory"):
+                block = layout.get(snapshot, {}).get(location) if isinstance(layout, dict) \
+                    else None
+                if not isinstance(block, dict) or not all(
+                        isinstance(block.get(field), int) for field in ("runs", "bytes")):
+                    problems.append(f"{place}: index_layout.{snapshot}.{location} is malformed")
+    summed = counts("sequence", sequence)
+    if summed is not None and not problems and summed != total:
+        problems.append("sequence: index_run_reads are not the sums of the refreshes'")
+    return problems
 
 
 def owner_write_problems(report: dict[str, Any]) -> list[str]:
@@ -432,7 +489,7 @@ def run(argv: list[str]) -> int:
                 record["driver"] = raw
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
-                problems = owner_write_problems(raw)
+                problems = owner_write_problems(raw) + index_read_problems(raw)
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

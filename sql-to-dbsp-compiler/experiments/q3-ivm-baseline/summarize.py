@@ -24,11 +24,14 @@ reports, over the repetitions:
   the driver ran in a cgroup v2 group, the window deltas of `sequence.cgroup` that the kernel
   provides (`cgroup_delta_*`: `pgscan`, `pgsteal`, the workingset refaults, the memory events
   and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
-  reset worked) and the maximum sampled `memory.current`.
+  reset worked) and the maximum sampled `memory.current`;
+- for the merged-index mode only, `sequence.index_run_reads` summed over the readers
+  (`index_seeks`, `index_key_reads`, `index_value_reads`, `index_weight_reads`), under the
+  mode's `index_run_reads`. Only file runs count key, value and weight reads.
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 4, a field is missing or not a finite non-negative number, a
+measurement version 5, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -42,9 +45,10 @@ import statistics
 import sys
 from typing import Any
 
-from measure import MODES, WRITE_OWNERS, owner_write_problems
+from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, WRITE_OWNERS, index_read_problems,
+                     owner_write_problems)
 
-MEASUREMENT_VERSION = 4
+MEASUREMENT_VERSION = 5
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
@@ -80,11 +84,15 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     if driver.get("measurement_version") != MEASUREMENT_VERSION:
         # Version 2 timed base-table maintenance inside q3_ms, and version 3 booked the merged
         # index in combined_maintenance_ms instead of base_ms, so their sums are not comparable.
+        # Version 4 has no merged-index run reads.
         raise SummaryError(f"{where}: measurement_version is "
                            f"{driver.get('measurement_version')!r}, not {MEASUREMENT_VERSION}")
     problems = owner_write_problems(driver)
     if problems:
         raise SummaryError(f"{where}: inconsistent write attribution: " + "; ".join(problems))
+    problems = index_read_problems(driver)
+    if problems:
+        raise SummaryError(f"{where}: inconsistent index run reads: " + "; ".join(problems))
     metrics = {
         "sequence_wall_ms": number(driver, ("sequence", "end_to_end_ms"), where),
         "sequence_cpu_ms": number(driver, ("sequence", "resources", "cpu_microseconds"),
@@ -109,6 +117,16 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     metrics["peak_rss_bytes"] = number(driver, (*resources, "peak_rss_bytes"), where)
     metrics.update(window_memory_metrics(driver, where))
     return metrics
+
+
+def index_read_metrics(driver: dict[str, Any]) -> dict[str, float]:
+    """The sequence's merged-index run reads, summed over the readers, or nothing in native
+    mode. `index_read_problems` has already checked the fields."""
+    reads = driver["sequence"]["index_run_reads"]
+    if reads is None:
+        return {}
+    return {f"index_{field}": sum(reads[reader][field] for reader in INDEX_READERS)
+            for field in RUN_READ_FIELDS}
 
 
 def window_memory_metrics(driver: dict[str, Any], where: str) -> dict[str, float]:
@@ -168,6 +186,9 @@ def summarize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any]:
     if not isinstance(runs, list):
         raise SummaryError(f"{label}: manifest has no runs list")
     by_mode: dict[str, dict[int, dict[str, float]]] = {mode: {} for mode in MODES}
+    # The merged index's run reads exist in one mode only, so they are kept apart from the
+    # metrics that both modes report.
+    index_by_mode: dict[str, dict[int, dict[str, float]]] = {mode: {} for mode in MODES}
     for run in runs:
         mode, repetition = run.get("mode"), run.get("repetition")
         where = f"{label} {mode} run {repetition}"
@@ -179,6 +200,7 @@ def summarize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any]:
         if not isinstance(repetition, int) or repetition in by_mode[mode]:
             raise SummaryError(f"{where}: repetition is missing or repeated")
         by_mode[mode][repetition] = run_metrics(run, where)
+        index_by_mode[mode][repetition] = index_read_metrics(run["driver"])
     names_by_run = {tuple(metrics) for found in by_mode.values() for metrics in found.values()}
     if len(names_by_run) > 1:
         raise SummaryError(f"{label}: runs report different sets of metrics (for example, a "
@@ -196,6 +218,11 @@ def summarize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any]:
             "metrics": {name: summarize_values([metrics[name] for metrics in found.values()])
                         for name in names},
         }
+        index_names = next(iter(index_by_mode[mode].values())).keys()
+        if index_names:
+            modes[mode]["index_run_reads"] = {
+                name: summarize_values([reads[name] for reads in index_by_mode[mode].values()])
+                for name in index_names}
     return {"platform": manifest.get("platform"), "revision": manifest.get("revision"),
             "configuration": manifest.get("configuration"), "modes": modes}
 
@@ -242,6 +269,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
                      for mode in MODES for stat in STATISTICS]
             lines.append(f"| `{name}` | " + " | ".join(cells) + " |")
         lines.append("")
+        for mode in MODES:
+            reads = workload["modes"][mode].get("index_run_reads")
+            if not reads:
+                continue
+            lines += [f"Merged-index run reads ({mode}), summed over the readers. Only file "
+                      "runs count key, value and weight reads; each refresh's `index_layout` "
+                      "in the driver report says where the runs were.", "",
+                      "| Metric | " + " | ".join(STATISTICS) + " |",
+                      "| --- | " + " | ".join("---:" for _ in STATISTICS) + " |"]
+            for name, values in reads.items():
+                lines.append(f"| `{name}` | "
+                             + " | ".join(format_value(values[stat]) for stat in STATISTICS)
+                             + " |")
+            lines.append("")
     return "\n".join(lines)
 
 

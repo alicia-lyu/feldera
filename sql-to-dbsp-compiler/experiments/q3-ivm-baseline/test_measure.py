@@ -298,6 +298,46 @@ class MeasureTest(unittest.TestCase):
         return {"mode": mode, "sequence": {"resources": resources},
                 "refreshes": [{"refresh": 1, "resources": resources}]}
 
+    @staticmethod
+    def index_report(mode: str = "reconstructed") -> dict:
+        """A report whose sequence index reads are the sums of its two refreshes'."""
+        if mode == "native":
+            return {"mode": "native", "sequence": {"index_run_reads": None},
+                    "refreshes": [{"refresh": 1, "index_run_reads": None, "index_layout": None}]}
+
+        def reads(seeks: int) -> dict:
+            return {reader: {field: seeks for field in measure.RUN_READ_FIELDS}
+                    for reader in measure.INDEX_READERS}
+        layout = {snapshot: {location: {"runs": 1, "bytes": 8}
+                             for location in ("file", "memory")}
+                  for snapshot in ("before", "after")}
+        return {"mode": mode, "sequence": {"index_run_reads": reads(3)},
+                "refreshes": [{"refresh": number, "index_run_reads": reads(number),
+                               "index_layout": layout} for number in (1, 2)]}
+
+    def test_index_reads_are_complete_and_sum_to_the_sequence(self) -> None:
+        self.assertEqual(measure.index_read_problems(self.index_report()), [])
+        self.assertEqual(measure.index_read_problems(self.index_report("native")), [])
+
+        unsummed = self.index_report()
+        unsummed["sequence"]["index_run_reads"]["customers_after"]["seeks"] = 4
+        self.assertIn("not the sums", measure.index_read_problems(unsummed)[0])
+
+        negative = self.index_report()
+        negative["refreshes"][0]["index_run_reads"]["lineitems_before"]["key_reads"] = -1
+        self.assertIn("lineitems_before.key_reads is -1",
+                      measure.index_read_problems(negative)[0])
+
+        no_layout = self.index_report()
+        del no_layout["refreshes"][1]["index_layout"]["after"]["file"]
+        self.assertIn("index_layout.after.file is malformed",
+                      measure.index_read_problems(no_layout)[0])
+
+        native = self.index_report("native")
+        native["refreshes"][0]["index_run_reads"] = {}
+        self.assertIn("a native run reports merged-index reads",
+                      measure.index_read_problems(native)[0])
+
     def test_owner_writes_must_sum_to_totals_in_every_report_block(self) -> None:
         self.assertEqual(measure.owner_write_problems(self.owner_report()), [])
         self.assertEqual(measure.owner_write_problems(self.owner_report("native")), [])

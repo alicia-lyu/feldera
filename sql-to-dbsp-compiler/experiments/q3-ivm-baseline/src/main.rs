@@ -29,7 +29,7 @@ use dbsp::storage::file::writer::{
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
-use merged_index_col::q3::Q3State;
+use merged_index_col::q3::{IndexReads, Q3State};
 #[cfg(feature = "merged-index")]
 use reconstruction::ManualIndex;
 use serde_json::{json, Value};
@@ -404,6 +404,13 @@ struct Measurements {
     delta_positive: Option<i64>,
     delta_negative: Option<i64>,
     view_rows: Option<i64>,
+    /// The merged index's run reads in the view transactions, per reader, counted on the view
+    /// worker (reconstructed mode).
+    #[cfg(feature = "merged-index")]
+    index_reads: IndexReads,
+    /// Where the last transaction's published index snapshots kept their runs (reconstructed
+    /// mode).
+    index_layout: Option<Value>,
 }
 
 impl Measurements {
@@ -473,6 +480,10 @@ fn transact_inner(
         let (before_index, after_index) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         let publish_started = Instant::now();
+        stats.index_layout = Some(json!({
+            "before": reconstruction::snapshot_layout(&before_index),
+            "after": reconstruction::snapshot_layout(&after_index),
+        }));
         pipeline
             .q3_state
             .publish(before_index, after_index, placements)
@@ -495,7 +506,9 @@ fn transact_inner(
     };
     transaction_result?;
     #[cfg(feature = "merged-index")]
-    finish_result?;
+    {
+        stats.index_reads += finish_result?;
+    }
     stats.view_circuit += latency;
     stats.latencies.push(latency);
     stats.transactions += 1;
@@ -1301,7 +1314,7 @@ fn finish_loading(
     ))
 }
 
-/// The phases of a refresh (measurement version 4).
+/// The phases of a refresh (since measurement version 4).
 ///
 /// `base_ms` is base maintenance: the base circuit's transaction plus the merged index's
 /// upkeep. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `ivm_ms` is
@@ -1324,6 +1337,18 @@ fn phase_json(stats: &Measurements) -> Value {
         "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction. Report base_ms and ivm_ms side by side. forward_ms (net delta read and feed), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
     })
+}
+
+/// The merged index's run reads per reader (measurement version 5). Only file runs count key,
+/// value and weight reads; `index_layout` says where the runs were.
+#[cfg(feature = "merged-index")]
+fn index_reads_json(reads: &IndexReads) -> Result<Value> {
+    Ok(json!({
+        "customers_after": serde_json::to_value(reads.customers_after)?,
+        "orders_before": serde_json::to_value(reads.orders_before)?,
+        "joined_orders_after": serde_json::to_value(reads.joined_orders_after)?,
+        "lineitems_before": serde_json::to_value(reads.lineitems_before)?,
+    }))
 }
 
 /// Inspects the actual batches behind the catalogs' snapshots, without scanning rows: the base
@@ -1526,6 +1551,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut reports = Vec::new();
     let mut verification_time = Duration::ZERO;
     let mut foreground_total = Duration::ZERO;
+    #[cfg(feature = "merged-index")]
+    let mut sequence_index_reads = IndexReads::default();
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
@@ -1617,6 +1644,17 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         } else {
             resource_delta
         };
+        // Run reads are counted on the view worker, so validation on the driver adds none.
+        #[cfg(feature = "merged-index")]
+        {
+            sequence_index_reads += measurement.index_reads;
+            report["index_run_reads"] = index_reads_json(&measurement.index_reads)?;
+        }
+        #[cfg(not(feature = "merged-index"))]
+        {
+            report["index_run_reads"] = Value::Null;
+        }
+        report["index_layout"] = json!(measurement.index_layout);
         println!(
             "run={run_number} refresh={} phase={phase} {}",
             number + 1,
@@ -1626,6 +1664,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     // The window ends with the last refresh; read its memory figures before anything else runs.
     let window_memory_fields = window_evidence.finish();
+    #[cfg(feature = "merged-index")]
+    let sequence_index_run_reads = index_reads_json(&sequence_index_reads)?;
+    #[cfg(not(feature = "merged-index"))]
+    let sequence_index_run_reads = Value::Null;
     let sequence_elapsed = sequence_finished
         .duration_since(sequence_started)
         .saturating_sub(verification_time);
@@ -1680,7 +1722,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 4,
+        "measurement_version": 5,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -1754,6 +1796,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "window_started_micros": window_started_micros, "window_finished_micros": window_finished_micros,
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
+            "index_run_reads": sequence_index_run_reads,
             "manual_index_storage": manual_storage,
             "completion_boundary": "last_refresh_complete",
             "catalog_storage": storage_evidence,
@@ -2591,7 +2634,43 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 4);
+        assert_eq!(output["measurement_version"], 5);
+        // Version 5 adds the merged index's run reads per reader, and where its runs were.
+        const READERS: [&str; 4] = [
+            "customers_after",
+            "orders_before",
+            "joined_orders_after",
+            "lineitems_before",
+        ];
+        let seeks = |reads: &Value| -> u64 {
+            READERS
+                .iter()
+                .map(|reader| reads[reader]["seeks"].as_u64().unwrap())
+                .sum()
+        };
+        if cfg!(feature = "merged-index") {
+            for refresh in refreshes {
+                let layout = &refresh["index_layout"];
+                for snapshot in ["before", "after"] {
+                    for location in ["file", "memory"] {
+                        assert!(layout[snapshot][location]["runs"].is_u64(), "{refresh}");
+                        assert!(layout[snapshot][location]["bytes"].is_u64(), "{refresh}");
+                    }
+                }
+            }
+            let per_refresh: u64 = refreshes
+                .iter()
+                .map(|refresh| seeks(&refresh["index_run_reads"]))
+                .sum();
+            assert!(per_refresh > 0);
+            assert_eq!(seeks(&output["sequence"]["index_run_reads"]), per_refresh);
+        } else {
+            for refresh in refreshes {
+                assert!(refresh["index_run_reads"].is_null(), "{refresh}");
+                assert!(refresh["index_layout"].is_null(), "{refresh}");
+            }
+            assert!(output["sequence"]["index_run_reads"].is_null());
+        }
         assert_eq!(
             output["sequence"]["completion_boundary"],
             "last_refresh_complete"

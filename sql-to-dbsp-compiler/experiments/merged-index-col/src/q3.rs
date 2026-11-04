@@ -10,6 +10,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::AddAssign,
     sync::{Arc, Mutex},
 };
 
@@ -57,6 +58,15 @@ pub struct IndexReads {
     pub orders_before: RunReads,
     pub joined_orders_after: RunReads,
     pub lineitems_before: RunReads,
+}
+
+impl AddAssign for IndexReads {
+    fn add_assign(&mut self, other: Self) {
+        self.customers_after += other.customers_after;
+        self.orders_before += other.orders_before;
+        self.joined_orders_after += other.joined_orders_after;
+        self.lineitems_before += other.lineitems_before;
+    }
 }
 
 /// One externally prepared transaction's read views, shared by the generated joins.
