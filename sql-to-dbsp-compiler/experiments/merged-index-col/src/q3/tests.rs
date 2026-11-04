@@ -545,7 +545,7 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
             run_reads_of(|| state.joined_orders_after(&lines_delta).unwrap());
         let (lines, l_reads, l_other) =
             run_reads_of(|| state.lineitems_before(&joined_delta).unwrap());
-        state.finish().unwrap();
+        let tally = state.finish().unwrap();
 
         assert_eq!(
             tuples(&customers),
@@ -612,5 +612,46 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
         for other in [c_other, o_other, j_other, l_other] {
             assert_eq!(other, RunReads::default());
         }
+
+        // `finish` returns the same counts, as the harness reports them.
+        assert_eq!(
+            tally,
+            IndexReads {
+                customers_after: c_reads,
+                orders_before: o_reads,
+                joined_orders_after: j_reads,
+                lineitems_before: l_reads,
+            }
+        );
     });
+}
+
+#[test]
+fn finish_returns_each_transactions_index_reads() {
+    let state = Q3State::default();
+    let orders_delta = delta(vec![(Tup1(5), Tup3(5, Date::from_days(11), 7), 1)]);
+    let one_run = || source(vec![vec![customer(5, "only", 1)]]);
+
+    // Two calls in one transaction accumulate: each scan seeks the one
+    // in-memory run once, and in-memory runs count no other reads.
+    state
+        .publish(one_run(), one_run(), BTreeMap::new())
+        .unwrap();
+    state.customers_after(&orders_delta).unwrap();
+    state.customers_after(&orders_delta).unwrap();
+    let tally = state.finish().unwrap();
+    assert_eq!(tally.customers_after.seeks, 2);
+    assert_eq!(
+        IndexReads {
+            customers_after: RunReads::default(),
+            ..tally
+        },
+        IndexReads::default()
+    );
+
+    // The next transaction starts from zero.
+    state
+        .publish(one_run(), one_run(), BTreeMap::new())
+        .unwrap();
+    assert_eq!(state.finish().unwrap(), IndexReads::default());
 }

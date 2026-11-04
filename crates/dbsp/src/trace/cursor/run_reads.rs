@@ -41,6 +41,7 @@
 //! not inherit it.
 
 use std::cell::Cell;
+use std::ops::AddAssign;
 use std::thread::LocalKey;
 
 use serde::Serialize;
@@ -101,13 +102,18 @@ impl RunReads {
         }
     }
 
-    fn plus(self, other: Self) -> Self {
-        Self {
-            seeks: self.seeks + other.seeks,
-            key_reads: self.key_reads + other.key_reads,
-            value_reads: self.value_reads + other.value_reads,
-            weight_reads: self.weight_reads + other.weight_reads,
-        }
+    fn plus(mut self, other: Self) -> Self {
+        self += other;
+        self
+    }
+}
+
+impl AddAssign for RunReads {
+    fn add_assign(&mut self, other: Self) {
+        self.seeks += other.seeks;
+        self.key_reads += other.key_reads;
+        self.value_reads += other.value_reads;
+        self.weight_reads += other.weight_reads;
     }
 }
 
@@ -174,6 +180,31 @@ mod tests {
                 key_reads: 2,
                 value_reads: 1,
                 weight_reads: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn add_assign_adds_each_count() {
+        let mut sum = RunReads {
+            seeks: 1,
+            key_reads: 2,
+            value_reads: 3,
+            weight_reads: 4,
+        };
+        sum += RunReads {
+            seeks: 10,
+            key_reads: 20,
+            value_reads: 30,
+            weight_reads: 40,
+        };
+        assert_eq!(
+            sum,
+            RunReads {
+                seeks: 11,
+                key_reads: 22,
+                value_reads: 33,
+                weight_reads: 44,
             }
         );
     }

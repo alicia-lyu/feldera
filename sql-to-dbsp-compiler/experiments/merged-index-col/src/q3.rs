@@ -19,7 +19,7 @@ use dbsp::{
     storage::write_attribution::WriteOwner,
     trace::{
         current_read_owner, merged_index::MergedIndexBatch, with_read_owner,
-        BatchReader as DynamicBatchReader, Cursor, SpineSnapshot as DynamicSnapshot,
+        BatchReader as DynamicBatchReader, Cursor, RunReads, SpineSnapshot as DynamicSnapshot,
     },
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
@@ -42,11 +42,21 @@ pub type LineitemBatch =
     OrdIndexedZSet<Tup1<i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>;
 pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 
-#[derive(Clone)]
 struct ReadViews {
     before: SourceSnapshot,
     after: SourceSnapshot,
     order_customers: BTreeMap<i64, BTreeSet<i64>>,
+    reads: Mutex<IndexReads>,
+}
+
+/// The index's run reads in one transaction, per reader. Each reader's calls
+/// accumulate in its field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexReads {
+    pub customers_after: RunReads,
+    pub orders_before: RunReads,
+    pub joined_orders_after: RunReads,
+    pub lineitems_before: RunReads,
 }
 
 /// One externally prepared transaction's read views, shared by the generated joins.
@@ -78,17 +88,20 @@ impl Q3State {
             before,
             after,
             order_customers,
+            reads: Mutex::default(),
         }));
         Ok(())
     }
 
-    /// Release published handles after all transaction consumers finish.
-    pub fn finish(&self) -> Result<(), String> {
+    /// Release published handles after all transaction consumers finish, and
+    /// return the index's run reads in the transaction.
+    pub fn finish(&self) -> Result<IndexReads, String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
-        if views.take().is_none() {
-            return Err("no Q3 transaction views were published".into());
-        }
-        Ok(())
+        let views = views
+            .take()
+            .ok_or("no Q3 transaction views were published")?;
+        let reads = *views.reads.lock().map_err(|_| "Q3 reads lock poisoned")?;
+        Ok(reads)
     }
 
     fn views(&self) -> Result<Arc<ReadViews>, String> {
@@ -104,23 +117,29 @@ impl Q3State {
         delta: &SpineSnapshot<OrdersBatch>,
     ) -> Result<SpineSnapshot<CustomerBatch>, String> {
         let views = self.views()?;
-        let mut output = RequestedRows::new();
-        for customer in requested_keys(delta) {
-            let key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
-                CustomerByCustkeyKey { custkey: customer },
-            ));
-            scan(&views.after, key.as_bytes(), |key, payload, weight| {
-                if let (
-                    Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
-                    Payload::CustomerByCustkey(payload),
-                ) = (key, payload)
-                {
-                    output.push(Tup1(custkey), Tup1(payload.c_mktsegment), weight);
+        count_index_reads(
+            &views,
+            |reads| &mut reads.customers_after,
+            || {
+                let mut output = RequestedRows::new();
+                for customer in requested_keys(delta) {
+                    let key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
+                        CustomerByCustkeyKey { custkey: customer },
+                    ));
+                    scan(&views.after, key.as_bytes(), |key, payload, weight| {
+                        if let (
+                            Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
+                            Payload::CustomerByCustkey(payload),
+                        ) = (key, payload)
+                        {
+                            output.push(Tup1(custkey), Tup1(payload.c_mktsegment), weight);
+                        }
+                        Ok(())
+                    })?;
                 }
-                Ok(())
-            })?;
-        }
-        Ok(output.finish())
+                Ok(output.finish())
+            },
+        )
     }
 
     pub fn orders_before(
@@ -128,31 +147,37 @@ impl Q3State {
         delta: &SpineSnapshot<CustomerBatch>,
     ) -> Result<SpineSnapshot<OrdersBatch>, String> {
         let views = self.views()?;
-        let mut output = RequestedRows::new();
-        for customer in requested_keys(delta) {
-            scan(
-                &views.before,
-                &prefix_custkey(customer),
-                |key, payload, weight| {
-                    if let (
-                        Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
-                            custkey,
-                            orderkey,
-                        }),
-                        Payload::OrdersByCustkeyOrderkey(payload),
-                    ) = (key, payload)
-                    {
-                        output.push(
-                            Tup1(custkey),
-                            Tup3(orderkey, payload.o_orderdate, payload.o_shippriority),
-                            weight,
-                        );
-                    }
-                    Ok(())
-                },
-            )?;
-        }
-        Ok(output.finish())
+        count_index_reads(
+            &views,
+            |reads| &mut reads.orders_before,
+            || {
+                let mut output = RequestedRows::new();
+                for customer in requested_keys(delta) {
+                    scan(
+                        &views.before,
+                        &prefix_custkey(customer),
+                        |key, payload, weight| {
+                            if let (
+                                Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+                                    custkey,
+                                    orderkey,
+                                }),
+                                Payload::OrdersByCustkeyOrderkey(payload),
+                            ) = (key, payload)
+                            {
+                                output.push(
+                                    Tup1(custkey),
+                                    Tup3(orderkey, payload.o_orderdate, payload.o_shippriority),
+                                    weight,
+                                );
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                Ok(output.finish())
+            },
+        )
     }
 
     pub fn joined_orders_after(
@@ -160,62 +185,70 @@ impl Q3State {
         delta: &SpineSnapshot<LineitemBatch>,
     ) -> Result<SpineSnapshot<JoinedOrdersBatch>, String> {
         let views = self.views()?;
-        let mut output = RequestedRows::new();
-        for order in requested_keys(delta) {
-            for &customer in placements(&views, order)? {
-                let mut customers = Vec::new();
-                let customer_key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
-                    CustomerByCustkeyKey { custkey: customer },
-                ));
-                scan(
-                    &views.after,
-                    customer_key.as_bytes(),
-                    |key, payload, weight| {
-                        if let (Key::CustomerByCustkey(_), Payload::CustomerByCustkey(payload)) =
-                            (key, payload)
-                        {
-                            customers.push((payload.c_mktsegment, weight));
-                        }
-                        Ok(())
-                    },
-                )?;
-                let order_key = CustomerOrdersLineitemDefinition::fold(
-                    &Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
-                        custkey: customer,
-                        orderkey: order,
-                    }),
-                );
-                scan(
-                    &views.after,
-                    order_key.as_bytes(),
-                    |key, payload, order_weight| {
-                        if let (
-                            Key::OrdersByCustkeyOrderkey(_),
-                            Payload::OrdersByCustkeyOrderkey(payload),
-                        ) = (key, payload)
-                        {
-                            for (segment, customer_weight) in &customers {
-                                let weight = order_weight
-                                    .checked_mul(*customer_weight)
-                                    .ok_or("Q3 reconstructed join weight overflow")?;
-                                output.push(
-                                    Tup1(order),
-                                    Tup4(
-                                        customer,
-                                        segment.clone(),
-                                        payload.o_orderdate,
-                                        payload.o_shippriority,
-                                    ),
-                                    weight,
-                                );
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-        }
-        Ok(output.finish())
+        count_index_reads(
+            &views,
+            |reads| &mut reads.joined_orders_after,
+            || {
+                let mut output = RequestedRows::new();
+                for order in requested_keys(delta) {
+                    for &customer in placements(&views, order)? {
+                        let mut customers = Vec::new();
+                        let customer_key = CustomerOrdersLineitemDefinition::fold(
+                            &Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: customer }),
+                        );
+                        scan(
+                            &views.after,
+                            customer_key.as_bytes(),
+                            |key, payload, weight| {
+                                if let (
+                                    Key::CustomerByCustkey(_),
+                                    Payload::CustomerByCustkey(payload),
+                                ) = (key, payload)
+                                {
+                                    customers.push((payload.c_mktsegment, weight));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        let order_key = CustomerOrdersLineitemDefinition::fold(
+                            &Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
+                                custkey: customer,
+                                orderkey: order,
+                            }),
+                        );
+                        scan(
+                            &views.after,
+                            order_key.as_bytes(),
+                            |key, payload, order_weight| {
+                                if let (
+                                    Key::OrdersByCustkeyOrderkey(_),
+                                    Payload::OrdersByCustkeyOrderkey(payload),
+                                ) = (key, payload)
+                                {
+                                    for (segment, customer_weight) in &customers {
+                                        let weight = order_weight
+                                            .checked_mul(*customer_weight)
+                                            .ok_or("Q3 reconstructed join weight overflow")?;
+                                        output.push(
+                                            Tup1(order),
+                                            Tup4(
+                                                customer,
+                                                segment.clone(),
+                                                payload.o_orderdate,
+                                                payload.o_shippriority,
+                                            ),
+                                            weight,
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+                Ok(output.finish())
+            },
+        )
     }
 
     pub fn lineitems_before(
@@ -223,42 +256,62 @@ impl Q3State {
         delta: &SpineSnapshot<JoinedOrdersBatch>,
     ) -> Result<SpineSnapshot<LineitemBatch>, String> {
         let views = self.views()?;
-        let mut output = RequestedRows::new();
-        for order in requested_keys(delta) {
-            for &customer in placements(&views, order)? {
-                scan(
-                    &views.before,
-                    &prefix_custkey_orderkey_then_linenumber(customer, order),
-                    |key, payload, weight| {
-                        if let (
-                            Key::LineitemByCustkeyOrderkeyLinenumber(
-                                LineitemByCustkeyOrderkeyLinenumberKey {
-                                    orderkey,
-                                    linenumber,
-                                    ..
-                                },
-                            ),
-                            Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
-                        ) = (key, payload)
-                        {
-                            output.push(
-                                Tup1(orderkey),
-                                Tup4(
-                                    linenumber,
-                                    payload.l_extendedprice,
-                                    payload.l_discount,
-                                    payload.l_shipdate,
-                                ),
-                                weight,
-                            );
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-        }
-        Ok(output.finish())
+        count_index_reads(
+            &views,
+            |reads| &mut reads.lineitems_before,
+            || {
+                let mut output = RequestedRows::new();
+                for order in requested_keys(delta) {
+                    for &customer in placements(&views, order)? {
+                        scan(
+                            &views.before,
+                            &prefix_custkey_orderkey_then_linenumber(customer, order),
+                            |key, payload, weight| {
+                                if let (
+                                    Key::LineitemByCustkeyOrderkeyLinenumber(
+                                        LineitemByCustkeyOrderkeyLinenumberKey {
+                                            orderkey,
+                                            linenumber,
+                                            ..
+                                        },
+                                    ),
+                                    Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
+                                ) = (key, payload)
+                                {
+                                    output.push(
+                                        Tup1(orderkey),
+                                        Tup4(
+                                            linenumber,
+                                            payload.l_extendedprice,
+                                            payload.l_discount,
+                                            payload.l_shipdate,
+                                        ),
+                                        weight,
+                                    );
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+                Ok(output.finish())
+            },
+        )
     }
+}
+
+/// Runs `read` and adds the index's run reads that it makes on this thread to
+/// the field of `views.reads` that `field` selects.
+fn count_index_reads<T>(
+    views: &ReadViews,
+    field: impl FnOnce(&mut IndexReads) -> &mut RunReads,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let before = RunReads::current_for(WriteOwner::MergedIndex);
+    let result = read();
+    let made = RunReads::current_for(WriteOwner::MergedIndex).since(before);
+    *field(&mut *views.reads.lock().map_err(|_| "Q3 reads lock poisoned")?) += made;
+    result
 }
 
 fn placements(views: &ReadViews, order: i64) -> Result<&BTreeSet<i64>, String> {
