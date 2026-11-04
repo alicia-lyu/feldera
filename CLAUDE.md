@@ -80,6 +80,7 @@ The harness runs two chained circuits in two DBSP runtimes (user decision of 202
 | Spec parser and schema validator (roadmap Step 3) | package `org.dbsp.sqlCompiler.compiler.frontend.mergedIndex` in `sql-to-dbsp-compiler/SQL-compiler` |
 | Rust emitter for a spec (Step 4), selected by `--merged-index` and `--merged-index-output` | `MergedIndexRustEmitter.java` (`backend/rust`), `CompilerMain.emitMergedIndex` |
 | COL spec and its generated module, which COL re-exports as its definition (`lib.rs` adds only `build_batch`) | `merged-index-col/col.mi`, `generate.sh`, `src/generated.rs` |
+| Run counters: per-thread seeks, and key, value, and weight reads of single runs (roadmap step 1 of shared-traversal.md) | `RunReads` in `crates/dbsp/src/trace/cursor/run_reads.rs`; counted in `VecIndexedWSetCursor` and `FileIndexedWSetCursor`; baseline in `merged-index-col/src/q3/tests.rs` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 
 ### Experiment commands

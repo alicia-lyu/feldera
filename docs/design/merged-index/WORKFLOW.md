@@ -64,7 +64,10 @@ cargo +1.96.1 test --offline --locked
 # From the repository root
 cargo +1.96.1 test --offline -p dbsp --lib merged_index
 cargo +1.96.1 test --offline -p dbsp --lib supplied_snapshot_join
+cargo +1.96.1 test --offline -p dbsp --lib run_reads
 ```
+
+The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`.
 
 The merged-index spec parser, validator, and emitter test in the SQL compiler, with Java 21 configured:
 

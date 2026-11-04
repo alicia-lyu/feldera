@@ -4,10 +4,15 @@ use crate::{
     OrdersByCustkeyOrderkeyPayload,
 };
 use dbsp::{
-    dynamic::{DowncastTrait, DynData},
-    trace::{BatchReaderFactories, OrdIndexedWSetFactories, WithSnapshot},
-    DynZWeight,
+    circuit::{CircuitConfig, CircuitStorageConfig},
+    dynamic::{DowncastTrait, DynData, Erase},
+    trace::{
+        Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
+        WithSnapshot,
+    },
+    DynZWeight, Runtime,
 };
+use feldera_types::config::{StorageConfig, StorageOptions};
 
 type SourceRow = (Key, Payload, i64);
 
@@ -382,4 +387,215 @@ fn reconstruction_chunks_use_native_ordering_and_consolidation() {
     assert_eq!(actual.first(), Some(&(Tup1(1), Tup1(9), 1)));
     assert_eq!(actual.last(), Some(&(Tup1((count - 1) as i64), Tup1(9), 1)));
     assert!(actual.windows(2).all(|rows| rows[0].0 < rows[1].0));
+}
+
+/// Copies `run` into a batch in a file.
+fn file_run(run: &MergedIndexBatch) -> MergedIndexBatch {
+    let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+        Vec<u8>,
+        StoredPayload,
+        i64,
+    >();
+    let mut builder = <MergedIndexBatch as Batch>::Builder::with_capacity_in_location(
+        &factories,
+        run.key_count(),
+        run.len(),
+        Some(BatchLocation::Storage),
+    );
+    let mut cursor = run.cursor();
+    while cursor.key_valid() {
+        while cursor.val_valid() {
+            let weight = **cursor.weight();
+            builder.push_val_diff(cursor.val(), weight.erase());
+            cursor.step_val();
+        }
+        builder.push_key(cursor.key());
+        cursor.step_key();
+    }
+    builder.done()
+}
+
+/// Runs `f` on the one worker of a runtime with storage. Only batches built
+/// for storage go there, so the readers' driving deltas and outputs stay in
+/// memory and add no file reads.
+fn in_storage_runtime(f: impl FnOnce() + Clone + Send + 'static) {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let config = CircuitConfig::with_workers(1).with_storage(Some(
+        CircuitStorageConfig::for_config(
+            StorageConfig {
+                path: storage_dir.path().to_string_lossy().into_owned(),
+                cache: Default::default(),
+            },
+            StorageOptions::default(),
+        )
+        .unwrap(),
+    ));
+    let _handle = Runtime::init_circuit(config, move |_| {
+        f();
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The reads that `f` makes on this thread.
+fn run_reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
+    let before = RunReads::current();
+    let result = f();
+    (result, RunReads::current().since(before))
+}
+
+/// The storage-level baseline of today's four readers on the worked
+/// transaction of `docs/design/merged-index/shared-traversal.md`, without
+/// its invoices, since COL has none.
+#[test]
+fn todays_readers_run_reads_on_the_worked_transaction() {
+    in_storage_runtime(|| {
+        // `Old`: a file run with customer 5 (orders 3 and 4, line items 7, 8,
+        // and 9) and customer 6, plus an in-memory run with customer 7.
+        let old_file = file_run(
+            &build_batch(vec![
+                customer(5, "old", 1),
+                order(5, 3, 10, 1),
+                line(5, 3, 7, 100, 1),
+                line(5, 3, 8, 100, 1),
+                order(5, 4, 10, 1),
+                line(5, 4, 9, 100, 1),
+                customer(6, "other", 1),
+            ])
+            .unwrap(),
+        );
+        let old_memory = build_batch(vec![customer(7, "later", 1)]).unwrap();
+        // `Dlt`: customer 5 replaced, and order 5 inserted with line items 10
+        // and 11.
+        let dlt = build_batch(vec![
+            customer(5, "old", -1),
+            customer(5, "new", 1),
+            order(5, 5, 11, 1),
+            line(5, 5, 10, 200, 1),
+            line(5, 5, 11, 200, 1),
+        ])
+        .unwrap();
+        assert_eq!(old_file.location(), BatchLocation::Storage);
+        assert_eq!(old_memory.location(), BatchLocation::Memory);
+        assert_eq!(dlt.location(), BatchLocation::Memory);
+
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            StoredPayload,
+            i64,
+        >();
+        let (old_file, old_memory, dlt) = (Arc::new(old_file), Arc::new(old_memory), Arc::new(dlt));
+        let before =
+            SourceSnapshot::with_batches(&factories, vec![old_file.clone(), old_memory.clone()]);
+        let after = SourceSnapshot::with_batches(&factories, vec![old_file, old_memory, dlt]);
+        // Today's harness takes placements from the Orders delta alone and
+        // would reject this `ΔC`; the readers accept any placements.
+        let state = Q3State::default();
+        state
+            .publish(
+                before,
+                after,
+                BTreeMap::from([3, 4, 5].map(|order| (order, BTreeSet::from([5])))),
+            )
+            .unwrap();
+
+        let orders_delta = delta(vec![(Tup1(5), Tup3(5, Date::from_days(11), 7), 1)]);
+        let customers_delta = delta(vec![
+            (Tup1(5), Tup1(SqlString::from("old")), -1),
+            (Tup1(5), Tup1(SqlString::from("new")), 1),
+        ]);
+        let lines_delta = delta(
+            [10, 11]
+                .map(|linenumber| {
+                    (
+                        Tup1(5),
+                        Tup4(
+                            linenumber,
+                            SqlDecimal::new(200, 2).unwrap(),
+                            SqlDecimal::new(4, 2).unwrap(),
+                            Date::from_days(30),
+                        ),
+                        1,
+                    )
+                })
+                .to_vec(),
+        );
+        let joined_delta = delta(
+            [3, 4, 5]
+                .map(|order| {
+                    (
+                        Tup1(order),
+                        Tup4(5, SqlString::from("new"), Date::from_days(10), 7),
+                        1,
+                    )
+                })
+                .to_vec(),
+        );
+
+        let (customers, c_reads) = run_reads_of(|| state.customers_after(&orders_delta).unwrap());
+        let (orders, o_reads) = run_reads_of(|| state.orders_before(&customers_delta).unwrap());
+        let (joined, j_reads) = run_reads_of(|| state.joined_orders_after(&lines_delta).unwrap());
+        let (lines, l_reads) = run_reads_of(|| state.lineitems_before(&joined_delta).unwrap());
+        state.finish().unwrap();
+
+        assert_eq!(
+            tuples(&customers),
+            vec![(Tup1(5), Tup1(SqlString::from("new")), 1)]
+        );
+        assert_eq!(
+            tuples(&orders),
+            vec![
+                (Tup1(5), Tup3(3, Date::from_days(10), 7), 1),
+                (Tup1(5), Tup3(4, Date::from_days(10), 7), 1),
+            ]
+        );
+        assert_eq!(
+            tuples(&joined),
+            vec![(
+                Tup1(5),
+                Tup4(5, SqlString::from("new"), Date::from_days(11), 7),
+                1
+            )]
+        );
+        assert_eq!(
+            tuples(&lines)
+                .into_iter()
+                .map(|(order, Tup4(linenumber, ..), weight)| (order.0, linenumber, weight))
+                .collect::<Vec<_>>(),
+            vec![(3, 7, 1), (3, 8, 1), (4, 9, 1)]
+        );
+
+        // The file run's keys, in folded-key order, are c5, o3, l7, l8, o4,
+        // l9, and c6, each with one value. Every scan opens a cursor over all
+        // runs, which lands the file run on c5 (one key read and one value
+        // read), and seeks every run once. A key step of the file run reads
+        // the new key and its first value. A seek that leaves the file run on
+        // its current key still reads that key's first value. `CursorList`
+        // reads a file weight whenever the file run holds the smallest value,
+        // to skip zero weights.
+        let reads = |seeks, key_reads, value_reads, weight_reads| RunReads {
+            seeks,
+            key_reads,
+            value_reads,
+            weight_reads,
+        };
+        // C⁺: one scan of c5's own key over three runs. The seek leaves the
+        // file run on c5 (one value read); `Dlt`'s "new" comes first, then
+        // "old" cancels across `Dlt` and the file run (one weight read). The
+        // step to o3 ends the range (one key, value, and weight read).
+        assert_eq!(c_reads, reads(3, 2, 3, 2));
+        // O⁻: one scan of c5's range over two runs. Opening and the seek stay
+        // on c5 (a weight read each); then six key steps, c5 through c6, each
+        // read a key, a value, and a weight.
+        assert_eq!(o_reads, reads(2, 7, 8, 8));
+        // J⁺: c5's key as in C⁺, then (c5, o5)'s key, whose seek lands the
+        // file run on c6 (one key and one value read). Only `Dlt` holds o5,
+        // so no file weight is read.
+        assert_eq!(j_reads, reads(6, 4, 5, 2));
+        // L⁻: the line items of o3, o4, and o5, one scan each over two runs.
+        // Each scan opens on c5 and seeks to its order's first line item: o3
+        // reads l7, l8, and o4 (4 of each); o4 reads l9 and c6 (3 of each);
+        // o5 has no line items and lands on c6 (2 of each).
+        assert_eq!(l_reads, reads(6, 9, 9, 9));
+    });
 }
