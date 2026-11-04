@@ -27,16 +27,11 @@ one workload. The base Order keys must be strictly ascending (what the driver's
 loader requires), and every RF1 Order key must be absent from the base Orders
 and from the other RF1 sets; the script fails otherwise.
 
-RF2 selection (inserts and deletes are chosen independently):
-
-- clustered: order the base Orders by (o_custkey, o_orderkey). Let T be the sum
-  of the N(K). The Orders of the lowest-keyed Customers, taken until they hold
-  at least T Orders, are the candidates (the narrowest Customer-key prefix that
-  holds T Orders). Pair K takes the next N(K) Orders in that order. Nothing is
-  random.
-- scattered: a uniform sample of T distinct row positions of `orders.tbl`,
-  drawn with `random.Random(f"{seed}:scattered-rf2")` and dealt in order to the
-  pairs. It samples existing rows, not integers in the sparse key range.
+RF2 selection (inserts and deletes are chosen independently): both workloads
+delete the oldest Orders, as an analytical database ages out its history. Let T
+be the sum of the N(K). The T lowest base Order keys are the candidates, and
+pair K takes the next N(K) of them in key order. Nothing is random, so the two
+workloads share their RF2 sets and differ only in RF1.
 
 RF1 remapping. Only o_custkey of each RF1 Order changes. Let C be the sorted
 list of all Customer keys in `customer.tbl`. Neither rule looks at the RF2
@@ -64,10 +59,9 @@ Equal seeds and inputs give byte-identical outputs on one Python version.
 from __future__ import annotations
 
 import argparse
-from array import array
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from collections import Counter
-from itertools import accumulate
+from itertools import accumulate, islice
 import math
 from pathlib import Path
 import json
@@ -161,14 +155,9 @@ def read_customer_keys(path: Path) -> list[int]:
     return keys
 
 
-def scan_base_orders(path: Path, customers: list[int],
-                     rf1_keys: set[int]) -> tuple[int, array]:
-    """One pass over the base Orders: validate, count, and tally Orders per Customer.
-
-    Returns the Order count and an array indexed by position in `customers`.
-    """
+def scan_base_orders(path: Path, customers: list[int], rf1_keys: set[int]) -> int:
+    """One pass over the base Orders: validate them and return their count."""
     known = set(customers)
-    per_customer = array("I", [0]) * len(customers)
     count = 0
     previous = None
     for row in tbl_rows(path):
@@ -181,40 +170,18 @@ def scan_base_orders(path: Path, customers: list[int],
         customer = order_customer(row, path)
         if customer not in known:
             raise InputError(f"{path}: Order {key} references missing Customer {customer}")
-        per_customer[bisect_left(customers, customer)] += 1
         count += 1
-    return count, per_customer
+    return count
 
 
-def clustered_prefix(customers: list[int], per_customer: array, needed: int) -> int:
-    """Return the highest Customer key of the narrowest prefix holding `needed` Orders."""
-    held = 0
-    for customer, orders in zip(customers, per_customer):
-        held += orders
-        if held >= needed:
-            return customer
-    raise InputError(f"base Orders hold {held}, fewer than the {needed} needed")
+def oldest_orders(path: Path, needed: int) -> list[tuple[int, int]]:
+    """Return (o_custkey, o_orderkey) of the `needed` lowest Order keys.
 
-
-def select_rf2_candidates(path: Path, prefix_bound: int, sampled: dict[int, int]
-                          ) -> tuple[list[tuple[int, int]], dict[int, tuple[int, int]]]:
-    """One pass: gather the prefix Orders and the sampled rows.
-
-    Returns [(o_custkey, o_orderkey)] for Customers up to `prefix_bound`, and
-    {row position: (o_custkey, o_orderkey)} for the sampled positions.
+    `scan_base_orders` has checked that the keys ascend, so these are the file's
+    first `needed` rows.
     """
-    prefix: list[tuple[int, int]] = []
-    picked: dict[int, tuple[int, int]] = {}
-    for position, row in enumerate(tbl_rows(path)):
-        customer = order_customer(row, path)
-        if customer <= prefix_bound or position in sampled:
-            pair = (customer, order_key(row, path))
-            if customer <= prefix_bound:
-                prefix.append(pair)
-            if position in sampled:
-                picked[position] = pair
-    prefix.sort()
-    return prefix, picked
+    return [(order_customer(row, path), order_key(row, path))
+            for row in islice(tbl_rows(path), needed)]
 
 
 def write_rows(path: Path, rows: Iterable[bytes]) -> None:
@@ -309,21 +276,12 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     needed = sum(sizes)
 
     customers = read_customer_keys(base_paths["customer"])
-    order_count, per_customer = scan_base_orders(base_paths["orders"], customers, rf1_keys)
+    order_count = scan_base_orders(base_paths["orders"], customers, rf1_keys)
     if order_count < needed:
         raise InputError(f"base Orders hold {order_count}, fewer than the {needed} "
                          f"RF2 deletions needed for {pair_count} pairs")
 
-    prefix_bound = clustered_prefix(customers, per_customer, needed)
-    sample = random.Random(f"{seed}:scattered-rf2").sample(range(order_count), needed)
-    owner_of_position: dict[int, int] = {}
-    cursor = 0
-    for index, size in enumerate(sizes):
-        for position in sample[cursor:cursor + size]:
-            owner_of_position[position] = index
-        cursor += size
-    prefix, picked = select_rf2_candidates(base_paths["orders"], prefix_bound,
-                                           owner_of_position)
+    oldest = oldest_orders(base_paths["orders"], needed)
 
     scattered_rf1 = random.Random(f"{seed}:scattered-rf1")
     popularity = customers.copy()
@@ -333,7 +291,7 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     cursor = 0
     for index, (size, (orders, lines)) in enumerate(zip(sizes, update_sets)):
         number = index + 1
-        block = prefix[cursor:cursor + size]
+        block = oldest[cursor:cursor + size]
         cursor += size
         workloads["clustered"].append({
             "number": number, "orders": orders, "lines": lines,
@@ -343,12 +301,10 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
                 popularity, cumulative,
                 random.Random(f"{seed}:clustered-rf1:{number}"), len(orders)),
         })
-        scattered = [pair for position, pair in sorted(picked.items())
-                     if owner_of_position[position] == index]
         workloads["scattered"].append({
             "number": number, "orders": orders, "lines": lines,
-            "rf2_keys": [key for _, key in scattered],
-            "rf2_customers": [customer for customer, _ in scattered],
+            "rf2_keys": [key for _, key in block],
+            "rf2_customers": [customer for customer, _ in block],
             "rf1_customers": [customers[scattered_rf1.randrange(len(customers))]
                               for _ in orders],
         })
@@ -356,7 +312,7 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     manifest: dict[str, Any] = {
         "seed": seed, "pairs": pair_count, "zipf_exponent": zipf_exponent,
         "base": {"customers": len(customers), "orders": order_count,
-                 "clustered_rf2_customer_prefix_bound": prefix_bound},
+                 "rf2_highest_order_key": oldest[-1][1]},
         "inputs": {}, "workloads": {},
         "unused_dbgen_files": [f"delete.{n}" for n in range(1, pair_count + 1)],
     }

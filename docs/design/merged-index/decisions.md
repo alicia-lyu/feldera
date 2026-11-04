@@ -202,8 +202,8 @@ The user decided how `prepare_inputs.py` chooses refreshes:
 
 - RF1 inserts and RF2 deletes are chosen independently and never deliberately correlated.
 - Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0, which the user confirmed on 2026-10-26.
-- Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block.
-- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders.
+- Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block. *Superseded on 2026-11-04: both workloads delete the lowest Order keys.*
+- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders. *Superseded on 2026-11-04, as above.*
 
 `prepare_inputs.py` implements this.
 
@@ -265,6 +265,10 @@ The execution passes its readers to the session. Each reader fixes its kind, ver
 ### 2026-11-04: Run reads are attributed by a read scope
 
 Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
+
+### 2026-11-04: RF2 deletes the oldest Orders
+
+In both workloads, RF2 deletes the lowest base Order keys, as an analytical database ages out its oldest history. Pair K takes the next block, as large as its RF1. The two workloads then share their RF2 sets and differ only in RF1 (Zipf against uniform Customers). This replaces the RF2 rules of 2026-10-23; the RF1 rules stand.
 
 ### 2026-11-04: Run counters count decodes
 

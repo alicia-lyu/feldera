@@ -141,8 +141,8 @@ integrity.
 A macOS smoke run with the current configuration. `$SMOKE_INPUTS` holds `customer.tbl`,
 `orders.tbl`, `lineitem.tbl`, and `refreshes.json` of one small workload. Do not use the earlier
 smoke inputs in `target/r5-smoke-inputs/`: their RF2 deletes the Orders that their RF1 inserted,
-which violates the refresh selection of 2026-10-23 (RF2 deletes existing base Orders, chosen
-independently of RF1). Prepare smoke inputs from dbgen output at `-s 0.01` with
+which violates the refresh selection (RF2 deletes the oldest base Orders, chosen independently
+of RF1). Prepare smoke inputs from dbgen output at `-s 0.01` with
 `prepare_inputs.py` (see "Prepare the workloads").
 Both destinations must be new:
 

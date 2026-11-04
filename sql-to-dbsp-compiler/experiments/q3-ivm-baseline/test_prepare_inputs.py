@@ -121,33 +121,27 @@ class PrepareInputsTest(unittest.TestCase):
                 self.assertEqual((self.updates / f"lineitem.tbl.u{number}").read_text(),
                                  (out / workload / f"rf1-lines-{number}.tbl").read_text())
 
-    def test_clustered_sets_use_the_lowest_customers(self) -> None:
+    def test_rf2_deletes_the_lowest_order_keys_in_both_workloads(self) -> None:
         out = self.prepare()
+        clustered = self.rf2_sets(out, "clustered")
+        # Both workloads delete the oldest Orders, so they share their RF2 sets.
+        self.assertEqual(clustered, self.rf2_sets(out, "scattered"))
+        deleted = [key for keys in clustered for key in keys]
+        # Pair K takes the next block of the lowest base Order keys, in key order.
+        self.assertEqual(deleted, sorted(self.base_orders)[:len(deleted)])
         manifest = json.loads((out / "prepare-manifest.json").read_text())
-        bound = manifest["base"]["clustered_rf2_customer_prefix_bound"]
-        deleted = [key for keys in self.rf2_sets(out, "clustered") for key in keys]
-        needed = len(deleted)
-        # Every Order of a Customer below the bound is deleted or the bound's own customer holds
-        # the rest, and the prefix below the bound holds fewer than `needed` Orders.
-        below = [key for key, customer in self.base_orders.items() if customer < bound]
-        self.assertLess(len(below), needed)
-        self.assertTrue(set(below) <= set(deleted))
-        self.assertLessEqual(max(self.base_orders[key] for key in deleted), bound)
-        # Scattered sets spread far wider than the clustered prefix.
-        scattered = [self.base_orders[key] for keys in self.rf2_sets(out, "scattered")
-                     for key in keys]
-        self.assertGreater(max(scattered), bound)
+        self.assertEqual(manifest["base"]["rf2_highest_order_key"], deleted[-1])
 
     def test_clustered_rf1_customers_do_not_depend_on_the_rf2_sets(self) -> None:
         before = self.prepare("before")
-        # Rotate which Customer owns which base Order: the lowest-keyed Customers, and so the
-        # clustered RF2 sets, change; the Customer keys and the seed stay the same.
+        # Rotate which Customer owns which base Order; the Customer keys and the seed stay the
+        # same. Neither the RF1 Customers nor the RF2 keys depend on the Orders' Customers.
         rows = (self.base / "orders.tbl").read_text().splitlines()
         rotated = [order_row(int(row.split("|")[0]), CUSTOMERS - int(row.split("|")[1]) + 1)
                    for row in rows]
         write_lines(self.base / "orders.tbl", rotated)
         after = self.prepare("after")
-        self.assertNotEqual(self.rf2_sets(before, "clustered"), self.rf2_sets(after, "clustered"))
+        self.assertEqual(self.rf2_sets(before, "clustered"), self.rf2_sets(after, "clustered"))
         for number in range(1, PAIRS + 1):
             name = Path("clustered") / f"rf1-orders-{number}.tbl"
             self.assertEqual((before / name).read_bytes(), (after / name).read_bytes())
@@ -223,8 +217,11 @@ class PrepareInputsTest(unittest.TestCase):
         for name in names:
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
         other = self.prepare("other", seed=12)
-        self.assertNotEqual(self.rf2_sets(first, "scattered"), self.rf2_sets(other, "scattered"))
-        self.assertEqual(self.rf2_sets(first, "clustered"), self.rf2_sets(other, "clustered"))
+        # The seed drives only RF1; RF2 is the oldest Orders whatever the seed.
+        for workload in ("clustered", "scattered"):
+            self.assertEqual(self.rf2_sets(first, workload), self.rf2_sets(other, workload))
+        self.assertNotEqual((first / "scattered" / "rf1-orders-1.tbl").read_bytes(),
+                            (other / "scattered" / "rf1-orders-1.tbl").read_bytes())
 
     def test_too_few_orders_is_an_error(self) -> None:
         for name in ("orders.tbl", "lineitem.tbl"):
