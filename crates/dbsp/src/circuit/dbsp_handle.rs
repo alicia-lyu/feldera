@@ -6,6 +6,8 @@ use crate::circuit::schedule::CommitProgress;
 use crate::monitor::visual_graph::Graph;
 use crate::operator::dynamic::balance::{BalancerHint, PartitioningPolicy};
 use crate::storage::backend::StorageError;
+use crate::storage::write_attribution::WriteOwner;
+use crate::trace::RunReads;
 use crate::trace::spine_async::MAX_LEVEL0_BATCH_SIZE_RECORDS;
 use crate::{
     Error as DbspError, RootCircuit, Runtime, RuntimeError, circuit::runtime::RuntimeHandle,
@@ -996,6 +998,12 @@ impl Runtime {
                             return;
                         }
                     }
+                    Ok(Command::RunReads) => {
+                        let reads = WriteOwner::ALL.map(RunReads::current_for);
+                        if status_sender.send(Ok(Response::RunReads(reads))).is_err() {
+                            return;
+                        }
+                    }
                     Ok(Command::IsBackgroundMergeIdle) => {
                         let idle = circuit.is_background_merge_idle();
                         if status_sender
@@ -1297,6 +1305,8 @@ enum Command {
     StartCompaction,
     IsCompactionComplete,
     IsBackgroundMergeIdle,
+    /// Report the worker thread's run reads, per read owner.
+    RunReads,
     /// Build the bootstrap circuit: a second copy of the circuit, built from
     /// the same constructor as the main one (see
     /// [`DBSPHandle::create_bootstrap_circuit`]).  When a checkpoint path is
@@ -1362,6 +1372,7 @@ impl Debug for Command {
             Command::StartCompaction => write!(f, "StartCompaction"),
             Command::IsCompactionComplete => write!(f, "IsCompactionComplete"),
             Command::IsBackgroundMergeIdle => write!(f, "IsBackgroundMergeIdle"),
+            Command::RunReads => write!(f, "RunReads"),
             Command::CreateBootstrapCircuit(checkpoint) => f
                 .debug_tuple("CreateBootstrapCircuit")
                 .field(checkpoint)
@@ -1387,6 +1398,7 @@ enum Response {
     BootstrapComplete(bool),
     IsCompactionComplete(bool),
     IsBackgroundMergeIdle(bool),
+    RunReads([RunReads; 3]),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2620,6 +2632,25 @@ impl DBSPHandle {
         Ok(idle)
     }
 
+    /// The run reads of the worker threads so far, per read owner, indexed
+    /// like [`WriteOwner::ALL`] and summed over the workers.
+    ///
+    /// These are running totals; take them before and after a transaction
+    /// and subtract with [`RunReads::since`]. They cover what the circuit's
+    /// operators read on the workers. Background compaction and auxiliary
+    /// threads run elsewhere and are not included.
+    pub fn run_reads(&mut self) -> Result<[RunReads; 3], DbspError> {
+        let mut reads = [RunReads::default(); 3];
+        self.broadcast_command(Command::RunReads, |_, response| {
+            if let Response::RunReads(worker_reads) = response {
+                for (total, worker) in reads.iter_mut().zip(worker_reads) {
+                    *total += worker;
+                }
+            }
+        })?;
+        Ok(reads)
+    }
+
     /// Block until background compaction has fully converged on every worker,
     /// or until `timeout` elapses.
     ///
@@ -2868,6 +2899,8 @@ impl CheckpointPublisher {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::storage::write_attribution::WriteOwner;
+    use crate::trace::RunReads;
     use std::fs::{File, create_dir_all};
     use std::io;
     use std::path::Path;
@@ -3445,6 +3478,43 @@ pub(crate) mod tests {
                 .output();
             Ok((handle, sample_handle, sample_size_handle))
         })
+    }
+
+    /// A join's partner reads on the worker reach `run_reads`, under the
+    /// default read owner.
+    #[test]
+    fn run_reads_reports_the_workers_reads() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let (mut circuit, (left_input, right_input)) =
+            Runtime::init_circuit(mkconfig(temp.path()), |circuit| {
+                let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                left.join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                    .accumulate_output();
+                Ok((left_input, right_input))
+            })
+            .unwrap();
+        right_input.append(&mut (0..100).map(|key| Tup2(key, Tup2(key, 1))).collect());
+        circuit.transaction().unwrap();
+        // A step's batch stays in memory; full compaction writes the right
+        // input's trace to storage, since `min_storage_bytes` is zero.
+        circuit.start_compaction().unwrap();
+        circuit
+            .wait_for_compaction(std::time::Duration::from_secs(60))
+            .unwrap();
+
+        // The left delta probes that file run, which decodes what it lands on.
+        let before = circuit.run_reads().unwrap();
+        left_input.append(&mut vec![Tup2(7, Tup2(0, 1))]);
+        circuit.transaction().unwrap();
+        let after = circuit.run_reads().unwrap();
+        let read = |owner: WriteOwner| after[owner.index()].since(before[owner.index()]);
+        assert!(read(WriteOwner::Query).seeks > 0);
+        assert!(read(WriteOwner::Query).key_reads > 0);
+        assert_eq!(read(WriteOwner::MergedIndex), RunReads::default());
+        assert_eq!(read(WriteOwner::BaseRelation), RunReads::default());
+
+        circuit.kill().unwrap();
     }
 
     pub(crate) fn mkconfig(path: &Path) -> CircuitConfig {
