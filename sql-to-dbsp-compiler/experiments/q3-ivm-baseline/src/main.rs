@@ -26,6 +26,8 @@ use dbsp::storage::file::writer::{
     ELIDED_VALUE_HEADER_BLOCKS, FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS,
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
+use dbsp::storage::write_attribution::WriteOwner;
+use dbsp::trace::RunReads;
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
@@ -411,6 +413,9 @@ struct Measurements {
     /// Where the last transaction's published index snapshots kept their runs (reconstructed
     /// mode).
     index_layout: Option<Value>,
+    /// The view worker's run reads in the view transactions, per read owner, indexed like
+    /// `WriteOwner::ALL` (both modes).
+    view_reads: [RunReads; 3],
 }
 
 impl Measurements {
@@ -494,9 +499,20 @@ fn transact_inner(
     net_delta.apply_optional(None, &mut pipeline.view.inputs)?;
     stats.forward += feed_started.elapsed();
 
+    // The view worker counts its own run reads; they are read outside the transaction's timer.
+    let view_reads_before = pipeline.view.circuit.run_reads()?;
     let view_started = Instant::now();
     let transaction_result = pipeline.view.circuit.transaction();
     let latency = view_started.elapsed();
+    let view_reads_after = pipeline.view.circuit.run_reads()?;
+    for ((total, after), before) in stats
+        .view_reads
+        .iter_mut()
+        .zip(view_reads_after)
+        .zip(view_reads_before)
+    {
+        *total += after.since(before);
+    }
     #[cfg(feature = "merged-index")]
     let finish_result = {
         let cleanup_started = Instant::now();
@@ -1339,6 +1355,22 @@ fn phase_json(stats: &Measurements) -> Value {
     })
 }
 
+/// The view worker's run reads per read owner (measurement version 5): the join traces'
+/// partner reads in native mode are under `query`; in reconstructed mode the index readers are
+/// under `merged_index`.
+fn view_reads_json(reads: &[RunReads; 3]) -> Result<Value> {
+    WriteOwner::ALL
+        .into_iter()
+        .map(|owner| {
+            Ok((
+                owner.name().to_owned(),
+                serde_json::to_value(reads[owner as usize])?,
+            ))
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()
+        .map(Value::Object)
+}
+
 /// The merged index's run reads per reader (measurement version 5). Only file runs count key,
 /// value and weight reads; `index_layout` says where the runs were.
 #[cfg(feature = "merged-index")]
@@ -1553,6 +1585,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut foreground_total = Duration::ZERO;
     #[cfg(feature = "merged-index")]
     let mut sequence_index_reads = IndexReads::default();
+    let mut sequence_view_reads = [RunReads::default(); 3];
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
@@ -1655,6 +1688,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             report["index_run_reads"] = Value::Null;
         }
         report["index_layout"] = json!(measurement.index_layout);
+        for (total, reads) in sequence_view_reads.iter_mut().zip(measurement.view_reads) {
+            *total += reads;
+        }
+        report["view_run_reads"] = view_reads_json(&measurement.view_reads)?;
         println!(
             "run={run_number} refresh={} phase={phase} {}",
             number + 1,
@@ -1797,6 +1834,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
             "index_run_reads": sequence_index_run_reads,
+            "view_run_reads": view_reads_json(&sequence_view_reads)?,
             "manual_index_storage": manual_storage,
             "completion_boundary": "last_refresh_complete",
             "catalog_storage": storage_evidence,
@@ -2670,6 +2708,43 @@ mod measurement_tests {
                 assert!(refresh["index_layout"].is_null(), "{refresh}");
             }
             assert!(output["sequence"]["index_run_reads"].is_null());
+        }
+        // The view worker's reads, per owner, in both modes. The index readers are the only
+        // reads under `merged_index`, so in reconstructed mode that owner's counts are the sums
+        // of `index_run_reads` over the readers.
+        for refresh in refreshes {
+            let view = &refresh["view_run_reads"];
+            for owner in ["query", "base_relation", "merged_index"] {
+                assert!(view[owner]["seeks"].is_u64(), "{refresh}");
+            }
+            for field in ["seeks", "filter_rejections", "key_decodes", "value_decodes"] {
+                let index_part = view["merged_index"][field].as_u64().unwrap();
+                if cfg!(feature = "merged-index") {
+                    let by_reader: u64 = READERS
+                        .iter()
+                        .map(|reader| refresh["index_run_reads"][reader][field].as_u64().unwrap())
+                        .sum();
+                    assert_eq!(index_part, by_reader, "{refresh}");
+                } else {
+                    assert_eq!(index_part, 0, "{refresh}");
+                }
+            }
+        }
+        let view_seeks: u64 = refreshes
+            .iter()
+            .map(|refresh| {
+                refresh["view_run_reads"]["query"]["seeks"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(
+            output["sequence"]["view_run_reads"]["query"]["seeks"],
+            view_seeks
+        );
+        if !cfg!(feature = "merged-index") {
+            // The native joins probe their traces on the view worker.
+            assert!(view_seeks > 0);
         }
         assert_eq!(
             output["sequence"]["completion_boundary"],

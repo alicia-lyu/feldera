@@ -22,7 +22,10 @@ use crate::{
         FileValBatch, VecIndexedWSetFactories, WeightedItem,
         cursor::{
             CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor,
-            run_reads::{count_key_read, count_seek, count_value_read, count_weight_read},
+            run_reads::{
+                count_filter_rejection, count_key_decode, count_seek, count_value_decode,
+                count_weight_decode,
+            },
         },
         filter::BatchFilters,
         merge_batches_by_reference,
@@ -716,10 +719,10 @@ where
         };
         // Opening the cursor reads the first key and its first value.
         if key_cursor.has_value() {
-            count_key_read();
+            count_key_decode();
         }
         if val_cursor.has_value() {
-            count_value_read();
+            count_value_decode();
         }
         Self {
             wset,
@@ -739,7 +742,7 @@ where
         let start = row(&self.key_cursor);
         op(&mut self.key_cursor).unwrap_storage();
         if landing.reads(start, row(&self.key_cursor)) {
-            count_key_read();
+            count_key_decode();
         }
         self.val_cursor = unsafe {
             self.key_cursor
@@ -749,7 +752,7 @@ where
                 .unwrap_storage()
         };
         if self.val_cursor.has_value() {
-            count_value_read();
+            count_value_decode();
         }
     }
 
@@ -762,13 +765,13 @@ where
         let start = row(&self.val_cursor);
         op(&mut self.val_cursor).unwrap_storage();
         if landing.reads(start, row(&self.val_cursor)) {
-            count_value_read();
+            count_value_decode();
         }
     }
 
     /// Deserializes the current value's weight into `self.diff`.
     fn read_weight(&mut self) {
-        count_weight_read();
+        count_weight_decode();
         unsafe { self.val_cursor.aux(&mut self.diff) };
     }
 }
@@ -878,6 +881,7 @@ where
 
     fn seek_key_exact(&mut self, key: &K, hash: Option<u64>) -> bool {
         if !self.wset.filters.maybe_contains_key(key, hash) {
+            count_filter_rejection();
             return false;
         }
         self.seek_key(key);
@@ -888,7 +892,7 @@ where
         count_seek();
         // Each call of the predicate follows the deserialization of a probe.
         let predicate = |key: &K| {
-            count_key_read();
+            count_key_decode();
             predicate(key)
         };
         self.move_key(Landing::IfMoved, |key_cursor| unsafe {
@@ -899,7 +903,7 @@ where
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
         count_seek();
         let predicate = |key: &K| {
-            count_key_read();
+            count_key_decode();
             predicate(key)
         };
         self.move_key(Landing::Always, |key_cursor| unsafe {
@@ -928,7 +932,7 @@ where
 
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
         let predicate = |val: &V| {
-            count_value_read();
+            count_value_decode();
             predicate(val)
         };
         self.move_val(Landing::IfMoved, |val_cursor| unsafe {
@@ -968,7 +972,7 @@ where
 
     fn seek_val_with_reverse(&mut self, predicate: &dyn Fn(&V) -> bool) {
         let predicate = |val: &V| {
-            count_value_read();
+            count_value_decode();
             predicate(val)
         };
         self.move_val(Landing::Always, |val_cursor| unsafe {

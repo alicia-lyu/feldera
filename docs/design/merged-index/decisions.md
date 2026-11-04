@@ -266,6 +266,10 @@ The execution passes its readers to the session. Each reader fixes its kind, ver
 
 Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
 
+### 2026-11-04: Run counters count decodes
+
+`RunReads`' `key_reads`, `value_reads`, and `weight_reads` are renamed `key_decodes`, `value_decodes`, and `weight_decodes`. They count entries deserialized from file runs, which usually come from the buffer cache, not disk reads. Storage traffic is reported by the backend read counters beside them.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

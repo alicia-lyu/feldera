@@ -582,11 +582,13 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
         // its current key still reads that key's first value. `CursorList`
         // reads a file weight whenever the file run holds the smallest value,
         // to skip zero weights.
-        let reads = |seeks, key_reads, value_reads, weight_reads| RunReads {
+        // `scan` seeks with `seek_key`, so no filter rejects a probe.
+        let reads = |seeks, key_decodes, value_decodes, weight_decodes| RunReads {
             seeks,
-            key_reads,
-            value_reads,
-            weight_reads,
+            filter_rejections: 0,
+            key_decodes,
+            value_decodes,
+            weight_decodes,
         };
         // C⁺: one scan of c5's own key over three runs. The seek leaves the
         // file run on c5 (one value read); `Dlt`'s "new" comes first, then

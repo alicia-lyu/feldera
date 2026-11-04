@@ -22,7 +22,7 @@ MODES = ("native", "merged-index")
 WRITE_OWNERS = ("query", "base_relation", "merged_index")
 # The merged index's readers, and the run counts reported for each (measurement version 5).
 INDEX_READERS = ("customers_after", "orders_before", "joined_orders_after", "lineitems_before")
-RUN_READ_FIELDS = ("seeks", "key_reads", "value_reads", "weight_reads")
+RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes")
 
 
 def sha256(path: Path) -> str:
@@ -108,6 +108,56 @@ def index_read_problems(report: dict[str, Any]) -> list[str]:
     summed = counts("sequence", sequence)
     if summed is not None and not problems and summed != total:
         problems.append("sequence: index_run_reads are not the sums of the refreshes'")
+    return problems
+
+
+def view_read_problems(report: dict[str, Any]) -> list[str]:
+    """List where a driver report's view-worker run reads are malformed.
+
+    Each refresh and the sequence give `view_run_reads` for every owner in
+    `WRITE_OWNERS`, with every `RUN_READ_FIELDS` a non-negative integer, and the
+    sequence's counts are the sums of the refreshes'. Only the index readers read
+    under `merged_index`: a native report has none, and a reconstructed report's
+    `merged_index` counts are its `index_run_reads` summed over the readers. A
+    report that names neither mode is not checked here.
+    """
+    mode = report.get("mode")
+    if mode not in ("native", "reconstructed"):
+        return []
+    problems: list[str] = []
+
+    def counts(place: str, reads: Any) -> dict[tuple[str, str], int] | None:
+        found = {}
+        for owner in WRITE_OWNERS:
+            for field in RUN_READ_FIELDS:
+                value = reads.get(owner, {}).get(field) if isinstance(reads, dict) else None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    problems.append(f"{place}: view_run_reads.{owner}.{field} is {value!r}")
+                    return None
+                found[(owner, field)] = value
+        return found
+
+    total: dict[tuple[str, str], int] = {}
+    for item in report.get("refreshes", []):
+        place = f"refresh {item.get('refresh')}"
+        found = counts(place, item.get("view_run_reads"))
+        if found is None:
+            continue
+        for key, value in found.items():
+            total[key] = total.get(key, 0) + value
+        for field in RUN_READ_FIELDS:
+            index_part = found[("merged_index", field)]
+            if mode == "native":
+                expected = 0
+            else:
+                readers = item.get("index_run_reads") or {}
+                expected = sum(readers.get(reader, {}).get(field, 0) for reader in INDEX_READERS)
+            if index_part != expected:
+                problems.append(f"{place}: view_run_reads.merged_index.{field} is {index_part}, "
+                                f"expected {expected}")
+    summed = counts("sequence", report.get("sequence", {}).get("view_run_reads"))
+    if summed is not None and not problems and summed != total:
+        problems.append("sequence: view_run_reads are not the sums of the refreshes'")
     return problems
 
 
@@ -489,7 +539,8 @@ def run(argv: list[str]) -> int:
                 record["driver"] = raw
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
-                problems = owner_write_problems(raw) + index_read_problems(raw)
+                problems = (owner_write_problems(raw) + index_read_problems(raw)
+                            + view_read_problems(raw))
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

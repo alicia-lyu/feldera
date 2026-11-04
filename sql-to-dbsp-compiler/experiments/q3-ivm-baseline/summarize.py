@@ -25,9 +25,13 @@ reports, over the repetitions:
   provides (`cgroup_delta_*`: `pgscan`, `pgsteal`, the workingset refaults, the memory events
   and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
   reset worked) and the maximum sampled `memory.current`;
+- `sequence.view_run_reads`, the view worker's run reads summed over the owners
+  (`view_seeks`, `view_filter_rejections`, `view_key_decodes`, `view_value_decodes`,
+  `view_weight_decodes`), in both modes: the join traces' partner reads in native mode, the index
+  readers' and the rest of the view circuit's in reconstructed mode;
 - for the merged-index mode only, `sequence.index_run_reads` summed over the readers
-  (`index_seeks`, `index_key_reads`, `index_value_reads`, `index_weight_reads`), under the
-  mode's `index_run_reads`. Only file runs count key, value and weight reads.
+  (`index_seeks`, `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
+  `index_weight_decodes`), under the mode's `index_run_reads`. Only file runs count decodes.
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
@@ -46,7 +50,7 @@ import sys
 from typing import Any
 
 from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, WRITE_OWNERS, index_read_problems,
-                     owner_write_problems)
+                     owner_write_problems, view_read_problems)
 
 MEASUREMENT_VERSION = 5
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
@@ -90,9 +94,6 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     problems = owner_write_problems(driver)
     if problems:
         raise SummaryError(f"{where}: inconsistent write attribution: " + "; ".join(problems))
-    problems = index_read_problems(driver)
-    if problems:
-        raise SummaryError(f"{where}: inconsistent index run reads: " + "; ".join(problems))
     metrics = {
         "sequence_wall_ms": number(driver, ("sequence", "end_to_end_ms"), where),
         "sequence_cpu_ms": number(driver, ("sequence", "resources", "cpu_microseconds"),
@@ -101,6 +102,9 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     refreshes = driver.get("refreshes")
     if not isinstance(refreshes, list) or not refreshes:
         raise SummaryError(f"{where}: no refreshes in the driver report")
+    problems = index_read_problems(driver) + view_read_problems(driver)
+    if problems:
+        raise SummaryError(f"{where}: inconsistent run reads: " + "; ".join(problems))
     for field in REFRESH_SUMS:
         metrics[f"refresh_{field}"] = sum(
             number(refresh, (field,), f"{where} refresh {index}")
@@ -115,6 +119,12 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     metrics["write_bytes_total"] = number(driver, (*resources, "backend_write_bytes"), where)
     metrics["observed_storage_bytes"] = number(driver, ("sequence", "observed_storage_bytes"), where)
     metrics["peak_rss_bytes"] = number(driver, (*resources, "peak_rss_bytes"), where)
+    # The view worker's run reads over all owners: in native mode the join traces' partner
+    # reads, in reconstructed mode the index readers' and the rest of the view circuit's.
+    for field in RUN_READ_FIELDS:
+        metrics[f"view_{field}"] = sum(
+            number(driver, ("sequence", "view_run_reads", owner, field), where)
+            for owner in WRITE_OWNERS)
     metrics.update(window_memory_metrics(driver, where))
     return metrics
 
@@ -274,7 +284,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
             if not reads:
                 continue
             lines += [f"Merged-index run reads ({mode}), summed over the readers. Only file "
-                      "runs count key, value and weight reads; each refresh's `index_layout` "
+                      "runs count decodes; each refresh's `index_layout` "
                       "in the driver report says where the runs were.", "",
                       "| Metric | " + " | ".join(STATISTICS) + " |",
                       "| --- | " + " | ".join("---:" for _ in STATISTICS) + " |"]

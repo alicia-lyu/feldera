@@ -324,8 +324,8 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("not the sums", measure.index_read_problems(unsummed)[0])
 
         negative = self.index_report()
-        negative["refreshes"][0]["index_run_reads"]["lineitems_before"]["key_reads"] = -1
-        self.assertIn("lineitems_before.key_reads is -1",
+        negative["refreshes"][0]["index_run_reads"]["lineitems_before"]["key_decodes"] = -1
+        self.assertIn("lineitems_before.key_decodes is -1",
                       measure.index_read_problems(negative)[0])
 
         no_layout = self.index_report()
@@ -337,6 +337,41 @@ class MeasureTest(unittest.TestCase):
         native["refreshes"][0]["index_run_reads"] = {}
         self.assertIn("a native run reports merged-index reads",
                       measure.index_read_problems(native)[0])
+
+    def test_view_reads_match_the_index_and_sum_to_the_sequence(self) -> None:
+        def view(index_seeks: int, query_seeks: int) -> dict:
+            reads = {owner: {field: 0 for field in measure.RUN_READ_FIELDS}
+                     for owner in measure.WRITE_OWNERS}
+            reads["merged_index"]["seeks"] = index_seeks
+            reads["query"]["seeks"] = query_seeks
+            return reads
+        report = self.index_report()
+        for refresh in report["refreshes"]:
+            # Four readers with `refresh` seeks each.
+            refresh["view_run_reads"] = view(4 * refresh["refresh"], 5)
+            for reader in measure.INDEX_READERS:
+                for field in measure.RUN_READ_FIELDS:
+                    refresh["index_run_reads"][reader][field] = 0
+                refresh["index_run_reads"][reader]["seeks"] = refresh["refresh"]
+        report["sequence"]["view_run_reads"] = view(12, 10)
+        self.assertEqual(measure.view_read_problems(report), [])
+
+        report["sequence"]["view_run_reads"]["query"]["seeks"] = 11
+        self.assertIn("not the sums", measure.view_read_problems(report)[0])
+
+        report["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 5
+        self.assertIn("view_run_reads.merged_index.seeks is 5, expected 4",
+                      measure.view_read_problems(report)[0])
+
+        native = {"mode": "native", "sequence": {"view_run_reads": view(0, 3)},
+                  "refreshes": [{"refresh": 1, "view_run_reads": view(0, 3)}]}
+        self.assertEqual(measure.view_read_problems(native), [])
+        native["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 1
+        self.assertIn("expected 0", measure.view_read_problems(native)[0])
+
+        missing = {"mode": "native", "sequence": {}, "refreshes": [{"refresh": 1}]}
+        self.assertIn("view_run_reads.query.seeks is None",
+                      measure.view_read_problems(missing)[0])
 
     def test_owner_writes_must_sum_to_totals_in_every_report_block(self) -> None:
         self.assertEqual(measure.owner_write_problems(self.owner_report()), [])

@@ -3510,7 +3510,7 @@ pub(crate) mod tests {
         let after = circuit.run_reads().unwrap();
         let read = |owner: WriteOwner| after[owner.index()].since(before[owner.index()]);
         assert!(read(WriteOwner::Query).seeks > 0);
-        assert!(read(WriteOwner::Query).key_reads > 0);
+        assert!(read(WriteOwner::Query).key_decodes > 0);
         assert_eq!(read(WriteOwner::MergedIndex), RunReads::default());
         assert_eq!(read(WriteOwner::BaseRelation), RunReads::default());
 

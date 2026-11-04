@@ -51,12 +51,14 @@ fn reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
     (result, RunReads::current().since(before))
 }
 
-fn reads(seeks: u64, key_reads: u64, value_reads: u64, weight_reads: u64) -> RunReads {
+/// Reads with no filter rejection.
+fn reads(seeks: u64, key_decodes: u64, value_decodes: u64, weight_decodes: u64) -> RunReads {
     RunReads {
         seeks,
-        key_reads,
-        value_reads,
-        weight_reads,
+        filter_rejections: 0,
+        key_decodes,
+        value_decodes,
+        weight_decodes,
     }
 }
 
@@ -110,7 +112,20 @@ fn file_run_filter_rejection_counts_no_seek() {
         let mut cursor = run.cursor();
         let (found, rejected) = reads_of(|| cursor.seek_key_exact(100_i32.erase(), None));
         assert!(!found);
-        assert_eq!(rejected, reads(0, 0, 0, 0));
+        // The filter answers without a seek or a decode.
+        assert_eq!(
+            rejected,
+            RunReads {
+                filter_rejections: 1,
+                ..RunReads::default()
+            }
+        );
+
+        // A key the filter admits is sought, and counts no rejection.
+        let (found, admitted) = reads_of(|| cursor.seek_key_exact(3_i32.erase(), None));
+        assert!(found);
+        assert_eq!(admitted.seeks, 1);
+        assert_eq!(admitted.filter_rejections, 0);
     });
 }
 

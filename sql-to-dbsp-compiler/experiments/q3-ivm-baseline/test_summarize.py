@@ -23,9 +23,20 @@ def owners(query: int, base: int, index: int) -> dict[str, dict[str, int]]:
 
 def index_reads(seeks: int) -> dict[str, dict[str, int]]:
     """Every reader with `seeks` seeks and twice as many key, value and weight reads."""
-    return {reader: {"seeks": seeks, "key_reads": 2 * seeks, "value_reads": 2 * seeks,
-                     "weight_reads": 2 * seeks}
+    return {reader: {"seeks": seeks, "filter_rejections": 0, "key_decodes": 2 * seeks,
+                     "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks}
             for reader in summarize.INDEX_READERS}
+
+
+def view_reads(index: dict | None, query: int) -> dict[str, dict[str, int]]:
+    """The view worker's reads: `query` of every count under `query`, and the index readers'
+    sums under `merged_index` (zero without an index)."""
+    return {
+        "query": {field: query for field in summarize.RUN_READ_FIELDS},
+        "base_relation": {field: 0 for field in summarize.RUN_READ_FIELDS},
+        "merged_index": {field: sum(reads[field] for reads in index.values()) if index else 0
+                         for field in summarize.RUN_READ_FIELDS},
+    }
 
 
 LAYOUT = {snapshot: {"file": {"runs": 1, "bytes": 10}, "memory": {"runs": 1, "bytes": 5}}
@@ -44,12 +55,16 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                   "index_run_reads": None if native else index_reads(int(number * scale)),
                   "index_layout": None if native else LAYOUT}
                  for number in (1, 2)]
+    for refresh in refreshes:
+        refresh["view_run_reads"] = view_reads(refresh["index_run_reads"],
+                                               10 * refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
         "measurement_version": 5, "os": "linux",
         "refreshes": refreshes,
         "sequence": {
             "index_run_reads": None if native else index_reads(int(3 * scale)),
+            "view_run_reads": view_reads(None if native else index_reads(int(3 * scale)), 30),
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
             "window_peak_rss_bytes": 7_000_000 + int(scale),
             "window_end_rss_bytes": 6_000_000 + int(scale), "cgroup": None,
@@ -124,10 +139,14 @@ class SummarizeTest(unittest.TestCase):
         merged = summary["workloads"]["clustered"]["modes"]["merged-index"]
         seeks = merged["index_run_reads"]["index_seeks"]
         self.assertEqual((seeks["median"], seeks["min"], seeks["max"]), (72, 60, 84))
-        self.assertEqual(merged["index_run_reads"]["index_value_reads"]["median"], 144)
+        self.assertEqual(merged["index_run_reads"]["index_value_decodes"]["median"], 144)
         self.assertNotIn("index_seeks", merged["metrics"])
         self.assertIn("Merged-index run reads (merged-index)", markdown)
         self.assertIn("| `index_seeks` | 72 | 60 | 84 |", markdown)
+        # Both modes report the view worker's reads, summed over the owners: 30 query seeks,
+        # plus the index's 12 * scale in the merged-index mode.
+        self.assertEqual(native["metrics"]["view_seeks"]["median"], 30)
+        self.assertEqual(merged["metrics"]["view_seeks"]["median"], 30 + 72)
         self.assertTrue(markdown.endswith("|\n"))
         self.assertNotIn("  \n", markdown)
 
@@ -291,7 +310,12 @@ class SummarizeTest(unittest.TestCase):
     def test_inconsistent_index_run_reads_are_an_error(self) -> None:
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["sequence"]["index_run_reads"]["orders_before"]["seeks"] += 1
-        self.failing(content, "inconsistent index run reads")
+        self.failing(content, "inconsistent run reads")
+        # The view worker's index part must match the index readers'.
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        refresh = content["runs"][1]["driver"]["refreshes"][0]
+        refresh["view_run_reads"]["merged_index"]["seeks"] += 1
+        self.failing(content, "view_run_reads.merged_index.seeks")
 
     def test_repetition_count_mismatch_is_an_error(self) -> None:
         self.failing(manifest({"native": [1.0, 2.0, 3.0], "merged-index": [1.0, 2.0]}),
