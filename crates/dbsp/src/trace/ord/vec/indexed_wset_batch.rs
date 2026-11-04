@@ -12,7 +12,7 @@ use crate::{
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, DbspSerializer,
         Deserializer, Filter, GroupFilter, MergeCursor, VecValBatch, WeightedItem,
-        cursor::Position,
+        cursor::{Position, run_reads::count_seek},
         deserialize_indexed_wset,
         layers::{
             Cursor as _, Layer, LayerCursor, LayerFactories, Leaf, LeafFactories, OrdOffset, Trie,
@@ -638,6 +638,7 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
+        count_seek();
         self.cursor.seek(key);
     }
 
@@ -647,14 +648,17 @@ where
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
+        count_seek();
         self.cursor.seek_with(predicate);
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
+        count_seek();
         self.cursor.seek_reverse(key);
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
+        count_seek();
         self.cursor.seek_with_reverse(predicate);
     }
 

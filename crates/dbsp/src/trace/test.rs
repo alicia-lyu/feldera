@@ -48,6 +48,7 @@ use super::Filter;
 use crate::circuit::runtime::tests::with_mock_process_rss;
 use itertools::Itertools;
 
+mod run_reads;
 pub mod test_batch;
 
 type DynI32 = DynData;

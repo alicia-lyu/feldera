@@ -13,14 +13,17 @@ use crate::{
         buffer_cache::CacheStats,
         file::{
             Factories as FileFactories, FilterPlan,
-            reader::{BulkRows, Cursor as FileCursor, Error as ReaderError, Reader},
+            reader::{BulkRows, ColumnSpec, Cursor as FileCursor, Error as ReaderError, Reader},
             writer::Writer2,
         },
     },
     trace::{
         Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
         FileValBatch, VecIndexedWSetFactories, WeightedItem,
-        cursor::{CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor},
+        cursor::{
+            CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor,
+            run_reads::{count_key_read, count_seek, count_value_read, count_weight_read},
+        },
         filter::BatchFilters,
         merge_batches_by_reference,
         ord::{file::UnwrapStorage, merge_batcher::MergeBatcher},
@@ -438,7 +441,9 @@ where
             let mut indexes = sample(rng, size, sample_size).into_vec();
             indexes.sort_unstable();
             for index in indexes.into_iter() {
-                cursor.move_key(|key_cursor| unsafe { key_cursor.move_to_row(index as u64) });
+                cursor.move_key(Landing::Always, |key_cursor| unsafe {
+                    key_cursor.move_to_row(index as u64)
+                });
                 output.push_ref(cursor.key());
             }
         }
@@ -709,6 +714,13 @@ where
                 .first()
                 .unwrap_storage()
         };
+        // Opening the cursor reads the first key and its first value.
+        if key_cursor.has_value() {
+            count_key_read();
+        }
+        if val_cursor.has_value() {
+            count_value_read();
+        }
         Self {
             wset,
             key_cursor,
@@ -717,11 +729,18 @@ where
         }
     }
 
-    fn move_key<F>(&mut self, op: F)
+    /// Moves the key cursor with `op`, then puts the value cursor on the new
+    /// key's first value. Counts the key read that `landing` says `op` makes,
+    /// and the read of the first value.
+    fn move_key<F>(&mut self, landing: Landing, op: F)
     where
         F: Fn(&mut KeyCursor<'s, K, V, R>) -> Result<(), ReaderError>,
     {
+        let start = row(&self.key_cursor);
         op(&mut self.key_cursor).unwrap_storage();
+        if landing.reads(start, row(&self.key_cursor)) {
+            count_key_read();
+        }
         self.val_cursor = unsafe {
             self.key_cursor
                 .next_column()
@@ -729,14 +748,57 @@ where
                 .first_with_hint(&self.val_cursor)
                 .unwrap_storage()
         };
+        if self.val_cursor.has_value() {
+            count_value_read();
+        }
     }
 
-    fn move_val<F>(&mut self, op: F)
+    /// Moves the value cursor with `op`, counting the value read that
+    /// `landing` says `op` makes.
+    fn move_val<F>(&mut self, landing: Landing, op: F)
     where
         F: Fn(&mut ValCursor<'s, K, V, R>) -> Result<(), ReaderError>,
     {
+        let start = row(&self.val_cursor);
         op(&mut self.val_cursor).unwrap_storage();
+        if landing.reads(start, row(&self.val_cursor)) {
+            count_value_read();
+        }
     }
+
+    /// Deserializes the current value's weight into `self.diff`.
+    fn read_weight(&mut self) {
+        count_weight_read();
+        unsafe { self.val_cursor.aux(&mut self.diff) };
+    }
+}
+
+/// When a move of a file cursor deserializes the key it lands on.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// Steps, rewinds, and reverse seeks read the key of any row they end on.
+    Always,
+    /// Forward seeks read a key only when they leave the current row.
+    IfMoved,
+}
+
+impl Landing {
+    fn reads(self, start: Option<u64>, end: Option<u64>) -> bool {
+        match self {
+            Landing::Always => end.is_some(),
+            Landing::IfMoved => end.is_some() && end != start,
+        }
+    }
+}
+
+/// The absolute row a file cursor is on, or `None` before or after its rows.
+fn row<K, A, N, T>(cursor: &FileCursor<'_, K, A, N, T>) -> Option<u64>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    cursor.has_value().then(|| cursor.absolute_position())
 }
 
 impl<K, V, R> Cursor<K, V, (), R> for FileIndexedWSetCursor<'_, K, V, R>
@@ -760,7 +822,7 @@ where
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&(), &R)) {
         if self.val_valid() {
-            unsafe { self.val_cursor.aux(&mut self.diff) };
+            self.read_weight();
             logic(&(), self.diff.as_ref())
         }
     }
@@ -771,7 +833,7 @@ where
 
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         while self.val_valid() {
-            unsafe { self.val_cursor.aux(&mut self.diff) };
+            self.read_weight();
             logic(self.val(), self.diff.as_ref());
             self.step_val();
         }
@@ -779,7 +841,7 @@ where
 
     fn weight(&mut self) -> &R {
         debug_assert!(self.val_valid());
-        unsafe { self.val_cursor.aux(&mut self.diff) };
+        self.read_weight();
         self.diff.as_ref()
     }
 
@@ -796,15 +858,22 @@ where
     }
 
     fn step_key(&mut self) {
-        self.move_key(|key_cursor| unsafe { key_cursor.move_next() });
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.move_next()
+        });
     }
 
     fn step_key_reverse(&mut self) {
-        self.move_key(|key_cursor| unsafe { key_cursor.move_prev() });
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.move_prev()
+        });
     }
 
     fn seek_key(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.advance_to_value_or_larger(key) });
+        count_seek();
+        self.move_key(Landing::IfMoved, |key_cursor| unsafe {
+            key_cursor.advance_to_value_or_larger(key)
+        });
     }
 
     fn seek_key_exact(&mut self, key: &K, hash: Option<u64>) -> bool {
@@ -816,55 +885,101 @@ where
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_forward_until(predicate) });
+        count_seek();
+        // Each call of the predicate follows the deserialization of a probe.
+        let predicate = |key: &K| {
+            count_key_read();
+            predicate(key)
+        };
+        self.move_key(Landing::IfMoved, |key_cursor| unsafe {
+            key_cursor.seek_forward_until(predicate)
+        });
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_backward_until(predicate) });
+        count_seek();
+        let predicate = |key: &K| {
+            count_key_read();
+            predicate(key)
+        };
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.seek_backward_until(predicate)
+        });
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.rewind_to_value_or_smaller(key) });
+        count_seek();
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.rewind_to_value_or_smaller(key)
+        });
     }
 
     fn step_val(&mut self) {
-        self.move_val(|val_cursor| unsafe { val_cursor.move_next() });
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.move_next()
+        });
     }
 
     fn seek_val(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.advance_to_value_or_larger(val) });
+        self.move_val(Landing::IfMoved, |val_cursor| unsafe {
+            val_cursor.advance_to_value_or_larger(val)
+        });
     }
 
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_forward_until(predicate) });
+        let predicate = |val: &V| {
+            count_value_read();
+            predicate(val)
+        };
+        self.move_val(Landing::IfMoved, |val_cursor| unsafe {
+            val_cursor.seek_forward_until(predicate)
+        });
     }
 
     fn rewind_keys(&mut self) {
-        self.move_key(|key_cursor| unsafe { key_cursor.move_first() });
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.move_first()
+        });
     }
 
     fn fast_forward_keys(&mut self) {
-        self.move_key(|key_cursor| unsafe { key_cursor.move_last() });
+        self.move_key(Landing::Always, |key_cursor| unsafe {
+            key_cursor.move_last()
+        });
     }
 
     fn rewind_vals(&mut self) {
-        self.move_val(|val_cursor| unsafe { val_cursor.move_first() });
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.move_first()
+        });
     }
 
     fn step_val_reverse(&mut self) {
-        self.move_val(|val_cursor| unsafe { val_cursor.move_prev() });
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.move_prev()
+        });
     }
 
     fn seek_val_reverse(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.rewind_to_value_or_smaller(val) });
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.rewind_to_value_or_smaller(val)
+        });
     }
 
     fn seek_val_with_reverse(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_backward_until(predicate) });
+        let predicate = |val: &V| {
+            count_value_read();
+            predicate(val)
+        };
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.seek_backward_until(predicate)
+        });
     }
 
     fn fast_forward_vals(&mut self) {
-        self.move_val(|val_cursor| unsafe { val_cursor.move_last() });
+        self.move_val(Landing::Always, |val_cursor| unsafe {
+            val_cursor.move_last()
+        });
     }
 
     fn position(&self) -> Option<Position> {
