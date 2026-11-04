@@ -111,6 +111,11 @@ impl RunReads {
     }
 }
 
+/// The owner that this thread's run reads are now counted for.
+pub fn current_read_owner() -> WriteOwner {
+    CURRENT_READ_OWNER.get()
+}
+
 /// Runs `f` with `owner` as this thread's read owner, then restores the
 /// previous owner, even if `f` panics.
 pub fn with_read_owner<R>(owner: WriteOwner, f: impl FnOnce() -> R) -> R {
@@ -222,9 +227,11 @@ mod tests {
         let (_, [query, base, index]) = reads_by_owner(|| {
             with_read_owner(WriteOwner::MergedIndex, || {
                 with_read_owner(WriteOwner::BaseRelation, count_seek);
+                assert_eq!(current_read_owner(), WriteOwner::MergedIndex);
                 count_seek();
             });
         });
+        assert_eq!(current_read_owner(), WriteOwner::Query);
         assert_eq!(base, ONE_SEEK);
         assert_eq!(index, ONE_SEEK);
         assert_eq!(query, RunReads::default());

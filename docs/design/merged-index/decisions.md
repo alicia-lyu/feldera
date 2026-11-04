@@ -262,6 +262,10 @@ Buffered and selective execution share one scan session, which each execution us
 
 The execution passes its readers to the session. Each reader fixes its kind, version, and streams, and owns a queue of its requests in record order. A request is an instance node (its key prefix); it does not name its reader. A request carries no rows, since that would duplicate `Dlt`, which the session reads through its own cursor. Buffered execution's own readers do not matter to the session: it passes one group reader, whose queue holds the touched roots, which reads each whole group and passes only the domains the plan never reads. The run counters are always on, as per-thread running totals, with no build flag.
 
+### 2026-11-04: Run reads are attributed by a read scope
+
+Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

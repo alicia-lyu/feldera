@@ -6,6 +6,7 @@ use crate::{
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DowncastTrait, DynData, Erase},
+    storage::write_attribution::WriteOwner,
     trace::{
         Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
         WithSnapshot,
@@ -437,11 +438,15 @@ fn in_storage_runtime(f: impl FnOnce() + Clone + Send + 'static) {
     .unwrap();
 }
 
-/// The reads that `f` makes on this thread.
-fn run_reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
-    let before = RunReads::current();
+/// The run reads that `f` makes on this thread for the merged index, and for
+/// every other owner together.
+fn run_reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads, RunReads) {
+    let index = || RunReads::current_for(WriteOwner::MergedIndex);
+    let (total_before, index_before) = (RunReads::current(), index());
     let result = f();
-    (result, RunReads::current().since(before))
+    let index_reads = index().since(index_before);
+    let total_reads = RunReads::current().since(total_before);
+    (result, index_reads, total_reads.since(index_reads))
 }
 
 /// The storage-level baseline of today's four readers on the worked
@@ -532,10 +537,14 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
                 .to_vec(),
         );
 
-        let (customers, c_reads) = run_reads_of(|| state.customers_after(&orders_delta).unwrap());
-        let (orders, o_reads) = run_reads_of(|| state.orders_before(&customers_delta).unwrap());
-        let (joined, j_reads) = run_reads_of(|| state.joined_orders_after(&lines_delta).unwrap());
-        let (lines, l_reads) = run_reads_of(|| state.lineitems_before(&joined_delta).unwrap());
+        let (customers, c_reads, c_other) =
+            run_reads_of(|| state.customers_after(&orders_delta).unwrap());
+        let (orders, o_reads, o_other) =
+            run_reads_of(|| state.orders_before(&customers_delta).unwrap());
+        let (joined, j_reads, j_other) =
+            run_reads_of(|| state.joined_orders_after(&lines_delta).unwrap());
+        let (lines, l_reads, l_other) =
+            run_reads_of(|| state.lineitems_before(&joined_delta).unwrap());
         state.finish().unwrap();
 
         assert_eq!(
@@ -565,10 +574,10 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
             vec![(3, 7, 1), (3, 8, 1), (4, 9, 1)]
         );
 
-        // The file run's keys, in folded-key order, are c5, o3, l7, l8, o4,
-        // l9, and c6, each with one value. Every scan opens a cursor over all
-        // runs, which lands the file run on c5 (one key read and one value
-        // read), and seeks every run once. A key step of the file run reads
+        // The index reads. The file run's keys, in folded-key order, are c5,
+        // o3, l7, l8, o4, l9, and c6, each with one value. Every scan opens a
+        // cursor over all runs, which lands the file run on c5 (one key read
+        // and one value read), and seeks every run once. A key step of the file run reads
         // the new key and its first value. A seek that leaves the file run on
         // its current key still reads that key's first value. `CursorList`
         // reads a file weight whenever the file run holds the smallest value,
@@ -597,5 +606,11 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
         // reads l7, l8, and o4 (4 of each); o4 reads l9 and c6 (3 of each);
         // o5 has no line items and lands on c6 (2 of each).
         assert_eq!(l_reads, reads(6, 9, 9, 9));
+
+        // The driving deltas are in memory and only stepped, so nothing but
+        // the index is read.
+        for other in [c_other, o_other, j_other, l_other] {
+            assert_eq!(other, RunReads::default());
+        }
     });
 }

@@ -16,9 +16,10 @@ use std::{
 use dbsp::{
     circuit::{splitter_output_chunk_size, RootCircuit},
     dynamic::{DowncastTrait, Erase},
+    storage::write_attribution::WriteOwner,
     trace::{
-        merged_index::MergedIndexBatch, BatchReader as DynamicBatchReader, Cursor,
-        SpineSnapshot as DynamicSnapshot,
+        current_read_owner, merged_index::MergedIndexBatch, with_read_owner,
+        BatchReader as DynamicBatchReader, Cursor, SpineSnapshot as DynamicSnapshot,
     },
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
@@ -278,32 +279,37 @@ fn requested_keys<V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<Tup1<i64>, V>>
     keys
 }
 
+/// Visits the index entries under `prefix` in `snapshot`. The snapshot's run
+/// reads count for the merged index; `visit` runs under the caller's owner.
 fn scan(
     snapshot: &SourceSnapshot,
     prefix: &[u8],
     mut visit: impl FnMut(Key, Payload, i64) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut cursor = snapshot.cursor();
-    let seek = prefix.to_vec();
-    cursor.seek_key(seek.erase());
-    while cursor.key_valid() {
-        let bytes = cursor.key().downcast_checked::<Vec<u8>>();
-        if !bytes.starts_with(prefix) {
-            break;
+    let caller = current_read_owner();
+    with_read_owner(WriteOwner::MergedIndex, || {
+        let mut cursor = snapshot.cursor();
+        let seek = prefix.to_vec();
+        cursor.seek_key(seek.erase());
+        while cursor.key_valid() {
+            let bytes = cursor.key().downcast_checked::<Vec<u8>>();
+            if !bytes.starts_with(prefix) {
+                break;
+            }
+            let key = CustomerOrdersLineitemDefinition::unfold(bytes)?;
+            while cursor.val_valid() {
+                let weight = **cursor.weight();
+                // The stored bytes carry no tag: the key names the fields.
+                let stored = cursor.val().downcast_checked::<StoredPayload>();
+                let payload = decode_payload(&key, stored)
+                    .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
+                with_read_owner(caller, || visit(key.clone(), payload, weight))?;
+                cursor.step_val();
+            }
+            cursor.step_key();
         }
-        let key = CustomerOrdersLineitemDefinition::unfold(bytes)?;
-        while cursor.val_valid() {
-            let weight = **cursor.weight();
-            // The stored bytes carry no tag: the key names the fields.
-            let stored = cursor.val().downcast_checked::<StoredPayload>();
-            let payload = decode_payload(&key, stored)
-                .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
-            visit(key.clone(), payload, weight)?;
-            cursor.step_val();
-        }
-        cursor.step_key();
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Bounded sort chunks, combined through the native consolidated snapshot cursor.
