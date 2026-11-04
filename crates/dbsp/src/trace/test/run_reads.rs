@@ -9,11 +9,13 @@ use super::{DynI32, indexed_zset_tuples, run_in_circuit_with_storage};
 use crate::{
     DynZWeight, ZWeight,
     dynamic::{DowncastTrait, Erase},
+    storage::write_attribution::WriteOwner,
     trace::{
         Batch, BatchLocation, BatchReader, BatchReaderFactories, FileIndexedWSetFactories,
         RunReads, VecIndexedWSet, VecIndexedWSetFactories,
         cursor::{Cursor, CursorList},
         ord::FileIndexedWSet,
+        with_read_owner,
     },
     utils::Tup2,
 };
@@ -172,4 +174,26 @@ fn cursor_list_seeks_every_run() {
     let ((), sought) = reads_of(|| cursor.seek_key(2_i32.erase()));
     assert_eq!(key_of(&cursor), 2);
     assert_eq!(sought, reads(2, 0, 0, 0));
+}
+
+#[test]
+fn a_read_scope_attributes_a_file_run_to_its_owner() {
+    run_in_circuit_with_storage(|| {
+        let run = file_run();
+        let index_before = RunReads::current_for(WriteOwner::MergedIndex);
+        let query_before = RunReads::current_for(WriteOwner::Query);
+        with_read_owner(WriteOwner::MergedIndex, || {
+            let mut cursor = run.cursor();
+            cursor.seek_key(3_i32.erase());
+        });
+        // The opening reads key 1 and value 10; the seek reads key 3 and 30.
+        assert_eq!(
+            RunReads::current_for(WriteOwner::MergedIndex).since(index_before),
+            reads(1, 2, 2, 0)
+        );
+        assert_eq!(
+            RunReads::current_for(WriteOwner::Query).since(query_before),
+            RunReads::default()
+        );
+    });
 }

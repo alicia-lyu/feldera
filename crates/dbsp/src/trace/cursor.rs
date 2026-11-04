@@ -20,7 +20,7 @@ pub use cursor_with_polarity::CursorWithPolarity;
 pub use saturating_cursor::SaturatingCursor;
 
 pub use reverse::ReverseKeyCursor;
-pub use run_reads::RunReads;
+pub use run_reads::{RunReads, with_read_owner};
 use size_of::SizeOf;
 
 use crate::dynamic::{DataTrait, Factory};

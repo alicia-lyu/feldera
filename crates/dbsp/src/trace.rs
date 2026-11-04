@@ -85,7 +85,7 @@ use crate::{
     dynamic::{DataTrait, DynPair, DynVec, DynWeightedPairs, Erase, Factory, WeightTrait},
     storage::file::reader::Error as ReaderError,
 };
-pub use cursor::{Cursor, MergeCursor, RunReads};
+pub use cursor::{Cursor, MergeCursor, RunReads, with_read_owner};
 pub use filter::{BatchFilterStats, BatchFilters, Filter, GroupFilter};
 pub use layers::Trie;
 
