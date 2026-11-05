@@ -10,7 +10,7 @@ This file defines what is measured and what remains pending. Commands (the runne
 - The macOS smoke runs were repeated in the current configuration after Step 5 (2026-10-22, in RESULTS.md); storage matched the packed, elided campaign byte for byte.
 - Measurement version 3 (two chained circuits, refresh pre-read, input eviction) ran the same smoke workloads on 2026-10-25 (in RESULTS.md). Storage matched again, and forwarding the base delta as JSON took more time than either circuit in large-group. Forwarding is harness overhead: a single DBSP circuit passes deltas between views as in-memory streams, so the JSON hop has no counterpart in a deployed pipeline.
 - Measurement version 4 (the merged index maintained in the base runtime and booked in `base_ms`; `combined_maintenance_ms` renamed `ivm_ms`) ran the same smoke workloads on 2026-10-26 (in RESULTS.md), with base and IVM reported side by side. Storage matched again.
-- Measurement version 5 (2026-11-04) adds run reads: the merged index's per reader, the view worker's per owner in both modes, and the index snapshots' layout. Its timing and write fields are those of version 4. One macOS smoke run per workload and mode is in [Run reads](#run-reads-version-5-smoke-2026-11-04). Native decodes are not counted yet: the R5 native join fetches its partner rows through a path that has no counters.
+- Measurement version 5 (2026-11-04) adds run reads: the merged index's per reader, the view worker's per owner in both modes, and the index snapshots' layout. Its timing and write fields are those of version 4. One macOS smoke run per workload and mode is in [Run reads](#run-reads-version-5-smoke-2026-11-04), with native joins reading through run cursors.
 - macOS runs are smoke tests only. Their highest RSS (47.0 MiB in the 2026-10-22 rerun) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
 - The smoke runs' write and storage gap is explained down to record size; see [the investigation](history.md#2026-10-14-write-and-storage-investigation). With the packed payloads of [Packed, untagged values](#packed-untagged-values-2026-10-19-to-2026-10-20), the merged index's file is smaller than the four join traces' files in these runs.
 - Pressure instrumentation is implemented, with Linux paths not yet run (see [Pending: pressure evidence](#pending-pressure-evidence)). Pending: the Linux pilot and the three-repetition campaign, all below. Input preparation (`prepare_inputs.py`) exists and ran end to end on macOS at SF 0.01; no SF 10 input has been generated.
@@ -72,31 +72,32 @@ Three macOS smoke workloads exist, each starting from 64 Customers, 512 Orders, 
 
 ## Run reads, version 5 smoke (2026-11-04)
 
-One run per workload and mode on macOS, revision `9acc6122e`, with the version 4 smoke settings (`--batch 512 --cache-bytes 33554432 --memory-target-bytes 536870912 --runs 1 --no-verify --setup-full-compaction --front-code-byte-keys --elide-value-headers`). These are smoke figures: one repetition, no memory pressure, and no claim of cost or saving.
+One run per workload and mode on macOS, revision `78b10002b`, with the version 4 smoke settings (`--batch 512 --cache-bytes 33554432 --memory-target-bytes 536870912 --runs 1 --no-verify --setup-full-compaction --front-code-byte-keys --elide-value-headers`). Native joins read through run cursors (`native_join_fetch: false`; [decisions.md](decisions.md#2026-11-04-native-joins-read-through-run-cursors)). These are smoke figures: one repetition, no memory pressure, and no claim of cost or saving.
 
 - **Inputs.** dbgen at `-s 0.01` (1,500 Customers, 15,000 Orders, 60,175 Lines; `target/r5-sf001-dbgen/`), prepared by `prepare_inputs.py --seed 1 --pairs 3` into `target/r5-sf001-oldest-inputs/`. Each RF1 inserts 10 Orders (37, 44 and 37 Lines). Each RF2 deletes the next 10 lowest base Order keys, keys 1 to 102 in all, in both workloads. Clustered RF1 put its 10 Orders on 8 to 10 Customers, so at this scale it is barely clustered. The sequence is RF1, RF2, three times.
-- **Artifacts.** `target/r5-v5-oldest-rf2/{clustered,scattered}/manifest.json`, with each run's `driver.json` beside it.
+- **Artifacts.** `target/r5-v5-cursor-join/{clustered,scattered}/manifest.json`, with each run's `driver.json` beside it. An earlier run with the native join fetch on is in `target/r5-v5-oldest-rf2/`; its reconstructed index reads are identical, refresh for refresh.
 - **The old smoke inputs** (`target/r5-smoke-inputs/`) are not used: their RF2 deleted the Orders their RF1 had inserted.
 
 The view worker's run reads, summed over the sequence and the owners (`sequence.view_run_reads`), with the process's backend reads:
 
 | Workload | Mode | Seeks | Filter rejections | Key decodes | Value decodes | Weight decodes | Backend reads |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| clustered | native | 536 | 0 | 0 | 0 | 0 | 13 |
-| clustered | reconstructed | 1,120 | 0 | 1,146 | 1,146 | 1,060 | 173 |
-| scattered | native | 540 | 0 | 0 | 0 | 0 | 14 |
-| scattered | reconstructed | 1,140 | 0 | 1,146 | 1,146 | 1,052 | 185 |
+| clustered | native | 476 | 60 | 194 | 452 | 436 | 8 |
+| clustered | reconstructed | 1,120 | 0 | 1,146 | 1,146 | 1,060 | 175 |
+| scattered | native | 480 | 60 | 198 | 456 | 440 | 7 |
+| scattered | reconstructed | 1,140 | 0 | 1,146 | 1,146 | 1,052 | 179 |
 
-How to read the table:
+What the counts show, each against the counting rules:
 
-- **Native decodes are not measured.** The R5 driver sets `dev_tweaks.fetch_join` (`native_join_fetch: true`). The native join then fetches, for each delta key, the matching rows of each file run (`FileIndexedWSet::fetch`, `fetch_indexed_zset` in `storage/file/reader.rs`) into an in-memory batch, and cursors over that copy. The fetch decodes the rows it copies, and the batch filter drops keys before it, but neither is counted. Native's seeks are seeks of those in-memory copies, not of the traces' runs. Neither column compares with reconstructed mode until the fetch path is counted.
-- **Backend reads compare.** They are process-wide storage-backend reads in both modes, and they include the base circuit and the index upkeep. Native read 13 and 14 blocks over the sequence, reconstructed 173 and 185. Native's reads all fall in its first three refreshes (6, 6 and 1 in clustered; 6, 7 and 1 in scattered); reconstructed mode reads in every refresh, 29 to 45 blocks per RF2 and 12 to 39 per RF1.
-- **In reconstructed mode, seeks follow the runs.** The index is one file run plus one in-memory run per refresh, since nothing compacts after setup. A scan seeks every run, so seeks grow with the run count at a similar number of scans (index seeks per refresh 66, 110, 150, 190, 218, 270 in clustered).
-- **RF2 decodes about three times what RF1 does.** RF2 deletes old Orders, whose entries are in the file run, so its readers land on file entries they take. `L⁻` decodes 56 to 63 values per RF2, against 20 per RF1, and `J⁺` 142 to 156, against 50. RF1's Orders are new and live in memory, so its decodes are the per-scan cursor opening and landing on the file run.
+- **Seeks.** Reconstructed mode seeks about 2.4 times as often. Two causes follow from the code. `J⁺` rebuilds `J` from two index entries, so it scans twice per Order, where native probes its stored `J` trace once. The index also takes a run on every transaction that touches any of its tables, while a native trace takes one only when its own input changes, and every scan seeks every run. In both modes the seeks grow with the run count, since nothing compacts after setup.
+- **Filter rejections.** Native has 20 per RF1. That is consistent with one probe for each of the 10 new Orders in each of the two traces keyed by Order, answered by the file run's filter without a seek; the counters do not name the trace. RF2 deletes existing Orders, so it has none. The index's `scan` seeks without asking a filter, so reconstructed mode counts none.
+- **Key decodes.** Reconstructed mode decodes about 5.8 to 5.9 times as many keys. A native trace groups the values of a key under one key, so a probe decodes one key and then its values. Every index entry has its own folded key, and a scan steps from key to key. Each scan also decodes the file run's first key when it opens its cursor, and the key past its range when it ends.
+- **Value and weight decodes.** Reconstructed mode decodes about 2.5 times as many values. RF2 decodes about three times what RF1 does in reconstructed mode (`L⁻` 56 to 63 values per RF2 against 20 per RF1), because RF2 deletes Orders whose entries are in the file run, while RF1's new Orders live in memory.
 - **`O⁻` reads nothing.** RF1 and RF2 change no Customers, so `ΔC` is empty.
-- **The non-index view reads.** In reconstructed mode, the rest of the view circuit seeks 18 to 20 times per refresh under `query`, with no decodes.
+- **The non-index view reads.** In reconstructed mode, the rest of the view circuit seeks 18 to 20 times per refresh under `query`, with no decodes: the joins over the readers' in-memory batches.
+- **Backend reads.** They are process-wide, so they include the base circuit and the index upkeep. Native reads 7 or 8 blocks, almost all in the first refresh. Reconstructed mode reads in every refresh, 12 to 46 blocks. Why the index's blocks are read again in later refreshes is not established here; each runtime's buffer cache is 16 MiB.
 
-## Pending: Linux campaign
+## Pending: Linux campaign## Pending: Linux campaign
 
 macOS gives no enforced memory limit, so qualification needs Linux. The runner (`measure.py`) already supports `--cgroup-root` and `--total-memory-bytes`: it creates a cgroup v2 child per run with `memory.max` set, `memory.swap.max=0`, copies the input files inside that cgroup before loading, and records `memory.peak` (`null` on a kernel without that file), `memory.events`, and `io.stat`.
 
