@@ -266,6 +266,10 @@ The execution passes its readers to the session. Each reader fixes its kind, ver
 
 Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
 
+### 2026-11-04: Path reads and subtree roots probe exact keys
+
+Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this.
+
 ### 2026-11-04: Native joins read through run cursors
 
 R5 runs the native join with DBSP's default read path, `fetch_join` off. With it on, as R5 had it since the driver was written, the native join batch-fetched each delta's keys from every file run into in-memory copies: an access style unlike the reconstructed readers' per-key cursor seeks, and one that the run counters do not see. With it off, both modes read their partner state through the counted run cursors. The fetch path stays uncounted. Reconstructed mode's counts do not depend on the setting.

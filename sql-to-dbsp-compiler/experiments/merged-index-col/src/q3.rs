@@ -16,7 +16,7 @@ use std::{
 
 use dbsp::{
     circuit::{splitter_output_chunk_size, RootCircuit},
-    dynamic::{DowncastTrait, Erase},
+    dynamic::{DowncastTrait, DynData, Erase},
     storage::write_attribution::WriteOwner,
     trace::{
         current_read_owner, merged_index::MergedIndexBatch, with_read_owner,
@@ -24,7 +24,7 @@ use dbsp::{
     },
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
-    DBData, OrdIndexedZSet, OrdZSet, Stream,
+    DBData, DynZWeight, OrdIndexedZSet, OrdZSet, Stream,
 };
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
@@ -136,7 +136,7 @@ impl Q3State {
                     let key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
                         CustomerByCustkeyKey { custkey: customer },
                     ));
-                    scan(&views.after, key.as_bytes(), |key, payload, weight| {
+                    scan_entry(&views.after, key.as_bytes(), |key, payload, weight| {
                         if let (
                             Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
                             Payload::CustomerByCustkey(payload),
@@ -206,7 +206,7 @@ impl Q3State {
                         let customer_key = CustomerOrdersLineitemDefinition::fold(
                             &Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: customer }),
                         );
-                        scan(
+                        scan_entry(
                             &views.after,
                             customer_key.as_bytes(),
                             |key, payload, weight| {
@@ -226,7 +226,7 @@ impl Q3State {
                                 orderkey: order,
                             }),
                         );
-                        scan(
+                        scan_entry(
                             &views.after,
                             order_key.as_bytes(),
                             |key, payload, order_weight| {
@@ -342,8 +342,9 @@ fn requested_keys<V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<Tup1<i64>, V>>
     keys
 }
 
-/// Visits the index entries under `prefix` in `snapshot`. The snapshot's run
-/// reads count for the merged index; `visit` runs under the caller's owner.
+/// Visits the index entries under `prefix` in `snapshot`: a range read. The
+/// snapshot's run reads count for the merged index; `visit` runs under the
+/// caller's owner.
 fn scan(
     snapshot: &SourceSnapshot,
     prefix: &[u8],
@@ -355,24 +356,57 @@ fn scan(
         let seek = prefix.to_vec();
         cursor.seek_key(seek.erase());
         while cursor.key_valid() {
-            let bytes = cursor.key().downcast_checked::<Vec<u8>>();
-            if !bytes.starts_with(prefix) {
+            if !cursor
+                .key()
+                .downcast_checked::<Vec<u8>>()
+                .starts_with(prefix)
+            {
                 break;
             }
-            let key = CustomerOrdersLineitemDefinition::unfold(bytes)?;
-            while cursor.val_valid() {
-                let weight = **cursor.weight();
-                // The stored bytes carry no tag: the key names the fields.
-                let stored = cursor.val().downcast_checked::<StoredPayload>();
-                let payload = decode_payload(&key, stored)
-                    .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
-                with_read_owner(caller, || visit(key.clone(), payload, weight))?;
-                cursor.step_val();
-            }
+            visit_values(&mut cursor, caller, &mut visit)?;
             cursor.step_key();
         }
         Ok(())
     })
+}
+
+/// Visits the one index entry whose folded key is `key`: a path read. Each
+/// run's filters answer first, so a run that cannot hold `key` is neither
+/// sought nor decoded, as in a native join's probe.
+fn scan_entry(
+    snapshot: &SourceSnapshot,
+    key: &[u8],
+    mut visit: impl FnMut(Key, Payload, i64) -> Result<(), String>,
+) -> Result<(), String> {
+    let caller = current_read_owner();
+    with_read_owner(WriteOwner::MergedIndex, || {
+        let mut cursor = snapshot.cursor();
+        let probe = key.to_vec();
+        if cursor.seek_key_exact(probe.erase(), None) {
+            visit_values(&mut cursor, caller, &mut visit)?;
+        }
+        Ok(())
+    })
+}
+
+/// Decodes the values of the cursor's current key and visits each under
+/// `caller`'s read owner.
+fn visit_values(
+    cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
+    caller: WriteOwner,
+    visit: &mut impl FnMut(Key, Payload, i64) -> Result<(), String>,
+) -> Result<(), String> {
+    let key = CustomerOrdersLineitemDefinition::unfold(cursor.key().downcast_checked::<Vec<u8>>())?;
+    while cursor.val_valid() {
+        let weight = **cursor.weight();
+        // The stored bytes carry no tag: the key names the fields.
+        let stored = cursor.val().downcast_checked::<StoredPayload>();
+        let payload = decode_payload(&key, stored)
+            .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
+        with_read_owner(caller, || visit(key.clone(), payload, weight))?;
+        cursor.step_val();
+    }
+    Ok(())
 }
 
 /// Bounded sort chunks, combined through the native consolidated snapshot cursor.

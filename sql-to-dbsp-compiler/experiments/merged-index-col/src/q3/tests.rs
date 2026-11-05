@@ -576,38 +576,44 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
 
         // The index reads. The file run's keys, in folded-key order, are c5,
         // o3, l7, l8, o4, l9, and c6, each with one value. Every scan opens a
-        // cursor over all runs, which lands the file run on c5 (one key read
-        // and one value read), and seeks every run once. A key step of the file run reads
-        // the new key and its first value. A seek that leaves the file run on
-        // its current key still reads that key's first value. `CursorList`
-        // reads a file weight whenever the file run holds the smallest value,
-        // to skip zero weights.
-        // `scan` seeks with `seek_key`, so no filter rejects a probe.
-        let reads = |seeks, key_decodes, value_decodes, weight_decodes| RunReads {
-            seeks,
-            filter_rejections: 0,
-            key_decodes,
-            value_decodes,
-            weight_decodes,
-        };
-        // C⁺: one scan of c5's own key over three runs. The seek leaves the
-        // file run on c5 (one value read); `Dlt`'s "new" comes first, then
-        // "old" cancels across `Dlt` and the file run (one weight read). The
-        // step to o3 ends the range (one key, value, and weight read).
-        assert_eq!(c_reads, reads(3, 2, 3, 2));
+        // cursor over all runs, which lands the file run on c5 (one key decode
+        // and one value decode). A key step of the file run decodes the new
+        // key and its first value. A seek that leaves the file run on its
+        // current key still decodes that key's first value. `CursorList`
+        // decodes a file weight whenever the file run holds the smallest
+        // value, to skip zero weights.
+        //
+        // The path reads, C⁺ and J⁺, probe one exact key (`scan_entry`): a run
+        // whose filter excludes the key is neither sought nor decoded, and
+        // nothing past the entry is read. The range reads, O⁻ and L⁻, seek a
+        // prefix and step through it (`scan`), with no filter.
+        let reads =
+            |seeks, filter_rejections, key_decodes, value_decodes, weight_decodes| RunReads {
+                seeks,
+                filter_rejections,
+                key_decodes,
+                value_decodes,
+                weight_decodes,
+            };
+        // C⁺: one probe of c5's own key over three runs. Opening decodes c5's
+        // key and value; the file filter admits c5, and its seek stays on c5,
+        // which decodes the value again. `Dlt`'s "new" comes first, then
+        // "old" cancels across `Dlt` and the file run (one weight decode).
+        assert_eq!(c_reads, reads(3, 0, 1, 2, 1));
         // O⁻: one scan of c5's range over two runs. Opening and the seek stay
-        // on c5 (a weight read each); then six key steps, c5 through c6, each
-        // read a key, a value, and a weight.
-        assert_eq!(o_reads, reads(2, 7, 8, 8));
-        // J⁺: c5's key as in C⁺, then (c5, o5)'s key, whose seek lands the
-        // file run on c6 (one key and one value read). Only `Dlt` holds o5,
-        // so no file weight is read.
-        assert_eq!(j_reads, reads(6, 4, 5, 2));
+        // on c5 (a weight decode each); then six key steps, c5 through c6,
+        // each decode a key, a value, and a weight.
+        assert_eq!(o_reads, reads(2, 0, 7, 8, 8));
+        // J⁺: c5's key as in C⁺, then a probe of (c5, o5)'s key. Its opening
+        // decodes c5 again (one key, one value); the file filter rejects o5,
+        // which only `Dlt` holds, so the file run is not sought, and the two
+        // in-memory runs are sought once each.
+        assert_eq!(j_reads, reads(5, 1, 2, 3, 1));
         // L⁻: the line items of o3, o4, and o5, one scan each over two runs.
         // Each scan opens on c5 and seeks to its order's first line item: o3
-        // reads l7, l8, and o4 (4 of each); o4 reads l9 and c6 (3 of each);
-        // o5 has no line items and lands on c6 (2 of each).
-        assert_eq!(l_reads, reads(6, 9, 9, 9));
+        // decodes l7, l8, and o4 (4 of each); o4 decodes l9 and c6 (3 of
+        // each); o5 has no line items and lands on c6 (2 of each).
+        assert_eq!(l_reads, reads(6, 0, 9, 9, 9));
 
         // The driving deltas are in memory and only stepped, so nothing but
         // the index is read.

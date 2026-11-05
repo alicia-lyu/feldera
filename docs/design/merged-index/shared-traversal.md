@@ -320,6 +320,8 @@ A request carries no rows. The driving rows of a static request stay in `Dlt`, w
 
 No request of buffered execution can be late, since the group buffer keeps the whole group (compare `ex:coarse-request`).
 
+Buffered execution seeks only the roots of customer subtrees (user direction of 2026-11-04). `enter(a)` probes the root's exact key, the customer entry, with `seek_key_exact`, and the subtree is then read by a range scan: a prefix seek in every run, stepping and buffering what it takes. The range scan reaches every run, because a run is a transaction's delta: a later run can hold new orders or line items of `c5` without `c5`'s own entry, which did not change. A run whose filter excludes the root is therefore skipped only for the root, never for the subtree. No prefix filter is needed. Selective execution also seeks children below the root, by prefix, where the filters do not help.
+
 ### The logical overlay
 
 The session never merges `Old` and `Dlt` into a run. It keeps sorted forward streams: the cursor over `Old`, a cursor over `Dlt`, and the readers' request queues. It compares them by key bytes. Nothing is consolidated between `Old` and `Dlt` either, since the tagged overlay `Old ⊎ Dlt` stays unconsolidated (`prop:overlay`). Each step costs one key comparison, on keys the cursors have already read.
@@ -415,15 +417,16 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - *Exit:* DBSP unit tests (filter `run_reads`) pin the counts of single moves on an in-memory run and a file run, and one seek per run through `CursorList`. A COL test pins today's four readers on the worked transaction (without `v2` and `v8`, since COL has no invoices), over a file run plus an in-memory run.
    - *Baseline.* `Old` is a file run holding `c5`, `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`, plus an in-memory run holding `c7`; the after state adds `Dlt`. Each comment in `todays_readers_run_reads_on_the_worked_transaction` derives its count. The counts are the index's own; the test also checks that no other owner reads any run, since the driving deltas are in memory and only stepped.
 
-     | Reader | Per-run seeks | Key decodes | Value decodes | Weight decodes |
-     | --- | --- | --- | --- | --- |
-     | `C⁺` | 3 | 2 | 3 | 2 |
-     | `O⁻` | 2 | 7 | 8 | 8 |
-     | `J⁺` | 6 | 4 | 5 | 2 |
-     | `L⁻` | 6 | 9 | 9 | 9 |
-     | Total | 17 | 22 | 25 | 21 |
+     | Reader | Per-run seeks | Filter rejections | Key decodes | Value decodes | Weight decodes |
+     | --- | --- | --- | --- | --- | --- |
+     | `C⁺` | 3 | 0 | 1 | 2 | 1 |
+     | `O⁻` | 2 | 0 | 7 | 8 | 8 |
+     | `J⁺` | 5 | 1 | 2 | 3 | 1 |
+     | `L⁻` | 6 | 0 | 9 | 9 | 9 |
+     | Total | 16 | 1 | 19 | 22 | 19 |
 
-     Six old entries are taken (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`), against 25 value decodes. `O⁻` alone reads all seven file keys, and `c6` is read four times, as the end of four ranges.
+     Six old entries are taken (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`), against 22 value decodes. `O⁻` alone reads all seven file keys, and `c6` is decoded three times, as the end of `O⁻`'s range and as `L⁻`'s landing for `o4` and `o5`.
+   - The path reads, `C⁺` and `J⁺`, probe their one exact key with `seek_key_exact` (`scan_entry`), as a native join probes its trace: a file run whose filter excludes the key is neither sought nor decoded, and nothing past the entry is read. `J⁺`'s probe of `(c5, o5)`, which only `Dlt` holds, is the one rejection. The range reads, `O⁻` and `L⁻`, keep `scan`, since the filters answer whole keys, not prefixes. Each probe still opens a cursor, which decodes the file run's first key and value. *Changed on 2026-11-04;* before, the path reads also used `scan`, and the totals were 17 seeks and 22, 25 and 21 decodes.
 2. **Decode-free storage and the scan session.**
    - Lazy value positioning in `FileIndexedWSetCursor` (rule 2 of [No extra decoding](#no-extra-decoding)).
    - A merging cursor over `Old`'s runs that consolidates only taken entries (rule 3).
