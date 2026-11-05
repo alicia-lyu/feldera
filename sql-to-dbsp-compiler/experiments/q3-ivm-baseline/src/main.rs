@@ -1421,7 +1421,9 @@ fn circuit_config(
 ) -> Result<CircuitConfig> {
     let mut circuit_config =
         CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
-    circuit_config.dev_tweaks.fetch_join = Some(config.r5);
+    // Native joins probe their traces through run cursors, as the reconstructed readers do, so
+    // both modes' run reads are counted alike (user decision of 2026-11-04).
+    circuit_config.dev_tweaks.fetch_join = Some(false);
     circuit_config.dev_tweaks.front_code_byte_keys = Some(config.front_code_byte_keys);
     circuit_config.dev_tweaks.elide_value_headers = Some(config.elide_value_headers);
     if let Some(path) = storage_path {
@@ -1775,7 +1777,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             },
             "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
-            "native_join_fetch": config.r5, "compaction_timeout_secs": config.compaction_timeout_secs,
+            "native_join_fetch": false, "compaction_timeout_secs": config.compaction_timeout_secs,
             "compaction_policy": if config.setup_full_compaction {
                 "setup full compaction after loading, before the refreshes; no compaction requested after any refresh; no final wait"
             } else {

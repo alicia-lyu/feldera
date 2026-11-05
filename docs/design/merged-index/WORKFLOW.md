@@ -170,8 +170,9 @@ under it, holding `storage/`, `driver.json`, and the logs. The Linux campaign ad
 and `--total-memory-bytes`; see the [Linux handoff](#linux-handoff).
 
 The runner always starts the driver with `--r5`. That flag (`Config::from_args` in `src/main.rs`)
-selects the measured configuration: it turns on DBSP's native join fetch and records it as
-`native_join_fetch` in the report. It is accepted only with one worker, one run per process
+selects the measured configuration. Native joins probe their traces through run cursors, with
+DBSP's asynchronous join fetch off (`native_join_fetch: false` in the report; it was on until
+2026-11-04). It is accepted only with one worker, one run per process
 (`--runs 1`), `--storage-path`, `--cache-bytes`, `--memory-target-bytes`, and `--report`;
 otherwise the driver exits with an error. Running the driver by hand with `--r5` therefore needs
 all of those. `--cache-bytes` must be a whole number of MiB.

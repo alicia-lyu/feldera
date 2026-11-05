@@ -266,6 +266,10 @@ The execution passes its readers to the session. Each reader fixes its kind, ver
 
 Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
 
+### 2026-11-04: Native joins read through run cursors
+
+R5 runs the native join with DBSP's default read path, `fetch_join` off. With it on, as R5 had it since the driver was written, the native join batch-fetched each delta's keys from every file run into in-memory copies: an access style unlike the reconstructed readers' per-key cursor seeks, and one that the run counters do not see. With it off, both modes read their partner state through the counted run cursors. The fetch path stays uncounted. Reconstructed mode's counts do not depend on the setting.
+
 ### 2026-11-04: RF2 deletes the oldest Orders
 
 In both workloads, RF2 deletes the lowest base Order keys, as an analytical database ages out its oldest history. Pair K takes the next block, as large as its RF1. The two workloads then share their RF2 sets and differ only in RF1 (Zipf against uniform Customers). This replaces the RF2 rules of 2026-10-23; the RF1 rules stand.
