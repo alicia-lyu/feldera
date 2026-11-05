@@ -5,7 +5,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented; nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29 and 2026-11-03.
+> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes, except that the native join's fetch path is not yet counted; nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29 and 2026-11-03.
 
 This doc covers:
 
@@ -399,12 +399,14 @@ These are implementation questions, not algorithm questions:
 
 The steps are ordered. Each has an exit check and updates its docs. They are not R-numbered, since R1–R5 is the only numbering scheme.
 
-1. **Run counters in DBSP.** *Done on 2026-11-03.*
+1. **Run counters in DBSP.** *Done on 2026-11-03; extended on 2026-11-04. Open: the native fetch path.*
    - Per-run seeks in both run cursors, `VecIndexedWSetCursor` and `FileIndexedWSetCursor`. Key decodes, value decodes, and weight decodes in the file cursor only, since only file runs deserialize.
    - A thread-local running total, read before and after a region on the same thread. The generic `Cursor` trait gains no counters.
    - Each read also counts for the thread's read owner, set by `with_read_owner` and given by `RunReads::current_for`. COL's `scan` reads the index under `WriteOwner::MergedIndex` and runs its callback under the caller's owner, so index reads stand apart from reads of driving deltas and other batches. *Added on 2026-11-04.*
    - The R5 harness reports each refresh's index run reads per reader, beside the index snapshots' layout (measurement version 5; fields in [measurement.md](measurement.md#report-fields)). *Added on 2026-11-04.*
    - For a native comparison, `DBSPHandle::run_reads` asks the workers for their totals per owner, and the harness reports the view worker's reads per refresh in both modes. Native join traces count under `query`; the index readers count under `merged_index`. Only indexed Z-set runs count, so a non-join trace such as `V`'s output is uncounted in both modes. A `seek_key_exact` that a file filter rejects counts as a filter rejection, not a seek: native joins probe this way, while the index's `scan` uses plain seeks. The fields were renamed from `*_reads` to `*_decodes` on 2026-11-04. *Added on 2026-11-04.*
+   - *Measured on 2026-11-04* ([measurement.md](measurement.md#run-reads-version-5-smoke-2026-11-04)): one macOS smoke run per mode at SF 0.01, with RF2 deleting the oldest Orders. Reconstructed mode's counts follow the rules: seeks are scans times runs, only the file run decodes, and RF2 decodes about three times what RF1 does, because it deletes Orders whose entries are in the file run.
+   - *Open:* native decodes are not counted. With `fetch_join` on, as in R5, the native join fetches each delta key's rows from each file run (`FileIndexedWSet::fetch`) into an in-memory batch and cursors over the copy. The fetch's decodes and the filter's rejections there are uncounted, and native's seeks are seeks of the copies. Counting the fetch path (`fetch_indexed_zset` in `storage/file/reader.rs`, and `filtered_keys`) is needed before native and reconstructed decodes compare.
    - *Exit:* DBSP unit tests (filter `run_reads`) pin the counts of single moves on an in-memory run and a file run, and one seek per run through `CursorList`. A COL test pins today's four readers on the worked transaction (without `v2` and `v8`, since COL has no invoices), over a file run plus an in-memory run.
    - *Baseline.* `Old` is a file run holding `c5`, `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`, plus an in-memory run holding `c7`; the after state adds `Dlt`. Each comment in `todays_readers_run_reads_on_the_worked_transaction` derives its count. The counts are the index's own; the test also checks that no other owner reads any run, since the driving deltas are in memory and only stepped.
 
