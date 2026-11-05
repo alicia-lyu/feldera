@@ -95,9 +95,37 @@ What the counts show, each against the counting rules:
 - **Value and weight decodes.** Reconstructed mode decodes about 2.5 times as many values. RF2 decodes about three times what RF1 does in reconstructed mode (`L⁻` 56 to 63 values per RF2 against 20 per RF1), because RF2 deletes Orders whose entries are in the file run, while RF1's new Orders live in memory.
 - **`O⁻` reads nothing.** RF1 and RF2 change no Customers, so `ΔC` is empty.
 - **The non-index view reads.** In reconstructed mode, the rest of the view circuit seeks 18 to 20 times per refresh under `query`, with no decodes: the joins over the readers' in-memory batches.
-- **Backend reads.** They are process-wide, so they include the base circuit and the index upkeep. Native reads 7 or 8 blocks, almost all in the first refresh. Reconstructed mode reads in every refresh, 12 to 46 blocks. Why the index's blocks are read again in later refreshes is not established here; each runtime's buffer cache is 16 MiB.
+- **Backend reads.** They are process-wide, so they include the base circuit and the index upkeep. Native reads 7 or 8 blocks, almost all in the first refresh. Reconstructed mode reads in every refresh, 12 to 46 blocks. The cause is the cache placement explained under [Exact path reads](#exact-path-reads-2026-11-05).
 
-## Pending: Linux campaign## Pending: Linux campaign
+### Exact path reads (2026-11-05)
+
+The same inputs and settings at revision `6be8e8108`, where the path readers `C⁺` and `J⁺` probe their exact key with `seek_key_exact` ([decisions.md](decisions.md)); `O⁻` and `L⁻` still range-scan. Artifacts: `target/r5-v5-exact-path/{clustered,scattered}/manifest.json`. Native counts are unchanged; its backend reads differ by a few blocks between runs.
+
+| Workload | Mode | Seeks | Filter rejections | Key decodes | Value decodes | Weight decodes | Backend reads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clustered | native | 476 | 60 | 194 | 452 | 436 | 6 |
+| clustered | reconstructed | 1,090 | 30 | 559 | 559 | 559 | 169 |
+| scattered | native | 480 | 60 | 198 | 456 | 440 | 9 |
+| scattered | reconstructed | 1,110 | 30 | 567 | 567 | 566 | 192 |
+
+Per reader, clustered, against the cursor-join run:
+
+| Reader | Seeks | Filter rejections | Key decodes | Value decodes | Weight decodes |
+| --- | --- | --- | --- | --- | --- |
+| `C⁺` | 254 → 254 | 0 → 0 | 315 → 112 | 315 → 112 | 289 → 112 |
+| `J⁺` | 540 → 510 | 0 → 30 | 594 → 210 | 594 → 210 | 534 → 210 |
+| `L⁻` | 210 → 210 | 0 → 0 | 237 → 237 | 237 → 237 | 237 → 237 |
+
+- **Seeks.** `J⁺` loses 30, one per new Order: the node `(c, o)` of an Order that RF1 inserts exists only in the transaction delta, so the file run's filter rejects the probe without a seek. Reconstructed mode now seeks about 2.3 times as often as native.
+- **Decodes.** The path readers decode about a third of what they did, since an exact probe no longer steps past its key to end a range. Reconstructed mode now decodes about 2.9 times native's keys and 1.2 to 1.3 times its values and weights. `L⁻` is unchanged.
+- **Backend reads are not comparable.** A storage writer puts each block it writes into its own thread's buffer cache. Native's traces are written and read inside the view runtime, so its probes find their blocks cached. `ManualIndex` writes the index on an auxiliary thread bound to the base runtime's cache, and the view worker reads it through the view runtime's cache, which never received those blocks; each refresh probes other Customers and Orders, so it keeps reaching blocks that cache has not held. A diagnostic run (`target/diag-backend-reads/`, instrumented driver, not committed) showed that:
+  - with a 256 MiB cache per runtime, both about half full, reconstructed mode still read 12 to 28 blocks per refresh (`target/r5-v5-cache256/clustered/`);
+  - every backend read fell inside the view transaction;
+  - after one full scan of the index in the view runtime before the window, backend reads were 0 in every refresh, and the decode counts were identical, refresh for refresh.
+
+  Until both modes read through a cache their writes warm, backend reads favor native.
+
+## Pending: Linux campaign
 
 macOS gives no enforced memory limit, so qualification needs Linux. The runner (`measure.py`) already supports `--cgroup-root` and `--total-memory-bytes`: it creates a cgroup v2 child per run with `memory.max` set, `memory.swap.max=0`, copies the input files inside that cgroup before loading, and records `memory.peak` (`null` on a kernel without that file), `memory.events`, and `io.stat`.
 
