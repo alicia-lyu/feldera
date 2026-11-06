@@ -97,7 +97,7 @@ What the counts show, each against the counting rules:
 - **Value and weight decodes.** Reconstructed mode decodes about 2.5 times as many values. RF2 decodes about three times what RF1 does in reconstructed mode (`L⁻` 56 to 63 values per RF2 against 20 per RF1), because RF2 deletes Orders whose entries are in the file run, while RF1's new Orders live in memory.
 - **`O⁻` reads nothing.** RF1 and RF2 change no Customers, so `ΔC` is empty.
 - **The non-index view reads.** In reconstructed mode, the rest of the view circuit seeks 18 to 20 times per refresh under `query`, with no decodes: the joins over the readers' in-memory batches.
-- **Backend reads.** They are process-wide, so they include the base circuit and the index upkeep. Native reads 7 or 8 blocks, almost all in the first refresh. Reconstructed mode reads in every refresh, 12 to 46 blocks. The cause is the cache placement explained under [Exact path reads](#exact-path-reads-2026-11-05).
+- **Backend reads.** They are process-wide, so they include the base circuit and the index upkeep. Native reads 7 or 8 blocks, almost all in the first refresh. Reconstructed mode reads in every refresh, 12 to 46 blocks. In these runs (two runtimes) the cause was the cache placement explained under [Exact path reads](#exact-path-reads-2026-11-05); version 6 changed it.
 
 ### Exact path reads (2026-11-05)
 
@@ -120,12 +120,48 @@ Per reader, clustered, against the cursor-join run:
 
 - **Seeks.** `J⁺` loses 30, one per new Order: the node `(c, o)` of an Order that RF1 inserts exists only in the transaction delta, so the file run's filter rejects the probe without a seek. Reconstructed mode now seeks about 2.3 times as often as native.
 - **Decodes.** The path readers decode about a third of what they did, since an exact probe no longer steps past its key to end a range. The step past cost most in RF2: the merged cursor over the runs (`CursorList::step_key`) skips keys whose weights cancel, reading each one's weight, and in the after snapshot the deleted Order and its Lines cancel between the file run and the transaction delta. Stepping past the Customer therefore walked that whole deleted subtree before it reached a live key that ended the range. Per probe, `C⁺` decoded 3 keys in RF1 and 7 to 8 in RF2 (24 for 8 probes, 76 to 83 for 10); with exact probes, it decodes 2 in both. Reconstructed mode now decodes about 2.9 times native's keys and 1.2 to 1.3 times its values and weights. `L⁻` is unchanged.
-- **Backend reads are not comparable.** A storage writer puts each block it writes into its own thread's buffer cache. Native's traces are written and read inside the view runtime, so its probes find their blocks cached. `ManualIndex` writes the index on an auxiliary thread bound to the base runtime's cache, and the view worker reads it through the view runtime's cache, which never received those blocks; each refresh probes other Customers and Orders, so it keeps reaching blocks that cache has not held. A diagnostic run (`target/diag-backend-reads/`, instrumented driver, not committed) showed that:
+- **Backend reads are not comparable (versions 5 and earlier).** A storage writer puts each block it writes into its own thread's buffer cache. Native's traces are written and read inside the view runtime, so its probes find their blocks cached. `ManualIndex` writes the index on an auxiliary thread bound to the base runtime's cache, and the view worker reads it through the view runtime's cache, which never received those blocks; each refresh probes other Customers and Orders, so it keeps reaching blocks that cache has not held. A diagnostic run (`target/diag-backend-reads/`, instrumented driver, not committed) showed that:
   - with a 256 MiB cache per runtime, both about half full, reconstructed mode still read 12 to 28 blocks per refresh (`target/r5-v5-cache256/clustered/`);
   - every backend read fell inside the view transaction;
   - after one full scan of the index in the view runtime before the window, backend reads were 0 in every refresh, and the decode counts were identical, refresh for refresh.
 
-  Until both modes read through a cache their writes warm, backend reads favor native.
+  Version 6 removed that cause: one runtime has one cache, which the index's writes warm and the view worker's reads use. Backend reads fell but did not reach native's; see [One runtime](#one-runtime-version-6-2026-11-05).
+
+## One runtime (version 6, 2026-11-05)
+
+The base and view circuits run in one DBSP runtime, with one storage directory and one buffer cache of `--cache-bytes` ([decisions.md](decisions.md#2026-11-05-one-runtime-for-the-base-and-view-circuits)). The same inputs and settings as the [exact path reads](#exact-path-reads-2026-11-05) run, at revision `7e73c0b4f` (clean tree), one run per workload and mode on macOS. These are smoke figures: one repetition, no memory pressure, and no claim of cost or saving.
+
+Artifacts: `target/r5-v6-one-runtime/{clustered,scattered}/manifest.json`, with each run's `driver.json` beside it. The baseline is `target/r5-v5-exact-path/`. A diagnostic run at a larger cache is in `target/r5-v6-one-runtime-cache256/clustered/`. All of them are local-only.
+
+The view worker's run reads, summed over the sequence and the owners, with the process's backend reads. The backend reads of version 5 (two runtimes) are in the last column for comparison:
+
+| Workload | Mode | Seeks | Filter rejections | Key decodes | Value decodes | Weight decodes | Backend reads | Backend reads, v5 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| clustered | native | 476 | 60 | 194 | 452 | 436 | 7 | 6 |
+| clustered | reconstructed | 1,090 | 30 | 559 | 559 | 559 | 72 | 169 |
+| scattered | native | 480 | 60 | 198 | 456 | 440 | 11 | 9 |
+| scattered | reconstructed | 1,110 | 30 | 567 | 567 | 566 | 83 | 192 |
+
+- **Run reads are unchanged.** Every seek, filter rejection, and decode count equals the version 5 figure, in both modes and both workloads. Version 6 changes where the blocks are cached and which thread writes them, not what a probe reads from a run. In reconstructed mode the `merged_index` owner accounts for all the filter rejections and decodes and for most of the seeks (clustered 974 of 1,090, scattered 990 of 1,110); the rest are other owners' reads of the view circuit. Native's `merged_index` owner reads nothing.
+- **Backend reads in reconstructed mode fell, but not to native's level.** Clustered went from 169 to 72, scattered from 192 to 83. Native's moved by a few blocks (6 to 7, 9 to 11), as it did between version 5 runs. Reconstructed mode still reads more than native, per refresh:
+
+  | Mode | Clustered, per refresh | Scattered, per refresh |
+  | --- | --- | --- |
+  | native | 5, 1, 1, 0, 0, 0 | 10, 0, 1, 0, 0, 0 |
+  | reconstructed | 21, 14, 12, 9, 6, 10 | 24, 14, 14, 11, 11, 9 |
+
+- **What the remaining reads depend on.** The cache is nearly full at the start of the window: 31.9 MB of 33.6 MB (95 percent) in both modes and both workloads, and its occupancy hardly moves across the window. In the diagnostic run (clustered, `--cache-bytes 268435456`) the cache held 99.0 MB (native) and 96.8 MB (reconstructed), about 37 percent of capacity, and both modes made **0 backend reads** in every refresh, with run reads identical to the table above. So the remaining reads at 32 MiB depend on the cache's capacity; they are not the placement effect of version 5. The counters do not separate a first read of an uncached block from a re-read after an eviction, so which of the two the remaining reads are is not measured. The diagnostic ran for clustered only.
+
+The per-phase timings, summed over the six refreshes, in milliseconds (`ivm_ms` equals `q3_ms`; `index_ms` is inside `base_ms`; `profiled_cpu_ms` is the CPU profiler's step CPU time of each circuit, definitions under [Report fields](#report-fields)):
+
+| Workload | Mode | `base_ms` | `index_ms` | `ivm_ms` | Profiled base | Profiled q3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| clustered | native | 0.60 | 0.00 | 1.11 | 0.55 | 1.03 |
+| clustered | reconstructed | 0.91 | 0.21 | 1.86 | 0.65 | 1.81 |
+| scattered | native | 0.62 | 0.00 | 1.06 | 0.57 | 1.02 |
+| scattered | reconstructed | 0.98 | 0.24 | 2.23 | 0.66 | 2.10 |
+
+Each refresh takes well under a millisecond, from one run, so these figures show only that the phases are told apart and that the profiler's times track the phase timers' (`profiled_cpu_ms.q3` is within 0.15 ms of `q3_ms` in every row). Nothing here is a cost comparison; the Linux campaign measures one. Version 5 recorded no profiler times, and its phase timings were taken with two runtimes, so they are not tabulated against these.
 
 ## Pending: Linux campaign
 
