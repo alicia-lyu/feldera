@@ -23,11 +23,12 @@ runtime (user decision of 2026-10-23):
 [query.sql](query.sql) remains the logical definition: keyed tables plus `V`. The merged-index
 module is generated from its schema.
 
-Each runtime has one worker, its own storage directory (`run-N/base` and `run-N/q3`), and its own
-buffer cache. The driver splits `--cache-bytes` between them (the base circuit gets half the MiB,
-rounded down) and gives both the same `--memory-target-bytes`, because RSS is process-wide. The
-report records both. In reconstructed mode the merged index lives in the base runtime (storage
-under `run-N/base`), because its upkeep is base maintenance. The phases are `base_ms` (the base
+Both circuits run in one runtime (`Runtime::init_circuits`, measurement version 6), with one
+worker, one storage directory (`run-N`), and one buffer cache of `--cache-bytes` (rounded down to
+whole MiB) under one `--memory-target-bytes`. The base transaction commits before the view
+transaction starts, and the CPU profiler's per-circuit step CPU time (`profiled_cpu_ms`) is
+reported beside the phase timers as a cross-check. In reconstructed mode the merged index lives in
+the same runtime and writes through its buffer cache, because its upkeep is base maintenance. The phases are `base_ms` (the base
 circuit's transaction plus the index append), `index_ms` (the append alone, a sub-phase of
 `base_ms` and never added to it again), `forward_ms`, and `q3_ms`, the view circuit alone, which
 is also reported as `ivm_ms`. Base and IVM are always reported side by side.
@@ -68,7 +69,8 @@ The concrete COL codecs and storage tests live in the standalone
 [`merged-index-col`](../merged-index-col/README.md) library, which the native path does not use.
 
 In reconstructed mode the harness maintains the merged index in `ManualIndex`, outside both
-circuits, on an auxiliary thread of the base circuit's runtime (measurement version 4). Per
+circuits, on an auxiliary thread of the runtime that hosts both circuits (booked as base maintenance since
+measurement version 4). Per
 transaction it converts the base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
 publishes the before and after snapshots to the view circuit, which keeps them until its
 consumers finish. The placement map (order → customer) is built from the Orders rows of that net

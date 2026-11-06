@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use data::{Customer, Line, Order};
+use dbsp::circuit::metadata::{MetaItem, CIRCUIT_CPU_TIME_SECONDS};
 use dbsp::circuit::{
-    CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
+    CircuitConfig, CircuitConstructor, CircuitStorageConfig, GlobalNodeId, StorageCacheConfig,
+    StorageConfig, StorageOptions,
 };
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
 use dbsp::storage::file::writer::{
@@ -28,6 +30,7 @@ use dbsp::storage::file::writer::{
 };
 use dbsp::storage::write_attribution::WriteOwner;
 use dbsp::trace::RunReads;
+use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
@@ -291,24 +294,22 @@ impl Stage {
             inputs,
         })
     }
-
-    /// Runs `f` with this stage's buffer cache bound to the calling thread, so that reads of
-    /// this circuit's files are charged to its cache and not to the other circuit's.
-    fn in_cache<R>(&self, f: impl FnOnce() -> R) -> R {
-        self.circuit.runtime().with_buffer_cache(0, f)
-    }
 }
 
 /// The two chained circuits, each timed on its own.
 ///
-/// A transaction runs first on `base`, which holds the base relations in primary-key input
-/// maps. The net change of those relations is then forwarded to `view`, which maintains `V`.
-/// In reconstructed mode the same net change also feeds the merged index, which lives in the
-/// base runtime and stands in for the view circuit's join traces; the view circuit reads it
-/// through published snapshots.
+/// Both circuits run in one DBSP runtime, with one storage directory and one buffer cache. The
+/// separation between them is the transaction: a transaction runs first on `base`, which holds
+/// the base relations in primary-key input maps, and commits. The net change of those relations
+/// is then forwarded to `view`, which maintains `V`. In reconstructed mode the same net change
+/// also feeds the merged index, which stands in for the view circuit's join traces; the view
+/// circuit reads it through published snapshots. The index is base storage, written through the
+/// runtime's buffer cache, which the view circuit's readers use too.
 struct Pipeline {
     base: Stage,
     view: Stage,
+    /// Whether each transaction reads the circuits' CPU profiles (off while loading).
+    profile_cpu: bool,
     #[cfg(feature = "merged-index")]
     index: ManualIndex,
     #[cfg(feature = "merged-index")]
@@ -316,25 +317,41 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    /// Builds both circuits; each has its own runtime, and so its own storage and buffer cache.
-    fn new(base_config: CircuitConfig, view_config: CircuitConfig) -> Result<Self> {
-        let base = Stage::new(q3_base_circuit::circuit(base_config)?, DeleteStyle::ByKey)?;
-        workload::enable_net_delta(&base.catalog)?;
+    /// Builds both circuits in one runtime, base first. The CPU profiler is enabled in both.
+    fn new(config: CircuitConfig) -> Result<Self> {
         #[cfg(feature = "merged-index")]
         let q3_state = Q3State::default();
+        let base_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
+            q3_base_circuit::build(circuit).map_err(anyhow::Error::from)
+        });
         #[cfg(feature = "merged-index")]
-        let view_circuit = q3_view_circuit::circuit(view_config, q3_state.clone())?;
+        let view_state = q3_state.clone();
+        #[cfg(feature = "merged-index")]
+        let view_constructor = CircuitConstructor::new(move |circuit: &mut RootCircuit| {
+            q3_view_circuit::build(circuit, view_state.clone()).map_err(anyhow::Error::from)
+        });
         #[cfg(not(feature = "merged-index"))]
-        let view_circuit = q3_view_circuit::circuit(view_config)?;
-        let view = Stage::new(view_circuit, DeleteStyle::WholeRow)?;
-        // The index is secondary storage of the base relations, so it belongs to the base
-        // runtime (thread, buffer cache, storage directory) and its upkeep is base maintenance.
-        // The view circuit reads it only through the snapshots that `Q3State` publishes.
+        let view_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
+            q3_view_circuit::build(circuit).map_err(anyhow::Error::from)
+        });
+        let mut circuits =
+            Runtime::init_circuits(config, vec![base_constructor, view_constructor])?;
+        let view_circuit = circuits.pop().context("missing view circuit")?;
+        let base_circuit = circuits.pop().context("missing base circuit")?;
+        let mut base = Stage::new(base_circuit, DeleteStyle::ByKey)?;
+        workload::enable_net_delta(&base.catalog)?;
+        let mut view = Stage::new(view_circuit, DeleteStyle::WholeRow)?;
+        base.circuit.enable_cpu_profiler()?;
+        view.circuit.enable_cpu_profiler()?;
+        // The index is secondary storage of the base relations: its upkeep is base maintenance
+        // (its thread binds the runtime's buffer cache). The view circuit reads it only through
+        // the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
         let index = ManualIndex::new(base.circuit.runtime());
         Ok(Self {
             base,
             view,
+            profile_cpu: false,
             #[cfg(feature = "merged-index")]
             index,
             #[cfg(feature = "merged-index")]
@@ -342,13 +359,38 @@ impl Pipeline {
         })
     }
 
+    /// The runtime that hosts both circuits.
+    fn runtime(&self) -> &Runtime {
+        self.base.circuit.runtime()
+    }
+
+    /// Runs `f` with the runtime's buffer cache bound to the calling thread, so that the
+    /// driver's reads of the circuits' files go through the same cache as the workers' reads.
+    fn in_cache<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.runtime().with_buffer_cache(0, f)
+    }
+
     /// Both circuits with `workers` workers and memory-backed state.
     #[cfg(test)]
     fn with_workers(workers: usize) -> Result<Self> {
-        Self::new(
-            CircuitConfig::with_workers(workers),
-            CircuitConfig::with_workers(workers),
-        )
+        Self::new(CircuitConfig::with_workers(workers))
+    }
+}
+
+/// A circuit's cumulative CPU time inside steps, from the CPU profiler. The profile is read
+/// outside the phase timers.
+fn profiled_cpu(circuit: &mut DBSPHandle) -> Result<Duration> {
+    let profile = circuit.retrieve_profile()?;
+    let worker = profile
+        .worker_profiles
+        .first()
+        .context("the circuit has no worker profile")?;
+    match worker
+        .attribute_profile(&CIRCUIT_CPU_TIME_SECONDS)
+        .get(&GlobalNodeId::root())
+    {
+        Some(MetaItem::Duration(cpu)) => Ok(*cpu),
+        other => bail!("the root circuit's CPU time is {other:?}, not a duration"),
     }
 }
 
@@ -416,6 +458,16 @@ struct Measurements {
     /// The view worker's run reads in the view transactions, per read owner, indexed like
     /// `WriteOwner::ALL` (both modes).
     view_reads: [RunReads; 3],
+    /// The CPU profiler's step CPU time of each circuit in the measured transactions, a
+    /// cross-check of the phase timers. `None` while the pipeline is not profiling.
+    profiled_cpu: Option<ProfiledCpu>,
+}
+
+/// The CPU time that the profiler attributes to each circuit's steps.
+#[derive(Clone, Copy, Default)]
+struct ProfiledCpu {
+    base: Duration,
+    view: Duration,
 }
 
 impl Measurements {
@@ -464,9 +516,21 @@ fn transact_inner(
     change.apply_optional(None, &mut pipeline.base.inputs)?;
     stats.preparation += preparation_started.elapsed();
 
+    // The profiler's cumulative CPU time before the transactions; both circuits are idle.
+    let cpu_before = if pipeline.profile_cpu {
+        Some(ProfiledCpu {
+            base: profiled_cpu(&mut pipeline.base.circuit)?,
+            view: profiled_cpu(&mut pipeline.view.circuit)?,
+        })
+    } else {
+        None
+    };
     let base_started = Instant::now();
     pipeline.base.circuit.transaction()?;
     stats.base_circuit += base_started.elapsed();
+    let base_cpu_after = cpu_before
+        .map(|_| profiled_cpu(&mut pipeline.base.circuit))
+        .transpose()?;
 
     // The base circuit's delta streams hold the net change of each base table: an upsert that
     // replaces a row appears as a deletion of the old row and an insertion of the new one.
@@ -505,6 +569,12 @@ fn transact_inner(
     let transaction_result = pipeline.view.circuit.transaction();
     let latency = view_started.elapsed();
     let view_reads_after = pipeline.view.circuit.run_reads()?;
+    if let (Some(before), Some(base_after)) = (cpu_before, base_cpu_after) {
+        let view_after = profiled_cpu(&mut pipeline.view.circuit)?;
+        let spent = stats.profiled_cpu.get_or_insert_with(ProfiledCpu::default);
+        spent.base += base_after.saturating_sub(before.base);
+        spent.view += view_after.saturating_sub(before.view);
+    }
     for ((total, after), before) in stats
         .view_reads
         .iter_mut()
@@ -539,9 +609,7 @@ fn transact_inner(
             .catalog
             .output_handles(&SqlIdentifier::from("V"))
             .context("missing V output")?;
-        let actual_delta = pipeline
-            .view
-            .in_cache(|| read_output(&*output.delta_handle))?;
+        let actual_delta = pipeline.in_cache(|| read_output(&*output.delta_handle))?;
         let expected_delta = difference(&before, &after);
         if actual_delta != expected_delta {
             bail!("emitted delta differs from independent full join: actual {actual_delta:?}, expected {expected_delta:?}");
@@ -550,7 +618,7 @@ fn transact_inner(
             .integrate_handle
             .as_ref()
             .context("V has no materialized snapshot")?;
-        let actual_state = pipeline.view.in_cache(|| read_output(&**snapshot))?;
+        let actual_state = pipeline.in_cache(|| read_output(&**snapshot))?;
         if actual_state != after {
             bail!("materialized V differs from independent full join: actual {actual_state:?}, expected {after:?}");
         }
@@ -1019,12 +1087,11 @@ impl PreparedRefresh {
     }
 }
 
-/// The current memory-pressure level of each circuit's runtime. The level comes from the
-/// process's RSS against the memory target, not from cgroup memory.
+/// The current memory-pressure level of the runtime. The level comes from the process's RSS
+/// against the memory target, not from cgroup memory.
 fn memory_pressure_levels(pipeline: &Pipeline) -> Result<Value> {
     Ok(json!({
-        "base_runtime": serde_json::to_value(pipeline.base.circuit.runtime().current_memory_pressure())?,
-        "q3_runtime": serde_json::to_value(pipeline.view.circuit.runtime().current_memory_pressure())?,
+        "runtime": serde_json::to_value(pipeline.runtime().current_memory_pressure())?,
     }))
 }
 
@@ -1352,6 +1419,11 @@ fn phase_json(stats: &Measurements) -> Value {
         "ivm_ms": milliseconds(stats.ivm_phase()),
         "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction. Report base_ms and ivm_ms side by side. forward_ms (net delta read and feed), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
+        "profiled_cpu_ms": stats.profiled_cpu.map(|cpu| json!({
+            "base": milliseconds(cpu.base),
+            "q3": milliseconds(cpu.view),
+            "note": "The CPU profiler's step CPU time of each circuit in this refresh's transactions: a cross-check of base_ms and q3_ms, not a phase. base excludes the merged index's upkeep, which runs on its own thread.",
+        })),
     })
 }
 
@@ -1400,25 +1472,14 @@ fn storage_evidence(base: &workload::BaseState, pipeline: &Pipeline) -> Result<V
     Ok(Value::Object(evidence))
 }
 
-/// Splits the buffer cache between the two circuits' runtimes: the base circuit takes half the
-/// MiB rounded down, the view circuit the rest.
-fn split_cache_mib(cache_bytes: Option<usize>) -> (Option<usize>, Option<usize>) {
-    match cache_bytes {
-        Some(bytes) => {
-            let mib = bytes / (1024 * 1024);
-            (Some(mib / 2), Some(mib - mib / 2))
-        }
-        None => (None, None),
-    }
+/// The whole buffer cache in MiB, rounded down. Both circuits share it.
+fn cache_mib(cache_bytes: Option<usize>) -> Option<usize> {
+    cache_bytes.map(|bytes| bytes / (1024 * 1024))
 }
 
-/// The configuration of one circuit. Both circuits get the same worker count and memory-pressure
-/// target; they differ in storage directory and buffer cache.
-fn circuit_config(
-    config: &Config,
-    storage_path: Option<&Path>,
-    cache_mib: Option<usize>,
-) -> Result<CircuitConfig> {
+/// The configuration of the runtime that hosts both circuits: one storage directory, one buffer
+/// cache, and the memory-pressure target.
+fn runtime_config(config: &Config, storage_path: Option<&Path>) -> Result<CircuitConfig> {
     let mut circuit_config =
         CircuitConfig::with_workers(config.workers).with_max_rss_bytes(config.memory_target_bytes);
     // Native joins probe their traces through run cursors, as the reconstructed readers do, so
@@ -1435,7 +1496,7 @@ fn circuit_config(
             },
             StorageOptions {
                 min_storage_bytes: Some(0),
-                cache_mib,
+                cache_mib: cache_mib(config.cache_bytes),
                 compression: feldera_types::config::StorageCompression::None,
                 ..StorageOptions::default()
             },
@@ -1443,10 +1504,6 @@ fn circuit_config(
     }
     Ok(circuit_config)
 }
-
-/// The two circuits' storage directories under one run's storage root.
-const BASE_STORAGE_DIRECTORY: &str = "base";
-const Q3_STORAGE_DIRECTORY: &str = "q3";
 
 fn run(config: &Config, run_number: usize) -> Result<()> {
     let started = Instant::now();
@@ -1461,16 +1518,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         }
         std::fs::create_dir_all(path)?;
     }
-    // Each circuit has its own runtime, and a storage directory is locked by one runtime.
-    let base_storage = storage_root
-        .as_ref()
-        .map(|root| root.join(BASE_STORAGE_DIRECTORY));
-    let q3_storage = storage_root
-        .as_ref()
-        .map(|root| root.join(Q3_STORAGE_DIRECTORY));
-    let (base_cache_mib, q3_cache_mib) = split_cache_mib(config.cache_bytes);
-    let base_config = circuit_config(config, base_storage.as_deref(), base_cache_mib)?;
-    let q3_config = circuit_config(config, q3_storage.as_deref(), q3_cache_mib)?;
+    // Both circuits share one runtime, and so its storage directory and its buffer cache.
+    let pipeline_config = runtime_config(config, storage_root.as_deref())?;
     // Diagnostics must be on before any spine exists, so that all are registered.
     let diagnostics = config
         .diagnostics
@@ -1486,10 +1535,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             )
         })
         .transpose()?;
-    let mut pipeline = Pipeline::new(base_config, q3_config)?;
-    let base_runtime = pipeline.base.circuit.runtime().clone();
-    // The driver thread reads base state; reads of the view circuit's state bind its cache.
-    base_runtime.with_buffer_cache(0, || {
+    let mut pipeline = Pipeline::new(pipeline_config)?;
+    let runtime = pipeline.runtime().clone();
+    // The driver thread binds the runtime's buffer cache, as the workers do.
+    runtime.with_buffer_cache(0, || {
     let sampler = storage_root
         .clone()
         .map(measurement::StorageSampler::start)
@@ -1575,8 +1624,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut window_evidence = window_memory::WindowMemory::start();
     // The buffer cache is left warm (there is no API to clear it); its state at the start of
     // the window is recorded beside its state at the end.
-    let (base_cache_occupancy_at_start, _) = pipeline.base.circuit.runtime().cache_occupancy();
-    let (q3_cache_occupancy_at_start, _) = pipeline.view.circuit.runtime().cache_occupancy();
+    let (cache_occupancy_at_start, _) = pipeline.runtime().cache_occupancy();
+    pipeline.profile_cpu = true;
     let mut memory_pressure_before = memory_pressure_levels(&pipeline)?;
     let sequence_started = Instant::now();
     let mut sequence_finished = sequence_started;
@@ -1600,11 +1649,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
                     #[cfg(feature = "merged-index")]
                     {
-                        // The index belongs to the base runtime, so its files are read
-                        // through the base buffer cache.
-                        pipeline
-                            .base
-                            .in_cache(|| reconstruction::lines(&snapshot, order))
+                        // The index's files are read through the runtime's buffer cache,
+                        // as the view circuit's readers read them.
+                        pipeline.in_cache(|| reconstruction::lines(&snapshot, order))
                     }
                     #[cfg(not(feature = "merged-index"))]
                     {
@@ -1714,16 +1761,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         .as_deref()
         .map(measurement::storage_size_bytes)
         .transpose()?;
-    let observed = |path: &Option<PathBuf>| {
-        path.as_deref()
-            .map(measurement::storage_size_bytes)
-            .transpose()
-    };
-    let base_storage_bytes = observed(&base_storage)?;
-    let q3_storage_bytes = observed(&q3_storage)?;
     let sampled_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
-    let (base_cache_occupancy, base_cache_capacity) = pipeline.base.circuit.runtime().cache_occupancy();
-    let (q3_cache_occupancy, q3_cache_capacity) = pipeline.view.circuit.runtime().cache_occupancy();
+    let (cache_occupancy, cache_capacity) = pipeline.runtime().cache_occupancy();
     #[cfg(feature = "merged-index")]
     let manual_storage = Some(pipeline.index.storage_evidence()?);
     #[cfg(not(feature = "merged-index"))]
@@ -1753,15 +1792,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     // counters, the disk usage and the cache occupancy have been read.
     if let Some(diagnostics) = &diagnostics {
         diagnostics.write_run_contents(
-            &[base_storage.as_deref(), q3_storage.as_deref()]
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .context("--diagnostics requires file storage")?,
+            &[storage_root
+                .as_deref()
+                .context("--diagnostics requires file storage")?],
         )?;
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 5,
+        "measurement_version": 6,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -1770,10 +1808,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "driver_reference_bytes": state.as_ref().map_or(0, |s| s.size_of().total_bytes()),
             "rf2_discovery_full_scans": 0,
             "cache_bytes": config.cache_bytes, "memory_pressure_target_bytes": config.memory_target_bytes,
-            "circuits": {
-                "base": {"storage_path": base_storage, "cache_mib": base_cache_mib},
-                "q3": {"storage_path": q3_storage, "cache_mib": q3_cache_mib},
-                "note": "Two runtimes, each with one storage directory and one buffer cache. cache_bytes is split between them; both get the same memory_pressure_target_bytes, because RSS is process-wide.",
+            "runtime": {
+                "storage_path": storage_root, "cache_mib": cache_mib(config.cache_bytes),
+                "note": "One runtime hosts the base and the view circuit, with one storage directory and one buffer cache of cache_bytes. The phases are told apart by transaction boundaries (base commits before the view transaction starts), with the CPU profiler's per-circuit step CPU time as a cross-check.",
             },
             "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
@@ -1813,25 +1850,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "foreground_ms": milliseconds(foreground_total),
             "end_to_end_ms": milliseconds(sequence_elapsed), "observed_storage_bytes": observed_storage_bytes,
             "sampled_peak_storage_bytes": sampled_peak_storage_bytes, "storage_peak_sampling_ms": 10,
-            // The sums over both runtimes; the breakdown is under `circuits`.
-            "cache_occupancy_bytes": base_cache_occupancy + q3_cache_occupancy,
-            "cache_occupancy_at_window_start_bytes": base_cache_occupancy_at_start + q3_cache_occupancy_at_start,
+            // The one buffer cache of the runtime.
+            "cache_occupancy_bytes": cache_occupancy,
+            "cache_occupancy_at_window_start_bytes": cache_occupancy_at_start,
             "snapshot_publication_transactions": 0,
-            "cache_capacity_bytes": base_cache_capacity + q3_cache_capacity,
-            "circuits": {
-                "base": {
-                    "observed_storage_bytes": base_storage_bytes,
-                    "cache_occupancy_bytes": base_cache_occupancy,
-                    "cache_occupancy_at_window_start_bytes": base_cache_occupancy_at_start,
-                    "cache_capacity_bytes": base_cache_capacity,
-                },
-                "q3": {
-                    "observed_storage_bytes": q3_storage_bytes,
-                    "cache_occupancy_bytes": q3_cache_occupancy,
-                    "cache_occupancy_at_window_start_bytes": q3_cache_occupancy_at_start,
-                    "cache_capacity_bytes": q3_cache_capacity,
-                },
-            },
+            "cache_capacity_bytes": cache_capacity,
             "window_started_micros": window_started_micros, "window_finished_micros": window_finished_micros,
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
@@ -2425,82 +2448,6 @@ mod reconstructed_tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn checkpoint_restores_q3_and_manual_index_at_completed_boundary() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "q3-reconstructed-checkpoint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        // A storage directory belongs to one runtime, so each circuit gets its own.
-        let base_directory = path.join("base");
-        let q3_directory = path.join("q3");
-        std::fs::create_dir_all(&base_directory)?;
-        std::fs::create_dir_all(&q3_directory)?;
-        let config = |directory: &Path, checkpoint| -> Result<CircuitConfig> {
-            let storage = StorageConfig {
-                path: directory.to_string_lossy().into_owned(),
-                cache: StorageCacheConfig::default(),
-            };
-            let options = StorageOptions {
-                min_storage_bytes: Some(0),
-                ..StorageOptions::default()
-            };
-            Ok(CircuitConfig::with_workers(1).with_storage(Some(
-                CircuitStorageConfig::for_config(storage, options)?
-                    .with_init_checkpoint(checkpoint),
-            )))
-        };
-        let mut pipeline =
-            Pipeline::new(config(&base_directory, None)?, config(&q3_directory, None)?)?;
-        let mut reference = Reference::default();
-        let mut stats = Measurements::default();
-        transact(
-            &mut pipeline,
-            &mut reference,
-            Change {
-                customers: vec![(customer(2), true)],
-                ..Change::default()
-            },
-            true,
-            &mut stats,
-        )?;
-        transact(
-            &mut pipeline,
-            &mut reference,
-            Change {
-                orders: vec![(order(20, 2), true), (order(30, 2), true)],
-                lines: vec![(line(20, 1), true), (line(30, 1), true)],
-                ..Change::default()
-            },
-            true,
-            &mut stats,
-        )?;
-        let restored_reference = reference.clone();
-        let base_committer = pipeline.base.circuit.checkpoint().prepare()?;
-        let q3_committer = pipeline.view.circuit.checkpoint().prepare()?;
-        let (base_checkpoint, q3_checkpoint) = (base_committer.uuid(), q3_committer.uuid());
-        // The index lives in the base runtime, so its files belong to the base checkpoint.
-        pipeline.index.save(base_checkpoint.to_string().into())?;
-        base_committer.commit()?.publish()?;
-        q3_committer.commit()?.publish()?;
-        drop(pipeline);
-
-        let mut pipeline = Pipeline::new(
-            config(&base_directory, Some(base_checkpoint))?,
-            config(&q3_directory, Some(q3_checkpoint))?,
-        )?;
-        pipeline.index.restore(base_checkpoint.to_string().into())?;
-        let mut reference = restored_reference;
-        let mut stats = Measurements::default();
-        let deletion = rf2_changes(&reference, &HashSet::from([20]));
-        transact(&mut pipeline, &mut reference, deletion, true, &mut stats)?;
-        assert_eq!(stats.view_rows, Some(1));
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2644,37 +2591,26 @@ mod measurement_tests {
                 assert_eq!(phase("index_ms"), 0.0);
             }
         }
-        // Two runtimes, each with its own storage directory and its share of the cache.
-        let circuits = &output["configuration"]["circuits"];
-        assert_eq!(
-            circuits["base"]["cache_mib"].as_u64().unwrap()
-                + circuits["q3"]["cache_mib"].as_u64().unwrap(),
-            8
-        );
-        assert_ne!(
-            circuits["base"]["storage_path"],
-            circuits["q3"]["storage_path"]
-        );
-        let by_circuit = &output["sequence"]["circuits"];
-        assert!(
-            by_circuit["base"]["observed_storage_bytes"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(by_circuit["q3"]["observed_storage_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(
-            output["sequence"]["cache_capacity_bytes"].as_u64().unwrap(),
-            by_circuit["base"]["cache_capacity_bytes"].as_u64().unwrap()
-                + by_circuit["q3"]["cache_capacity_bytes"].as_u64().unwrap()
-        );
+        // One runtime, with one storage directory and the whole cache.
+        let runtime = &output["configuration"]["runtime"];
+        assert_eq!(runtime["cache_mib"].as_u64().unwrap(), 8);
+        assert!(runtime["storage_path"].is_string());
+        assert!(output["configuration"].get("circuits").is_none());
+        assert!(output["sequence"].get("circuits").is_none());
+        assert!(output["sequence"]["cache_capacity_bytes"].as_u64().unwrap() > 0);
+        // The CPU profiler's per-circuit time is reported for every refresh.
+        for refresh in refreshes {
+            let cpu = &refresh["profiled_cpu_ms"];
+            assert!(cpu["base"].as_f64().unwrap() >= 0.0, "{refresh}");
+            assert!(cpu["q3"].as_f64().unwrap() >= 0.0, "{refresh}");
+        }
         assert!(
             output["sequence"]["observed_storage_bytes"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 5);
+        assert_eq!(output["measurement_version"], 6);
         // Version 5 adds the merged index's run reads per reader, and where its runs were.
         const READERS: [&str; 4] = [
             "customers_after",
@@ -2800,12 +2736,10 @@ mod measurement_tests {
         }
         for refresh in refreshes {
             for side in ["before", "after"] {
-                for runtime in ["base_runtime", "q3_runtime"] {
-                    assert!(
-                        refresh["memory_pressure"][side][runtime].is_string(),
-                        "{refresh}"
-                    );
-                }
+                assert!(
+                    refresh["memory_pressure"][side]["runtime"].is_string(),
+                    "{refresh}"
+                );
             }
         }
         assert!(sequence["cache_occupancy_at_window_start_bytes"]

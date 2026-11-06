@@ -35,7 +35,7 @@ reports, over the repetitions:
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 5, a field is missing or not a finite non-negative number, a
+measurement version 6, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -52,7 +52,7 @@ from typing import Any
 from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, WRITE_OWNERS, index_read_problems,
                      owner_write_problems, view_read_problems)
 
-MEASUREMENT_VERSION = 5
+MEASUREMENT_VERSION = 6
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when

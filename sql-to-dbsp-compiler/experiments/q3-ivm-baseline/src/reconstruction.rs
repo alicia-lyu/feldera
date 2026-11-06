@@ -48,9 +48,10 @@ pub(crate) struct ManualIndex {
 }
 
 impl ManualIndex {
-    /// Starts the index's owner thread in `runtime`, which must be the base circuit's runtime:
-    /// the index is secondary storage of the base relations, so its thread, buffer cache and
-    /// storage directory are the base runtime's.
+    /// Starts the index's owner thread in `runtime`, the runtime that hosts the base and the view
+    /// circuit: the index is secondary storage of the base relations, so its thread, buffer cache
+    /// and storage directory are the runtime's. The view circuit's index readers use the same
+    /// buffer cache.
     pub(crate) fn new(runtime: &Runtime) -> Self {
         let (requests, incoming) = mpsc::channel();
         let parker = Parker::new();

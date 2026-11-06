@@ -196,6 +196,8 @@ The agent chose three settings, which are not yet confirmed: `--cache-bytes` is 
 
 Amended on 2026-10-26: the user confirmed the even cache split and the same memory target. The user rejected the `ManualIndex` binding; see "Merged-index maintenance in the base phase".
 
+Amended on 2026-11-05: the two circuits no longer run in separate runtimes, and the even cache split and per-runtime memory target are retired; see "One runtime for the base and view circuits". The two circuits, the net-delta chaining, and the measurement of the phases stand.
+
 ### 2026-10-23: Linux campaign refresh selection
 
 The user decided how `prepare_inputs.py` chooses refreshes:
@@ -220,13 +222,13 @@ Reporting rule: results always report the base and IVM phases side by side. An I
 
 ### 2026-10-26: Merged-index maintenance in the base phase
 
-`ManualIndex` binds to the base runtime. Its append and snapshot acquisition count in `base_ms`. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `combined_maintenance_ms` is renamed `ivm_ms` and equals `q3_ms`. The change alters what the phase means, so it is measurement version 4.
+`ManualIndex` binds to the base runtime. (Amended on 2026-11-05: there is one runtime for both circuits, and `ManualIndex` binds to it; the booking below stands.) Its append and snapshot acquisition count in `base_ms`. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `combined_maintenance_ms` is renamed `ivm_ms` and equals `q3_ms`. The change alters what the phase means, so it is measurement version 4.
 
 This supersedes the choice in "Separate base-table maintenance from IVM" that `ManualIndex` binds to the view runtime.
 
 ### 2026-10-26: Feldera's buffer cache stays warm at window start
 
-The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded per runtime (`cache_occupancy_at_window_start_bytes` in the `main.rs` report, under both the base and the view runtime). Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
+The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded (`cache_occupancy_at_window_start_bytes` in the `main.rs` report). Before 2026-11-05 it was recorded per runtime, under both the base and the view runtime; there is now one runtime and one cache. Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
 
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
 
@@ -282,10 +284,21 @@ In both workloads, RF2 deletes the lowest base Order keys, as an analytical data
 
 `RunReads`' `key_reads`, `value_reads`, and `weight_reads` are renamed `key_decodes`, `value_decodes`, and `weight_decodes`. They count entries deserialized from file runs, which usually come from the buffer cache, not disk reads. Storage traffic is reported by the backend read counters beside them.
 
+### 2026-11-05: One runtime for the base and view circuits
+
+The base circuit and the view circuit run in one DBSP runtime, with one storage directory and one buffer cache of `--cache-bytes`. `Runtime::init_circuits` builds both on the same worker and returns one `DBSPHandle` per circuit. The runtime keeps the one worker of 2026-10-12.
+
+Why: DBSP builds one runtime per circuit, and the harness split Q3 into two circuits (2026-10-23) only to bound the measurement. That split also isolated the buffer caches. `ManualIndex` wrote the index into the base runtime's cache, while the index readers ran on the view worker and read through the view runtime's cache, because a file reader resolves the cache of the reading thread at read time. Reconstructed mode therefore missed on the first touch of every index block in every refresh. The diagnostic of 2026-11-05 warmed the view cache once, and backend reads fell to 0 with identical decode counts. Native's traces are written and read through one cache.
+
+What stays: two generated circuits and two transactions per refresh. The base transaction commits first. The index append and the snapshot publication happen between the two transactions, since they need the base commit's net delta. Index upkeep stays in `base_ms`, and the read and write owners are unchanged. The base/view split is now only a measurement boundary: transaction boundaries tell the phases apart, and the CPU profiler's per-circuit step CPU time (`profiled_cpu_ms`) cross-checks the timers. This is measurement version 6.
+
+This supersedes the separate runtimes of 2026-10-23, its even cache split and per-runtime memory target, the base-runtime cache binding of 2026-10-26 "Merged-index maintenance in the base phase" (the phase booking stands), and the per-runtime occupancy of 2026-10-26 "Feldera's buffer cache stays warm at window start".
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |
 | 2026-09-28 | Compose the Q3 circuit by hand; compiler shape control is an optional later route. | 2026-10-12: the compiler hook is the current approach. 2026-10-29: hand-written again, for the shared-traversal mode only. |

@@ -245,6 +245,10 @@ produced will look like this^[1]:
 
 [1] Note: the compiler output changes as the compiler implementation
     evolves.  This code is shown for illustrative purposes only.
+    In particular, the body of the closure passed to `Runtime::init_circuit`
+    is now a separate public function, `build(circuit: &mut RootCircuit)`,
+    which `circuit` calls.  A caller can pass several programs' `build`
+    functions to `Runtime::init_circuits` to run the circuits in one runtime.
 
 ```rust
 $ cat ../temp/src/lib.rs

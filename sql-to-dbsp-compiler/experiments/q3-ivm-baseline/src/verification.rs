@@ -343,7 +343,7 @@ fn publish(
 #[test]
 fn rf1_rf2_transcript() -> Result<()> {
     let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
-    let mut pipeline = Pipeline::new(config(), config())?;
+    let mut pipeline = Pipeline::new(config())?;
     let mut state = Reference::default();
     let mut transcript = Vec::new();
 

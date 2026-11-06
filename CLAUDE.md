@@ -65,13 +65,14 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 - **Native:** ordinary Feldera state. The two joins keep four integrator traces.
 - **Reconstructed:** those four traces are not built. The join reads requested key ranges from a secondary "COL" merged index (folded keys: customer > order > line). The index is maintained outside the circuit on an auxiliary thread, and its before/after snapshots are published before each transaction.
 
-The harness runs two chained circuits in two DBSP runtimes (user decision of 2026-10-23). The base circuit (`base.sql`) holds the primary-key base tables. The view circuit (`q3.sql`, keyless Z-set tables plus `V`) maintains `V` from the base circuit's net delta. `--q3-merged-index` applies to the view circuit only. `ManualIndex` binds to the base runtime (auxiliary thread, buffer cache, storage), not the view runtime, so its upkeep is base maintenance (user decision of 2026-10-26): `base_ms` includes `index_ms`, and `ivm_ms` equals `q3_ms`. Always report the base and IVM phases side by side.
+The harness runs two chained circuits in one DBSP runtime (user decisions of 2026-10-23 and 2026-11-05), with one storage directory and one buffer cache. The base circuit (`base.sql`) holds the primary-key base tables. The view circuit (`q3.sql`, keyless Z-set tables plus `V`) maintains `V` from the base circuit's net delta. `--q3-merged-index` applies to the view circuit only. The base transaction commits before the view transaction starts, and the phases are told apart by those boundaries; the CPU profiler's per-circuit step CPU time (`profiled_cpu_ms`) is a cross-check. `ManualIndex` runs on an auxiliary thread of the runtime and writes through the runtime's buffer cache, which the view circuit's index readers also use. Its upkeep is base maintenance (user decision of 2026-10-26): `base_ms` includes `index_ms`, and `ivm_ms` equals `q3_ms`. Always report the base and IVM phases side by side.
 
 ### Where the code lives
 
 | Piece | Location |
 | --- | --- |
 | Key trie (`trie.rs`), order-preserving key encoders, packed payload encoders (`packed.rs`), folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
+| Several circuits in one runtime (`Runtime::init_circuits`, `CircuitConstructor`, one `DBSPHandle` per circuit); each generated crate exports `build` beside `circuit` | `crates/dbsp/src/circuit/dbsp_handle.rs`; `ToRustVisitor.java` |
 | Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | Q3 readers, `Q3State`, and the COL storage tests | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
@@ -108,6 +109,7 @@ The COL library tests with `cargo +1.96.1 test --offline --locked` in its own di
   - The harness's `prepare` rejects such changes.
   - Reaching the circuit any other way hits `expect` in `merged-index-col/src/q3.rs` and panics the worker.
 - **Uniqueness.** Folded keys are unique because of the base tables' primary keys; no separate validator is needed. The merged index is fed the base circuit's net delta (`workload::net_delta`, via `reconstruction::prepare`), not the driver's logical change, so an upsert reaches it as a deletion of the old row and an insertion of the new one.
+- **One runtime, two handles.** The handles share the runtime and its one worker thread, so `run_reads()` (a per-thread total) reports the same answer from either handle; the harness takes it around the view transaction, when only the view circuit runs. Checkpointing a runtime with several circuits is unsupported (`init_circuits` rejects an initial checkpoint), so the harness has no checkpoint test.
 - **Net delta.** The base tables' delta streams stay idle until `workload::enable_net_delta` enables them, which `Pipeline::new` does. Reading `net_delta` drains them, and reading a snapshot through `BaseState::new` consumes it, so take one `BaseState` per transaction. Deletions in the view circuit need the complete row (`DeleteStyle::WholeRow`); the base circuit deletes by key.
 
 ### Trusting the docs
