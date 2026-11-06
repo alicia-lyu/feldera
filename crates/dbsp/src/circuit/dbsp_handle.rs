@@ -3064,7 +3064,7 @@ pub(crate) mod tests {
     use std::fs::{File, create_dir_all};
     use std::io;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::{fs, vec};
 
@@ -3073,15 +3073,21 @@ pub(crate) mod tests {
     use crate::circuit::CircuitConfig;
     use crate::circuit::checkpointer::Checkpointer;
     use crate::circuit::runtime::{TOKIO_WORKER_INDEX, current_thread_type};
-    use crate::dynamic::{ClonableTrait, DowncastTrait, DynData, Erase};
+    use crate::dynamic::pair::DynPair;
+    use crate::dynamic::{ClonableTrait, DowncastTrait, DynData, DynWeightedPairs, Erase, LeanVec};
     use crate::operator::Generator;
     use crate::operator::TraceBound;
     use crate::storage::backend::StorageError;
-    use crate::trace::{BatchReaderFactories, Filter, Spine, Trace, TraceRole};
+    use crate::storage::buffer_cache::{CacheAccess, CacheStats};
+    use crate::trace::ord::FileIndexedWSet;
+    use crate::trace::{
+        Batch, BatchLocation, BatchReader, BatchReaderFactories, FileIndexedWSetFactories, Filter,
+        Spine, Trace, TraceRole, cursor::Cursor,
+    };
     use crate::utils::Tup2;
     use crate::{
-        Circuit, DBSPHandle, Error as DbspError, IndexedZSetHandle, InputHandle, OrdZSet,
-        OutputHandle, RootCircuit, Runtime, RuntimeError, ZSetHandle, ZWeight,
+        Circuit, DBSPHandle, DynZWeight, Error as DbspError, IndexedZSetHandle, InputHandle,
+        OrdZSet, OutputHandle, RootCircuit, Runtime, RuntimeError, ZSetHandle, ZWeight,
     };
     use anyhow::anyhow;
     use feldera_buffer_cache::ThreadType;
@@ -3755,6 +3761,137 @@ pub(crate) mod tests {
         let mut second = circuits.pop().unwrap().0;
         let mut first = circuits.pop().unwrap().0;
         assert_eq!(first.run_reads().unwrap(), second.run_reads().unwrap());
+    }
+
+    /// A file-backed batch, handed from one circuit's step to another's.
+    type HandedBatch = FileIndexedWSet<DynData, DynData, DynZWeight>;
+
+    /// A circuit whose step builds a file-backed batch into `slot`.
+    fn batch_writer(slot: Arc<Mutex<Option<HandedBatch>>>) -> CircuitConstructor<()> {
+        CircuitConstructor::new(move |circuit: &mut RootCircuit| {
+            let slot = slot.clone();
+            circuit.add_source(Generator::new(move || {
+                let mut slot = slot.lock().unwrap();
+                if slot.is_none() {
+                    let factories = FileIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+                        u64,
+                        u64,
+                        ZWeight,
+                    >();
+                    let mut tuples: Box<DynWeightedPairs<DynPair<DynData, DynData>, DynZWeight>> =
+                        Box::new(LeanVec::from(
+                            (0..10_000u64)
+                                .map(|key| Tup2(Tup2(key, key), 1))
+                                .collect::<Vec<_>>(),
+                        ))
+                        .erase_box();
+                    *slot = Some(HandedBatch::dyn_from_tuples(&factories, (), &mut tuples));
+                }
+            }));
+            Ok(())
+        })
+    }
+
+    /// A circuit whose step reads every entry of the batch in `slot`, once the
+    /// writer has put it there, and records where the batch lives and the
+    /// cache accesses of its file by then.
+    fn batch_reader(
+        slot: Arc<Mutex<Option<HandedBatch>>>,
+        observed: Arc<Mutex<Option<(BatchLocation, CacheStats)>>>,
+    ) -> CircuitConstructor<()> {
+        CircuitConstructor::new(move |circuit: &mut RootCircuit| {
+            let (slot, observed) = (slot.clone(), observed.clone());
+            circuit.add_source(Generator::new(move || {
+                let slot = slot.lock().unwrap();
+                let mut observed = observed.lock().unwrap();
+                let Some(batch) = slot.as_ref() else { return };
+                if observed.is_some() {
+                    return;
+                }
+                let mut cursor = batch.cursor();
+                while cursor.key_valid() {
+                    while cursor.val_valid() {
+                        std::hint::black_box(cursor.key());
+                        std::hint::black_box(cursor.val());
+                        std::hint::black_box(cursor.weight());
+                        cursor.step_val();
+                    }
+                    cursor.step_key();
+                }
+                *observed = Some((batch.location(), batch.cache_stats()));
+            }));
+            Ok(())
+        })
+    }
+
+    /// Cache accesses of `access` kind that `stats` counts, over all threads.
+    fn accesses(stats: CacheStats, access: CacheAccess) -> u64 {
+        stats
+            .0
+            .values()
+            .map(|by_access| by_access[access].count)
+            .sum()
+    }
+
+    /// A file that one circuit wrote is read from the cache by the other, as
+    /// they share the runtime's cache. The writer caches the blocks it writes,
+    /// and the reader finds them without going to storage.
+    #[test]
+    fn init_circuits_read_each_others_cached_blocks() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let slot = Arc::new(Mutex::new(None));
+        let observed = Arc::new(Mutex::new(None));
+        let mut circuits = Runtime::init_circuits(
+            mkconfig(temp.path()),
+            vec![
+                batch_writer(slot.clone()),
+                batch_reader(slot, observed.clone()),
+            ],
+        )
+        .unwrap();
+        let (mut reader, _) = circuits.pop().unwrap();
+        let (mut writer, _) = circuits.pop().unwrap();
+
+        writer.transaction().unwrap();
+        reader.transaction().unwrap();
+
+        let (location, stats) = observed.lock().unwrap().take().expect("reader ran");
+        assert_eq!(location, BatchLocation::Storage);
+        assert!(stats.0[ThreadType::Foreground][CacheAccess::Hit].count > 0);
+        assert_eq!(accesses(stats, CacheAccess::Miss), 0);
+        writer.kill().unwrap();
+        reader.kill().unwrap();
+    }
+
+    /// Control for the test above: with a runtime, and so a cache, per
+    /// circuit, the reader misses on the blocks that the writer cached.
+    #[test]
+    fn separate_runtimes_miss_each_others_blocks() {
+        let (writer_temp, reader_temp) = (tempdir().unwrap(), tempdir().unwrap());
+        let slot = Arc::new(Mutex::new(None));
+        let observed = Arc::new(Mutex::new(None));
+        // One `init_circuits` call per circuit gives each its own runtime.
+        let (mut writer, _) = Runtime::init_circuits(
+            mkconfig(writer_temp.path()),
+            vec![batch_writer(slot.clone())],
+        )
+        .unwrap()
+        .remove(0);
+        let (mut reader, _) = Runtime::init_circuits(
+            mkconfig(reader_temp.path()),
+            vec![batch_reader(slot, observed.clone())],
+        )
+        .unwrap()
+        .remove(0);
+
+        writer.transaction().unwrap();
+        reader.transaction().unwrap();
+
+        let (location, stats) = observed.lock().unwrap().take().expect("reader ran");
+        assert_eq!(location, BatchLocation::Storage);
+        assert!(accesses(stats, CacheAccess::Miss) > 0);
+        writer.kill().unwrap();
+        reader.kill().unwrap();
     }
 
     pub(crate) fn mkconfig(path: &Path) -> CircuitConfig {

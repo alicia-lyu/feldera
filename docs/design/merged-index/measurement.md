@@ -143,6 +143,7 @@ The view worker's run reads, summed over the sequence and the owners, with the p
 | scattered | reconstructed | 1,110 | 30 | 567 | 567 | 566 | 83 | 192 |
 
 - **Run reads are unchanged.** Every seek, filter rejection, and decode count equals the version 5 figure, in both modes and both workloads. Version 6 changes where the blocks are cached and which thread writes them, not what a probe reads from a run. In reconstructed mode the `merged_index` owner accounts for all the filter rejections and decodes and for most of the seeks (clustered 974 of 1,090, scattered 990 of 1,110); the rest are other owners' reads of the view circuit. Native's `merged_index` owner reads nothing.
+- **The shared cache is tested directly.** The DBSP tests `init_circuits_read_each_others_cached_blocks` and `separate_runtimes_miss_each_others_blocks` (`crates/dbsp/src/circuit/dbsp_handle.rs`) back the claim that a block one circuit wrote is a cache hit for the other. A file-backed batch built in one circuit's step is read in full by the other's step: on one runtime the file's foreground cache accesses are hits and none is a miss; on two runtimes (the version 5 arrangement) the reader misses.
 - **Backend reads in reconstructed mode fell, but not to native's level.** Clustered went from 169 to 72, scattered from 192 to 83. Native's moved by a few blocks (6 to 7, 9 to 11), as it did between version 5 runs. Reconstructed mode still reads more than native, per refresh:
 
   | Mode | Clustered, per refresh | Scattered, per refresh |
