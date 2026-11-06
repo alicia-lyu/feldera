@@ -103,6 +103,10 @@ public class ToRustVisitor extends CircuitVisitor {
     protected final IIndentStream builder;
     public final ToRustInnerVisitor innerVisitor;
     final boolean useHandles;
+    /** Name of the generated type whose associated function `build` constructs the circuit.
+     * The compiler does not otherwise generate Rust items with this name (user types are named
+     * after a hash), and a user function cannot clash with a type that has no value. */
+    public static final String CIRCUIT_TYPE_NAME = "SqlCircuit";
     /** How are nodes named in Rust?  false - human-friendly, true - compiler-friendly */
     boolean preferHash = false;
     final CompilerOptions options;
@@ -332,6 +336,15 @@ public class ToRustVisitor extends CircuitVisitor {
 
         // The constructor of the circuit is a separate function, so that a caller can build several
         // circuits in one runtime (Runtime::init_circuits) instead of calling `circuit` for each.
+        // It is an associated function of a type, which lives in the type's namespace, so that it
+        // cannot shadow or duplicate a user function named `build`, which the generated code calls
+        // by its bare name. The type is an empty enum, not a unit struct: a unit struct also
+        // defines a value of the same name, which would shadow a user function named `SqlCircuit`.
+        this.builder.append("pub enum " + CIRCUIT_TYPE_NAME + " {}")
+                .newline()
+                .newline()
+                .append("impl " + CIRCUIT_TYPE_NAME + " {")
+                .increase();
         this.builder.append("pub fn build(circuit: &mut RootCircuit");
         if (this.q3MergedIndexBinding != null)
             this.builder.append(", q3_state: merged_index_col::q3::Q3State");
@@ -405,6 +418,9 @@ public class ToRustVisitor extends CircuitVisitor {
                 .decrease()
                 .append("}")
                 .newline()
+                .decrease()
+                .append("}")
+                .newline()
                 .newline();
 
         // The entry point for a caller that wants a circuit in a runtime of its own.
@@ -429,8 +445,8 @@ public class ToRustVisitor extends CircuitVisitor {
                         "let (mut circuit, streams) = Runtime::init_circuit(cconf, move |circuit| {")
                 .increase()
                 .append(this.q3MergedIndexBinding == null ?
-                        "build(circuit).map_err(Into::into)" :
-                        "build(circuit, q3_state).map_err(Into::into)")
+                        CIRCUIT_TYPE_NAME + "::build(circuit).map_err(Into::into)" :
+                        CIRCUIT_TYPE_NAME + "::build(circuit, q3_state).map_err(Into::into)")
                 .newline()
                 .decrease()
                 .append("})?;")

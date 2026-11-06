@@ -246,9 +246,18 @@ produced will look like this^[1]:
 [1] Note: the compiler output changes as the compiler implementation
     evolves.  This code is shown for illustrative purposes only.
     In particular, the body of the closure passed to `Runtime::init_circuit`
-    is now a separate public function, `build(circuit: &mut RootCircuit)`,
-    which `circuit` calls.  A caller can pass several programs' `build`
+    is now a separate public function, `SqlCircuit::build(circuit: &mut RootCircuit)`,
+    which `circuit` calls.  A caller can pass several programs' `SqlCircuit::build`
     functions to `Runtime::init_circuits` to run the circuits in one runtime.
+    `build` is an associated function of the generated empty enum `SqlCircuit`
+    (the circuit's type, never instantiated), so that it lives in that type's namespace.
+    A user-defined function named `build` (a Rust function in `udf.rs`, or one with
+    a SQL body) neither shadows it nor is shadowed by it, and generated code that
+    calls the user's function by its bare name keeps calling it.  The entry point
+    `circuit` (named after the program) is a free function of the crate root and
+    has no such protection: a user function with the same name would shadow
+    the glob-imported one.  It predates `SqlCircuit` and the pipeline manager calls
+    it, so it is unchanged.
 
 ```rust
 $ cat ../temp/src/lib.rs
