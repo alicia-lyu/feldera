@@ -413,7 +413,9 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - Every index entry has its own key, where a native trace groups values under one.
      - Each scan opens a cursor and ends past its range.
 
-     *Rerun on 2026-11-05* with exact path reads ([measurement.md](measurement.md#exact-path-reads-2026-11-05)): reconstructed mode seeks about 2.3 times as often as native and decodes about 2.9 times the keys and 1.2 to 1.3 times the values. `J⁺` skips one seek per new Order through the file filter. Backend reads are not comparable yet: the index's blocks are cached in the base runtime, which writes them, not the view runtime, which reads them.
+     *Rerun on 2026-11-05* with exact path reads ([measurement.md](measurement.md#exact-path-reads-2026-11-05)): reconstructed mode seeks about 2.3 times as often as native and decodes about 2.9 times the keys and 1.2 to 1.3 times the values. `J⁺` skips one seek per new Order through the file filter. Backend reads were not comparable in that run: the index's blocks were cached in the base runtime, which wrote them, not the view runtime, which read them.
+
+     *Rerun on 2026-11-05* in one runtime with one buffer cache ([measurement.md](measurement.md#one-runtime-version-6-2026-11-05)): every run-read count equals the exact-path run's, in both workloads and modes. Reconstructed backend reads fell from 169 to 72 (clustered) and from 192 to 83 (scattered); native read 7 and 11. At a 256 MiB cache (clustered only), both modes made no backend reads, so the remaining reads at 32 MiB depend on cache capacity, not on placement.
 
      Steps 2, 5 and 6 address the per-scan cursors, the repeated customer reads, and the landings that take nothing. The per-run multiplier of a logical seek depends on compaction, which no step changes.
    - *Exit:* DBSP unit tests (filter `run_reads`) pin the counts of single moves on an in-memory run and a file run, and one seek per run through `CursorList`. A COL test pins today's four readers on the worked transaction (without `v2` and `v8`, since COL has no invoices), over a file run plus an in-memory run.

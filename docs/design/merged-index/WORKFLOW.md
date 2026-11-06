@@ -36,8 +36,9 @@ configuration. No multiworker extension is planned.
 Run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`. `generate.sh` writes the git-ignored
 `q3-base-circuit/src/{lib,stubs}.rs` from `base.sql`, and `q3-view-circuit/src/{lib,stubs}.rs` and
 `plan.json` from `q3.sql` (Catalog mode, default optimization level 2). The two circuits are the
-base tables and the view; `query.sql` stays the logical definition. Run it before building or
-testing a fresh checkout.
+base tables and the view; `query.sql` stays the logical definition. The driver builds both in one
+DBSP runtime, with one storage directory and one buffer cache (`--cache-bytes`). Run it before
+building or testing a fresh checkout.
 
 `generate.sh` stops with a message if `src/lib.rs` or `src/stubs.rs` exists in the experiment.
 Those are stale files from before the base/view split. They are untracked and no longer
