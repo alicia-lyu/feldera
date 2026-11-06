@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::Duration;
 use std::{
     collections::HashSet,
@@ -755,16 +755,62 @@ impl Runtime {
         F: FnOnce(&mut RootCircuit) -> Result<T, AnyError> + Clone + Send + 'static,
         T: Send + 'static,
     {
+        let mut circuits = Self::init_circuits(config, vec![CircuitConstructor::new(constructor)])?;
+        Ok(circuits.remove(0))
+    }
+
+    /// Instantiate several circuits in one multithreaded runtime.
+    ///
+    /// Like [`Self::init_circuit`], but every `constructor` builds one circuit
+    /// on the runtime's workers, in the order given. The circuits share the
+    /// runtime, and so its storage directory, its buffer caches, and its worker
+    /// threads. Each circuit is controlled through its own [`DBSPHandle`], and a
+    /// handle's commands act on its circuit alone. Returns one handle, with the
+    /// constructor's value, per constructor, in the same order.
+    ///
+    /// The runtime stops when the last handle is dropped or killed, or when
+    /// any handle meets a fatal error. Commands from different handles are
+    /// serialized, so handles may be used from different threads.
+    ///
+    /// Checkpointing is not supported for more than one circuit: the circuits
+    /// would share one checkpoint directory. Passing an initial checkpoint is
+    /// an error.
+    ///
+    /// Commands that concern the runtime rather than a circuit report the
+    /// same answer from every handle; [`DBSPHandle::run_reads`] is one.
+    pub fn init_circuits<T>(
+        config: impl Into<CircuitConfig>,
+        constructors: Vec<CircuitConstructor<T>>,
+    ) -> Result<Vec<(DBSPHandle, T)>, DbspError>
+    where
+        T: Send + 'static,
+    {
+        assert!(
+            !constructors.is_empty(),
+            "init_circuits needs at least one circuit constructor"
+        );
         let config: CircuitConfig = config.into();
         let nworkers = config.layout.local_workers().len();
+        let ncircuits = constructors.len();
+        if ncircuits > 1
+            && config
+                .storage
+                .as_ref()
+                .is_some_and(|storage| storage.init_checkpoint.is_some())
+        {
+            return Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(
+                "a runtime with several circuits cannot restore an initial checkpoint".to_string(),
+            )));
+        }
 
-        // When a worker finishes building the circuit, it sends completion status back
+        // When a worker finishes building the circuits, it sends completion status back
         // to us via this channel.  The function returns after receiving a
         // notification from each worker.
         let (init_senders, init_receivers): (Vec<_>, Vec<_>) =
             (0..nworkers).map(|_| bounded(0)).unzip();
 
-        // Channels used to send commands to workers.
+        // Channels used to send commands to workers. Each command names the
+        // circuit it is for.
         let (command_senders, command_receivers): (Vec<_>, Vec<_>) =
             (0..nworkers).map(|_| bounded(1)).unzip();
 
@@ -783,38 +829,49 @@ impl Runtime {
             let status_sender = status_senders.into_iter().nth(worker_index).unwrap();
             let command_receiver = command_receivers.into_iter().nth(worker_index).unwrap();
 
-            // Retain a copy of the constructor: `Command::CreateBootstrapCircuit`
-            // re-runs it to build a structurally identical second circuit.
-            let bootstrap_constructor = constructor.clone();
-
-            let circuit_fn = |circuit: &mut RootCircuit| {
-                let profiler = Profiler::new(circuit);
-                constructor(circuit).map(|res| (res, profiler))
-            };
-            let (mut circuit, profiler) = match RootCircuit::build(circuit_fn) {
-                Ok((circuit, (res, profiler))) => {
-                    if init_sender.send(Ok((res, circuit.fingerprint()))).is_err() {
+            // Build the circuits in order. Each slot retains its constructor:
+            // `Command::CreateBootstrapCircuit` re-runs it to build a
+            // structurally identical second copy of that circuit.
+            let mut slots: Vec<CircuitSlot<T>> = Vec::with_capacity(constructors.len());
+            let mut built = Vec::with_capacity(constructors.len());
+            for constructor in constructors {
+                let circuit_fn = |circuit: &mut RootCircuit| {
+                    let profiler = Profiler::new(circuit);
+                    constructor.construct(circuit).map(|res| (res, profiler))
+                };
+                match RootCircuit::build(circuit_fn) {
+                    Ok((circuit, (res, profiler))) => {
+                        built.push((res, circuit.fingerprint()));
+                        slots.push(CircuitSlot {
+                            circuit,
+                            profiler,
+                            bootstrap_circuit: None,
+                            constructor,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = init_sender.send(Err(e));
                         return;
                     }
-                    (circuit, profiler)
                 }
-                Err(e) => {
-                    let _ = init_sender.send(Err(e));
-                    return;
-                }
-            };
-
-            // The bootstrap circuit (the second copy of the circuit used by
-            // concurrent bootstrapping), when one exists.  All workers
-            // create, step, and destroy their bootstrap circuits in lockstep
-            // through broadcast commands; this keeps the per-worker
-            // `Runtime::sequence_next` counters, which assign exchange ids,
-            // identical across workers.
-            let mut bootstrap_circuit: Option<CircuitHandle> = None;
+            }
+            if init_sender.send(Ok(built)).is_err() {
+                return;
+            }
 
             while !Runtime::kill_in_progress() {
                 // Wait for command.
-                match command_receiver.try_recv() {
+                let (circuit_index, received) = match command_receiver.try_recv() {
+                    Ok((circuit_index, command)) => (circuit_index, Ok(command)),
+                    Err(error) => (0, Err(error)),
+                };
+                let CircuitSlot {
+                    circuit,
+                    profiler,
+                    bootstrap_circuit,
+                    constructor: bootstrap_constructor,
+                } = &mut slots[circuit_index];
+                match received {
                     Ok(Command::Transaction) => {
                         let status = circuit.transaction().map(|_| Response::Unit);
                         // Send response.
@@ -1031,8 +1088,8 @@ impl Runtime {
                             // hooks are circuit event handlers and do not
                             // affect node ids.
                             let constructor = bootstrap_constructor.clone();
-                            RootCircuit::build(move |circuit| constructor(circuit)).and_then(
-                                |(mut handle, _catalog)| {
+                            RootCircuit::build(move |circuit| constructor.construct(circuit))
+                                .and_then(|(mut handle, _catalog)| {
                                     // A fingerprint mismatch means the
                                     // constructor is nondeterministic, which
                                     // also desyncs the per-worker sequence
@@ -1057,10 +1114,9 @@ impl Runtime {
                                         Some(base) => handle.restore(base, true)?,
                                         None => None,
                                     };
-                                    bootstrap_circuit = Some(handle);
+                                    *bootstrap_circuit = Some(handle);
                                     Ok(Response::CheckpointRestored(replay_info))
-                                },
-                            )
+                                })
                         };
                         if status_sender.send(status).is_err() {
                             return;
@@ -1174,13 +1230,13 @@ impl Runtime {
         })?;
 
         // Receive initialization status from all workers and take the return
-        // value and fingerprint from the first worker, or the first error among
+        // values and fingerprints from the first worker, or the first error among
         // all the workers.
         //
-        // The return value should return be the same in all workers (we don't
+        // The return values should be the same in all workers (we don't
         // check).
         //
-        // The fingerprint might differ between workers (even if the circuit is
+        // The fingerprints might differ between workers (even if the circuits are
         // really the same, because of differing effects of e.g. the "gather"
         // operator).
         let result = init_receivers
@@ -1200,13 +1256,14 @@ impl Runtime {
                 }
             })
             .unwrap();
-        let (ret, fingerprint) = match result {
+        let built = match result {
             Err(error) => {
                 let _ = runtime.kill();
                 return Err(error);
             }
-            Ok(result) => result,
+            Ok(built) => built,
         };
+        debug_assert_eq!(built.len(), ncircuits);
 
         let (backend, init_checkpoint, defer_restore) = match storage {
             Some(storage) => (
@@ -1216,25 +1273,95 @@ impl Runtime {
             ),
             None => (None, None, false),
         };
-        let mut dbsp = DBSPHandle::new(
-            backend,
-            runtime,
-            command_senders,
-            status_receivers,
-            fingerprint,
-        )?;
-        // When `defer_restore` is set the caller drives a concurrent bootstrap
-        // (`start_concurrent_bootstrap`) instead of the automatic stop-the-world
-        // restore; the circuit comes up un-restored and the caller supplies the
-        // checkpoint base itself.
-        if let Some(init_checkpoint) = init_checkpoint
-            && !defer_restore
-        {
-            dbsp.send_restore(init_checkpoint.to_string().into())?;
-        }
 
-        Ok((dbsp, ret))
+        // All handles share the runtime and the channels; `round_trip` keeps
+        // one command's replies from being taken by another handle.
+        let runtime = Arc::new(runtime);
+        let round_trip = Arc::new(Mutex::new(()));
+        let mut circuits = Vec::with_capacity(ncircuits);
+        for (circuit_index, (ret, fingerprint)) in built.into_iter().enumerate() {
+            let mut dbsp = DBSPHandle::new(
+                backend.clone(),
+                Arc::clone(&runtime),
+                circuit_index,
+                Arc::clone(&round_trip),
+                command_senders.clone(),
+                status_receivers.clone(),
+                fingerprint,
+            )?;
+            // When `defer_restore` is set the caller drives a concurrent bootstrap
+            // (`start_concurrent_bootstrap`) instead of the automatic stop-the-world
+            // restore; the circuit comes up un-restored and the caller supplies the
+            // checkpoint base itself.
+            if let Some(init_checkpoint) = &init_checkpoint
+                && !defer_restore
+            {
+                dbsp.send_restore(init_checkpoint.to_string().into())?;
+            }
+            circuits.push((dbsp, ret));
+        }
+        Ok(circuits)
     }
+}
+
+/// The constructor of one circuit, for [`Runtime::init_circuits`].
+///
+/// It is the closure that [`Runtime::init_circuit`] takes, with its type
+/// erased so that circuits built by different closures can share a runtime.
+pub struct CircuitConstructor<T>(Box<dyn ConstructCircuit<T>>);
+
+impl<T: 'static> CircuitConstructor<T> {
+    pub fn new<F>(constructor: F) -> Self
+    where
+        F: FnOnce(&mut RootCircuit) -> Result<T, AnyError> + Clone + Send + 'static,
+    {
+        Self(Box::new(constructor))
+    }
+
+    /// Builds the circuit in `circuit`, from a copy of the constructor.
+    fn construct(&self, circuit: &mut RootCircuit) -> Result<T, AnyError> {
+        self.0.construct(circuit)
+    }
+}
+
+impl<T: 'static> Clone for CircuitConstructor<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone_boxed())
+    }
+}
+
+/// Object-safe view of a cloneable `FnOnce` constructor.
+trait ConstructCircuit<T>: Send {
+    fn construct(&self, circuit: &mut RootCircuit) -> Result<T, AnyError>;
+    fn clone_boxed(&self) -> Box<dyn ConstructCircuit<T>>;
+}
+
+impl<T, F> ConstructCircuit<T> for F
+where
+    T: 'static,
+    F: FnOnce(&mut RootCircuit) -> Result<T, AnyError> + Clone + Send + 'static,
+{
+    fn construct(&self, circuit: &mut RootCircuit) -> Result<T, AnyError> {
+        self.clone()(circuit)
+    }
+
+    fn clone_boxed(&self) -> Box<dyn ConstructCircuit<T>> {
+        Box::new(self.clone())
+    }
+}
+
+/// One circuit on a worker, with the state that goes with it.
+struct CircuitSlot<T> {
+    circuit: CircuitHandle,
+    profiler: Profiler,
+    /// The bootstrap circuit (the second copy of the circuit used by
+    /// concurrent bootstrapping), when one exists.  All workers
+    /// create, step, and destroy their bootstrap circuits in lockstep
+    /// through broadcast commands; this keeps the per-worker
+    /// `Runtime::sequence_next` counters, which assign exchange ids,
+    /// identical across workers.
+    bootstrap_circuit: Option<CircuitHandle>,
+    constructor: CircuitConstructor<T>,
 }
 
 /// The error returned by bootstrap-circuit commands when no bootstrap
@@ -1421,14 +1548,23 @@ pub struct DBSPHandle {
     /// number of foreground and background threads.
     runtime_elapsed: Duration,
 
-    /// The underlying runtime.
+    /// The underlying runtime, shared with the handles of the other circuits
+    /// built by the same [`Runtime::init_circuits`] call.
     ///
     /// Normally this will be some runtime, but we take it out if we need to
-    /// kill the runtime.
-    runtime: Option<RuntimeHandle>,
+    /// kill the runtime. The last handle to let go of the runtime joins it.
+    runtime: Option<Arc<RuntimeHandle>>,
+
+    /// The position of this handle's circuit among the circuits of the
+    /// runtime. Every command names it.
+    circuit_index: usize,
+
+    /// Held for the duration of one command, so that handles on different
+    /// threads do not take each other's replies from the shared channels.
+    round_trip: Arc<Mutex<()>>,
 
     /// Channels used to send commands to workers.
-    command_senders: Vec<Sender<Command>>,
+    command_senders: Vec<Sender<(usize, Command)>>,
 
     /// Channels used to receive command completion status from workers.
     status_receivers: Vec<Receiver<Result<Response, DbspError>>>,
@@ -1507,8 +1643,10 @@ impl WorkersCommitProgress {
 impl DBSPHandle {
     fn new(
         backend: Option<Arc<dyn StorageBackend>>,
-        runtime: RuntimeHandle,
-        command_senders: Vec<Sender<Command>>,
+        runtime: Arc<RuntimeHandle>,
+        circuit_index: usize,
+        round_trip: Arc<Mutex<()>>,
+        command_senders: Vec<Sender<(usize, Command)>>,
         status_receivers: Vec<Receiver<Result<Response, DbspError>>>,
         fingerprint: u64,
     ) -> Result<Self, DbspError> {
@@ -1531,6 +1669,8 @@ impl DBSPHandle {
         Ok(Self {
             start_time: Instant::now(),
             runtime: Some(runtime),
+            circuit_index,
+            round_trip,
             command_senders,
             status_receivers,
             checkpointer,
@@ -1549,10 +1689,23 @@ impl DBSPHandle {
         self.runtime.as_ref().unwrap().runtime()
     }
 
+    /// Lets go of the runtime; the last handle to do so kills and joins it.
     fn kill_inner(&mut self) -> ThreadResult<()> {
         self.command_senders.clear();
         self.status_receivers.clear();
-        self.runtime.take().unwrap().kill()
+        match Arc::into_inner(self.runtime.take().unwrap()) {
+            Some(runtime) => runtime.kill(),
+            None => Ok(()),
+        }
+    }
+
+    /// Stops the whole runtime, including the other circuits' handles, after
+    /// an error that leaves the workers in an unknown state.
+    fn abort_runtime(&mut self) -> ThreadResult<()> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.kill_async();
+        }
+        self.kill_inner()
     }
 
     fn kill_async(&mut self) {
@@ -1580,10 +1733,12 @@ impl DBSPHandle {
         if self.runtime.is_none() {
             return Err(DbspError::Runtime(RuntimeError::Terminated));
         }
+        let round_trip = Arc::clone(&self.round_trip);
+        let _round_trip = round_trip.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Send command.
         for (worker, sender) in self.command_senders.iter().enumerate() {
-            if sender.send(command.clone()).is_err() {
+            if sender.send((self.circuit_index, command.clone())).is_err() {
                 let panic_info = self.collect_panic_info().unwrap_or_default();
 
                 // Worker thread panicked. Exit without waiting for all workers to exit
@@ -1627,7 +1782,7 @@ impl DBSPHandle {
             match ready.recv(&self.status_receivers[worker]) {
                 Err(_) => return handle_panic(self),
                 Ok(Err(e)) => {
-                    let _ = self.kill_inner();
+                    let _ = self.abort_runtime();
                     return Err(e);
                 }
                 Ok(Ok(resp)) => handler(worker, resp),
@@ -1644,9 +1799,14 @@ impl DBSPHandle {
         if self.runtime.is_none() {
             return Err(DbspError::Runtime(RuntimeError::Terminated));
         }
+        let round_trip = Arc::clone(&self.round_trip);
+        let _round_trip = round_trip.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Send command.
-        if self.command_senders[worker].send(command.clone()).is_err() {
+        if self.command_senders[worker]
+            .send((self.circuit_index, command.clone()))
+            .is_err()
+        {
             let panic_info = self.collect_panic_info().unwrap_or_default();
 
             // Worker thread panicked. Exit without waiting for all workers to exit
@@ -1670,7 +1830,7 @@ impl DBSPHandle {
         let reply = match ready.recv(&self.status_receivers[worker]) {
             Err(_) => return handle_panic(self),
             Ok(Err(e)) => {
-                let _ = self.kill_inner();
+                let _ = self.abort_runtime();
                 return Err(e);
             }
             Ok(Ok(resp)) => resp,
@@ -1952,7 +2112,7 @@ impl DBSPHandle {
         })?;
         for i in 1..worker_outcomes.len() {
             if worker_outcomes[&i] != worker_outcomes[&0] {
-                let _ = self.kill_inner();
+                let _ = self.abort_runtime();
                 return Err(DbspError::Scheduler(SchedulerError::ReplayInfoConflict {
                     error: format!(
                         "worker 0 and worker {i} returned different outcomes during a \
@@ -2111,7 +2271,7 @@ impl DBSPHandle {
                 // Workers that disagree on the replay info have divergent
                 // scheduler state; the lockstep invariants are
                 // unrecoverable, so kill the pipeline.
-                let _ = self.kill_inner();
+                let _ = self.abort_runtime();
                 return Err(DbspError::Scheduler(SchedulerError::ReplayInfoConflict {
                     error: format!(
                         "worker 0 and worker {i} returned different replay info during {what}; \
@@ -2908,7 +3068,7 @@ pub(crate) mod tests {
     use std::time::Duration;
     use std::{fs, vec};
 
-    use super::CircuitStorageConfig;
+    use super::{CircuitConstructor, CircuitStorageConfig};
     use crate::algebra::OrdZSet as DynOrdZSet;
     use crate::circuit::CircuitConfig;
     use crate::circuit::checkpointer::Checkpointer;
@@ -2921,7 +3081,7 @@ pub(crate) mod tests {
     use crate::utils::Tup2;
     use crate::{
         Circuit, DBSPHandle, Error as DbspError, IndexedZSetHandle, InputHandle, OrdZSet,
-        OutputHandle, Runtime, RuntimeError, ZSetHandle, ZWeight,
+        OutputHandle, RootCircuit, Runtime, RuntimeError, ZSetHandle, ZWeight,
     };
     use anyhow::anyhow;
     use feldera_buffer_cache::ThreadType;
@@ -3515,6 +3675,86 @@ pub(crate) mod tests {
         assert_eq!(read(WriteOwner::BaseRelation), RunReads::default());
 
         circuit.kill().unwrap();
+    }
+
+    /// Two circuits on one runtime: each steps on its own handle, keeps its
+    /// own output, and the runtime outlives the first handle dropped.
+    #[test]
+    fn init_circuits_steps_circuits_independently() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let shifting = |shift: u64| {
+            CircuitConstructor::new(move |circuit: &mut RootCircuit| {
+                let (stream, input) = circuit.add_input_zset::<u64>();
+                let output = stream.map(move |key| *key + shift).output();
+                Ok((input, output))
+            })
+        };
+        let mut circuits =
+            Runtime::init_circuits(mkconfig(temp.path()), vec![shifting(100), shifting(200)])
+                .unwrap();
+        let (mut second, (second_input, second_output)) = circuits.pop().unwrap();
+        let (mut first, (first_input, first_output)) = circuits.pop().unwrap();
+
+        first_input.push(1, 1);
+        first.transaction().unwrap();
+        assert_eq!(first_output.consolidate(), crate::zset! { 101u64 => 1 });
+        // The second circuit has seen no input and no step.
+        assert!(second_output.consolidate().is_empty());
+
+        second_input.push(2, 1);
+        second.transaction().unwrap();
+        assert_eq!(second_output.consolidate(), crate::zset! { 202u64 => 1 });
+        assert!(first_output.consolidate().is_empty());
+
+        // The runtime stays up while one handle remains.
+        drop(first);
+        second_input.push(3, 1);
+        second.transaction().unwrap();
+        assert_eq!(second_output.consolidate(), crate::zset! { 203u64 => 1 });
+        second.kill().unwrap();
+    }
+
+    /// The circuits' workers read through one buffer cache.
+    #[test]
+    fn init_circuits_share_the_buffer_cache() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let cache_address = || {
+            CircuitConstructor::new(|_circuit: &mut RootCircuit| {
+                Ok(Arc::as_ptr(&Runtime::buffer_cache().unwrap()) as usize)
+            })
+        };
+        let circuits = Runtime::init_circuits(
+            mkconfig(temp.path()),
+            vec![cache_address(), cache_address()],
+        )
+        .unwrap();
+        assert_eq!(circuits[0].1, circuits[1].1);
+    }
+
+    /// Several circuits cannot restore one checkpoint directory.
+    #[test]
+    fn init_circuits_rejects_an_initial_checkpoint() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let mut config = mkconfig(temp.path());
+        config.storage.as_mut().unwrap().init_checkpoint = Some(Uuid::now_v7());
+        let nothing = || CircuitConstructor::new(|_circuit: &mut RootCircuit| Ok(()));
+        let result = Runtime::init_circuits(config, vec![nothing(), nothing()]);
+        assert!(matches!(
+            result,
+            Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(_)))
+        ));
+    }
+
+    /// Run reads are the worker thread's, so every handle reports the same.
+    #[test]
+    fn init_circuits_report_the_same_run_reads_on_every_handle() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let nothing = || CircuitConstructor::new(|_circuit: &mut RootCircuit| Ok(()));
+        let mut circuits =
+            Runtime::init_circuits(mkconfig(temp.path()), vec![nothing(), nothing()]).unwrap();
+        let mut second = circuits.pop().unwrap().0;
+        let mut first = circuits.pop().unwrap().0;
+        assert_eq!(first.run_reads().unwrap(), second.run_reads().unwrap());
     }
 
     pub(crate) fn mkconfig(path: &Path) -> CircuitConfig {

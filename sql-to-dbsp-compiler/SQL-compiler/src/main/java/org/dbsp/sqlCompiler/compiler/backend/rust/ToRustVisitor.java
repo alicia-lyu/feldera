@@ -330,9 +330,12 @@ public class ToRustVisitor extends CircuitVisitor {
             }
         }
 
-        this.builder.append("pub fn ")
-                .append(circuit.getName());
-
+        // The constructor of the circuit is a separate function, so that a caller can build several
+        // circuits in one runtime (Runtime::init_circuits) instead of calling `circuit` for each.
+        this.builder.append("pub fn build(circuit: &mut RootCircuit");
+        if (this.q3MergedIndexBinding != null)
+            this.builder.append(", q3_state: merged_index_col::q3::Q3State");
+        this.builder.append(") -> Result<");
         if (!this.useHandles) {
             signature.append("Catalog");
         } else {
@@ -352,23 +355,8 @@ public class ToRustVisitor extends CircuitVisitor {
         }
 
         this.builder
-                .append("(cconf: CircuitConfig");
-        if (this.q3MergedIndexBinding != null)
-            this.builder.append(", q3_state: merged_index_col::q3::Q3State");
-        this.builder
-                .append(") -> Result<(DBSPHandle, ")
                 .append(signature.toString())
-                .append("), Error> {")
-                .increase();
-        if (!this.compiler.options.languageOptions.incrementalize) {
-                this.builder
-                        .append("let cconf = cconf.with_step_size(StepSize::FullSteps);")
-                        .newline();
-        }
-        this.builder
-                .append(this.q3MergedIndexBinding == null ?
-                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, |circuit| {" :
-                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, move |circuit| {")
+                .append(", Error> {")
                 .increase();
         if (!this.useHandles)
             this.builder.append("let mut catalog = Catalog::new();").newline();
@@ -414,6 +402,36 @@ public class ToRustVisitor extends CircuitVisitor {
             this.builder.append("))");
         }
         this.builder.newline()
+                .decrease()
+                .append("}")
+                .newline()
+                .newline();
+
+        // The entry point for a caller that wants a circuit in a runtime of its own.
+        this.builder.append("pub fn ")
+                .append(circuit.getName())
+                .append("(cconf: CircuitConfig");
+        if (this.q3MergedIndexBinding != null)
+            this.builder.append(", q3_state: merged_index_col::q3::Q3State");
+        this.builder
+                .append(") -> Result<(DBSPHandle, ")
+                .append(signature.toString())
+                .append("), Error> {")
+                .increase();
+        if (!this.compiler.options.languageOptions.incrementalize) {
+                this.builder
+                        .append("let cconf = cconf.with_step_size(StepSize::FullSteps);")
+                        .newline();
+        }
+        this.builder
+                .append(this.q3MergedIndexBinding == null ?
+                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, |circuit| {" :
+                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, move |circuit| {")
+                .increase()
+                .append(this.q3MergedIndexBinding == null ?
+                        "build(circuit).map_err(Into::into)" :
+                        "build(circuit, q3_state).map_err(Into::into)")
+                .newline()
                 .decrease()
                 .append("})?;")
                 .newline();
