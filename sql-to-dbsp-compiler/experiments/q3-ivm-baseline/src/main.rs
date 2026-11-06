@@ -2448,6 +2448,103 @@ mod reconstructed_tests {
         );
         Ok(())
     }
+
+    /// The index's file runs are written by its spine's compaction, which `ManualIndex` owns,
+    /// and read on the view worker. With one runtime they share a buffer cache, so the view
+    /// transaction finds every block of the published file runs cached, given a cache with
+    /// room for the whole index.
+    #[test]
+    fn view_transaction_reads_the_indexs_file_runs_from_the_cache() -> Result<()> {
+        use dbsp::storage::buffer_cache::{CacheAccess, CacheStats};
+        use dbsp::trace::{BatchLocation, BatchReader};
+
+        let storage = std::env::temp_dir().join(format!(
+            "q3-shared-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let config = Config {
+            workers: 1,
+            cache_bytes: Some(64 * 1024 * 1024),
+            memory_target_bytes: Some(512 * 1024 * 1024),
+            ..Config::default()
+        };
+        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
+        let mut reference = Reference::default();
+        let mut stats = Measurements::default();
+        let customers = Change {
+            customers: vec![(customer(2), true), (customer(3), true)],
+            ..Change::default()
+        };
+        transact(&mut pipeline, &mut reference, customers, true, &mut stats)?;
+        let first_orders = Change {
+            orders: vec![(order(20, 2), true), (order(30, 3), true)],
+            lines: vec![
+                (line(20, 1), true),
+                (line(20, 2), true),
+                (line(30, 1), true),
+            ],
+            ..Change::default()
+        };
+        transact(
+            &mut pipeline,
+            &mut reference,
+            first_orders,
+            true,
+            &mut stats,
+        )?;
+        // Full compaction writes the index's runs to storage; the refresh below then
+        // publishes a file run beside the memory run that it appends.
+        setup_full_compaction(&mut pipeline, Duration::from_secs(30))?;
+
+        let change = Change {
+            orders: vec![(order(40, 2), true)],
+            lines: vec![(line(40, 1), true)],
+            ..Change::default()
+        };
+        let net_delta = run_base(&mut pipeline, &mut reference, change, false)?;
+        let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
+        let (before, after) = pipeline.index.append(index_rows)?;
+        let file_runs: Vec<_> = after
+            .batches()
+            .iter()
+            .filter(|run| !run.is_empty() && run.location() == BatchLocation::Storage)
+            .cloned()
+            .collect();
+        assert!(!file_runs.is_empty(), "the index has no file run to read");
+        let cache_stats = || {
+            file_runs
+                .iter()
+                .fold(CacheStats::default(), |sum, run| sum + run.cache_stats())
+        };
+        let count = |stats: CacheStats, access: CacheAccess| -> u64 {
+            stats
+                .0
+                .values()
+                .map(|by_access| by_access[access].count)
+                .sum()
+        };
+        let reads_before = cache_stats();
+        pipeline
+            .q3_state
+            .publish(before, after, placements)
+            .map_err(anyhow::Error::msg)?;
+        run_view(&mut pipeline, net_delta, false)?;
+        let reads_after = cache_stats();
+
+        assert_eq!(
+            count(reads_after, CacheAccess::Miss),
+            count(reads_before, CacheAccess::Miss),
+            "the view transaction missed the cache on a block of the index's file runs"
+        );
+        assert!(
+            count(reads_after, CacheAccess::Hit) > count(reads_before, CacheAccess::Hit),
+            "the view transaction read no block of the index's file runs"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
