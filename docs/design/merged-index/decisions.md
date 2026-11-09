@@ -305,6 +305,10 @@ Results so far (versions 4 to 6) ran with the flag, and each recorded result kee
 The Linux pilot and campaign drop `--setup-full-compaction` in both front-coding arms, as the default workload of 2026-11-09 does. The arms still differ in the key encoding alone: both keep `--elide-value-headers`, and arm B drops only `--front-code-byte-keys`. This amends 2026-10-22, which kept the flag in both arms.
 
 
+### 2026-11-09: One buffer cache, enforced
+
+Everything in the harness uses the runtime's one buffer cache. `ManualIndex`'s thread checks at start that its cache is the runtime's foreground cache (`Arc::ptr_eq`), and `ManualIndex::new` returns an error if it is not, so no run can proceed with the index on another cache. The unbound thread exists only in tests, as the control that shows the check fires.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

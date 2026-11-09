@@ -363,7 +363,7 @@ impl Pipeline {
         // (its thread binds the runtime's buffer cache). The view circuit reads it only through
         // the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
-        let index = ManualIndex::new(base.circuit.runtime());
+        let index = ManualIndex::new(base.circuit.runtime())?;
         Ok(Self {
             base,
             view,
@@ -2480,8 +2480,7 @@ mod reconstructed_tests {
     }
 
     /// Appends one refresh to the index, so that the index's thread writes the file run, and
-    /// reports where the run's blocks landed. The index binds the runtime's buffer cache unless
-    /// `bind_runtime_cache` is false, which is the control.
+    /// reports where the run's blocks landed.
     ///
     /// The index inserts its run into the spine on its own thread, and the spine writes it to a
     /// file there only under memory pressure. A target far below the process's size puts the
@@ -2489,7 +2488,7 @@ mod reconstructed_tests {
     /// appends. The index then holds one run, so nothing merges it, and no background thread
     /// writes a file that the check could mistake for the index thread's. The check is by direct
     /// lookup of each block, so it neither reads from storage nor counts a hit or a miss.
-    fn append_one_file_run_to_the_index(bind_runtime_cache: bool) -> Result<IndexFileRun> {
+    fn append_one_file_run_to_the_index() -> Result<IndexFileRun> {
         use dbsp::trace::{Batch, BatchLocation, BatchReader};
         use feldera_types::memory_pressure::MemoryPressure;
 
@@ -2508,9 +2507,6 @@ mod reconstructed_tests {
             ..Config::default()
         };
         let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
-        if !bind_runtime_cache {
-            pipeline.index = ManualIndex::without_cache_binding(pipeline.runtime());
-        }
         measurement::drain_until(Duration::from_secs(30), || {
             Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
         })
@@ -2567,7 +2563,7 @@ mod reconstructed_tests {
     /// the worker's cache. The cache has room to spare, so no block was evicted.
     #[test]
     fn index_file_runs_land_in_the_view_workers_cache() -> Result<()> {
-        let run = append_one_file_run_to_the_index(true)?;
+        let run = append_one_file_run_to_the_index()?;
         assert!(run.same_cache, "the index thread has another cache");
         assert!(run.blocks > 0, "the file run has no block");
         assert_eq!(
@@ -2579,23 +2575,20 @@ mod reconstructed_tests {
         Ok(())
     }
 
-    /// The control: an index thread without the binding has another cache, and none of its
-    /// file's blocks is in the view worker's. The cache has room to spare here too, so the
-    /// blocks are absent because they are in the other cache, not because they were evicted.
+    /// The control of the test above, and the check that production relies on: a `ManualIndex`
+    /// thread that is not on the runtime's buffer cache is refused at start, so that no run can
+    /// write the index through another cache. The unbound thread is test-only.
     #[test]
-    fn index_file_runs_miss_the_view_workers_cache_without_the_binding() -> Result<()> {
-        let run = append_one_file_run_to_the_index(false)?;
-        assert!(
-            !run.same_cache,
-            "the control shares the view worker's cache"
-        );
-        assert!(run.blocks > 0, "the file run has no block");
+    fn manual_index_refuses_a_thread_off_the_runtimes_cache() -> Result<()> {
+        let pipeline = Pipeline::with_workers(1)?;
+        let refusal = match ManualIndex::without_cache_binding(pipeline.runtime()) {
+            Ok(_) => bail!("an index thread off the runtime's cache was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(
-            run.blocks_in_view_cache, 0,
-            "the control's blocks are in the view worker's cache"
+            refusal.to_string(),
+            "merged-index thread is not on the runtime's buffer cache"
         );
-        let (used, capacity) = run.occupancy;
-        assert!(used < capacity, "the cache is full: {used} of {capacity}");
         Ok(())
     }
 }

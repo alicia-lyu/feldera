@@ -1094,6 +1094,14 @@ impl Runtime {
         self.0.buffer_caches[local_worker_offset][thread_type].clone()
     }
 
+    /// Returns this runtime's foreground buffer cache for the worker with local offset
+    /// `local_worker_offset`: the cache that [Runtime::with_buffer_cache] binds, and that
+    /// [Runtime::buffer_cache] returns on that worker. A caller that must share the workers'
+    /// cache can compare it, by `Arc::ptr_eq`, with the cache of its own thread.
+    pub fn foreground_buffer_cache(&self, local_worker_offset: usize) -> Arc<BufferCache> {
+        self.get_buffer_cache(local_worker_offset, ThreadType::Foreground)
+    }
+
     /// Runs `f` with this runtime's foreground cache bound to the current thread.
     ///
     /// External snapshot readers and auxiliary threads can use this to share
@@ -1112,7 +1120,7 @@ impl Runtime {
             }
         }
 
-        let cache = self.get_buffer_cache(local_worker_offset, ThreadType::Foreground);
+        let cache = self.foreground_buffer_cache(local_worker_offset);
         let previous = BUFFER_CACHE.with(|binding| binding.replace(Some(cache)));
         let _restore = RestoreCache(previous);
         f()
