@@ -47,6 +47,7 @@ import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDot;
+import org.dbsp.sqlCompiler.compiler.backend.rust.GeneratedRustNames;
 import org.dbsp.sqlCompiler.compiler.errors.BaseCompilerException;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
@@ -718,6 +719,10 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                                 "different name for the user-defined function",
                                 stat.getCalciteObject());
                     }
+                    String reservedMessage = GeneratedRustNames.checkFunctionName(
+                            stat.function.getName(), stat.function.isSqlFunction());
+                    if (reservedMessage != null)
+                        throw new CompilationError(reservedMessage, stat.getCalciteObject());
                     SqlFunction function = stat.function;
                     if (!stat.function.isSqlFunction()) {
                         rustFunctions.add(function);

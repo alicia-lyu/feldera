@@ -309,6 +309,10 @@ The Linux pilot and campaign drop `--setup-full-compaction` in both front-coding
 
 Everything in the harness uses the runtime's one buffer cache. `ManualIndex`'s thread checks at start that its cache is the runtime's foreground cache (`Arc::ptr_eq`), and `ManualIndex::new` returns an error if it is not, so no run can proceed with the index on another cache. The unbound thread exists only in tests, as the control that shows the check fires.
 
+### 2026-11-09: Generated names fail fast
+
+A user function whose name collides with a name that the generated Rust code uses is rejected by the compiler at `CREATE FUNCTION`, with an error that names the function, instead of a confusing rustc error later. The reserved names are in `GeneratedRustNames` (`SQL-compiler`, package `org.dbsp.sqlCompiler.compiler.backend.rust`); [using.md](../../../sql-to-dbsp-compiler/using.md) lists them.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
