@@ -72,7 +72,7 @@ The harness runs two chained circuits in one DBSP runtime (user decisions of 202
 | Piece | Location |
 | --- | --- |
 | Key trie (`trie.rs`), order-preserving key encoders, packed payload encoders (`packed.rs`), folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
-| Several circuits in one runtime (`Runtime::init_circuits`, `CircuitConstructor`, one `DBSPHandle` per circuit); each generated crate exports `SqlCircuit::build` beside `circuit`; an associated function of an empty enum, so a user function named `build` cannot clash with it (`SqlCircuitConstructorTest`) | `crates/dbsp/src/circuit/dbsp_handle.rs`; `ToRustVisitor.java` |
+| Several circuits in one runtime (`Runtime::init_circuits`, `CircuitConstructor`, one `DBSPHandle` per circuit); each generated crate exports `SqlCircuit::build` beside `circuit`; an associated function of an empty enum, so a user function named `build` cannot clash with it; its parameter is `__circuit`, because a SQL-bodied function named `circuit` is declared inside `build` and would shadow a parameter of that name (`SqlCircuitConstructorTest`) | `crates/dbsp/src/circuit/dbsp_handle.rs`; `ToRustVisitor.java` |
 | Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
 | Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | Q3 readers, `Q3State`, and the COL storage tests | `sql-to-dbsp-compiler/experiments/merged-index-col/` |

@@ -41,6 +41,13 @@ public class SqlCircuitConstructorTest {
             CREATE VIEW V AS SELECT build(y) AS z FROM T;
             """;
 
+    /** A SQL-bodied function is declared inside the constructor, whose parameter is {@code circuit}. */
+    private static final String SQL_FUNCTION_NAMED_LIKE_THE_PARAMETER = """
+            CREATE FUNCTION circuit(x INT NOT NULL) RETURNS INT NOT NULL AS x + 1;
+            CREATE TABLE T(y INT NOT NULL);
+            CREATE VIEW V AS SELECT circuit(y) AS z FROM T;
+            """;
+
     private static final String SQL_TYPE_NAMED_LIKE_THE_CIRCUIT = """
             CREATE TYPE SqlCircuit AS (a INT NOT NULL);
             CREATE TABLE T(x SqlCircuit NOT NULL, y INT NOT NULL);
@@ -81,7 +88,7 @@ public class SqlCircuitConstructorTest {
             String rust = emit(RUST_UDF_PROGRAM, handles);
             Assert.assertTrue(hasTopLevelLine(rust, "pub enum SqlCircuit {}"));
             Assert.assertTrue(hasTopLevelLine(rust, "impl SqlCircuit {"));
-            Assert.assertTrue(rust.contains("    pub fn build(circuit: &mut RootCircuit"));
+            Assert.assertTrue(rust.contains("    pub fn build(__circuit: &mut RootCircuit"));
             Assert.assertFalse("build must not be a free function",
                     hasTopLevelLine(rust, "pub fn build("));
             Assert.assertTrue(rust.contains("SqlCircuit::build(circuit)"));
@@ -97,6 +104,18 @@ public class SqlCircuitConstructorTest {
         String rust = emit(SQL_FUNCTION_PROGRAM, true);
         Assert.assertFalse(hasTopLevelLine(rust, "pub fn build("));
         Assert.assertTrue(rust.contains("        pub fn build(x: i32) -> i32 {"));
+    }
+
+    @Test
+    public void sqlFunctionNamedCircuitDoesNotShadowTheConstructorParameter() {
+        // The function is declared inside the constructor. The constructor's parameter has
+        // another name, so the calls on the circuit resolve to the parameter, not to the function.
+        String rust = emit(SQL_FUNCTION_NAMED_LIKE_THE_PARAMETER, true);
+        Assert.assertTrue(rust.contains("        pub fn circuit(x: i32) -> i32 {"));
+        Assert.assertTrue(rust.contains("__circuit.add_input_zset"));
+        Assert.assertFalse("a method call on `circuit` would resolve to the user's function",
+                Pattern.compile("[^_\\w]circuit\\.(add_|recursive|set_|create_|open_|close_)")
+                        .matcher(rust).find());
     }
 
     @Test
@@ -144,6 +163,14 @@ public class SqlCircuitConstructorTest {
             return;
         BaseSQLTests.setupCargoLock();
         compileAndCheck(SQL_FUNCTION_PROGRAM, "");
+    }
+
+    @Test
+    public void sqlFunctionNamedLikeTheConstructorParameterCompiles() throws IOException, InterruptedException, SQLException {
+        if (BaseSQLTests.skipRust)
+            return;
+        BaseSQLTests.setupCargoLock();
+        compileAndCheck(SQL_FUNCTION_NAMED_LIKE_THE_PARAMETER, "");
     }
 
     @Test

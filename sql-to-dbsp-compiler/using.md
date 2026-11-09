@@ -246,8 +246,11 @@ produced will look like this^[1]:
 [1] Note: the compiler output changes as the compiler implementation
     evolves.  This code is shown for illustrative purposes only.
     In particular, the body of the closure passed to `Runtime::init_circuit`
-    is now a separate public function, `SqlCircuit::build(circuit: &mut RootCircuit)`,
-    which `circuit` calls.  A caller can pass several programs' `SqlCircuit::build`
+    is now a separate public function, `SqlCircuit::build(__circuit: &mut RootCircuit)`,
+    which `circuit` calls.  The parameter is called `__circuit` in the generated code,
+    although the listing below still shows `circuit`: a function with a SQL body
+    is declared inside `build`, where it would shadow a parameter of the same name
+    (a SQL function named `circuit` did, and the crate failed to compile).  A caller can pass several programs' `SqlCircuit::build`
     functions to `Runtime::init_circuits` to run the circuits in one runtime.
     `build` is an associated function of the generated empty enum `SqlCircuit`
     (the circuit's type, never instantiated), so that it lives in that type's namespace.

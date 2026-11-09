@@ -107,6 +107,15 @@ public class ToRustVisitor extends CircuitVisitor {
      * The compiler does not otherwise generate Rust items with this name (user types are named
      * after a hash), and a user function cannot clash with a type that has no value. */
     public static final String CIRCUIT_TYPE_NAME = "SqlCircuit";
+    /** Name of the circuit parameter of the generated constructor `SqlCircuit::build`. A function
+     * with a SQL body is declared inside the constructor, where an item shadows a parameter of the
+     * same name, so the parameter must not be a name that a SQL function could take, such as
+     * `circuit`. The leading underscores keep it clear of the compiler's other generated names. */
+    public static final String CIRCUIT_VARIABLE = "__circuit";
+    /** Name of the circuit variable in the code being generated. The multi-crate writers emit
+     * operators as functions with a parameter called `circuit`, with no nested SQL functions;
+     * only the single-crate constructor uses {@link #CIRCUIT_VARIABLE}. */
+    private String circuitVariable = "circuit";
     /** How are nodes named in Rust?  false - human-friendly, true - compiler-friendly */
     boolean preferHash = false;
     final CompilerOptions options;
@@ -192,14 +201,14 @@ public class ToRustVisitor extends CircuitVisitor {
             if (!exists) {
                 this.builder.append("let ")
                         .append(region.asVarName())
-                        .append(": RegionName = circuit.create_region_name(")
+                        .append(": RegionName = " + this.circuitVariable + ".create_region_name(")
                         .append(region.getTagQuoted())
                         .append(", ")
                         .append(region.getId())
                         .append(");")
                         .newline();
             }
-            this.builder.append("circuit.open_region(")
+            this.builder.append(this.circuitVariable + ".open_region(")
                     .append(region.asVarName())
                     .append(".clone());")
                     .newline();
@@ -210,7 +219,7 @@ public class ToRustVisitor extends CircuitVisitor {
     void emitCloseRegion(@Nullable RegionAnnotation region) {
         if (region != null) {
             this.builder.newline()
-                    .append("circuit.close_region(")
+                    .append(this.circuitVariable + ".close_region(")
                     .append(region.asVarName())
                     .append(".clone());");
         }
@@ -309,11 +318,12 @@ public class ToRustVisitor extends CircuitVisitor {
     }
 
     void emitBalancerHints() {
-        CircuitPostfix.emitBalancerHints(this.builder, this.postfix.balancerHints);
+        CircuitPostfix.emitBalancerHints(this.builder, this.postfix.balancerHints, this.circuitVariable);
     }
 
     @Override
     public VisitDecision preorder(DBSPCircuit circuit) {
+        this.circuitVariable = CIRCUIT_VARIABLE;
         if (this.options.ioOptions.q3MergedIndex) {
             if (!this.options.languageOptions.incrementalize || this.useHandles ||
                     this.options.ioOptions.multiCrates())
@@ -345,7 +355,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .newline()
                 .append("impl " + CIRCUIT_TYPE_NAME + " {")
                 .increase();
-        this.builder.append("pub fn build(circuit: &mut RootCircuit");
+        this.builder.append("pub fn build(" + this.circuitVariable + ": &mut RootCircuit");
         if (this.q3MergedIndexBinding != null)
             this.builder.append(", q3_state: merged_index_col::q3::Q3State");
         this.builder.append(") -> Result<");
@@ -486,7 +496,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 this.builder.append(port.getName(this.preferHash)).append(", ");
         }
         this.builder.append(") = ")
-                .append("circuit.recursive(|circuit, (");
+                .append(this.circuitVariable + ".recursive(|" + this.circuitVariable + ", (");
         for (int i = 0; i < operator.outputCount(); i++) {
             ProgramIdentifier view = operator.outputViews.get(i);
             DBSPViewDeclarationOperator decl = operator.declarationByName.get(view);
@@ -713,7 +723,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(delta.getNodeName(this.preferHash))
                 .append(" = ")
                 .append(this.getInputName(delta, 0))
-                .append(".delta0(circuit)")
+                .append(".delta0(" + this.circuitVariable + ")")
                 .append(this.markDistinct(delta))
                 .append(";");
         this.tagStream(delta);
@@ -760,7 +770,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(operator.getNodeName(this.preferHash))
                 .append(", ")
                 .append(this.handleName(operator))
-                .append(") = circuit.add_input_zset::<");
+                .append(") = " + this.circuitVariable + ".add_input_zset::<");
 
         DBSPTypeZSet zsetType = operator.getType().to(DBSPTypeZSet.class);
         this.innerVisitor.setOperatorContext(operator);
@@ -802,7 +812,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(operator.asOperator().getNodeName(this.preferHash))
                 .append(", ")
                 .append(this.handleName(operator.asOperator()))
-                .append(") = circuit.add_input_map_persistent::<");
+                .append(") = " + this.circuitVariable + ".add_input_map_persistent::<");
 
         DBSPTypeIndexedZSet ix = ((IInputMapOperator) operator).getOutputIndexedZSetType();
         this.innerVisitor.setOperatorContext(operator.asOperator());
@@ -864,7 +874,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(operator.getOutput(2).getName(this.preferHash))
                 .append(",")
                 .append(this.handleName(operator.asOperator()))
-                .append(") = circuit.add_input_map_with_waterline_persistent");
+                .append(") = " + this.circuitVariable + ".add_input_map_with_waterline_persistent");
 
         this.builder.append("(hash, ").increase();
         {
@@ -1939,7 +1949,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(operator.getNodeName(this.preferHash))
                 .append(": ");
         streamType.accept(this.innerVisitor);
-        this.builder.append(" = circuit.accumulate_concat_zsets")
+        this.builder.append(" = " + this.circuitVariable + ".accumulate_concat_zsets")
                 .append("(&[");
         for (int i = 0; i < operator.inputs.size(); i++) {
             if (i > 0)
@@ -2110,7 +2120,7 @@ public class ToRustVisitor extends CircuitVisitor {
         streamType.accept(this.innerVisitor);
         this.builder.append(" = ");
         this.builder.append(operator.operation);
-        this.builder.append("(circuit, streams.iter(),").newline();
+        this.builder.append("(" + this.circuitVariable + ", streams.iter(),").newline();
         DBSPClosureExpression closure = operator.getClosureFunction();
         // In Rust this closure takes an iterator as the only argument
         this.builder.append("move |i| {").increase();
@@ -2161,7 +2171,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(": ");
         streamType.accept(this.innerVisitor);
         this.builder.append(" = ")
-                .append("circuit.add_source(")
+                .append(this.circuitVariable + ".add_source(")
                 .increase()
                 .append("ConstantGenerator::new(");
         operator.function.accept(this.innerVisitor);
@@ -2182,7 +2192,7 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(": ");
         streamType.accept(this.innerVisitor);
         this.builder.append(" = ")
-                .append("circuit.add_source(")
+                .append(this.circuitVariable + ".add_source(")
                 .increase()
                 .append("Generator::new(|| ");
         this.builder.append("if Runtime::worker_index() == 0 {");
