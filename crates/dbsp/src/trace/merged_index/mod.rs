@@ -22,6 +22,18 @@ pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement
 /// Terminates the key fields of a folded key. No domain may use it as a tag.
 const INDEX_TAG: u8 = 0;
 
+/// The smallest byte string greater than every string that starts with
+/// `prefix`, so that `[prefix, successor)` holds exactly the strings with that
+/// prefix. `None` when no such string exists: the prefix is empty or all
+/// `0xFF`, and its range runs to the end of the index.
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let kept = prefix.iter().rposition(|&byte| byte != u8::MAX)? + 1;
+    let mut successor = prefix[..kept].to_vec();
+    // The kept bytes end in a byte below 0xFF, so the increment cannot overflow.
+    successor[kept - 1] += 1;
+    Some(successor)
+}
+
 /// A static merged-index definition: a key trie plus typed folding.
 ///
 /// A folded key is `[tag value]* 0 id`. It has one tag and one value per

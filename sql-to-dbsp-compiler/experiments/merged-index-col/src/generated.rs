@@ -33,6 +33,7 @@ pub const TRIE: merged_index::KeyTrie = merged_index::KeyTrie {
                     column: "o_custkey",
                 },
             ],
+            width: <i64 as merged_index::OrderedKey>::WIDTH,
         },
         merged_index::Domain {
             name: "orderkey",
@@ -46,6 +47,7 @@ pub const TRIE: merged_index::KeyTrie = merged_index::KeyTrie {
                     column: "l_orderkey",
                 },
             ],
+            width: <i64 as merged_index::OrderedKey>::WIDTH,
         },
         merged_index::Domain {
             name: "linenumber",
@@ -53,6 +55,7 @@ pub const TRIE: merged_index::KeyTrie = merged_index::KeyTrie {
                 relation: "Lineitem",
                 column: "l_linenumber",
             }],
+            width: <i32 as merged_index::OrderedKey>::WIDTH,
         },
     ],
     children: &[merged_index::Node {

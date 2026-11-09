@@ -23,6 +23,11 @@ pub struct ColumnRef {
 pub struct Domain {
     pub name: &'static str,
     pub columns: &'static [ColumnRef],
+    /// The byte width of the domain's encoded value: [`OrderedKey::WIDTH`]
+    /// of its type. The trie has no types, so it cannot derive this.
+    ///
+    /// [`OrderedKey::WIDTH`]: super::OrderedKey::WIDTH
+    pub width: usize,
 }
 
 /// Takes a key value for `domain` from the column of `relation` in that domain
@@ -163,6 +168,29 @@ impl KeyTrie {
             .find(|placed| placed.name() == name)
     }
 
+    /// The byte width of the value that follows the first tag of a key, or
+    /// `None` if the keys do not agree on one. They agree exactly when the
+    /// trie has one top-level node: sibling nodes have distinct domains, so
+    /// several top-level nodes begin keys with different tags, and possibly
+    /// different widths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the top-level node's domain is not declared, which
+    /// [`validate`](Self::validate) rejects.
+    pub fn root_width(&self) -> Option<usize> {
+        match self.children {
+            [only] => Some(
+                self.domain(only.domain)
+                    .unwrap_or_else(|| {
+                        panic!("invalid key trie: domain `{}` is not declared", only.domain)
+                    })
+                    .width,
+            ),
+            _ => None,
+        }
+    }
+
     /// Checks the rules that need no schema. Type, NOT NULL, and primary-key
     /// checks belong to the SQL compiler, which knows the schema.
     pub fn validate(&self) -> Result<(), String> {
@@ -182,6 +210,9 @@ impl KeyTrie {
                 .any(|earlier| earlier.name == domain.name)
             {
                 return Err(format!("domain `{}` is declared twice", domain.name));
+            }
+            if domain.width == 0 {
+                return Err(format!("domain `{}` has width 0", domain.name));
             }
         }
         Ok(())

@@ -8,6 +8,7 @@ use crate::{
 const FIXTURE_DOMAINS: &[Domain] = &[
     Domain {
         name: "root",
+        width: 8,
         columns: &[ColumnRef {
             relation: "Fixture",
             column: "f_root",
@@ -15,6 +16,7 @@ const FIXTURE_DOMAINS: &[Domain] = &[
     },
     Domain {
         name: "child",
+        width: 4,
         columns: &[ColumnRef {
             relation: "Fixture",
             column: "f_child",
@@ -214,6 +216,7 @@ const COL_TRIE: KeyTrie = KeyTrie {
     domains: &[
         Domain {
             name: "custkey",
+            width: 8,
             columns: &[
                 ColumnRef {
                     relation: "Customer",
@@ -227,6 +230,7 @@ const COL_TRIE: KeyTrie = KeyTrie {
         },
         Domain {
             name: "orderkey",
+            width: 8,
             columns: &[
                 ColumnRef {
                     relation: "Orders",
@@ -240,6 +244,7 @@ const COL_TRIE: KeyTrie = KeyTrie {
         },
         Domain {
             name: "linenumber",
+            width: 4,
             columns: &[ColumnRef {
                 relation: "Lineitem",
                 column: "l_linenumber",
@@ -346,6 +351,7 @@ fn tags_follow_first_appearance_and_ids_follow_visit_order() {
         domains: &[
             Domain {
                 name: "c",
+                width: 8,
                 columns: &[ColumnRef {
                     relation: "R",
                     column: "r_c",
@@ -353,6 +359,7 @@ fn tags_follow_first_appearance_and_ids_follow_visit_order() {
             },
             Domain {
                 name: "a",
+                width: 8,
                 columns: &[ColumnRef {
                     relation: "R",
                     column: "r_a",
@@ -360,6 +367,7 @@ fn tags_follow_first_appearance_and_ids_follow_visit_order() {
             },
             Domain {
                 name: "b",
+                width: 8,
                 columns: &[ColumnRef {
                     relation: "R",
                     column: "r_b",
@@ -488,6 +496,104 @@ fn validate_rejects_a_domain_declared_twice() {
 }
 
 #[test]
+fn validate_rejects_a_domain_of_width_zero() {
+    const ZERO_WIDTH: &[Domain] = &[Domain {
+        width: 0,
+        ..FIXTURE_DOMAINS[0]
+    }];
+    assert_invalid(
+        KeyTrie {
+            domains: ZERO_WIDTH,
+            ..FIXTURE_TRIE
+        },
+        "width 0",
+    );
+}
+
+#[test]
+fn root_width_is_the_width_of_the_only_top_level_domain() {
+    assert_eq!(FIXTURE_TRIE.root_width(), Some(8));
+    assert_eq!(COL_TRIE.root_width(), Some(8));
+}
+
+#[test]
+fn root_width_is_none_without_exactly_one_top_level_node() {
+    const TWO_ROOTS: &[Node] = &[
+        Node {
+            domain: "root",
+            placements: &[],
+            children: &[],
+        },
+        Node {
+            domain: "child",
+            placements: &[],
+            children: &[],
+        },
+    ];
+    assert_eq!(fixture_trie(TWO_ROOTS).root_width(), None);
+    assert_eq!(fixture_trie(&[]).root_width(), None);
+}
+
+#[test]
+fn col_domain_widths_follow_the_key_types() {
+    let widths: Vec<usize> = COL_TRIE.domains.iter().map(|domain| domain.width).collect();
+    assert_eq!(widths, [8, 8, 4]);
+}
+
+#[test]
+fn prefix_successor_of_the_empty_prefix_is_none() {
+    assert_eq!(prefix_successor(&[]), None);
+}
+
+#[test]
+fn prefix_successor_increments_the_last_byte() {
+    assert_eq!(prefix_successor(&[1, 2, 3]), Some(vec![1, 2, 4]));
+    assert_eq!(prefix_successor(&[0]), Some(vec![1]));
+    assert_eq!(prefix_successor(&[0xFE]), Some(vec![0xFF]));
+}
+
+#[test]
+fn prefix_successor_carries_past_trailing_0xff_bytes() {
+    assert_eq!(prefix_successor(&[1, 0xFF]), Some(vec![2]));
+    assert_eq!(prefix_successor(&[1, 2, 0xFF, 0xFF]), Some(vec![1, 3]));
+}
+
+#[test]
+fn prefix_successor_of_all_0xff_is_none() {
+    assert_eq!(prefix_successor(&[0xFF]), None);
+    assert_eq!(prefix_successor(&[0xFF, 0xFF, 0xFF]), None);
+}
+
+proptest::proptest! {
+    /// A key has the prefix exactly when it lies in `[prefix, successor)`.
+    #[test]
+    fn prefix_successor_bounds_exactly_the_strings_with_the_prefix(
+        prefix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..6),
+        key in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8),
+    ) {
+        let successor = prefix_successor(&prefix);
+        let in_range = prefix <= key && successor.as_ref().is_none_or(|end| key < *end);
+        proptest::prop_assert_eq!(key.starts_with(&prefix), in_range);
+    }
+
+    /// Keys that extend a shared prefix by a few bytes exercise the carry more
+    /// often than independent random bytes do.
+    #[test]
+    fn prefix_successor_bounds_keys_built_from_the_prefix(
+        prefix in proptest::collection::vec(proptest::prop_oneof![0u8..2, 254u8..], 0..5),
+        suffix in proptest::collection::vec(proptest::prop_oneof![0u8..2, 254u8..], 0..4),
+        other in proptest::collection::vec(proptest::prop_oneof![0u8..2, 254u8..], 0..8),
+    ) {
+        let successor = prefix_successor(&prefix);
+        let extended = [prefix.clone(), suffix].concat();
+        for key in [extended, other] {
+            let in_range = prefix <= key && successor.as_ref().is_none_or(|end| key < *end);
+            proptest::prop_assert_eq!(key.starts_with(&prefix), in_range);
+        }
+    }
+}
+
+#[test]
 fn validate_rejects_sibling_nodes_with_the_same_domain() {
     assert_invalid(
         fixture_trie(&[
@@ -539,6 +645,7 @@ fn validate_rejects_more_than_255_domains() {
     let domains: Vec<Domain> = (0..256)
         .map(|position| Domain {
             name: Box::leak(format!("d{position}").into_boxed_str()),
+            width: 8,
             columns: &[],
         })
         .collect();
@@ -668,6 +775,7 @@ fn validate_rejects_two_vias_for_one_domain() {
 fn validate_rejects_two_columns_of_one_relation_in_a_domain() {
     const TWO_COLUMNS: &[Domain] = &[Domain {
         name: "root",
+        width: 8,
         columns: &[
             ColumnRef {
                 relation: "Fixture",

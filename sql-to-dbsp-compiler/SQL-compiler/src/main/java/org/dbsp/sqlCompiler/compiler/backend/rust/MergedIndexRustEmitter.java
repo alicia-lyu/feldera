@@ -211,7 +211,10 @@ public final class MergedIndexRustEmitter {
             for (ColumnRef column : domain.columns())
                 this.out.append(MI).append("ColumnRef { relation: ").append(quote(column.relation()))
                         .append(", column: ").append(quote(column.column())).append(" },").newline();
+            // The width comes from the Rust type, so the Java trie needs no such field.
             this.out.decrease().append("],").newline()
+                    .append("width: <").append(this.rustType(this.index.domainTypes().get(domain.name())))
+                    .append(" as ").append(MI).append("OrderedKey>::WIDTH,").newline()
                     .decrease().append("},").newline();
         }
         this.out.decrease().append("],").newline();

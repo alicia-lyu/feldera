@@ -419,6 +419,14 @@ fn trie_is_valid_and_derives_the_spec() {
 }
 
 #[test]
+fn domain_widths_follow_the_key_types() {
+    let widths = TRIE.domains.iter().map(|domain| domain.width);
+    // custkey and orderkey are i64; linenumber is i32.
+    assert_eq!(widths.collect::<Vec<_>>(), [8, 8, 4]);
+    assert_eq!(TRIE.root_width(), Some(8));
+}
+
+#[test]
 fn tags_and_ids_agree_with_the_trie_at_the_extremes() {
     assert_eq!(
         [TAG_CUSTKEY, TAG_ORDERKEY, TAG_LINENUMBER].map(Some),

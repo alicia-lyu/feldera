@@ -9,6 +9,10 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.MergedIndexFixtures.COL_SPEC;
 import static org.dbsp.sqlCompiler.compiler.frontend.mergedIndex.MergedIndexFixtures.Q3_SCHEMA;
@@ -56,6 +60,23 @@ public class MergedIndexRustEmitterTest {
                 "payload: merged_index::Payload::All,",
                 "merged_index::Via { domain: \"custkey\", relation: \"Orders\" }",
                 "merged_index::Payload::Columns(&[\"l_shipdate\", \"l_extendedprice\", \"l_discount\", ])");
+    }
+
+    @Test
+    public void emitsEachDomainsWidthFromItsRustType() {
+        String rust = emit(Q3_SCHEMA, COL_SPEC);
+        String domains = rust.substring(rust.indexOf("domains: &["), rust.indexOf("children: &["));
+        assertContains(domains, "name: \"custkey\",", "name: \"linenumber\",");
+        assertEquals(List.of("i64", "i64", "i32"), widthTypes(domains));
+    }
+
+    /** The {@code T} of every {@code width: <T as merged_index::OrderedKey>::WIDTH,} in {@code text}. */
+    private static List<String> widthTypes(String text) {
+        Matcher matcher = Pattern.compile("width: <(.*) as merged_index::OrderedKey>::WIDTH,").matcher(text);
+        List<String> types = new ArrayList<>();
+        while (matcher.find())
+            types.add(matcher.group(1));
+        return types;
     }
 
     @Test
