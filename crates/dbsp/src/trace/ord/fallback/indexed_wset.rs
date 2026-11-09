@@ -1,4 +1,5 @@
 use super::utils::{copy_to_builder, pick_merge_destination};
+use crate::storage::backend::BlockLocation;
 use crate::storage::file::SerializerInner;
 use crate::storage::file::{FilterKind, FilterStats, TouchedWindowCount};
 use crate::{
@@ -375,6 +376,13 @@ where
         match &self.inner {
             Inner::Vec(vec) => vec.file_reader(),
             Inner::File(file) => file.file_reader(),
+        }
+    }
+
+    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
+        match &self.inner {
+            Inner::Vec(vec) => vec.file_block_locations(),
+            Inner::File(file) => file.file_block_locations(),
         }
     }
 

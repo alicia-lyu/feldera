@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
+#[cfg(all(test, feature = "merged-index"))]
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -314,6 +316,10 @@ struct Pipeline {
     index: ManualIndex,
     #[cfg(feature = "merged-index")]
     q3_state: Q3State,
+    /// The buffer cache that the view circuit's worker saw when it built the circuit, for the
+    /// test that the index's thread shares it.
+    #[cfg(all(test, feature = "merged-index"))]
+    view_worker_cache: Arc<OnceLock<Arc<dbsp::storage::buffer_cache::BufferCache>>>,
 }
 
 impl Pipeline {
@@ -322,17 +328,27 @@ impl Pipeline {
         #[cfg(feature = "merged-index")]
         let q3_state = Q3State::default();
         let base_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
-            q3_base_circuit::build(circuit).map_err(anyhow::Error::from)
+            q3_base_circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
         });
         #[cfg(feature = "merged-index")]
         let view_state = q3_state.clone();
+        #[cfg(all(test, feature = "merged-index"))]
+        let view_worker_cache = Arc::new(OnceLock::new());
+        #[cfg(all(test, feature = "merged-index"))]
+        let probe = view_worker_cache.clone();
         #[cfg(feature = "merged-index")]
         let view_constructor = CircuitConstructor::new(move |circuit: &mut RootCircuit| {
-            q3_view_circuit::build(circuit, view_state.clone()).map_err(anyhow::Error::from)
+            // The constructor runs on the view circuit's worker.
+            #[cfg(test)]
+            probe
+                .set(Runtime::buffer_cache().expect("the worker has a buffer cache"))
+                .expect("the view circuit is built once");
+            q3_view_circuit::SqlCircuit::build(circuit, view_state.clone())
+                .map_err(anyhow::Error::from)
         });
         #[cfg(not(feature = "merged-index"))]
         let view_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
-            q3_view_circuit::build(circuit).map_err(anyhow::Error::from)
+            q3_view_circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
         });
         let mut circuits =
             Runtime::init_circuits(config, vec![base_constructor, view_constructor])?;
@@ -356,6 +372,8 @@ impl Pipeline {
             index,
             #[cfg(feature = "merged-index")]
             q3_state,
+            #[cfg(all(test, feature = "merged-index"))]
+            view_worker_cache,
         })
     }
 
@@ -2446,6 +2464,136 @@ mod reconstructed_tests {
             )?,
             expected
         );
+        Ok(())
+    }
+
+    /// What the index's thread and the view worker make of the buffer cache once the index's
+    /// thread has written a file run.
+    struct IndexFileRun {
+        /// Whether the two threads use the same cache object.
+        same_cache: bool,
+        /// The blocks of the file run, and how many of them the view worker's cache holds.
+        blocks: usize,
+        blocks_in_view_cache: usize,
+        /// The view worker's cache: `(used, capacity)`.
+        occupancy: (usize, usize),
+    }
+
+    /// Appends one refresh to the index, so that the index's thread writes the file run, and
+    /// reports where the run's blocks landed. The index binds the runtime's buffer cache unless
+    /// `bind_runtime_cache` is false, which is the control.
+    ///
+    /// The index inserts its run into the spine on its own thread, and the spine writes it to a
+    /// file there only under memory pressure. A target far below the process's size puts the
+    /// runtime under pressure for good, and the test waits for the level to rise before it
+    /// appends. The index then holds one run, so nothing merges it, and no background thread
+    /// writes a file that the check could mistake for the index thread's. The check is by direct
+    /// lookup of each block, so it neither reads from storage nor counts a hit or a miss.
+    fn append_one_file_run_to_the_index(bind_runtime_cache: bool) -> Result<IndexFileRun> {
+        use dbsp::trace::{Batch, BatchLocation, BatchReader};
+        use feldera_types::memory_pressure::MemoryPressure;
+
+        let storage = std::env::temp_dir().join(format!(
+            "q3-index-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let config = Config {
+            workers: 1,
+            // Room for far more than the few kilobytes of the run.
+            cache_bytes: Some(64 * 1024 * 1024),
+            memory_target_bytes: Some(1024 * 1024),
+            ..Config::default()
+        };
+        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
+        if !bind_runtime_cache {
+            pipeline.index = ManualIndex::without_cache_binding(pipeline.runtime());
+        }
+        measurement::drain_until(Duration::from_secs(30), || {
+            Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
+        })
+        .context("the runtime did not come under memory pressure")?;
+
+        let refresh = Change {
+            customers: vec![(customer(2), true)],
+            orders: vec![(order(20, 2), true), (order(30, 2), true)],
+            lines: vec![
+                (line(20, 1), true),
+                (line(20, 2), true),
+                (line(30, 1), true),
+            ],
+        };
+        let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
+        let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
+        let (_before, after) = pipeline.index.append(index_rows)?;
+        let runs: Vec<_> = after
+            .batches()
+            .iter()
+            .filter(|run| !run.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(runs.len(), 1, "the index holds more than the appended run");
+        assert_eq!(
+            runs[0].location(),
+            BatchLocation::Storage,
+            "the appended run is not in a file"
+        );
+
+        let file = runs[0].file_reader().context("a file run has a file")?;
+        let locations = runs[0].file_block_locations()?;
+        let index_cache = pipeline.index.buffer_cache()?;
+        let view_cache = pipeline
+            .view_worker_cache
+            .get()
+            .context("the view circuit was not built")?
+            .clone();
+        Ok(IndexFileRun {
+            same_cache: Arc::ptr_eq(&index_cache, &view_cache),
+            blocks: locations.len(),
+            blocks_in_view_cache: locations
+                .iter()
+                .filter(|location| view_cache.get(&*file, **location).is_some())
+                .count(),
+            occupancy: view_cache.occupancy(),
+        })
+    }
+
+    /// The index's thread writes its file runs through the buffer cache that the view worker
+    /// reads: the two threads hold the same cache object, and every block of the file run is in
+    /// the worker's cache. The cache has room to spare, so no block was evicted.
+    #[test]
+    fn index_file_runs_land_in_the_view_workers_cache() -> Result<()> {
+        let run = append_one_file_run_to_the_index(true)?;
+        assert!(run.same_cache, "the index thread has another cache");
+        assert!(run.blocks > 0, "the file run has no block");
+        assert_eq!(
+            run.blocks_in_view_cache, run.blocks,
+            "a block of the file run is missing from the view worker's cache"
+        );
+        let (used, capacity) = run.occupancy;
+        assert!(used < capacity, "the cache is full: {used} of {capacity}");
+        Ok(())
+    }
+
+    /// The control: an index thread without the binding has another cache, and none of its
+    /// file's blocks is in the view worker's. The cache has room to spare here too, so the
+    /// blocks are absent because they are in the other cache, not because they were evicted.
+    #[test]
+    fn index_file_runs_miss_the_view_workers_cache_without_the_binding() -> Result<()> {
+        let run = append_one_file_run_to_the_index(false)?;
+        assert!(
+            !run.same_cache,
+            "the control shares the view worker's cache"
+        );
+        assert!(run.blocks > 0, "the file run has no block");
+        assert_eq!(
+            run.blocks_in_view_cache, 0,
+            "the control's blocks are in the view worker's cache"
+        );
+        let (used, capacity) = run.occupancy;
+        assert!(used < capacity, "the cache is full: {used} of {capacity}");
         Ok(())
     }
 }

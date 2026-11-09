@@ -696,6 +696,55 @@ fn test_file_indexed_wset_key_bounds() {
     });
 }
 
+/// `file_block_locations` names every block that the writer cached, and finds
+/// them without touching the cache.
+#[test]
+fn test_file_indexed_wset_block_locations_are_the_writers_cached_blocks() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        // Enough rows for a file with index blocks above its data blocks.
+        let tuples = (0..20_000).map(|key| Tup2(Tup2(key, key), 1)).collect();
+        let mut erased_tuples = indexed_zset_tuples(tuples);
+        let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &factories,
+            (),
+            &mut erased_tuples,
+        );
+
+        let accesses_before = total_cache_accesses(batch.cache_stats());
+        let locations = batch.file_block_locations().unwrap();
+        assert_eq!(total_cache_accesses(batch.cache_stats()), accesses_before);
+        // Both columns have a root, and each column's rows span many blocks.
+        assert!(locations.len() > 4, "only {} blocks", locations.len());
+        let distinct: std::collections::BTreeSet<_> =
+            locations.iter().map(|location| location.offset).collect();
+        assert_eq!(distinct.len(), locations.len());
+
+        // The writer cached each of them in this thread's cache, and no other cache has them.
+        let file = batch.file_reader().unwrap();
+        let this_cache = Runtime::buffer_cache().unwrap();
+        let other_cache = crate::storage::buffer_cache::BufferCache::new(64 * 1024 * 1024);
+        for location in locations {
+            assert!(this_cache.get(&*file, location).is_some());
+            assert!(other_cache.get(&*file, location).is_none());
+        }
+    });
+}
+
+#[test]
+fn test_vec_indexed_wset_has_no_file_block_locations() {
+    let factories =
+        <VecIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+    let mut erased_tuples = indexed_zset_tuples(vec![Tup2(Tup2(1, 1), 1)]);
+    let batch = VecIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+        &factories,
+        (),
+        &mut erased_tuples,
+    );
+    assert!(batch.file_block_locations().is_err());
+}
+
 #[test]
 fn test_file_key_batch_key_bounds() {
     run_in_circuit_with_storage(|| {

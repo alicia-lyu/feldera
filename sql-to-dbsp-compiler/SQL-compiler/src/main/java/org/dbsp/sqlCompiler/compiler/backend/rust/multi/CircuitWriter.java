@@ -220,7 +220,7 @@ public final class CircuitWriter extends BaseRustCodeGenerator {
     }
 
     void emitBalancerHints() {
-        CircuitPostfix.emitBalancerHints(this.builder(), this.materializations.balancerHints);
+        CircuitPostfix.emitBalancerHints(this.builder(), this.materializations.balancerHints, "circuit");
     }
 
     @Override

@@ -6,6 +6,8 @@ use std::sync::{mpsc, Arc};
 use anyhow::{bail, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::dynamic::{DowncastTrait, DynData, Erase};
+#[cfg(test)]
+use dbsp::storage::buffer_cache::BufferCache;
 use dbsp::storage::write_attribution::{with_write_owner, WriteOwner};
 use dbsp::trace::merged_index::MergedIndexDefinition;
 use dbsp::trace::{
@@ -37,6 +39,9 @@ enum Request {
     Append(Vec<SourceRow>, mpsc::SyncSender<Result<Snapshot, String>>),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
     Restore(StoragePath, mpsc::SyncSender<Result<(), String>>),
+    /// The buffer cache bound to the index's thread. Tests compare it with the view worker's.
+    #[cfg(test)]
+    BufferCache(mpsc::SyncSender<Arc<BufferCache>>),
     /// Request full compaction of the index's spine.
     StartCompaction(mpsc::SyncSender<()>),
     CompactionComplete(mpsc::SyncSender<bool>),
@@ -53,15 +58,27 @@ impl ManualIndex {
     /// and storage directory are the runtime's. The view circuit's index readers use the same
     /// buffer cache.
     pub(crate) fn new(runtime: &Runtime) -> Self {
+        Self::spawn(runtime, Some(runtime.clone()))
+    }
+
+    /// Like `new`, but leaves the thread's buffer cache unbound, so that it falls back to the
+    /// process-wide auxiliary cache. The control of the test that the binding matters.
+    #[cfg(test)]
+    pub(crate) fn without_cache_binding(runtime: &Runtime) -> Self {
+        Self::spawn(runtime, None)
+    }
+
+    /// Starts the owner thread in `runtime`. The thread binds the foreground cache of
+    /// `cache_owner`, when there is one.
+    fn spawn(runtime: &Runtime, cache_owner: Option<Runtime>) -> Self {
         let (requests, incoming) = mpsc::channel();
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
-        let cache_runtime = runtime.clone();
         runtime.spawn_aux_thread("q3-manual-merged-index", parker, move |parker| {
             // Every file this thread creates, and every spine it owns and that
             // spine's background compaction, belongs to the merged index.
             with_write_owner(WriteOwner::MergedIndex, || {
-                cache_runtime.with_buffer_cache(0, || {
+                bound_to_cache(cache_owner.as_ref(), || {
                     // Folded byte keys; packed payload bytes.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
@@ -77,6 +94,12 @@ impl ManualIndex {
                         match incoming.try_recv() {
                             Ok(Request::BackgroundIdle(reply)) => {
                                 let _ = reply.send(trace.is_background_merge_idle());
+                            }
+                            #[cfg(test)]
+                            Ok(Request::BufferCache(reply)) => {
+                                let _ = reply.send(
+                                    Runtime::buffer_cache().expect("the index thread has a cache"),
+                                );
                             }
                             Ok(Request::StartCompaction(reply)) => {
                                 trace.initiate_compaction();
@@ -156,6 +179,12 @@ impl ManualIndex {
         result.recv().context("merged-index owner exited")
     }
 
+    /// The buffer cache that the index's thread writes its files through.
+    #[cfg(test)]
+    pub(crate) fn buffer_cache(&self) -> Result<Arc<BufferCache>> {
+        self.request(Request::BufferCache)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
         self.request(Request::Snapshot)
     }
@@ -194,6 +223,15 @@ impl ManualIndex {
     pub(crate) fn restore(&self, path: StoragePath) -> Result<()> {
         self.request(|reply| Request::Restore(path, reply))?
             .map_err(anyhow::Error::msg)
+    }
+}
+
+/// Runs `f` with `cache_owner`'s buffer cache bound to the calling thread, or with the thread's
+/// default binding when there is no owner.
+fn bound_to_cache<R>(cache_owner: Option<&Runtime>, f: impl FnOnce() -> R) -> R {
+    match cache_owner {
+        Some(runtime) => runtime.with_buffer_cache(0, f),
+        None => f(),
     }
 }
 

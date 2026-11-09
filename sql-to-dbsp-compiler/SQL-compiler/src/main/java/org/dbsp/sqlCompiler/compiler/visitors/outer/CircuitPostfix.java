@@ -32,8 +32,8 @@ public class CircuitPostfix extends CircuitVisitor {
     final Set<String> regionsCreated = new HashSet<>();
 
     public record BalancerHint(DBSPBinaryOperator operator, JoinStrategy strategy) {
-        public void emit(IIndentStream builder) {
-            builder.append("circuit.set_balancer_hint(").increase();
+        public void emit(IIndentStream builder, String circuitVariable) {
+            builder.append(circuitVariable + ".set_balancer_hint(").increase();
             var input = this.strategy.input == 0 ? this.operator.left() : operator.right();
             var inputHash = OperatorHash.getHash(input.node(), true);
             builder.append(Objects.requireNonNull(inputHash).toQuotedString())
@@ -85,12 +85,13 @@ public class CircuitPostfix extends CircuitVisitor {
      * When adaptive joins are disabled (`dev_tweaks.adaptive_joins`), the streams a
      * hint references are never registered with the balancer; `adaptive_joins_enabled`
      * then returns false (logging a warning) and the hints are skipped. */
-    public static void emitBalancerHints(IIndentStream builder, List<BalancerHint> hints) {
+    public static void emitBalancerHints(
+            IIndentStream builder, List<BalancerHint> hints, String circuitVariable) {
         if (hints.isEmpty())
             return;
-        builder.append("if circuit.adaptive_joins_enabled() {").increase().newline();
+        builder.append("if " + circuitVariable + ".adaptive_joins_enabled() {").increase().newline();
         for (BalancerHint hint: hints)
-            hint.emit(builder);
+            hint.emit(builder, circuitVariable);
         builder.decrease().append("}").newline();
     }
 

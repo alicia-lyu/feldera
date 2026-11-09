@@ -28,6 +28,7 @@
 
 use crate::circuit::metadata::OperatorMeta;
 use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Weight};
+use crate::storage::backend::BlockLocation;
 use crate::storage::buffer_cache::CacheStats;
 use crate::storage::file::SerializerInner;
 use crate::storage::file::TouchedWindowCount;
@@ -1016,6 +1017,14 @@ where
     }
 
     fn from_path(_factories: &Self::Factories, _path: &StoragePath) -> Result<Self, ReaderError> {
+        Err(ReaderError::Unsupported)
+    }
+
+    /// Returns the locations of the data and index blocks of the batch's file,
+    /// read without touching the buffer cache, so that a caller can ask a cache
+    /// which of them it holds. Returns [`ReaderError::Unsupported`] for a batch
+    /// that is not in a file.
+    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
         Err(ReaderError::Unsupported)
     }
 

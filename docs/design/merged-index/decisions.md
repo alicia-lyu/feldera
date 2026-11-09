@@ -326,6 +326,14 @@ The session infers the touched customers from `Dlt`: a group is the first `1 + r
 
 `Maintain` takes `on_group: (group, buffers) -> ()`, and this is the permanent interface, not a stopgap. The session drives the traversal and hands each group's buffers to the execution; it then releases them. In roadmap step 2 the callbacks are tests. In roadmap step 5 the buffered-execution operator supplies the callback that evaluates `ΔJ` and `ΔV` over the buffers and emits rows.
 
+### 2026-11-09: No setup compaction is the default workload
+
+No compaction before the refreshes is the more realistic workload, so it is the default. `--setup-full-compaction` stays as a flag, to isolate the fragmentation effect: it starts both modes from one run per Spine, which removes where each Spine stands against the compaction threshold from the comparison. The flag was added by an agent on 2026-10-14 without a decision entry; this entry confirms its role.
+
+Results so far (versions 4 to 6) ran with the flag, and each recorded result keeps its settings as run. `main.rs` and `measure.py` already take the flag as opt-in. The standard R5 commands in [WORKFLOW.md](WORKFLOW.md) drop it.
+
+Conflict, not resolved here: the Linux campaign of 2026-10-22 and the pilot commands in WORKFLOW.md keep the flag in both arms. The campaign design is unchanged until the user revises it.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
