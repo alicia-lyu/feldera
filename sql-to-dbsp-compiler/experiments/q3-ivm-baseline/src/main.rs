@@ -2542,7 +2542,9 @@ mod reconstructed_tests {
         );
 
         let file = runs[0].file_reader().context("a file run has a file")?;
-        let locations = runs[0].file_block_locations()?;
+        let locations = runs[0]
+            .file_block_locations()?
+            .context("a file run has block locations")?;
         let index_cache = pipeline.index.buffer_cache()?;
         let view_cache = pipeline
             .view_worker_cache

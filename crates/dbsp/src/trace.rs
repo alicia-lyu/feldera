@@ -1022,10 +1022,10 @@ where
 
     /// Returns the locations of the data and index blocks of the batch's file,
     /// read without touching the buffer cache, so that a caller can ask a cache
-    /// which of them it holds. Returns [`ReaderError::Unsupported`] for a batch
-    /// that is not in a file.
-    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
-        Err(ReaderError::Unsupported)
+    /// which of them it holds. Like [`Batch::file_reader`], returns `Ok(None)` for
+    /// a batch that is not in a file; an error means that reading the file failed.
+    fn file_block_locations(&self) -> Result<Option<Vec<BlockLocation>>, ReaderError> {
+        Ok(None)
     }
 
     /// Minimum and maximum keys in this batch.

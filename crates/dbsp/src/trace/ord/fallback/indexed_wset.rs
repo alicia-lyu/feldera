@@ -379,7 +379,7 @@ where
         }
     }
 
-    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
+    fn file_block_locations(&self) -> Result<Option<Vec<BlockLocation>>, ReaderError> {
         match &self.inner {
             Inner::Vec(vec) => vec.file_block_locations(),
             Inner::File(file) => file.file_block_locations(),

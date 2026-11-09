@@ -713,7 +713,10 @@ fn test_file_indexed_wset_block_locations_are_the_writers_cached_blocks() {
         );
 
         let accesses_before = total_cache_accesses(batch.cache_stats());
-        let locations = batch.file_block_locations().unwrap();
+        let locations = batch
+            .file_block_locations()
+            .unwrap()
+            .expect("a file batch has a file");
         assert_eq!(total_cache_accesses(batch.cache_stats()), accesses_before);
         // Both columns have a root, and each column's rows span many blocks.
         assert!(locations.len() > 4, "only {} blocks", locations.len());
@@ -742,7 +745,7 @@ fn test_vec_indexed_wset_has_no_file_block_locations() {
         (),
         &mut erased_tuples,
     );
-    assert!(batch.file_block_locations().is_err());
+    assert!(batch.file_block_locations().unwrap().is_none());
 }
 
 #[test]
