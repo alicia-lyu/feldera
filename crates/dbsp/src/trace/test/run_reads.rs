@@ -261,7 +261,7 @@ fn a_clone_works_before_and_after_its_value_is_filled() {
     run_in_circuit_with_storage(|| {
         let run = file_run();
         let mut cursor = run.cursor();
-        let mut before = cursor.clone();
+        let before = cursor.clone();
 
         // The original fills; the clone made before is still empty.
         assert_eq!(*cursor.val().downcast_checked::<i32>(), 10);
