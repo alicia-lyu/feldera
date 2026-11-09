@@ -157,7 +157,7 @@ At roadmap Step 5, `merged-index-col/src/lib.rs` re-exports the generated module
 
 ### 2026-10-22: The Linux measurement A/B tests key front coding
 
-The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers` and `--setup-full-compaction`, so the arms differ in the key encoding alone. The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
+The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers`, so the arms differ in the key encoding alone. (Setup compaction was also kept in both arms until 2026-11-09; see [The Linux campaign runs without setup compaction](#2026-11-09-the-linux-campaign-runs-without-setup-compaction).) The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
 
 ### 2026-09-28: Maintained views exclude selection predicates
 
@@ -332,13 +332,25 @@ No compaction before the refreshes is the more realistic workload, so it is the 
 
 Results so far (versions 4 to 6) ran with the flag, and each recorded result keeps its settings as run. `main.rs` and `measure.py` already take the flag as opt-in. The standard R5 commands in [WORKFLOW.md](WORKFLOW.md) drop it.
 
-Conflict, not resolved here: the Linux campaign of 2026-10-22 and the pilot commands in WORKFLOW.md keep the flag in both arms. The campaign design is unchanged until the user revises it.
+### 2026-11-09: The Linux campaign runs without setup compaction
+
+The Linux pilot and campaign drop `--setup-full-compaction` in both front-coding arms, as the default workload of 2026-11-09 does. The arms still differ in the key encoding alone: both keep `--elide-value-headers`, and arm B drops only `--front-code-byte-keys`. This amends 2026-10-22, which kept the flag in both arms.
+
+
+### 2026-11-09: One buffer cache, enforced
+
+Everything in the harness uses the runtime's one buffer cache. `ManualIndex`'s thread checks at start that its cache is the runtime's foreground cache (`Arc::ptr_eq`), and `ManualIndex::new` returns an error if it is not, so no run can proceed with the index on another cache. The unbound thread exists only in tests, as the control that shows the check fires.
+
+### 2026-11-09: Generated names fail fast
+
+A user function whose name collides with a name that the generated Rust code uses is rejected by the compiler at `CREATE FUNCTION`, with an error that names the function, instead of a confusing rustc error later. The reserved names are in `GeneratedRustNames` (`SQL-compiler`, package `org.dbsp.sqlCompiler.compiler.backend.rust`); [using.md](../../../sql-to-dbsp-compiler/using.md) lists them.
 
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |
+| 2026-10-22 | Keep `--setup-full-compaction` in both arms of the Linux front-coding A/B. | 2026-11-09: the campaign runs without setup compaction. |
 | 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |

@@ -502,8 +502,8 @@ where
         Some(self.file.file_handle().clone())
     }
 
-    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
-        self.file.block_locations()
+    fn file_block_locations(&self) -> Result<Option<Vec<BlockLocation>>, ReaderError> {
+        self.file.block_locations().map(Some)
     }
 
     fn from_path(factories: &Self::Factories, path: &StoragePath) -> Result<Self, ReaderError> {

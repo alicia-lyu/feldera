@@ -118,6 +118,57 @@ public class SqlCircuitConstructorTest {
                         .matcher(rust).find());
     }
 
+    /** The message of the error that the compiler reports for {@code sql}; fails if there is none. */
+    private static String compilationError(String sql) {
+        try {
+            emit(sql, true);
+        } catch (RuntimeException error) {
+            return error.getMessage();
+        }
+        throw new AssertionError("the program compiled, but it should be rejected");
+    }
+
+    private static String reservedNameMessage(String name) {
+        return "function name `" + name + "` is reserved by the generated Rust code; " +
+                "rename the function";
+    }
+
+    @Test
+    public void sqlFunctionNamedLikeAGeneratedStreamIsRejected() {
+        String sql = """
+                CREATE FUNCTION "stream12"(x INT NOT NULL) RETURNS INT NOT NULL AS x + 1;
+                CREATE TABLE T(y INT NOT NULL);
+                CREATE VIEW V AS SELECT "stream12"(y) AS z FROM T;
+                """;
+        Assert.assertTrue(compilationError(sql).contains(reservedNameMessage("stream12")));
+    }
+
+    @Test
+    public void rustFunctionNamedLikeTheEntryPointIsRejected() {
+        // A Rust UDF is imported into the crate root, where the entry point `circuit` hides it.
+        String sql = """
+                CREATE FUNCTION circuit(x INT NOT NULL) RETURNS INT NOT NULL;
+                CREATE TABLE T(y INT NOT NULL);
+                CREATE VIEW V AS SELECT circuit(y) AS z FROM T;
+                """;
+        Assert.assertTrue(compilationError(sql).contains(reservedNameMessage("circuit")));
+    }
+
+    @Test
+    public void reservedNamesAreMatchedByTheirRule() {
+        // Exact names, a prefix with digits, and a prefix with any suffix.
+        for (String reserved : new String[] { "__circuit", "catalog", "hash", "q3_state", "s0",
+                "stream12", "p3", "handle", "handle_s3", "operator_ab12" })
+            Assert.assertNotNull(reserved, GeneratedRustNames.checkFunctionName(reserved, true));
+        // Names that only look close.
+        for (String allowed : new String[] { "stream_x", "stream", "s", "sx1", "p", "pad1", "handles",
+                "my_hash", "circuit", "udf", "SqlCircuit" })
+            Assert.assertNull(allowed, GeneratedRustNames.checkFunctionName(allowed, true));
+        // The entry point is reserved at the crate root only, so only for a Rust function.
+        Assert.assertNull(GeneratedRustNames.checkFunctionName("circuit", true));
+        Assert.assertNotNull(GeneratedRustNames.checkFunctionName("circuit", false));
+    }
+
     @Test
     public void userTypesCannotBeNamedLikeTheCircuit() {
         // User types are emitted under a hash of their definition, so no SQL type can produce a
@@ -171,6 +222,18 @@ public class SqlCircuitConstructorTest {
             return;
         BaseSQLTests.setupCargoLock();
         compileAndCheck(SQL_FUNCTION_NAMED_LIKE_THE_PARAMETER, "");
+    }
+
+    @Test
+    public void sqlFunctionNamedCloseToAGeneratedNameCompiles() throws IOException, InterruptedException, SQLException {
+        if (BaseSQLTests.skipRust)
+            return;
+        BaseSQLTests.setupCargoLock();
+        compileAndCheck("""
+                CREATE FUNCTION stream_x(x INT NOT NULL) RETURNS INT NOT NULL AS x + 1;
+                CREATE TABLE T(y INT NOT NULL);
+                CREATE VIEW V AS SELECT stream_x(y) AS z FROM T;
+                """, "");
     }
 
     @Test

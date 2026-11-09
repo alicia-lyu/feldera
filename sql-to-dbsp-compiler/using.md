@@ -250,17 +250,25 @@ produced will look like this^[1]:
     which `circuit` calls.  The parameter is called `__circuit` in the generated code,
     although the listing below still shows `circuit`: a function with a SQL body
     is declared inside `build`, where it would shadow a parameter of the same name
-    (a SQL function named `circuit` did, and the crate failed to compile).  A caller can pass several programs' `SqlCircuit::build`
+    (a SQL function named `circuit` did, and the crate failed to compile).
+    A caller can pass several programs' `SqlCircuit::build`
     functions to `Runtime::init_circuits` to run the circuits in one runtime.
     `build` is an associated function of the generated empty enum `SqlCircuit`
     (the circuit's type, never instantiated), so that it lives in that type's namespace.
     A user-defined function named `build` (a Rust function in `udf.rs`, or one with
     a SQL body) neither shadows it nor is shadowed by it, and generated code that
-    calls the user's function by its bare name keeps calling it.  The entry point
-    `circuit` (named after the program) is a free function of the crate root and
-    has no such protection: a user function with the same name would shadow
-    the glob-imported one.  It predates `SqlCircuit` and the pipeline manager calls
-    it, so it is unchanged.
+    calls the user's function by its bare name keeps calling it.
+
+    Other names that the generated code uses are reserved, because a user function
+    is called by its bare name and a function of the same name would shadow or be
+    shadowed by them.  The compiler rejects such a function at `CREATE FUNCTION`
+    with the error "function name `X` is reserved by the generated Rust code;
+    rename the function".  The names are listed in `GeneratedRustNames.java`:
+    in the body of `SqlCircuit::build`, `__circuit`, `catalog`, `hash`, `streams`,
+    `q3_state`, `handle`, `s<N>`, `stream<N>`, `p<N>` (`<N>` is a number), and any
+    name that starts with `handle_` or `operator_`; and, for a Rust function only
+    (it is imported into the crate root by a glob), the entry point `circuit`.
+    A function with a SQL body may be named `circuit`.
 
 ```rust
 $ cat ../temp/src/lib.rs

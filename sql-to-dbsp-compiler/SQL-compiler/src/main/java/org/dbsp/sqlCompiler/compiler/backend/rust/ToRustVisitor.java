@@ -103,15 +103,10 @@ public class ToRustVisitor extends CircuitVisitor {
     protected final IIndentStream builder;
     public final ToRustInnerVisitor innerVisitor;
     final boolean useHandles;
-    /** Name of the generated type whose associated function `build` constructs the circuit.
-     * The compiler does not otherwise generate Rust items with this name (user types are named
-     * after a hash), and a user function cannot clash with a type that has no value. */
-    public static final String CIRCUIT_TYPE_NAME = "SqlCircuit";
-    /** Name of the circuit parameter of the generated constructor `SqlCircuit::build`. A function
-     * with a SQL body is declared inside the constructor, where an item shadows a parameter of the
-     * same name, so the parameter must not be a name that a SQL function could take, such as
-     * `circuit`. The leading underscores keep it clear of the compiler's other generated names. */
-    public static final String CIRCUIT_VARIABLE = "__circuit";
+    /** Names that the generated code reserves are defined, and documented, in
+     * {@link GeneratedRustNames}. */
+    public static final String CIRCUIT_TYPE_NAME = GeneratedRustNames.CIRCUIT_TYPE_NAME;
+    public static final String CIRCUIT_VARIABLE = GeneratedRustNames.CIRCUIT_VARIABLE;
     /** Name of the circuit variable in the code being generated. The multi-crate writers emit
      * operators as functions with a parameter called `circuit`, with no nested SQL functions;
      * only the single-crate constructor uses {@link #CIRCUIT_VARIABLE}. */

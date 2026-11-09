@@ -3865,6 +3865,9 @@ pub(crate) mod tests {
 
     /// Control for the test above: with a runtime, and so a cache, per
     /// circuit, the reader misses on the blocks that the writer cached.
+    ///
+    /// This is a test of the cache itself and is test-only: it deliberately
+    /// builds two runtimes, which a pipeline that wants one cache never does.
     #[test]
     fn separate_runtimes_miss_each_others_blocks() {
         let (writer_temp, reader_temp) = (tempdir().unwrap(), tempdir().unwrap());

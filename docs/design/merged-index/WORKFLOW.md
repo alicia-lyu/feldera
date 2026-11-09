@@ -412,7 +412,6 @@ python3 measure.py \
   --runs 1 \
   --batch 10000 \
   --no-verify \
-  --setup-full-compaction \
   --front-code-byte-keys \
   --elide-value-headers
 ```
@@ -425,9 +424,6 @@ This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, a
 - `--runs 1`: one repetition per mode for the pilot. The campaign uses `--runs 3`.
 - `--batch 10000`: the loading target of 10,000 rows per transaction.
 - `--no-verify`: required for qualification (`qualification` rejects a verified run).
-- `--setup-full-compaction`: both modes start the refreshes from one run per Spine. The
-  2026-10-22 campaign design keeps it in both arms, although it is no longer the default
-  (decisions.md, 2026-11-09); the campaign is unchanged until the user revises it.
 - `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index.
   Native runs write the same files with or without them.
 

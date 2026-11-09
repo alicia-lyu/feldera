@@ -57,28 +57,41 @@ impl ManualIndex {
     /// circuit: the index is secondary storage of the base relations, so its thread, buffer cache
     /// and storage directory are the runtime's. The view circuit's index readers use the same
     /// buffer cache.
-    pub(crate) fn new(runtime: &Runtime) -> Self {
+    ///
+    /// Fails if the thread turns out not to be on the runtime's buffer cache: everything in the
+    /// harness uses that one cache, so the index must not run on another.
+    pub(crate) fn new(runtime: &Runtime) -> Result<Self> {
         Self::spawn(runtime, Some(runtime.clone()))
     }
 
     /// Like `new`, but leaves the thread's buffer cache unbound, so that it falls back to the
-    /// process-wide auxiliary cache. The control of the test that the binding matters.
+    /// process-wide auxiliary cache. Only the test of the one-cache check uses it, to show that
+    /// `new` refuses such a thread: production has no unbound path.
     #[cfg(test)]
-    pub(crate) fn without_cache_binding(runtime: &Runtime) -> Self {
+    pub(crate) fn without_cache_binding(runtime: &Runtime) -> Result<Self> {
         Self::spawn(runtime, None)
     }
 
     /// Starts the owner thread in `runtime`. The thread binds the foreground cache of
-    /// `cache_owner`, when there is one.
-    fn spawn(runtime: &Runtime, cache_owner: Option<Runtime>) -> Self {
+    /// `cache_owner`, when there is one, and then checks that it is on the runtime's own cache.
+    fn spawn(runtime: &Runtime, cache_owner: Option<Runtime>) -> Result<Self> {
         let (requests, incoming) = mpsc::channel();
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
+        let (started, startup) = mpsc::sync_channel(1);
+        let expected_cache_owner = runtime.clone();
         runtime.spawn_aux_thread("q3-manual-merged-index", parker, move |parker| {
             // Every file this thread creates, and every spine it owns and that
             // spine's background compaction, belongs to the merged index.
             with_write_owner(WriteOwner::MergedIndex, || {
                 bound_to_cache(cache_owner.as_ref(), || {
+                    // Before the thread builds anything, so that nothing is written elsewhere.
+                    let on_runtime_cache = check_on_runtime_cache(&expected_cache_owner);
+                    let refused = on_runtime_cache.is_err();
+                    let _ = started.send(on_runtime_cache);
+                    if refused {
+                        return;
+                    }
                     // Folded byte keys; packed payload bytes.
                     let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
                         Vec<u8>,
@@ -167,7 +180,11 @@ impl ManualIndex {
                 });
             });
         });
-        Self { requests, unparker }
+        startup
+            .recv()
+            .context("merged-index owner exited at start")?
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self { requests, unparker })
     }
 
     fn request<T>(&self, make: impl FnOnce(mpsc::SyncSender<T>) -> Request) -> Result<T> {
@@ -232,6 +249,17 @@ fn bound_to_cache<R>(cache_owner: Option<&Runtime>, f: impl FnOnce() -> R) -> R 
     match cache_owner {
         Some(runtime) => runtime.with_buffer_cache(0, f),
         None => f(),
+    }
+}
+
+/// Checks, on the calling thread, that its buffer cache is `runtime`'s foreground cache of
+/// worker 0, the cache that the view circuit's worker uses.
+fn check_on_runtime_cache(runtime: &Runtime) -> Result<(), String> {
+    let thread_cache = Runtime::buffer_cache().ok_or("merged-index thread has no buffer cache")?;
+    if Arc::ptr_eq(&thread_cache, &runtime.foreground_buffer_cache(0)) {
+        Ok(())
+    } else {
+        Err("merged-index thread is not on the runtime's buffer cache".to_owned())
     }
 }
 
