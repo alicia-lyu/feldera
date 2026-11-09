@@ -63,8 +63,8 @@ These were found by the 2026-10-12 review and are tracked here, not yet schedule
   leveled, placed in memory or files, and steered by memory pressure.
 - [support.md](support.md): the trace and cursor interface and acceptance criteria.
 - [shared-traversal.md](shared-traversal.md): the meta plan for shared partner reads
-  (thesis Chapter 3): the algorithm, its audit against the code, and the coding roadmap.
-- [deferred.md](deferred.md): designs not implemented, such as shared scan sessions.
+  (thesis Chapters 2 and 3): buffered execution, the scan session, its audit against the code, and the coding roadmap.
+- [deferred.md](deferred.md): designs not implemented, such as selective execution and shared scan sessions.
 - [references.md](references.md): sibling-repository sources and their roles.
 - [history.md](history.md): dated, non-authoritative records of superseded measurements and gaps.
 - [slides-oct-8/](slides-oct-8/README.md): the 2026-10-08 advisor deck.

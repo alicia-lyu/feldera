@@ -75,7 +75,7 @@ existing batches; they create no tuple copies, historical-version catalog, or ex
 ## Shared scan sessions
 
 > [!NOTE]
-> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward pre-order scan session per transaction that computes derived deltas during the scan. The material below remains background for full-query execution.
+> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward scan session per transaction that collects each touched group once and hands its buffers to the execution (buffered execution, as amended on 2026-11-09). The material below remains background for full-query execution.
 
 Shared scan sessions are a **deferred, optional abstraction** for either full-query execution or IVM.
 The current experiments use direct reconstruction. The design below applies only if later workloads
@@ -256,6 +256,23 @@ physical EOF, close lagging readers, and hold borrowed values during pressure. A
 sealing, independent seeks, cross-step view lifetime, oversized records, dependency cycles, external-order
 changes, and failure during commit. Compare both state-provider results and the shared IVM output with the
 retained-state baseline; report high-water bytes and every spill, reread, sort, and access-path write.
+
+## Selective execution
+
+Deferred on 2026-11-09. The thesis write-up moved selective execution out of Chapter 3 into the companion note `key-trie-execution-refinements` (a PDF linked from `key-trie-merged-index-order.tex`). [shared-traversal.md](shared-traversal.md) now follows buffered execution only. Its earlier text, with the material below in full, is in git history (commit `d8c1dbd11`).
+
+Selective execution visited only the instance nodes that requests needed, and kept only the entries that later requests could still name. The removed material:
+
+- **Requests.** A driving row made a request to a reader, anchored at the instance node of the row's values cut to the reader's key. A base delta row made a *static* request, known before the scan. A derived row made a *dynamic* request when it was computed.
+- **Order of requests.** Each reader owned a queue, and the session merged the queues' heads by key prefix, which is record order with ancestors first. A dynamic request entered its queue by a sorted insert.
+- **Ready pairs.** A pair of a delta term was ready when all its rows had been read. At each node, the session computed every ready pair and made the requests its rows produced before choosing a child.
+- **`Visit`.** The recursive traversal over instance nodes, with `Advance` and `AtRangeEnd`. It entered a child only if a request needed it or it had to be entered to compute requests, and otherwise skipped the child's range by one seek.
+- **Assumption (A3), available requests.** Every request names entries still ahead of the cursor or kept for its consumer, and before the session passes a child's range it knows every request that can name an entry there. It had to be shown per circuit. The write-up's examples that violate it: a coarse request (join `J` with `L` on `(custkey)` alone) and sibling tag order (`W = Invoice ⋈ (L ⋈ O)`).
+- **Kept path.** The entries of the current root-to-node path, kept for path reads such as `J⁺`.
+- **Width for child prefixes.** A per-domain width let the session compute a child domain's prefix length to seek straight to it. Buffered execution needs only the root's width, to infer groups from `Dlt`.
+- **Result.** On the worked transaction, two forward logical seeks served all four reads, and `v2`, `v8`, and `c6` were never decoded.
+
+Buffered execution replaces it as the fallback and as the only target. Reviving selective execution means restoring the request queues and `Visit` over the same `RunMerge`, `Old`, and `Dlt`, and showing (A3) for the circuit.
 
 ## General merged-index definition: later work
 
