@@ -16,7 +16,7 @@ Before Steps 1 and 2, the generic layer in `crates/dbsp/src/trace/merged_index/`
 - **Only `KeyPrimitive::I32` and `I64` could be encoded.** DATE, DECIMAL, and the other key types had no encoding.
 - **Tags were looked up at run time,** by linear scans of four flat constant tables.
 
-The companion note `merged_index_vldb2026_slides/docs/key-trie-laminar-ranges.tex` frames a merged index as a **key trie**:
+The companion note `merged_index_vldb2026_slides/docs/key-trie-merged-index-order.tex` frames a merged index as a **key trie**:
 
 - each node is a key, a sequence of domains;
 - each participating index is placed at the node of its full key;

@@ -232,7 +232,7 @@ The harness does not clear Feldera's buffer cache after loading and setup compac
 
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
 
-For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. The compiler hook stays for the existing reconstructed mode. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
+For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. (Amended on 2026-11-09: selective execution is deferred, so buffered execution applies.) The compiler hook stays for the existing reconstructed mode. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
 
 ### 2026-10-29: Merged-index deltas come from the base transaction
 
@@ -240,11 +240,11 @@ The merged index is base structure, not a view. Its transaction delta `Dlt`, wit
 
 ### 2026-10-29: Derived deltas are computed inside one scan session
 
-The joins whose partner reads share one traversal run inside one scan session per transaction. The session receives every base delta up front, computes derived deltas such as `ΔJ` at the instance node where they arise, and adds the requests they make. Selective execution in the session also needs (A3), available requests. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3; the write-up's earlier A3 and A4 are gone.) Rejected: a second traversal for downstream readers (too costly), a fused operator hard-coded to Q3 (not general), and DBSP scheduler changes that pipeline separate join operators (they deviate from the algorithm). The algorithm work in [shared-traversal.md](shared-traversal.md) precedes coding.
+The joins whose partner reads share one traversal run inside one scan session per transaction. The session receives every base delta up front, computes derived deltas such as `ΔJ` at the instance node where they arise, and adds the requests they make. Selective execution in the session also needs (A3), available requests. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3; the write-up's earlier A3 and A4 are gone. Amended on 2026-11-09: only buffered execution remains. The execution computes derived deltas in `Maintain`'s `on_group` callback, over a group's buffers; no requests exist, and (A3) is not used.) Rejected: a second traversal for downstream readers (too costly), a fused operator hard-coded to Q3 (not general), and DBSP scheduler changes that pipeline separate join operators (they deviate from the algorithm). The algorithm work in [shared-traversal.md](shared-traversal.md) precedes coding.
 
 ### 2026-11-03: Buffered execution comes before selective execution
 
-The roadmap of [shared-traversal.md](shared-traversal.md) builds the buffered-execution session first: one collection per touched customer, with the delta rules evaluated over its buffers. It is exact under (A1) and (A2), gives the baseline that selective execution is checked against, and stays the fallback for circuits for which (A3) has not been shown.
+The roadmap of [shared-traversal.md](shared-traversal.md) builds the buffered-execution session first: one collection per touched customer, with the delta rules evaluated over its buffers. It is exact under (A1) and (A2), gives the baseline that selective execution is checked against, and stays the fallback for circuits for which (A3) has not been shown. (Amended on 2026-11-09: the write-up now has buffered execution only, so there is no selective execution to build first; see "2026-11-09: The doc follows the buffered-only write-up".)
 
 ### 2026-11-03: Counters measure Feldera's costs as well as the write-up's
 
@@ -264,13 +264,15 @@ Buffered and selective execution share one scan session, which each execution us
 
 The execution passes its readers to the session. Each reader fixes its kind, version, and streams, and owns a queue of its requests in record order. A request is an instance node (its key prefix); it does not name its reader. A request carries no rows, since that would duplicate `Dlt`, which the session reads through its own cursor. Buffered execution's own readers do not matter to the session: it passes one group reader, whose queue holds the touched roots, which reads each whole group and passes only the domains the plan never reads. The run counters are always on, as per-thread running totals, with no build flag.
 
+*Superseded in part on 2026-11-09.* The requests, readers with queues, the group reader, selective execution's use of the session, and the passing of unread domains are withdrawn; see "2026-11-09: Maintain takes an `on_group` callback" and "2026-11-09: The session does not seek past unread domains". What stands: one session owns the cursors over `Old` and `Dlt`, the logical overlay builds no merged run, and the run counters are always on.
+
 ### 2026-11-04: Run reads are attributed by a read scope
 
 Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
 
 ### 2026-11-04: Path reads and subtree roots probe exact keys
 
-Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this.
+Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this. (Amended on 2026-11-09: the root probe is now the `ProbeThenRange` mode of the `GroupStart` knob, an A/B against `PrefixSeek`, not a fixed rule. Path reads keep their exact probes.)
 
 ### 2026-11-04: Native joins read through run cursors
 
@@ -294,10 +296,41 @@ What stays: two generated circuits and two transactions per refresh. The base tr
 
 This supersedes the separate runtimes of 2026-10-23, its even cache split and per-runtime memory target, the base-runtime cache binding of 2026-10-26 "Merged-index maintenance in the base phase" (the phase booking stands), and the per-runtime occupancy of 2026-10-26 "Feldera's buffer cache stays warm at window start".
 
+### 2026-11-09: The doc follows the buffered-only write-up
+
+The thesis write-up was renamed `key-trie-merged-index-order.tex`. Its Chapter 3 now has buffered execution only; selective execution moved to the companion note `key-trie-execution-refinements`. [shared-traversal.md](shared-traversal.md) follows the write-up first. Selective execution is deferred, and its removed material is summarized in [deferred.md](deferred.md#selective-execution). The roadmap is renumbered without it.
+
+### 2026-11-09: Step 2 includes lazy values and the session's own merging cursor
+
+Roadmap step 2 includes lazy value positioning in DBSP's file cursor (`FileIndexedWSetCursor` positions only the key on a landing) and a merging cursor of the session's own, `RunMerge`, that consolidates only buffered entries.
+
+Why: laziness lives in DBSP's own cursor, not in a cursor only the session uses, so native mode gets the same saving and the comparison stays fair. `CursorList` reads every run's weight at each landing, which a position that nothing buffers must not pay.
+
+### 2026-11-09: The session does not seek past unread domains
+
+The session reaches every position of a touched group, including streams the plan never reads, such as Q3's invoices. With lazy values such a position costs a key decode and nothing else. This withdraws the passing of unread domains by seeking (the group reader of 2026-11-03).
+
+### 2026-11-09: Groups are inferred from `Dlt`, with a width per domain
+
+The session infers the touched customers from `Dlt`: a group is the first `1 + root_width` bytes of a `Dlt` key. It calls the execution back once per group, so groups arrive in order with no waiting on calls. `KeyTrie` gets a width per domain; only the root's is used. Java's `KeyTrie` stores none, and the Rust emitter derives it from the domain type.
+
+### 2026-11-09: `Skip` is kept, and `Pass` is an A/B knob
+
+`Skip` of a rejected subtree (`alg:skip`) is kept. It shares a `Pass::{Seek, Step}` knob with the passing of untouched groups, so one A/B tests seeking against stepping for both.
+
+### 2026-11-09: `GroupStart` A/B-tests the root probe
+
+`GroupStart::{PrefixSeek, ProbeThenRange}` tests probing the customer's exact key before the range read, the decision of 2026-11-04, against seeking to the group's prefix.
+
+### 2026-11-09: Maintain takes an `on_group` callback
+
+`Maintain` takes `on_group: (group, buffers) -> ()`, and this is the permanent interface, not a stopgap. The session drives the traversal and hands each group's buffers to the execution; it then releases them. In roadmap step 2 the callbacks are tests. In roadmap step 5 the buffered-execution operator supplies the callback that evaluates `ΔJ` and `ΔV` over the buffers and emits rows.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |
 | 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |
