@@ -576,12 +576,21 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
 
         // The index reads. The file run's keys, in folded-key order, are c5,
         // o3, l7, l8, o4, l9, and c6, each with one value. Every scan opens a
-        // cursor over all runs, which lands the file run on c5 (one key decode
-        // and one value decode). A key step of the file run decodes the new
-        // key and its first value. A seek that leaves the file run on its
-        // current key still decodes that key's first value. `CursorList`
-        // decodes a file weight whenever the file run holds the smallest
-        // value, to skip zero weights.
+        // cursor over all runs, which lands the file run on c5 (one key
+        // decode).
+        //
+        // The file cursor decodes a value only when asked (lazy values), and
+        // `CursorList` asks for the first value of every run at its smallest
+        // key. The file run is at the smallest key at every landing
+        // here: the memory run holds only c7, past every file key, and `Dlt`
+        // holds c5 and the keys under it. So each landing of the file run
+        // costs one key decode and one value decode, as it did before lazy
+        // values, and lazy values change none of the counts below. A seek that
+        // leaves the file run on its current key still decodes that key's
+        // first value, since the seek empties the cursor's value and
+        // `CursorList` asks again. `CursorList` decodes a file weight
+        // whenever the file run holds the smallest value, to skip zero
+        // weights. `RunMerge` (roadmap step 2) avoids these reads.
         //
         // The path reads, C⁺ and J⁺, probe one exact key (`scan_entry`): a run
         // whose filter excludes the key is neither sought nor decoded, and
