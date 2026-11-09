@@ -161,7 +161,6 @@ python3 measure.py \
   --memory-target-bytes 536870912 \
   --runs 3 \
   --no-verify \
-  --setup-full-compaction \
   --front-code-byte-keys \
   --elide-value-headers
 ```
@@ -185,7 +184,9 @@ all of those. `--cache-bytes` must be a whole number of MiB.
 `--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests
 full compaction for the circuit and the merged index and waits for compaction to finish, then
 publishes and starts the measured refreshes. Nothing is compacted on request after any refresh.
-The report's `load.setup_full_compaction` holds the setup's cost.
+The report's `load.setup_full_compaction` holds the setup's cost. It is off by default, since no
+compaction before the refreshes is the more realistic workload (decision of 2026-11-09). Add it
+to isolate the fragmentation effect: both modes then start from one run per Spine.
 
 `--front-code-byte-keys` (also a driver flag) sets DBSP's `front_code_byte_keys` dev tweak. Every
 storage file writer then front-codes data blocks whose keys are raw byte strings with no auxiliary
@@ -424,7 +425,9 @@ This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, a
 - `--runs 1`: one repetition per mode for the pilot. The campaign uses `--runs 3`.
 - `--batch 10000`: the loading target of 10,000 rows per transaction.
 - `--no-verify`: required for qualification (`qualification` rejects a verified run).
-- `--setup-full-compaction`: both modes start the refreshes from one run per Spine.
+- `--setup-full-compaction`: both modes start the refreshes from one run per Spine. The
+  2026-10-22 campaign design keeps it in both arms, although it is no longer the default
+  (decisions.md, 2026-11-09); the campaign is unchanged until the user revises it.
 - `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index.
   Native runs write the same files with or without them.
 

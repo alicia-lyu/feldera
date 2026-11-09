@@ -294,6 +294,14 @@ What stays: two generated circuits and two transactions per refresh. The base tr
 
 This supersedes the separate runtimes of 2026-10-23, its even cache split and per-runtime memory target, the base-runtime cache binding of 2026-10-26 "Merged-index maintenance in the base phase" (the phase booking stands), and the per-runtime occupancy of 2026-10-26 "Feldera's buffer cache stays warm at window start".
 
+### 2026-11-09: No setup compaction is the default workload
+
+No compaction before the refreshes is the more realistic workload, so it is the default. `--setup-full-compaction` stays as a flag, to isolate the fragmentation effect: it starts both modes from one run per Spine, which removes where each Spine stands against the compaction threshold from the comparison. The flag was added by an agent on 2026-10-14 without a decision entry; this entry confirms its role.
+
+Results so far (versions 4 to 6) ran with the flag, and each recorded result keeps its settings as run. `main.rs` and `measure.py` already take the flag as opt-in. The standard R5 commands in [WORKFLOW.md](WORKFLOW.md) drop it.
+
+Conflict, not resolved here: the Linux campaign of 2026-10-22 and the pilot commands in WORKFLOW.md keep the flag in both arms. The campaign design is unchanged until the user revises it.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
