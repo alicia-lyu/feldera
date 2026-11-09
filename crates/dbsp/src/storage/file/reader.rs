@@ -2052,6 +2052,39 @@ where
         Ok(self.file.file_handle.get_size()?)
     }
 
+    /// Returns the location of every data block and index block of every
+    /// column, in no particular order.
+    ///
+    /// These are the blocks that a writer puts in its thread's buffer cache
+    /// and that a reader fetches through its own thread's cache. The walk reads
+    /// index blocks straight from the file, so it neither consults nor fills any
+    /// cache and counts no cache access: a caller can use the result to ask a
+    /// cache which of the file's blocks it holds, without disturbing the answer.
+    pub fn block_locations(&self) -> Result<Vec<BlockLocation>, Error> {
+        let mut locations = Vec::new();
+        let mut pending: Vec<TreeNode> = self
+            .columns
+            .iter()
+            .filter_map(|column| column.root.clone())
+            .collect();
+        while let Some(node) = pending.pop() {
+            locations.push(node.location);
+            if matches!(node.node_type, NodeType::Index) {
+                let raw = self.file.read_block(node.location)?;
+                let index_block = IndexBlock::<DynData>::from_raw(
+                    raw,
+                    node.location,
+                    node.rows.start,
+                    self.file.version,
+                )?;
+                for child in 0..index_block.n_children() {
+                    pending.push(index_block.get_child(child)?);
+                }
+            }
+        }
+        Ok(locations)
+    }
+
     /// Evict this file from the cache.
     #[cfg(test)]
     pub fn evict(&self) {

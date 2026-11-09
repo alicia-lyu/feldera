@@ -1,3 +1,4 @@
+use crate::storage::backend::BlockLocation;
 use crate::storage::file::format::BatchMetadata;
 use crate::storage::file::{
     FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
@@ -499,6 +500,10 @@ where
     fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         self.file.mark_for_checkpoint();
         Some(self.file.file_handle().clone())
+    }
+
+    fn file_block_locations(&self) -> Result<Vec<BlockLocation>, ReaderError> {
+        self.file.block_locations()
     }
 
     fn from_path(factories: &Self::Factories, path: &StoragePath) -> Result<Self, ReaderError> {
