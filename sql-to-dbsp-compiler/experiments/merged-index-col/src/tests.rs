@@ -366,8 +366,7 @@ fn column(relation: &'static str, column: &'static str) -> ColumnRef {
 }
 
 #[test]
-fn trie_is_valid_and_derives_the_spec() {
-    TRIE.validate().unwrap();
+fn trie_derives_the_spec() {
     assert_eq!(
         ["custkey", "orderkey", "linenumber"].map(|domain| TRIE.domain_tag(domain)),
         [Some(1), Some(2), Some(3)]

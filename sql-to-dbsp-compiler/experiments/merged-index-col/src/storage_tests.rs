@@ -426,6 +426,9 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
 #[test]
 fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
     let storage_dir = tempfile::tempdir().unwrap();
+    // This test keeps its own placement setting, unlike the R5 harness, which uses DBSP's
+    // defaults (user decision of 2026-11-09): it builds file runs on purpose, so it asks the
+    // runtime to put every batch in a file.
     let config = CircuitConfig::with_workers(1).with_storage(Some(
         CircuitStorageConfig::for_config(
             StorageConfig {

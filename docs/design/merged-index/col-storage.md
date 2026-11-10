@@ -37,7 +37,7 @@ Rules:
 - **Prefixes.** `KeyEncoder::prefix` returns the leading fields without `INDEX` or the placement id. A customer prefix ends after `c`; an order prefix ends after `o`; a line prefix also includes the line domain tag, through `KeyEncoder::then_tag`.
 - **Scans.** A prefix scan seeks the prefix and steps until the key no longer starts with it. No successor function is needed.
 
-Fixture tests: `mixed_width_folding_writes_tags_values_terminator_and_id`, `signed_boundaries_round_trip_and_sort`, `malformed_keys_are_rejected_without_panics`, `decoder_reports_each_kind_of_malformed_key`, and the `validate_rejects_*` tests in `crates/dbsp/src/trace/merged_index/tests.rs`.
+Fixture tests: `mixed_width_folding_writes_tags_values_terminator_and_id`, `signed_boundaries_round_trip_and_sort`, `malformed_keys_are_rejected_without_panics`, `decoder_reports_each_kind_of_malformed_key`, in `crates/dbsp/src/trace/merged_index/tests.rs`. The trie's accessors are tested there; the rules that reject a spec are tested in the compiler's `MergedIndexValidatorTest`.
 
 ## Definition and source types
 

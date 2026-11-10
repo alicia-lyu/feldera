@@ -70,7 +70,7 @@ cargo +1.96.1 test --offline -p dbsp --lib merged_index::run_merge
 cargo +1.96.1 test --offline -p dbsp --lib merged_index::session
 ```
 
-The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`. The `run_merge` and `session` filters cover the merging cursor and the scan session. The session's counters on the COL data are `session_run_reads_on_the_worked_transaction` and `the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways` (filter `session_run_reads` and `the_passes`) in the COL suite.
+The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`. The `run_merge` and `session` filters cover the merging cursor and the scan session. The session's counters on the COL data are `session_run_reads_on_the_worked_transaction` and `the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways` (filter `session_run_reads` and `the_passes`) in the COL suite. The same rows over one-run `Old` in memory and in a file are `session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file`; the native view circuit's reads on them are `worked_transaction_in_memory` and `worked_transaction_in_files` in the harness (`cargo +1.96.1 test --offline --locked worked_transaction` from `q3-ivm-baseline`, with the native circuits generated, which is what `./generate.sh` without arguments does).
 
 The merged-index spec parser, validator, and emitter test in the SQL compiler, with Java 21 configured:
 

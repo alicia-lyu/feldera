@@ -212,13 +212,6 @@ impl MergedIndexDefinition for StreamOneIndex {
     }
 }
 
-#[test]
-fn fixture_tries_are_valid() {
-    for trie in TRIES {
-        trie.validate().unwrap();
-    }
-}
-
 // ---- Helpers ----
 
 /// The folded key of placement `A` of [`TWO_LEVELS`].

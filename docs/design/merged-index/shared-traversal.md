@@ -7,7 +7,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10); nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, and 2026-11-09.
+> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10); nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, 2026-11-09, and 2026-11-10.
 
 This doc covers:
 
@@ -212,7 +212,7 @@ One scan session executes buffered execution. It is schema-independent, and it d
 - The index definition `D` (`MergedIndexDefinition`), which supplies the trie (`D::TRIE`) and the payload decoder (`D::decode_payload(stream_id, bytes)`). The stream id selects the payload type, so decoding needs no `unfold`. The session is bound to `D`: `ScanSession<D>`, and nothing else is passed.
 - One knob, below.
 
-A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. `KeyTrie::validate` and the Java `MergedIndexValidator` reject any other trie, so `root_width()` is a plain `usize` and the session cannot be built over a trie with no single root.
+A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. The Java `MergedIndexValidator` rejects any other trie, so `root_width()` is a plain `usize`; it panics on a hand-built trie with no single root, and so does the session (decision of 2026-11-10: the compiler's validator is the only trie check).
 
 The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
 
@@ -282,7 +282,7 @@ A group read has no exact-key probe (decision of 2026-11-09). A probe of the gro
 - `payload_decodes_old` and `payload_decodes_dlt`: one per buffered entry;
 - `cancelled`: values whose weights cancelled across runs.
 
-DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes. In-memory runs count their key, value, and weight accesses in separate fields, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (names unconfirmed; see [decisions.md](decisions.md)), by the same rules as the file decodes: a landing reads a key, a value counts once per position, and each weight returned reads a weight. A memory access deserializes nothing, so the two kinds are never added.
+DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes. In-memory runs count their key, value, and weight accesses in separate fields, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see [decisions.md](decisions.md)), by the same rules as the file decodes: a landing reads a key, a value counts once per position, and each weight returned reads a weight. A memory access deserializes nothing, so the two kinds are never added.
 
 ### Ownership
 
@@ -359,7 +359,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 2. **Decode-free storage and the buffered scan session.** *Done 2026-11-09.* The sub-steps committed one by one:
    - **Prefix successor and per-domain width.**
      - `prefix_successor(prefix) -> Option<Vec<u8>>` in `merged_index/mod.rs`. It drops trailing `0xFF` bytes and increments the last remaining byte. It returns `None` when every byte is `0xFF`, meaning the range runs to the end of the index.
-     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0 and any trie without exactly one top-level node (*changed on 2026-11-09*; `root_width()` returned an `Option` before). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
+     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `root_width()` that panics on any trie without exactly one top-level node (*changed on 2026-11-09*; it returned an `Option` before, and a Rust `validate()` rejected such tries until 2026-11-10, when the compiler's validator became the only check). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
      - Regenerate `merged-index-col/src/generated.rs`.
      - *Exit:* unit tests for the empty prefix, carry, and all-`0xFF`; a property test that `k.starts_with(p)` holds exactly when `p <= k < succ(p)`; COL's widths are 8, 8, and 4.
    - **Lazy value positioning** in `FileIndexedWSetCursor` ([Remedies](#remedies)). *Done 2026-11-09.* The value cursor becomes a once-filled slot (`OnceCell`), and `count_value_decode` moves to where it is filled. A landing reads the key only; the first `val`, `val_valid`, `weight`, `map_times`, or value move fills the slot. A key move keeps the emptied cursor as the hint for the next first value. The `run_reads` tests pin the lazy counts; the COL baseline is unchanged (see the note under its table).
@@ -380,8 +380,29 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      | Value decodes | 6 | 22 |
      | Weight decodes | 6 | 19 |
      | Payload decodes from `Old` | 6 | |
+     | Memory key reads (`M`, `Dlt`) | 5 | 11 |
+     | Memory value reads | 5 | 8 |
+     | Memory weight reads | 5 | 8 |
      | Payload decodes from `Dlt` | 5 | |
      | Logical seeks, steps, positions | 0, 6, 7 | |
+
+     *Added 2026-11-10:* the memory reads. The session reads `M`'s key at the opening and `Dlt` whole (4 keys, 5 values, 5 weights).
+
+     **Pinned: native and the session on the same rows** (*added 2026-11-10*). The native side is the view worker's run reads in the worked transaction, in the harness's native build (`native_worked_transaction_tests` in `q3-ivm-baseline/src/main.rs`): the old state is loaded (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`, `c6`, `c7`) and the transaction replaces `c5` and adds `o5` with `l10` and `l11`. The session side is `Maintain` over an `Old` of one run holding the same eight keys, which is the layout of a native trace after one load transaction (`session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file` in `merged-index-col/src/q3/tests.rs`). Both arms use DBSP's default placement. The memory arm runs at low memory pressure, where every run is in memory (the storage directory gains no file). The file arm waits until the runtime reports high memory pressure before the load, as `append_one_file_run_to_the_index` does, so that the runs are files (the directory gains files in the load and in the transaction).
+
+     | Reading | Layout | Seeks | Filter rejections | Key | Value | Weight | Memory key | Memory value | Memory weight |
+     | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+     | Native, view worker | memory | 7 | 0 | 0 | 0 | 0 | 16 | 41 | 38 |
+     | Native, view worker | files | 6 | 1 | 16 | 41 | 38 | 0 | 0 | 0 |
+     | Session | memory | 0 | 0 | 0 | 0 | 0 | 11 | 11 | 11 |
+     | Session | `Old` in a file, `Dlt` in memory | 0 | 0 | 7 | 6 | 6 | 4 | 5 | 5 |
+
+     How to read the table:
+
+     - *Native counts the whole of `V`'s maintenance*: both joins, all four traces. Each join probes the other side's trace once for each key of each delta: `ΔC` (`c5`) into O, `ΔO` (`c5`) into C, `ΔJ` (`o3`, `o4`, `o5`) into L, and `ΔL` (`o5`) into J. That is 1 + 1 + 3 + 1 = 7 probes, and the measured seeks are 7 in memory. In files one probe is answered by a run's filter (it counts a rejection and no seek, so 6 + 1); it is probably `ΔJ`'s probe of `o5` in L, which has no line item of `o5` yet, but the test does not check which one. The key, value, and weight counts (16, 41, 38) are the totals that the traces' cursors make, pinned as measured. They are not derived per operation.
+     - *The session counts only the traversal*: the old entries of the one touched group (7 positions, 6 entries taken) and the delta. Evaluating the delta rules over the buffers reads nothing more.
+     - *Placement does not change the counts*, only their kind: native's file arm decodes exactly the numbers that its memory arm reads (16, 41, 38), and the session's `Old` decodes in a file (7, 6, 6) what it reads in memory (7, 6, 6, inside the 11, 11, 11). The delta stays in memory in both of the session's arms, and native's step batches are not counted, since they are not indexed Z-set runs of a trace.
+     - *Native reads 16 keys, 41 values, and 38 weights, against the session's 7, 6, and 6 old reads* (11 keys, 11 values, and 11 weights, with `Dlt`). The comparison is of the two designs on one transaction at this tiny scale, not a claim about a workload: a measurement needs a raw artifact (see CLAUDE.md).
 
      **Pinned: the A/B.** `Old` has 18 keys (17 in a file run, `c7` in a memory run) over customers `c3`, `c5`, `c6`, `c7`, `c8`, `c9`. `Dlt` touches `c5` (old entries `c5`, `o3`, `l7`, `l8`, `o4`, `l9`; delta entries `-c5`, `+c5'`, `o5`, `l10`, `l11`), `c8` (a delta line item; its old customer is rejected by the segment filter, so its order and line item are passed unread), and `c10` (past the end of `Old`). Both passes buffer the same entries, and decode seven old payloads, eight delta payloads, seven values, and seven weights:
 
@@ -441,5 +462,3 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
-- `decode_payload` keys on the stream id, not on the unfolded key.
-- `ScanSession::new` and `KeyTrie::root_width` panic on a trie without one root domain, which `validate` rejects, instead of returning an error.

@@ -173,7 +173,6 @@ fn decoder_reports_each_kind_of_malformed_key() {
 
 #[test]
 fn fixture_agrees_with_its_trie() {
-    Definition::TRIE.validate().unwrap();
     check_against_trie::<Definition>([(i64::MIN, i32::MIN), (0, 0), (i64::MAX, i32::MAX)]);
 }
 
@@ -308,7 +307,6 @@ fn column(relation: &'static str, column: &'static str) -> ColumnRef {
 
 #[test]
 fn col_trie_derives_tags_ids_names_and_key_columns() {
-    COL_TRIE.validate().unwrap();
     assert_eq!(COL_TRIE.domain_tag("custkey"), Some(1));
     assert_eq!(COL_TRIE.domain_tag("orderkey"), Some(2));
     assert_eq!(COL_TRIE.domain_tag("linenumber"), Some(3));
@@ -478,72 +476,6 @@ fn fixture_trie(children: &'static [Node]) -> KeyTrie {
     }
 }
 
-fn assert_invalid(trie: KeyTrie, expected_message: &str) {
-    let error = trie.validate().unwrap_err();
-    assert!(
-        error.contains(expected_message),
-        "`{error}` should contain `{expected_message}`"
-    );
-}
-
-#[test]
-fn validate_rejects_a_node_domain_that_is_not_declared() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "undeclared",
-            placements: &[],
-            children: &[],
-        }]),
-        "`undeclared` is not declared",
-    );
-}
-
-#[test]
-fn validate_rejects_a_via_domain_that_is_not_declared() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Fixture",
-                via: &[Via {
-                    domain: "undeclared",
-                    relation: "Other",
-                }],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "via domain `undeclared` is not declared",
-    );
-}
-
-#[test]
-fn validate_rejects_a_domain_declared_twice() {
-    const TWICE: &[Domain] = &[FIXTURE_DOMAINS[0], FIXTURE_DOMAINS[0]];
-    assert_invalid(
-        KeyTrie {
-            domains: TWICE,
-            ..FIXTURE_TRIE
-        },
-        "declared twice",
-    );
-}
-
-#[test]
-fn validate_rejects_a_domain_of_width_zero() {
-    const ZERO_WIDTH: &[Domain] = &[Domain {
-        width: 0,
-        ..FIXTURE_DOMAINS[0]
-    }];
-    assert_invalid(
-        KeyTrie {
-            domains: ZERO_WIDTH,
-            ..FIXTURE_TRIE
-        },
-        "width 0",
-    );
-}
-
 #[test]
 fn root_width_is_the_width_of_the_only_top_level_domain() {
     assert_eq!(FIXTURE_TRIE.root_width(), 8);
@@ -557,13 +489,10 @@ fn root_width_panics_without_a_top_level_node() {
 }
 
 #[test]
-fn validate_rejects_a_trie_without_a_top_level_node() {
-    assert_invalid(fixture_trie(&[]), "no top-level node");
-}
-
-#[test]
-fn validate_rejects_two_top_level_nodes() {
-    // Two root domains would need two key tries, each its own merged index.
+#[should_panic(expected = "2 top-level nodes, not one")]
+fn root_width_panics_with_two_top_level_nodes() {
+    // Two root domains would need two key tries, each its own merged index. The compiler's
+    // validator rejects such a spec, so only a hand-built trie gets here.
     const TWO_ROOTS: &[Node] = &[
         Node {
             domain: "root",
@@ -576,7 +505,7 @@ fn validate_rejects_two_top_level_nodes() {
             children: &[],
         },
     ];
-    assert_invalid(fixture_trie(TWO_ROOTS), "2 top-level nodes");
+    fixture_trie(TWO_ROOTS).root_width();
 }
 
 #[test]
@@ -615,7 +544,6 @@ fn several_streams_may_share_the_root_node() {
             children: &[],
         }],
     };
-    SHARED_ROOT.validate().unwrap();
     assert_eq!(SHARED_ROOT.root_width(), 8);
     let paths: Vec<_> = SHARED_ROOT
         .placements()
@@ -682,218 +610,6 @@ proptest::proptest! {
             proptest::prop_assert_eq!(key.starts_with(&prefix), in_range);
         }
     }
-}
-
-#[test]
-fn validate_rejects_sibling_nodes_with_the_same_domain() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[],
-            children: &[
-                Node {
-                    domain: "child",
-                    placements: &[EMPTY_PLACEMENT],
-                    children: &[],
-                },
-                Node {
-                    domain: "child",
-                    placements: &[],
-                    children: &[],
-                },
-            ],
-        }]),
-        "sibling nodes repeat domain `child`",
-    );
-}
-
-#[test]
-fn validate_rejects_a_domain_that_repeats_on_a_path() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[],
-            children: &[Node {
-                domain: "root",
-                placements: &[],
-                children: &[],
-            }],
-        }]),
-        "repeats on the path",
-    );
-}
-
-#[test]
-fn validate_rejects_a_relation_placed_twice_at_a_node() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[EMPTY_PLACEMENT, EMPTY_PLACEMENT],
-            children: &[],
-        }]),
-        "placed twice",
-    );
-}
-
-#[test]
-fn validate_rejects_more_than_255_domains() {
-    let domains: Vec<Domain> = (0..256)
-        .map(|position| Domain {
-            name: Box::leak(format!("d{position}").into_boxed_str()),
-            width: 8,
-            columns: &[],
-        })
-        .collect();
-    assert_invalid(
-        KeyTrie {
-            domains: Box::leak(domains.into_boxed_slice()),
-            ..FIXTURE_TRIE
-        },
-        "more than 255 domains",
-    );
-}
-
-#[test]
-fn validate_rejects_more_than_255_placements() {
-    let placements: Vec<Placement> = (0..256).map(|_| EMPTY_PLACEMENT).collect();
-    let nodes = vec![Node {
-        domain: "root",
-        placements: Box::leak(placements.into_boxed_slice()),
-        children: &[],
-    }];
-    assert_invalid(
-        fixture_trie(Box::leak(nodes.into_boxed_slice())),
-        "more than 255 placements",
-    );
-}
-
-#[test]
-fn validate_rejects_a_path_domain_that_does_not_resolve() {
-    // `Other` has no column in `root` and no via for it.
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Other",
-                via: &[],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "no column in domain `root` and no via",
-    );
-}
-
-#[test]
-fn validate_rejects_a_via_relation_without_a_column_in_the_domain() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Other",
-                via: &[Via {
-                    domain: "root",
-                    relation: "Missing",
-                }],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "via relation `Missing` has no column",
-    );
-}
-
-#[test]
-fn validate_rejects_a_via_for_a_domain_the_relation_already_has() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Fixture",
-                via: &[Via {
-                    domain: "root",
-                    relation: "Fixture",
-                }],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "own column in domain `root` and also a via",
-    );
-}
-
-#[test]
-fn validate_rejects_a_via_domain_off_the_path() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Fixture",
-                via: &[Via {
-                    domain: "child",
-                    relation: "Fixture",
-                }],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "is not on the path",
-    );
-}
-
-#[test]
-fn validate_rejects_two_vias_for_one_domain() {
-    assert_invalid(
-        fixture_trie(&[Node {
-            domain: "root",
-            placements: &[Placement {
-                relation: "Other",
-                via: &[
-                    Via {
-                        domain: "root",
-                        relation: "Fixture",
-                    },
-                    Via {
-                        domain: "root",
-                        relation: "Fixture",
-                    },
-                ],
-                payload: Payload::All,
-            }],
-            children: &[],
-        }]),
-        "two vias",
-    );
-}
-
-#[test]
-fn validate_rejects_two_columns_of_one_relation_in_a_domain() {
-    const TWO_COLUMNS: &[Domain] = &[Domain {
-        name: "root",
-        width: 8,
-        columns: &[
-            ColumnRef {
-                relation: "Fixture",
-                column: "f_a",
-            },
-            ColumnRef {
-                relation: "Fixture",
-                column: "f_b",
-            },
-        ],
-    }];
-    assert_invalid(
-        KeyTrie {
-            domains: TWO_COLUMNS,
-            children: &[Node {
-                domain: "root",
-                placements: &[EMPTY_PLACEMENT],
-                children: &[],
-            }],
-            ..FIXTURE_TRIE
-        },
-        "two columns in domain `root`",
-    );
 }
 
 /// A stored row: folded key bytes, typed payload, weight.
