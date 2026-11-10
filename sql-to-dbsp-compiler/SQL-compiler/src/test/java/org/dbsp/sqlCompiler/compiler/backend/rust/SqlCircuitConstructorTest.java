@@ -8,6 +8,7 @@ import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
+import org.dbsp.util.IndentStream;
 import org.dbsp.util.IndentStreamBuilder;
 import org.dbsp.util.Utilities;
 import org.junit.Assert;
@@ -15,6 +16,7 @@ import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,10 +25,11 @@ import java.sql.SQLException;
 import java.util.regex.Pattern;
 
 /**
- * The generated crate exports its circuit constructor as {@code SqlCircuit::build}, an associated
- * function. A free function named {@code build} at the crate root would shadow a user function
- * of that name, which the generated code calls by its bare name and which the crate root
- * imports with a glob.
+ * The generated crate exports its circuit constructor as {@code <circuit>::SqlCircuit::build}, an
+ * associated function of a type inside a module named after the circuit. A free function named
+ * {@code build} at the crate root would shadow a user function of that name, which the generated
+ * code calls by its bare name and which the crate root imports with a glob. The module keeps
+ * several circuits in one crate from defining {@code SqlCircuit} twice.
  */
 public class SqlCircuitConstructorTest {
     private static final String RUST_UDF_PROGRAM = """
@@ -63,7 +66,10 @@ public class SqlCircuitConstructorTest {
             }
             """;
 
-    private static String emit(String sql, boolean handles) {
+    /** The compiler and the circuit of a program, which is named {@code circuitName}. */
+    private record Compiled(DBSPCompiler compiler, DBSPCircuit circuit) {}
+
+    private static Compiled compile(String sql, boolean handles, String circuitName) {
         CompilerOptions options = new CompilerOptions();
         options.languageOptions.incrementalize = true;
         options.languageOptions.throwOnError = true;
@@ -71,6 +77,18 @@ public class SqlCircuitConstructorTest {
         DBSPCompiler compiler = new DBSPCompiler(options);
         compiler.submitStatementsForCompilation(sql);
         DBSPCircuit circuit = compiler.getFinalCircuit(false);
+        circuit.setName(circuitName);
+        return new Compiled(compiler, circuit);
+    }
+
+    private static String emit(String sql, boolean handles) {
+        return emit(sql, handles, "circuit");
+    }
+
+    private static String emit(String sql, boolean handles, String circuitName) {
+        Compiled compiled = compile(sql, handles, circuitName);
+        DBSPCompiler compiler = compiled.compiler();
+        DBSPCircuit circuit = compiled.circuit();
         IndentStreamBuilder builder = new IndentStreamBuilder();
         new ToRustVisitor(compiler, builder, circuit.metadata, new ProjectDeclarations(),
                 new CircuitPostfix(compiler)).apply(circuit);
@@ -86,15 +104,36 @@ public class SqlCircuitConstructorTest {
     public void constructorIsAnAssociatedFunction() {
         for (boolean handles : new boolean[] { false, true }) {
             String rust = emit(RUST_UDF_PROGRAM, handles);
-            Assert.assertTrue(hasTopLevelLine(rust, "pub enum SqlCircuit {}"));
-            Assert.assertTrue(hasTopLevelLine(rust, "impl SqlCircuit {"));
-            Assert.assertTrue(rust.contains("    pub fn build(__circuit: &mut RootCircuit"));
+            // The type is inside the circuit's module, not at the crate root.
+            Assert.assertTrue(hasTopLevelLine(rust, "pub mod circuit {"));
+            Assert.assertTrue(rust.contains("    use super::*;"));
+            Assert.assertTrue(rust.contains("    pub enum SqlCircuit {}"));
+            Assert.assertTrue(rust.contains("    impl SqlCircuit {"));
+            Assert.assertFalse(hasTopLevelLine(rust, "pub enum SqlCircuit {}"));
+            Assert.assertTrue(rust.contains("        pub fn build(__circuit: &mut RootCircuit"));
             Assert.assertFalse("build must not be a free function",
                     hasTopLevelLine(rust, "pub fn build("));
-            Assert.assertTrue(rust.contains("SqlCircuit::build(circuit)"));
+            Assert.assertTrue(rust.contains("circuit::SqlCircuit::build(circuit)"));
             // The generated code still calls the user's function by its bare name.
             Assert.assertTrue(Pattern.compile("[^:\\w]build\\(\\(\\*p\\d").matcher(rust).find());
         }
+    }
+
+    @Test
+    public void everyCircuitHasItsOwnModule() {
+        // Circuits that share a crate (the compiler's tests concatenate them) each define
+        // `SqlCircuit`, so each must sit in a module named after the circuit.
+        String first = emit(SQL_FUNCTION_PROGRAM, true, "circuit0");
+        String second = emit(SQL_FUNCTION_PROGRAM, true, "circuit1");
+        Assert.assertTrue(hasTopLevelLine(first, "pub mod circuit0 {"));
+        Assert.assertTrue(hasTopLevelLine(second, "pub mod circuit1 {"));
+        for (String rust : new String[] { first, second }) {
+            Assert.assertEquals(1, rust.split("pub enum SqlCircuit", -1).length - 1);
+            Assert.assertFalse(hasTopLevelLine(rust, "pub enum SqlCircuit {}"));
+            Assert.assertFalse(hasTopLevelLine(rust, "impl SqlCircuit {"));
+        }
+        Assert.assertTrue(first.contains("circuit0::SqlCircuit::build(circuit)"));
+        Assert.assertTrue(second.contains("circuit1::SqlCircuit::build(circuit)"));
     }
 
     @Test
@@ -103,7 +142,7 @@ public class SqlCircuitConstructorTest {
         // so it cannot duplicate the constructor's name.
         String rust = emit(SQL_FUNCTION_PROGRAM, true);
         Assert.assertFalse(hasTopLevelLine(rust, "pub fn build("));
-        Assert.assertTrue(rust.contains("        pub fn build(x: i32) -> i32 {"));
+        Assert.assertTrue(rust.contains("            pub fn build(x: i32) -> i32 {"));
     }
 
     @Test
@@ -111,7 +150,7 @@ public class SqlCircuitConstructorTest {
         // The function is declared inside the constructor. The constructor's parameter has
         // another name, so the calls on the circuit resolve to the parameter, not to the function.
         String rust = emit(SQL_FUNCTION_NAMED_LIKE_THE_PARAMETER, true);
-        Assert.assertTrue(rust.contains("        pub fn circuit(x: i32) -> i32 {"));
+        Assert.assertTrue(rust.contains("            pub fn circuit(x: i32) -> i32 {"));
         Assert.assertTrue(rust.contains("__circuit.add_input_zset"));
         Assert.assertFalse("a method call on `circuit` would resolve to the user's function",
                 Pattern.compile("[^_\\w]circuit\\.(add_|recursive|set_|create_|open_|close_)")
@@ -198,6 +237,27 @@ public class SqlCircuitConstructorTest {
             Utilities.createEmptyFile(udfFile);
             BaseSQLTests.createEmptyStubs();
         }
+    }
+
+    @Test
+    public void twoCircuitsInOneCrateCompile() throws IOException, InterruptedException, SQLException {
+        if (BaseSQLTests.skipRust)
+            return;
+        BaseSQLTests.setupCargoLock();
+        // Concatenate two circuits into one crate, as BaseSQLTests does. Their user functions
+        // have the same names, and the second also has a type named like the circuit.
+        Compiled first = compile(SQL_FUNCTION_PROGRAM, true, "circuit0");
+        Compiled second = compile(SQL_TYPE_NAMED_LIKE_THE_CIRCUIT, true, "circuit1");
+        BaseSQLTests.createEmptyStubs();
+        Utilities.createEmptyFile(Paths.get(BaseSQLTests.RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME));
+        try (PrintStream output = new PrintStream(Files.newOutputStream(Paths.get(BaseSQLTests.TEST_FILE_PATH)))) {
+            RustFileWriter writer = new RustFileWriter(new CircuitPostfix(first.compiler()));
+            writer.setOutputBuilder(new IndentStream(output));
+            writer.add(first.circuit());
+            writer.add(second.circuit());
+            writer.write(first.compiler());
+        }
+        Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true, "");
     }
 
     @Test

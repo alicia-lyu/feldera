@@ -345,6 +345,10 @@ Everything in the harness uses the runtime's one buffer cache. `ManualIndex`'s t
 
 A user function whose name collides with a name that the generated Rust code uses is rejected by the compiler at `CREATE FUNCTION`, with an error that names the function, instead of a confusing rustc error later. The reserved names are in `GeneratedRustNames` (`SQL-compiler`, package `org.dbsp.sqlCompiler.compiler.backend.rust`); [using.md](../../../sql-to-dbsp-compiler/using.md) lists them.
 
+### 2026-11-09: Each generated circuit has its own module
+
+The user's decision: "give each circuit its own module". The generated crate holds `SqlCircuit` and its constructor `build` inside `pub mod <circuit name> { use super::*; ... }`, beside the entry-point function of the same name (a module and a function live in different Rust namespaces). A caller reaches the constructor as `<crate>::<circuit name>::SqlCircuit::build`, which is `q3_base_circuit::circuit::SqlCircuit::build` in the harness. Without the module, a crate that holds several circuits, as the compiler's `BaseSQLTests` runner builds, defined `SqlCircuit` more than once (error E0428). The check is `SqlCircuitConstructorTest`.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

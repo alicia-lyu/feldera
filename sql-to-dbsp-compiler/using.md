@@ -258,6 +258,13 @@ produced will look like this^[1]:
     A user-defined function named `build` (a Rust function in `udf.rs`, or one with
     a SQL body) neither shadows it nor is shadowed by it, and generated code that
     calls the user's function by its bare name keeps calling it.
+    The enum and its `impl` sit in a module named after the circuit, which has the same
+    name as the entry point (`circuit` in the listing): a module and a function are in
+    different Rust namespaces.  A caller writes
+    `<crate>::circuit::SqlCircuit::build`.  The module opens with `use super::*;`, so it
+    sees the crate root's items, including its private ones.  A crate that holds several
+    circuits, such as the compiler's tests build, therefore defines `SqlCircuit` once
+    per module.
 
     Other names that the generated code uses are reserved, because a user function
     is called by its bare name and a function of the same name would shadow or be
