@@ -20,9 +20,11 @@ from typing import Any
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
 WRITE_OWNERS = ("query", "base_relation", "merged_index")
-# The merged index's readers, and the run counts reported for each (measurement version 5).
+# The merged index's readers, and the run counts reported for each (measurement version 6). The
+# decodes are file runs'; the memory reads are in-memory runs', kept apart from them.
 INDEX_READERS = ("customers_after", "orders_before", "joined_orders_after", "lineitems_before")
-RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes")
+RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes",
+                   "memory_key_reads", "memory_value_reads", "memory_weight_reads")
 
 
 def sha256(path: Path) -> str:

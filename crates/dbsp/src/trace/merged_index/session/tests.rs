@@ -560,7 +560,9 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
 
             // Positions: A(1) at open, B(1,1), and A(2), which ends the group.
             // Each costs a key decode. Only A(1) is taken, so one value, one
-            // weight, and one payload are decoded.
+            // weight, and one payload are decoded. `Dlt` is a memory run of
+            // one row: its one key is read at open, and its one value and
+            // weight are taken with it, so one memory access of each kind.
             assert_eq!(counts.positions, 3, "{pass:?}");
             assert_eq!(counts.payload_decodes_old, 1);
             assert_eq!(counts.payload_decodes_dlt, 1);
@@ -571,6 +573,9 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
                     key_decodes: 3,
                     value_decodes: 1,
                     weight_decodes: 1,
+                    memory_key_reads: 1,
+                    memory_value_reads: 1,
+                    memory_weight_reads: 1,
                     ..RunReads::default()
                 },
                 "{pass:?}"
@@ -604,7 +609,11 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
         // on A2 (position 2); collect takes A2, steps to B2 (3) and A3 (4),
         // which ends the group. Group 5: the seek from A3 lands on A5 (5);
         // collect steps to B5 (6) and A6 (7). Two seeks, four steps, seven
-        // positions with a key decode each, two payloads.
+        // positions with a key decode each, two payloads. `Dlt` is a memory
+        // run of two rows, A2 and A5, and the session reads it whole: two key
+        // reads (the open and the step to A5; the step past A5 lands on
+        // nothing), and one value and one weight for each row. Its reads are
+        // the same for both passes, because `Dlt` is not seeked.
         let (counts, reads) = &measured[0];
         assert_eq!(counts.groups, 2);
         assert_eq!(counts.cursor_opens, 2);
@@ -620,6 +629,9 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
                 key_decodes: 7,
                 value_decodes: 2,
                 weight_decodes: 2,
+                memory_key_reads: 2,
+                memory_value_reads: 2,
+                memory_weight_reads: 2,
                 ..RunReads::default()
             }
         );
@@ -636,6 +648,9 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
                 key_decodes: 11,
                 value_decodes: 2,
                 weight_decodes: 2,
+                memory_key_reads: 2,
+                memory_value_reads: 2,
+                memory_weight_reads: 2,
                 ..RunReads::default()
             }
         );
@@ -670,6 +685,15 @@ fn a_rejected_node_is_passed_by_one_seek_or_by_steps() {
             assert_eq!(counts.payload_decodes_old, 1);
             assert_eq!(reads.value_decodes, 1);
             assert_eq!(reads.weight_decodes, 1);
+            // `Dlt` is one memory row: its key, value, and weight, once each.
+            assert_eq!(
+                (
+                    reads.memory_key_reads,
+                    reads.memory_value_reads,
+                    reads.memory_weight_reads
+                ),
+                (1, 1, 1)
+            );
             match pass {
                 // One seek to [1, 2]: A(1), then A(2) are the only key decodes.
                 Pass::Seek => {

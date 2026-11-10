@@ -1,7 +1,7 @@
 //! Counts of what the cursors over single runs read.
 //!
 //! A *run* is one immutable sorted batch, in memory or in a file. The cursors
-//! over a single run count five things in per-thread running totals:
+//! over a single run count eight things in per-thread running totals:
 //!
 //! * `seeks`: key seeks that reach the run (`seek_key`, `seek_key_with`, and
 //!   their reverse forms), in both in-memory and file runs. A
@@ -18,8 +18,14 @@
 //!   after a landing positions on the key's first value, and counts it once.
 //! * `weight_decodes`: weights a file run deserializes, one for each weight
 //!   that `weight`, `map_times`, or `map_values` returns.
-//!
-//! In-memory runs deserialize nothing, so they count only seeks.
+//! * `memory_key_reads`, `memory_value_reads`, `memory_weight_reads`: the
+//!   accesses of an in-memory run, counted by the same rules as the file
+//!   decodes above (a landing reads a key, a value counts once per position,
+//!   each returned weight reads a weight). They stay apart from the decodes,
+//!   because a memory access deserializes nothing; its cost is a cache line,
+//!   not a block read and a deserialization. A predicate key seek counts
+//!   one key read for each probe, as the file run counts one decode for each
+//!   probe. A plain key seek counts no probes in either kind of run.
 //!
 //! Only the cursors of indexed Z-set runs (`VecIndexedWSet` and
 //! `FileIndexedWSet`) count. Runs of other batch types, such as Z-sets, are
@@ -63,6 +69,9 @@ pub struct RunReads {
     pub key_decodes: u64,
     pub value_decodes: u64,
     pub weight_decodes: u64,
+    pub memory_key_reads: u64,
+    pub memory_value_reads: u64,
+    pub memory_weight_reads: u64,
 }
 
 /// One running total per owner, indexed like [`WriteOwner::ALL`].
@@ -75,6 +84,9 @@ thread_local! {
     static KEY_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
     static VALUE_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
     static WEIGHT_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
+    static MEMORY_KEY_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
+    static MEMORY_VALUE_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
+    static MEMORY_WEIGHT_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
 }
 
 impl RunReads {
@@ -97,6 +109,9 @@ impl RunReads {
             key_decodes: total(&KEY_DECODES),
             value_decodes: total(&VALUE_DECODES),
             weight_decodes: total(&WEIGHT_DECODES),
+            memory_key_reads: total(&MEMORY_KEY_READS),
+            memory_value_reads: total(&MEMORY_VALUE_READS),
+            memory_weight_reads: total(&MEMORY_WEIGHT_READS),
         }
     }
 
@@ -110,6 +125,9 @@ impl RunReads {
             key_decodes: self.key_decodes - earlier.key_decodes,
             value_decodes: self.value_decodes - earlier.value_decodes,
             weight_decodes: self.weight_decodes - earlier.weight_decodes,
+            memory_key_reads: self.memory_key_reads - earlier.memory_key_reads,
+            memory_value_reads: self.memory_value_reads - earlier.memory_value_reads,
+            memory_weight_reads: self.memory_weight_reads - earlier.memory_weight_reads,
         }
     }
 
@@ -126,6 +144,9 @@ impl AddAssign for RunReads {
         self.key_decodes += other.key_decodes;
         self.value_decodes += other.value_decodes;
         self.weight_decodes += other.weight_decodes;
+        self.memory_key_reads += other.memory_key_reads;
+        self.memory_value_reads += other.memory_value_reads;
+        self.memory_weight_reads += other.memory_weight_reads;
     }
 }
 
@@ -175,6 +196,18 @@ pub(crate) fn count_weight_decode() {
     increment(&WEIGHT_DECODES);
 }
 
+pub(crate) fn count_memory_key_read() {
+    increment(&MEMORY_KEY_READS);
+}
+
+pub(crate) fn count_memory_value_read() {
+    increment(&MEMORY_VALUE_READS);
+}
+
+pub(crate) fn count_memory_weight_read() {
+    increment(&MEMORY_WEIGHT_READS);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +226,14 @@ mod tests {
         count_weight_decode();
         count_weight_decode();
         count_weight_decode();
+        count_memory_key_read();
+        count_memory_key_read();
+        count_memory_key_read();
+        count_memory_key_read();
+        count_memory_key_read();
+        count_memory_value_read();
+        count_memory_value_read();
+        count_memory_weight_read();
         assert_eq!(
             RunReads::current().since(earlier),
             RunReads {
@@ -201,6 +242,9 @@ mod tests {
                 key_decodes: 2,
                 value_decodes: 1,
                 weight_decodes: 3,
+                memory_key_reads: 5,
+                memory_value_reads: 2,
+                memory_weight_reads: 1,
             }
         );
     }
@@ -213,6 +257,9 @@ mod tests {
             key_decodes: 2,
             value_decodes: 3,
             weight_decodes: 4,
+            memory_key_reads: 6,
+            memory_value_reads: 7,
+            memory_weight_reads: 8,
         };
         sum += RunReads {
             seeks: 10,
@@ -220,6 +267,9 @@ mod tests {
             key_decodes: 20,
             value_decodes: 30,
             weight_decodes: 40,
+            memory_key_reads: 60,
+            memory_value_reads: 70,
+            memory_weight_reads: 80,
         };
         assert_eq!(
             sum,
@@ -229,6 +279,9 @@ mod tests {
                 key_decodes: 22,
                 value_decodes: 33,
                 weight_decodes: 44,
+                memory_key_reads: 66,
+                memory_value_reads: 77,
+                memory_weight_reads: 88,
             }
         );
     }
@@ -246,6 +299,9 @@ mod tests {
         key_decodes: 0,
         value_decodes: 0,
         weight_decodes: 0,
+        memory_key_reads: 0,
+        memory_value_reads: 0,
+        memory_weight_reads: 0,
     };
 
     /// The reads that `f` makes, in total and for each owner.

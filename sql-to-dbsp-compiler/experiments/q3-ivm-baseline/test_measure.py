@@ -328,6 +328,12 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("lineitems_before.key_decodes is -1",
                       measure.index_read_problems(negative)[0])
 
+        # A report from before the memory reads (measurement version 6) is incomplete.
+        old_report = self.index_report()
+        del old_report["refreshes"][0]["index_run_reads"]["customers_after"]["memory_key_reads"]
+        self.assertIn("customers_after.memory_key_reads is None",
+                      measure.index_read_problems(old_report)[0])
+
         no_layout = self.index_report()
         del no_layout["refreshes"][1]["index_layout"]["after"]["file"]
         self.assertIn("index_layout.after.file is malformed",

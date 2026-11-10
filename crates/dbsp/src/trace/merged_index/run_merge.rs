@@ -11,7 +11,8 @@
 //! skip a key whose weights cancel. A scan session passes many entries that it
 //! buffers nothing from, so [`RunMerge::step`] and [`RunMerge::seek`] read only
 //! keys. Over file runs, that is a key decode per landing and no value or
-//! weight decode (see [`RunReads`](crate::trace::RunReads)).
+//! weight decode; over memory runs, a key read per landing and no value or
+//! weight read (see [`RunReads`](crate::trace::RunReads)).
 //!
 //! # Position
 //!
@@ -25,7 +26,7 @@
 //! [`RunMerge::take`] visits the values at the current key in ascending order,
 //! each with its weight summed over the runs, and skips a value whose weights
 //! sum to zero. It counts the skipped values ([`RunMerge::cancelled`]): they
-//! cost a value and a weight decode each, an inherent price of reading an
+//! cost a value and a weight read each, an inherent price of reading an
 //! uncompacted run set. `take` consumes the values of the runs at the key, so
 //! it visits nothing the second time. [`RunMerge::step`] and
 //! [`RunMerge::seek`] reposition the values of the keys they land on.
@@ -634,6 +635,44 @@ pub(crate) mod tests {
             assert_eq!(second.weight_decodes, 2);
             assert_eq!(merge.cancelled(), 1);
         });
+    }
+
+    #[test]
+    fn memory_runs_read_keys_while_stepping_and_each_value_and_weight_when_taken() {
+        // Two memory runs: key a has two values in the first; key b has one
+        // value in each, and the second run's cancels.
+        let runs = vec![
+            (
+                vec![row(b"a", 1, 1), row(b"a", 2, 1), row(b"b", 1, 1)],
+                false,
+            ),
+            (vec![row(b"b", 1, -1)], false),
+        ];
+        let snapshot = snapshot(&runs);
+        let (mut merge, opened) = reads_of(|| RunMerge::new(&snapshot));
+        // Each run reads its first key at the opening.
+        assert_eq!(opened.memory_key_reads, 2);
+
+        let (values, first) = reads_of(|| take_all(&mut merge));
+        assert_eq!(values, vec![(1, 1), (2, 1)]);
+        // Only the first run is at a: two values and two weights.
+        assert_eq!(first.memory_value_reads, 2);
+        assert_eq!(first.memory_weight_reads, 2);
+        assert_eq!(first.memory_key_reads, 0);
+
+        // The step lands the first run on b: one key read. The second run is
+        // already at b.
+        let (_, stepped) = reads_of(|| merge.step());
+        assert_eq!(stepped.memory_key_reads, 1);
+        assert_eq!(stepped.memory_value_reads, 0);
+        assert_eq!(stepped.memory_weight_reads, 0);
+
+        // Both runs are at b: one cancelled value, one read of each per run.
+        let (values, second) = reads_of(|| take_all(&mut merge));
+        assert!(values.is_empty());
+        assert_eq!(second.memory_value_reads, 2);
+        assert_eq!(second.memory_weight_reads, 2);
+        assert_eq!(merge.cancelled(), 1);
     }
 
     #[test]

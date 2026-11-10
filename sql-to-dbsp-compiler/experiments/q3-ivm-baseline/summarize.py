@@ -27,11 +27,14 @@ reports, over the repetitions:
   reset worked) and the maximum sampled `memory.current`;
 - `sequence.view_run_reads`, the view worker's run reads summed over the owners
   (`view_seeks`, `view_filter_rejections`, `view_key_decodes`, `view_value_decodes`,
-  `view_weight_decodes`), in both modes: the join traces' partner reads in native mode, the index
+  `view_weight_decodes`, `view_memory_key_reads`, `view_memory_value_reads`,
+  `view_memory_weight_reads`), in both modes: the join traces' partner reads in native mode, the index
   readers' and the rest of the view circuit's in reconstructed mode;
 - for the merged-index mode only, `sequence.index_run_reads` summed over the readers
   (`index_seeks`, `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
-  `index_weight_decodes`), under the mode's `index_run_reads`. Only file runs count decodes.
+  `index_weight_decodes`, `index_memory_key_reads`, `index_memory_value_reads`,
+  `index_memory_weight_reads`), under the mode's `index_run_reads`. File runs count decodes and
+  in-memory runs count memory reads; the two are never added.
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not

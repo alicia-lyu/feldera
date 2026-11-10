@@ -1445,9 +1445,9 @@ fn phase_json(stats: &Measurements) -> Value {
     })
 }
 
-/// The view worker's run reads per read owner (measurement version 5): the join traces'
-/// partner reads in native mode are under `query`; in reconstructed mode the index readers are
-/// under `merged_index`.
+/// The view worker's run reads per read owner: the join traces' partner reads in native mode are
+/// under `query`; in reconstructed mode the index readers are under `merged_index`. The fields
+/// are those of `RunReads`: file runs' decodes and in-memory runs' reads count apart.
 fn view_reads_json(reads: &[RunReads; 3]) -> Result<Value> {
     WriteOwner::ALL
         .into_iter()
@@ -1461,8 +1461,8 @@ fn view_reads_json(reads: &[RunReads; 3]) -> Result<Value> {
         .map(Value::Object)
 }
 
-/// The merged index's run reads per reader (measurement version 5). Only file runs count key,
-/// value and weight reads; `index_layout` says where the runs were.
+/// The merged index's run reads per reader. File runs count key, value and weight decodes and
+/// in-memory runs count `memory_*` reads, apart; `index_layout` says where the runs were.
 #[cfg(feature = "merged-index")]
 fn index_reads_json(reads: &IndexReads) -> Result<Value> {
     Ok(json!({
@@ -2798,7 +2798,16 @@ mod measurement_tests {
             for owner in ["query", "base_relation", "merged_index"] {
                 assert!(view[owner]["seeks"].is_u64(), "{refresh}");
             }
-            for field in ["seeks", "filter_rejections", "key_decodes", "value_decodes"] {
+            for field in [
+                "seeks",
+                "filter_rejections",
+                "key_decodes",
+                "value_decodes",
+                "weight_decodes",
+                "memory_key_reads",
+                "memory_value_reads",
+                "memory_weight_reads",
+            ] {
                 let index_part = view["merged_index"][field].as_u64().unwrap();
                 if cfg!(feature = "merged-index") {
                     let by_reader: u64 = READERS

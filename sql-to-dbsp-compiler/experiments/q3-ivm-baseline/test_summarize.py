@@ -22,9 +22,12 @@ def owners(query: int, base: int, index: int) -> dict[str, dict[str, int]]:
 
 
 def index_reads(seeks: int) -> dict[str, dict[str, int]]:
-    """Every reader with `seeks` seeks and twice as many key, value and weight reads."""
+    """Every reader with `seeks` seeks and twice as many key, value and weight decodes, and as
+    many memory reads."""
     return {reader: {"seeks": seeks, "filter_rejections": 0, "key_decodes": 2 * seeks,
-                     "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks}
+                     "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks,
+                     "memory_key_reads": seeks, "memory_value_reads": seeks,
+                     "memory_weight_reads": seeks}
             for reader in summarize.INDEX_READERS}
 
 
@@ -140,6 +143,8 @@ class SummarizeTest(unittest.TestCase):
         seeks = merged["index_run_reads"]["index_seeks"]
         self.assertEqual((seeks["median"], seeks["min"], seeks["max"]), (72, 60, 84))
         self.assertEqual(merged["index_run_reads"]["index_value_decodes"]["median"], 144)
+        # The memory reads are separate metrics, one per seek, not added to the decodes.
+        self.assertEqual(merged["index_run_reads"]["index_memory_value_reads"]["median"], 72)
         self.assertNotIn("index_seeks", merged["metrics"])
         self.assertIn("Merged-index run reads (merged-index)", markdown)
         self.assertIn("| `index_seeks` | 72 | 60 | 84 |", markdown)

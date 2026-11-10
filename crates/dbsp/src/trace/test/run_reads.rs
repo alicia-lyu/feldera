@@ -55,14 +55,25 @@ fn reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
     (result, RunReads::current().since(before))
 }
 
-/// Reads with no filter rejection.
+/// Reads of a file run, with no filter rejection and no memory access.
 fn reads(seeks: u64, key_decodes: u64, value_decodes: u64, weight_decodes: u64) -> RunReads {
     RunReads {
         seeks,
-        filter_rejections: 0,
         key_decodes,
         value_decodes,
         weight_decodes,
+        ..RunReads::default()
+    }
+}
+
+/// Reads of an in-memory run: seeks and memory accesses, and no decodes.
+fn memory_reads(seeks: u64, keys: u64, values: u64, weights: u64) -> RunReads {
+    RunReads {
+        seeks,
+        memory_key_reads: keys,
+        memory_value_reads: values,
+        memory_weight_reads: weights,
+        ..RunReads::default()
     }
 }
 
@@ -286,19 +297,204 @@ fn a_clone_works_before_and_after_its_value_is_filled() {
 }
 
 #[test]
-fn vec_run_counts_seeks_only() {
+fn vec_run_counts_each_access() {
     let run = vec_run();
+    let probes = Cell::new(0_u64);
+    let predicate = |key: &DynI32| {
+        probes.set(probes.get() + 1);
+        *key.downcast_checked::<i32>() >= 3
+    };
     let ((), all) = reads_of(|| {
+        // Opening lands on key 1: one key.
         let mut cursor = run.cursor();
+        // The first value move reads the first value (10), then lands on 11:
+        // two values.
         cursor.step_val();
+        // One weight.
         cursor.weight();
+        // Lands on key 2: one key. A seek to key 3 moves: one seek, one key.
         cursor.step_key();
         cursor.seek_key(3_i32.erase());
-        cursor.seek_key_with(&|key| *key.downcast_checked::<i32>() >= 3);
+        // A seek that stays on key 3 reads only its probes: one seek.
+        cursor.seek_key_with(&predicate);
+        // A seek that stays: one seek, no key.
         assert!(cursor.seek_key_exact(3_i32.erase(), None));
+        // Key 3 has one value and so one weight; the value is read on the
+        // first `val_valid`, and the step past it lands on nothing.
         cursor.map_values(&mut |_, _| ());
     });
-    assert_eq!(all, reads(3, 0, 0, 0));
+    assert!(probes.get() > 0);
+    assert_eq!(
+        all,
+        memory_reads(
+            3,                // the three seeks
+            3 + probes.get(), // opening, step, seek, then each probe
+            3,                // 10 and 11, then 30
+            2,                // `weight`, then the one `map_values` row
+        )
+    );
+}
+
+#[test]
+fn a_memory_run_reads_the_first_value_once() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    let (valid, first) = reads_of(|| cursor.val_valid());
+    assert!(valid);
+    assert_eq!(first, memory_reads(0, 0, 1, 0));
+
+    // `val` and `val_valid` read nothing more at this position.
+    let (value, again) = reads_of(|| {
+        assert!(cursor.val_valid());
+        *cursor.val().downcast_checked::<i32>()
+    });
+    assert_eq!(value, 10);
+    assert_eq!(again, RunReads::default());
+
+    // The next key's value is read once more, not before.
+    let ((), moved) = reads_of(|| cursor.step_key());
+    assert_eq!(moved, memory_reads(0, 1, 0, 0));
+    let (value, second) = reads_of(|| *cursor.val().downcast_checked::<i32>());
+    assert_eq!(value, 20);
+    assert_eq!(second, memory_reads(0, 0, 1, 0));
+}
+
+#[test]
+fn a_memory_landing_reads_no_value() {
+    let run = vec_run();
+    let ((), landed) = reads_of(|| {
+        let mut cursor = run.cursor();
+        cursor.step_key();
+        cursor.seek_key(3_i32.erase());
+        cursor.rewind_keys();
+        cursor.fast_forward_keys();
+        cursor.step_key_reverse();
+        cursor.seek_key_reverse(1_i32.erase());
+        assert!(cursor.key_valid());
+    });
+    // Only the keys: the opening, the step, the seek, the rewind, the
+    // fast-forward, the reverse step, and the reverse seek.
+    assert_eq!(landed, memory_reads(2, 7, 0, 0));
+}
+
+#[test]
+fn a_memory_seek_that_stays_reads_no_key() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    let (found, stayed) = reads_of(|| cursor.seek_key_exact(1_i32.erase(), None));
+    assert!(found);
+    assert_eq!(stayed, memory_reads(1, 0, 0, 0));
+    let (found, moved) = reads_of(|| cursor.seek_key_exact(3_i32.erase(), None));
+    assert!(found);
+    assert_eq!(moved, memory_reads(1, 1, 0, 0));
+    // A key that is absent lands on the next larger one, or on nothing.
+    let (found, missed) = reads_of(|| cursor.seek_key_exact(100_i32.erase(), None));
+    assert!(!found);
+    assert_eq!(missed, memory_reads(1, 0, 0, 0));
+}
+
+#[test]
+fn a_memory_predicate_seek_counts_each_probe() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    let probes = Cell::new(0_u64);
+    let predicate = |key: &DynI32| {
+        probes.set(probes.get() + 1);
+        *key.downcast_checked::<i32>() >= 3
+    };
+    let ((), sought) = reads_of(|| cursor.seek_key_with(&predicate));
+    assert_eq!(key_of(&cursor), 3);
+    assert!(probes.get() > 0);
+    // Every probe, then the landed key; no value.
+    assert_eq!(sought, memory_reads(1, probes.get() + 1, 0, 0));
+}
+
+#[test]
+fn a_memory_run_map_values_reads_each_weight() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    let mut weights = Vec::new();
+    let ((), mapped) = reads_of(|| {
+        cursor.map_values(&mut |_, weight| weights.push(**weight));
+    });
+    assert_eq!(weights, vec![1, 1]);
+    // Two weights and two values (10, then 11 after one step); the step past
+    // the end lands on nothing.
+    assert_eq!(mapped, memory_reads(0, 0, 2, 2));
+}
+
+#[test]
+fn a_memory_weight_or_value_move_reads_the_first_value_first() {
+    let run = vec_run();
+
+    // `weight` before any `val`, on a key reached by a seek: the value, then
+    // the weight.
+    let mut cursor = run.cursor();
+    cursor.seek_key(3_i32.erase());
+    let (weight, weighed) = reads_of(|| **cursor.weight());
+    assert_eq!(weight, 1);
+    assert_eq!(weighed, memory_reads(0, 0, 1, 1));
+
+    // `map_times` reads the value (via `val_valid`) and one weight.
+    let mut cursor = run.cursor();
+    let ((), timed) = reads_of(|| cursor.map_times(&mut |_, _| ()));
+    assert_eq!(timed, memory_reads(0, 0, 1, 1));
+
+    // `seek_val` to 11 from an unread value reads 10, then lands on 11.
+    let mut cursor = run.cursor();
+    let ((), sought) = reads_of(|| cursor.seek_val(11_i32.erase()));
+    assert_eq!(*cursor.val().downcast_checked::<i32>(), 11);
+    assert_eq!(sought, memory_reads(0, 0, 2, 0));
+
+    // `seek_val` that stays reads the first value only.
+    let mut cursor = run.cursor();
+    let ((), stayed) = reads_of(|| cursor.seek_val(10_i32.erase()));
+    assert_eq!(stayed, memory_reads(0, 0, 1, 0));
+}
+
+#[test]
+fn a_memory_value_move_past_the_end_reads_nothing() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    cursor.step_key();
+    cursor.step_key();
+    // Key 3 has one value: the first read counts it, and the step lands on
+    // nothing.
+    let ((), stepped) = reads_of(|| cursor.step_val());
+    assert!(!cursor.val_valid());
+    assert_eq!(stepped, memory_reads(0, 0, 1, 0));
+
+    // Past the last key there is no value to read.
+    cursor.step_key();
+    assert!(!cursor.key_valid());
+    let (_, ended) = reads_of(|| cursor.val_valid());
+    assert_eq!(ended, RunReads::default());
+}
+
+#[test]
+fn a_memory_clone_keeps_whether_its_value_was_read() {
+    let run = vec_run();
+    let mut cursor = run.cursor();
+    let before = cursor.clone();
+
+    // The original reads the value; the clone made before has not.
+    assert_eq!(*cursor.val().downcast_checked::<i32>(), 10);
+    let (value, filled) = reads_of(|| *before.val().downcast_checked::<i32>());
+    assert_eq!(value, 10);
+    assert_eq!(filled, memory_reads(0, 0, 1, 0));
+
+    // A clone made after the read carries it and reads nothing.
+    let mut after = cursor.clone();
+    let (value, copied) = reads_of(|| *after.val().downcast_checked::<i32>());
+    assert_eq!(value, 10);
+    assert_eq!(copied, RunReads::default());
+
+    // The three move independently.
+    cursor.step_key();
+    after.step_val();
+    assert_eq!(*cursor.val().downcast_checked::<i32>(), 20);
+    assert_eq!(*after.val().downcast_checked::<i32>(), 11);
+    assert_eq!(*before.val().downcast_checked::<i32>(), 10);
 }
 
 #[test]
@@ -311,7 +507,10 @@ fn cursor_list_seeks_every_run() {
     );
     let ((), sought) = reads_of(|| cursor.seek_key(2_i32.erase()));
     assert_eq!(key_of(&cursor), 2);
-    assert_eq!(sought, reads(2, 0, 0, 0));
+    // The seek moves each run from key 1 to key 2: one seek and one key read
+    // per run. `CursorList` then reads each run's value and weight at key 2,
+    // to skip zero weights.
+    assert_eq!(sought, memory_reads(2, 2, 2, 2));
 }
 
 #[test]

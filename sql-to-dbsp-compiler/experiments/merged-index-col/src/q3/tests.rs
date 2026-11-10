@@ -605,6 +605,14 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
         // whose filter excludes the key is neither sought nor decoded, and
         // nothing past the entry is read. The range reads, O⁻ and L⁻, seek a
         // prefix and step through it (`scan`), with no filter.
+        //
+        // The in-memory runs are the memory run M (c7 alone) and, for the
+        // reads of the new state, `Dlt`. Their accesses count apart from the
+        // file decodes (`memory_*`), by the same rules: opening reads a
+        // run's first key; a seek reads a key only if it moves the run; a
+        // value counts once per position, and `CursorList` reads the first
+        // value of every run at its smallest key, plus that value's weight
+        // to skip zero weights.
         let reads =
             |seeks, filter_rejections, key_decodes, value_decodes, weight_decodes| RunReads {
                 seeks,
@@ -612,32 +620,64 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
                 key_decodes,
                 value_decodes,
                 weight_decodes,
+                ..RunReads::default()
             };
         // C⁺: one probe of c5's own key over three runs. Opening decodes c5's
         // key and value; the file filter admits c5, and its seek stays on c5,
         // which decodes the value again. `Dlt`'s "new" comes first, then
         // "old" cancels across `Dlt` and the file run (one weight decode).
-        assert_eq!(c_reads, reads(3, 0, 1, 2, 1));
+        //
+        // Memory: opening reads M's key (c7) and `Dlt`'s (c5): 2 keys. `Dlt`
+        // holds c5's values "new" and "old", in that order. At the opening,
+        // `Dlt` is at the smallest value, "new": a value and its weight (the
+        // file run's value "old" is larger, so only its value is decoded).
+        // The seeks stay (M is past c5; `Dlt` and the file run are on it),
+        // and empty the values, so `Dlt` reads "new" and its weight again.
+        // Stepping to "old" reads that value (the third), and the sum over
+        // `Dlt` and the file run reads its weight (the third); the step past
+        // it lands on nothing. M is never at the smallest key, so none of
+        // its values is read.
+        assert_eq!(c_reads, with_memory(reads(3, 0, 1, 2, 1), 2, 3, 3));
         // O⁻: one scan of c5's range over two runs. Opening and the seek stay
         // on c5 (a weight decode each); then six key steps, c5 through c6,
         // each decode a key, a value, and a weight.
-        assert_eq!(o_reads, reads(2, 0, 7, 8, 8));
+        //
+        // Memory: only M's key (c7), read at the opening. The scan neither
+        // moves M (it is past the range) nor reads its value.
+        assert_eq!(o_reads, with_memory(reads(2, 0, 7, 8, 8), 1, 0, 0));
         // J⁺: c5's key as in C⁺, then a probe of (c5, o5)'s key. Its opening
         // decodes c5 again (one key, one value); the file filter rejects o5,
         // which only `Dlt` holds, so the file run is not sought, and the two
         // in-memory runs are sought once each.
-        assert_eq!(j_reads, reads(5, 1, 2, 3, 1));
+        //
+        // Memory: C⁺'s 2 keys, 3 values, and 3 weights. The second probe
+        // opens M and `Dlt` again (2 keys) and reads `Dlt`'s "new" and its
+        // weight, as the opening of C⁺ does (1 value, 1 weight). The seek
+        // to (c5, o5) moves `Dlt` from c5 to o5 (1 key); M stays on c7. Only
+        // `Dlt` holds o5, so `CursorList` reads its first value and weight
+        // there (1 and 1). In all: keys 2 + 2 + 1, values 3 + 1 + 1, weights
+        // 3 + 1 + 1.
+        assert_eq!(j_reads, with_memory(reads(5, 1, 2, 3, 1), 5, 5, 5));
         // L⁻: the line items of o3, o4, and o5, one scan each over two runs.
         // Each scan opens on c5 and seeks to its order's first line item: o3
         // decodes l7, l8, and o4 (4 of each); o4 decodes l9 and c6 (3 of
         // each); o5 has no line items and lands on c6 (2 of each).
-        assert_eq!(l_reads, reads(6, 0, 9, 9, 9));
+        //
+        // Memory: each of the three scans opens M, and reads its one key
+        // (c7). M is past every range, and so never at the smallest key.
+        assert_eq!(l_reads, with_memory(reads(6, 0, 9, 9, 9), 3, 0, 0));
 
-        // The driving deltas are in memory and only stepped, so nothing but
-        // the index is read.
-        for other in [c_other, o_other, j_other, l_other] {
-            assert_eq!(other, RunReads::default());
-        }
+        // The driving deltas are in memory and read by `requested_keys`,
+        // which steps through their keys: `CursorList` reads each landed key,
+        // and the first value and weight under it, to skip zero weights.
+        // That is one key, one value, and one weight for each key of a delta:
+        // one each for the Orders delta (key 5), the Customer delta (key 5,
+        // two values), and the Lineitem delta (key 5, two values), and three
+        // for the joined delta (keys 3, 4, and 5). Nothing is decoded.
+        assert_eq!(c_other, memory_only(1));
+        assert_eq!(o_other, memory_only(1));
+        assert_eq!(j_other, memory_only(1));
+        assert_eq!(l_other, memory_only(3));
 
         // `finish` returns the same counts, as the harness reports them.
         assert_eq!(
@@ -658,15 +698,29 @@ fn finish_returns_each_transactions_index_reads() {
     let orders_delta = delta(vec![(Tup1(5), Tup3(5, Date::from_days(11), 7), 1)]);
     let one_run = || source(vec![vec![customer(5, "only", 1)]]);
 
-    // Two calls in one transaction accumulate: each scan seeks the one
-    // in-memory run once, and in-memory runs count no other reads.
+    // Two calls in one transaction accumulate. Each scan of the one in-memory
+    // run seeks it once (the seek stays on c5), reads its key at the opening
+    // (1), and reads c5's first value and weight twice: at the opening, and
+    // again after the seek empties the value (2 and 2). So the two calls make
+    // 2 seeks, 2 key reads, 4 value reads, and 4 weight reads, and no decode.
     state
         .publish(one_run(), one_run(), BTreeMap::new())
         .unwrap();
     state.customers_after(&orders_delta).unwrap();
     state.customers_after(&orders_delta).unwrap();
     let tally = state.finish().unwrap();
-    assert_eq!(tally.customers_after.seeks, 2);
+    assert_eq!(
+        tally.customers_after,
+        with_memory(
+            RunReads {
+                seeks: 2,
+                ..RunReads::default()
+            },
+            2,
+            4,
+            4
+        )
+    );
     assert_eq!(
         IndexReads {
             customers_after: RunReads::default(),
@@ -737,6 +791,22 @@ fn buffered(buffers: &GroupBuffers<Payload>) -> [(usize, usize); 3] {
     .map(|id| (buffers.old(id).len(), buffers.dlt(id).len()))
 }
 
+/// The reads of in-memory runs that land on `keys` keys and read the first
+/// value and weight of each.
+fn memory_only(keys: u64) -> RunReads {
+    with_memory(RunReads::default(), keys, keys, keys)
+}
+
+/// `reads` with the accesses of the in-memory runs.
+fn with_memory(file: RunReads, keys: u64, values: u64, weights: u64) -> RunReads {
+    RunReads {
+        memory_key_reads: keys,
+        memory_value_reads: values,
+        memory_weight_reads: weights,
+        ..file
+    }
+}
+
 fn reads(
     seeks: u64,
     filter_rejections: u64,
@@ -750,6 +820,7 @@ fn reads(
         key_decodes,
         value_decodes,
         weight_decodes,
+        ..RunReads::default()
     }
 }
 
@@ -804,8 +875,15 @@ fn session_run_reads_on_the_worked_transaction() {
         // Seven key decodes, one for each position (the memory run decodes
         // nothing). Six value and six weight decodes, for the six old entries
         // taken; c6, which only ends the group, costs none of them. No seek.
-        assert_eq!(index, reads(0, 0, 7, 6, 6));
-        // `Dlt` is in memory and the session reads nothing else.
+        //
+        // Memory: the memory run M opens on c7, one key read, and is never
+        // moved or taken (the group ends at c6). `Dlt` is read whole: its
+        // keys c5, o5, l10, and l11 are four key reads (the step past l11
+        // lands on nothing), and its five entries (c5 has two) are five
+        // value reads and five weight reads. In all: 1 + 4 keys, 5 values,
+        // 5 weights.
+        assert_eq!(index, with_memory(reads(0, 0, 7, 6, 6), 5, 5, 5),);
+        // The session reads nothing outside its own owner.
         assert_eq!(other, RunReads::default());
     });
 }
@@ -925,19 +1003,28 @@ fn the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
         // 4 logical seeks, 5 run seeks, 10 positions; F decodes a key for each
         // of them (the memory run decodes nothing, and the seek past the end
         // lands on no key).
+        //
+        // Memory, for both passes: `Dlt` is read whole, and its keys are c5,
+        // o5, l10, l11, l14 (c8's), c10, and o10: 7 key reads for 8 entries
+        // (c5 has two), so 8 values and 8 weights. M opens on c7: 1 more key
+        // read. Its value is never taken (c7's group is not touched), and the
+        // seek or step past c7 lands on nothing. In all: 8 keys, 8 values,
+        // 8 weights.
         assert_eq!(
             (seek.logical_seeks, seek.logical_steps, seek.positions),
             (4, 6, 10)
         );
-        assert_eq!(seek_reads, reads(5, 0, 10, 7, 7));
+        assert_eq!(seek_reads, with_memory(reads(5, 0, 10, 7, 7), 8, 8, 8));
 
         // Step. Every key of the index is a position, 18 in
         // all, and every one is stepped past once: 18 steps and, F having 17
-        // of the keys, 17 key decodes (c7 is in memory). No seek.
+        // of the keys, 17 key decodes (c7 is in memory). No seek. The memory
+        // reads are the seek pass's: `Dlt` is read whole, and M's one key is
+        // read at the opening and never taken.
         assert_eq!(
             (step.logical_seeks, step.logical_steps, step.positions),
             (0, 18, 18)
         );
-        assert_eq!(step_reads, reads(0, 0, 17, 7, 7));
+        assert_eq!(step_reads, with_memory(reads(0, 0, 17, 7, 7), 8, 8, 8));
     });
 }

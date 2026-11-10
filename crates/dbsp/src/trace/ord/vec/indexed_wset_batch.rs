@@ -12,7 +12,13 @@ use crate::{
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, DbspSerializer,
         Deserializer, Filter, GroupFilter, MergeCursor, VecValBatch, WeightedItem,
-        cursor::{Position, run_reads::count_seek},
+        cursor::{
+            Position,
+            run_reads::{
+                count_memory_key_read, count_memory_value_read, count_memory_weight_read,
+                count_seek,
+            },
+        },
         deserialize_indexed_wset,
         layers::{
             Cursor as _, Layer, LayerCursor, LayerFactories, Leaf, LeafFactories, OrdOffset, Trie,
@@ -27,6 +33,7 @@ use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::any::TypeId;
+use std::cell::Cell;
 use std::fmt::{self, Debug, Display};
 
 pub struct VecIndexedWSetFactories<K, V, R>
@@ -524,6 +531,11 @@ where
 }
 
 /// A cursor for navigating a single layer.
+///
+/// The cursor counts its accesses for [`RunReads`](crate::trace::cursor::RunReads)
+/// by the rules of the file cursor, so that the two kinds of run are comparable:
+/// landing on a key reads that key, the first read of a value at a position
+/// reads that value, and each weight returned reads a weight.
 #[derive(Debug, SizeOf)]
 pub struct VecIndexedWSetCursor<'s, K, V, R, O = usize>
 where
@@ -533,6 +545,35 @@ where
     O: OrdOffset,
 {
     pub(crate) cursor: LayerCursor<'s, K, Leaf<V, R>, O>,
+
+    /// Whether the value at the cursor's key and value position was counted as
+    /// read. Every key move clears it, so that the first read of the new key's
+    /// first value counts, and every value move sets it, because a landing
+    /// counts the value it lands on. `Cell` lets `val` and `val_valid`, which
+    /// take `&self`, set it.
+    #[size_of(skip)]
+    value_counted: Cell<bool>,
+}
+
+/// When a move of a cursor over a run reads the key or value it lands on.
+/// Moves of a file cursor and of a memory cursor follow the same rules.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// Steps, rewinds, and reverse seeks read any row they end on.
+    Always,
+    /// Forward seeks read a row only when they leave the current one.
+    IfMoved,
+}
+
+impl Landing {
+    /// Whether a move from `start` to `end` reads, given whether `end` is on a
+    /// row.
+    fn reads(self, start: usize, end: usize, ends_on_row: bool) -> bool {
+        match self {
+            Landing::Always => ends_on_row,
+            Landing::IfMoved => ends_on_row && end != start,
+        }
+    }
 }
 
 impl<'s, K, V, R, O> VecIndexedWSetCursor<'s, K, V, R, O>
@@ -543,14 +584,69 @@ where
     O: OrdOffset,
 {
     pub fn new(zset: &'s VecIndexedWSet<K, V, R, O>) -> Self {
-        Self {
-            cursor: zset.layer.cursor(),
-        }
+        Self::at_first_key(zset.layer.cursor())
     }
 
     pub fn new_from(zset: &'s VecIndexedWSet<K, V, R, O>, lower_bound: usize) -> Self {
+        Self::at_first_key(zset.layer.cursor_from(lower_bound, zset.layer.keys()))
+    }
+
+    /// Opening a cursor reads the first key, if there is one. Its first value
+    /// waits for the first read of a value.
+    fn at_first_key(cursor: LayerCursor<'s, K, Leaf<V, R>, O>) -> Self {
+        if cursor.valid() {
+            count_memory_key_read();
+        }
         Self {
-            cursor: zset.layer.cursor_from(lower_bound, zset.layer.keys()),
+            cursor,
+            value_counted: Cell::new(false),
+        }
+    }
+
+    /// Moves the key cursor with `op`. Counts the key read that `landing` says
+    /// `op` makes. The new key's first value has not been read.
+    fn move_key(
+        &mut self,
+        landing: Landing,
+        op: impl FnOnce(&mut LayerCursor<'s, K, Leaf<V, R>, O>),
+    ) {
+        let start = self.cursor.position();
+        op(&mut self.cursor);
+        self.value_counted.set(false);
+        if landing.reads(start, self.cursor.position(), self.cursor.valid()) {
+            count_memory_key_read();
+        }
+    }
+
+    /// Counts the read of the current key's value at its first access after a
+    /// key move. A key that is not valid has no value to read.
+    fn read_value(&self) {
+        if !self.value_counted.get() && self.cursor.valid() && self.cursor.child.valid() {
+            self.value_counted.set(true);
+            count_memory_value_read();
+        }
+    }
+
+    /// Moves the value cursor with `op`. The first read of a value counts
+    /// before the move, as the file cursor positions on the first value before
+    /// it moves; `landing` says whether the move reads the value it lands on.
+    fn move_val(
+        &mut self,
+        landing: Landing,
+        op: impl FnOnce(&mut <Leaf<V, R> as Trie>::Cursor<'s>),
+    ) {
+        self.read_value();
+        let start = self.cursor.child.position();
+        op(&mut self.cursor.child);
+        self.value_counted.set(true);
+        if self.cursor.valid()
+            && landing.reads(
+                start,
+                self.cursor.child.position(),
+                self.cursor.child.valid(),
+            )
+        {
+            count_memory_value_read();
         }
     }
 }
@@ -564,6 +660,7 @@ where
     fn clone(&self) -> Self {
         Self {
             cursor: self.cursor.clone(),
+            value_counted: self.value_counted.clone(),
         }
     }
 }
@@ -592,11 +689,13 @@ where
     }
 
     fn val(&self) -> &V {
+        self.read_value();
         self.cursor.child.current_key()
     }
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&(), &R)) {
-        if self.cursor.child.valid() {
+        if self.val_valid() {
+            count_memory_weight_read();
             logic(&(), self.cursor.child.current_diff())
         }
     }
@@ -607,6 +706,8 @@ where
 
     fn weight(&mut self) -> &R {
         debug_assert!(&self.cursor.valid());
+        self.read_value();
+        count_memory_weight_read();
         self.cursor.child.current_diff()
     }
 
@@ -616,6 +717,7 @@ where
 
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         while self.val_valid() {
+            count_memory_weight_read();
             logic(self.val(), self.cursor.child.current_diff());
             self.step_val();
         }
@@ -626,20 +728,21 @@ where
     }
 
     fn val_valid(&self) -> bool {
+        self.read_value();
         self.cursor.child.valid()
     }
 
     fn step_key(&mut self) {
-        self.cursor.step();
+        self.move_key(Landing::Always, |cursor| cursor.step());
     }
 
     fn step_key_reverse(&mut self) {
-        self.cursor.step_reverse();
+        self.move_key(Landing::Always, |cursor| cursor.step_reverse());
     }
 
     fn seek_key(&mut self, key: &K) {
         count_seek();
-        self.cursor.seek(key);
+        self.move_key(Landing::IfMoved, |cursor| cursor.seek(key));
     }
 
     fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
@@ -649,57 +752,78 @@ where
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
         count_seek();
-        self.cursor.seek_with(predicate);
+        // Each call of the predicate reads a probe.
+        let predicate = |key: &K| {
+            count_memory_key_read();
+            predicate(key)
+        };
+        self.move_key(Landing::IfMoved, |cursor| cursor.seek_with(predicate));
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
         count_seek();
-        self.cursor.seek_reverse(key);
+        self.move_key(Landing::Always, |cursor| cursor.seek_reverse(key));
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
         count_seek();
-        self.cursor.seek_with_reverse(predicate);
+        let predicate = |key: &K| {
+            count_memory_key_read();
+            predicate(key)
+        };
+        self.move_key(Landing::Always, |cursor| {
+            cursor.seek_with_reverse(predicate)
+        });
     }
 
     fn step_val(&mut self) {
-        self.cursor.child.step();
+        self.move_val(Landing::Always, |child| child.step());
     }
 
     fn seek_val(&mut self, val: &V) {
-        self.cursor.child.seek(val);
+        self.move_val(Landing::IfMoved, |child| child.seek(val));
     }
 
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.cursor.child.seek_key_with(predicate);
+        let predicate = |val: &V| {
+            count_memory_value_read();
+            predicate(val)
+        };
+        self.move_val(Landing::IfMoved, |child| child.seek_key_with(&predicate));
     }
 
     fn rewind_keys(&mut self) {
-        self.cursor.rewind();
+        self.move_key(Landing::Always, |cursor| cursor.rewind());
     }
 
     fn fast_forward_keys(&mut self) {
-        self.cursor.fast_forward();
+        self.move_key(Landing::Always, |cursor| cursor.fast_forward());
     }
 
     fn rewind_vals(&mut self) {
-        self.cursor.child.rewind();
+        self.move_val(Landing::Always, |child| child.rewind());
     }
 
     fn step_val_reverse(&mut self) {
-        self.cursor.child.step_reverse();
+        self.move_val(Landing::Always, |child| child.step_reverse());
     }
 
     fn seek_val_reverse(&mut self, val: &V) {
-        self.cursor.child.seek_reverse(val);
+        self.move_val(Landing::Always, |child| child.seek_reverse(val));
     }
 
     fn seek_val_with_reverse(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.cursor.child.seek_key_with_reverse(predicate);
+        let predicate = |val: &V| {
+            count_memory_value_read();
+            predicate(val)
+        };
+        self.move_val(Landing::Always, |child| {
+            child.seek_key_with_reverse(&predicate)
+        });
     }
 
     fn fast_forward_vals(&mut self) {
-        self.cursor.child.fast_forward();
+        self.move_val(Landing::Always, |child| child.fast_forward());
     }
 
     fn position(&self) -> Option<Position> {
