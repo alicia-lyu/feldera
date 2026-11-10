@@ -27,12 +27,7 @@ type Expected = BTreeMap<u8, (Vec<Entry<u8>>, Vec<Entry<u8>>)>;
 /// What one run of the session hands to its callback.
 type Groups = Vec<(Vec<u8>, GroupBuffers<u8>)>;
 
-const KNOBS: [(Pass, GroupStart); 4] = [
-    (Pass::Seek, GroupStart::PrefixSeek),
-    (Pass::Seek, GroupStart::ProbeThenRange),
-    (Pass::Step, GroupStart::PrefixSeek),
-    (Pass::Step, GroupStart::ProbeThenRange),
-];
+const PASSES: [Pass; 2] = [Pass::Seek, Pass::Step];
 
 // ---- Fixture tries ----
 
@@ -125,8 +120,8 @@ const BRANCHING: KeyTrie = KeyTrie {
     }],
 };
 
-/// Like [`TWO_LEVELS`], but the root node has no placement, so there is no
-/// root entry to probe.
+/// Like [`TWO_LEVELS`], but the root node has no placement, so no key ends at
+/// the root node.
 const NO_ROOT_ENTRY: KeyTrie = KeyTrie {
     name: "NoRootEntry",
     domains: &[
@@ -195,11 +190,11 @@ fn run_session(
     trie: &KeyTrie,
     old: &SpineSnapshot<MergedIndexBatch>,
     dlt: &MergedIndexBatch,
-    (pass, start): (Pass, GroupStart),
+    pass: Pass,
     inputs: &BTreeSet<u8>,
     rejected: Option<&BTreeSet<u8>>,
 ) -> Result<(Groups, SessionCounts), String> {
-    let mut session = ScanSession::new(trie, old, dlt, pass, start)?;
+    let mut session = ScanSession::new(trie, old, dlt, pass)?;
     let mut groups = Vec::new();
     let mut reject = rejected.map(|bytes| move |entry: &Entry<u8>| bytes.contains(&entry.payload));
     session.maintain(
@@ -403,7 +398,7 @@ fn case() -> impl Strategy<Value = Case> {
         })
 }
 
-/// All four knob combinations hand over the buffers of the reference.
+/// Both passes hand over the buffers of the reference.
 fn check_case(case: &Case) -> Result<(), TestCaseError> {
     let trie = &TRIES[case.trie];
     let old_runs: Vec<OldRun> = case
@@ -432,12 +427,12 @@ fn check_case(case: &Case) -> Result<(), TestCaseError> {
         .flat_map(|(_, streams)| streams.values().map(|(_, dlt)| dlt.len()))
         .sum();
 
-    for knobs in KNOBS {
+    for pass in PASSES {
         let (groups, counts) = run_session(
             trie,
             &old,
             &dlt_run,
-            knobs,
+            pass,
             &case.inputs,
             case.rejected.as_ref(),
         )
@@ -446,24 +441,21 @@ fn check_case(case: &Case) -> Result<(), TestCaseError> {
             .iter()
             .map(|(group, buffers)| (group.clone(), expected_of(buffers)))
             .collect();
-        prop_assert_eq!(&actual, &expected, "knobs {:?}", knobs);
+        prop_assert_eq!(&actual, &expected, "pass {:?}", pass);
 
         // One decode per buffered entry; a cancelled value is never decoded.
         prop_assert_eq!(counts.groups, expected.len() as u64);
         prop_assert_eq!(counts.payload_decodes_old, buffered_old as u64);
         prop_assert_eq!(counts.payload_decodes_dlt, buffered_dlt as u64);
-        if knobs.0 == Pass::Step {
+        if pass == Pass::Step {
             prop_assert_eq!(counts.logical_seeks, 0);
-        }
-        if knobs.1 == GroupStart::PrefixSeek {
-            prop_assert_eq!(counts.probes, 0);
         }
     }
     Ok(())
 }
 
 #[test]
-fn every_knob_combination_buffers_what_the_brute_force_reference_does() {
+fn both_passes_buffer_what_the_brute_force_reference_does() {
     run_in_circuit_with_storage(|| {
         let mut runner = TestRunner::new(Config::with_cases(400));
         runner
@@ -472,7 +464,7 @@ fn every_knob_combination_buffers_what_the_brute_force_reference_does() {
     });
 }
 
-// ---- Counters and knobs on worked layouts ----
+// ---- Counters and passes on worked layouts ----
 
 /// Six groups of two keys each, `A(v)` then `B(v, 1)`.
 fn six_groups() -> Vec<Row> {
@@ -496,9 +488,9 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
             true,
         )]);
         let dlt = memory_run(&[row(a_key(1), 9, 1)]);
-        for knobs in KNOBS {
+        for pass in PASSES {
             let ((groups, counts), reads) =
-                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, knobs, &ids(&[1]), None).unwrap());
+                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, pass, &ids(&[1]), None).unwrap());
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].1.old(1).len(), 1);
             assert_eq!(groups[0].1.dlt(1).len(), 1);
@@ -506,7 +498,7 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
             // Positions: A(1) at open, B(1,1), and A(2), which ends the group.
             // Each costs a key decode. Only A(1) is taken, so one value, one
             // weight, and one payload are decoded.
-            assert_eq!(counts.positions, 3, "{knobs:?}");
+            assert_eq!(counts.positions, 3, "{pass:?}");
             assert_eq!(counts.payload_decodes_old, 1);
             assert_eq!(counts.payload_decodes_dlt, 1);
             assert_eq!(counts.logical_steps, 2);
@@ -518,7 +510,7 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
                     weight_decodes: 1,
                     ..RunReads::default()
                 },
-                "{knobs:?}"
+                "{pass:?}"
             );
         }
     });
@@ -535,16 +527,16 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
         let inputs = ids(&[1]);
         let mut outputs = Vec::new();
         let mut measured = Vec::new();
-        for knobs in KNOBS {
+        for pass in PASSES {
             let ((groups, counts), reads) =
-                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, knobs, &inputs, None).unwrap());
+                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, pass, &inputs, None).unwrap());
             outputs.push(groups);
             measured.push((counts, reads));
         }
         assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(outputs[0].len(), 2);
 
-        // Seek + PrefixSeek. Open on A1 (1 position). Group 2: the seek lands
+        // Seek. Open on A1 (1 position). Group 2: the seek lands
         // on A2 (position 2); collect takes A2, steps to B2 (3) and A3 (4),
         // which ends the group. Group 5: the seek from A3 lands on A5 (5);
         // collect steps to B5 (6) and A6 (7). Two seeks, four steps, seven
@@ -553,7 +545,6 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
         assert_eq!(counts.groups, 2);
         assert_eq!(counts.cursor_opens, 2);
         assert_eq!(counts.logical_seeks, 2);
-        assert_eq!(counts.probes, 0);
         assert_eq!(counts.logical_steps, 4);
         assert_eq!(counts.positions, 7);
         assert_eq!(counts.payload_decodes_old, 2);
@@ -569,29 +560,11 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
             }
         );
 
-        // Seek + ProbeThenRange. The probe finds A2, then A5, through the file
-        // run's filter and lands there; the prefix seeks that follow move
-        // nothing. So two probes, no logical seek, and the same seven
-        // positions and decodes. The two run seeks are the probes'.
-        let (counts, reads) = &measured[1];
-        assert_eq!((counts.probes, counts.logical_seeks), (2, 0));
-        assert_eq!((counts.logical_steps, counts.positions), (4, 7));
-        assert_eq!(
-            *reads,
-            RunReads {
-                seeks: 2,
-                key_decodes: 7,
-                value_decodes: 2,
-                weight_decodes: 2,
-                ..RunReads::default()
-            }
-        );
-
-        // Step + PrefixSeek. Group 2 steps A1, B1 to reach A2 (2 steps), then
+        // Step. Group 2 steps A1, B1 to reach A2 (2 steps), then
         // 2 steps end the group. Group 5 steps A3, B3, A4, B4 to reach A5 (4
         // steps), then 2. Ten steps, eleven positions, no seek.
-        let (counts, reads) = &measured[2];
-        assert_eq!((counts.logical_seeks, counts.probes), (0, 0));
+        let (counts, reads) = &measured[1];
+        assert_eq!(counts.logical_seeks, 0);
         assert_eq!((counts.logical_steps, counts.positions), (10, 11));
         assert_eq!(
             *reads,
@@ -602,14 +575,6 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
                 ..RunReads::default()
             }
         );
-
-        // Step + ProbeThenRange. The probes land on A2 and A5 as above, so
-        // only the 2 + 2 steps of the groups remain.
-        let (counts, reads) = &measured[3];
-        assert_eq!((counts.logical_seeks, counts.probes), (0, 2));
-        assert_eq!((counts.logical_steps, counts.positions), (4, 7));
-        assert_eq!(reads.seeks, 2);
-        assert_eq!(reads.key_decodes, 7);
     });
 }
 
@@ -636,7 +601,7 @@ fn a_rejected_node_is_passed_by_one_seek_or_by_steps() {
                     &TWO_LEVELS,
                     &old,
                     &dlt,
-                    (pass, GroupStart::PrefixSeek),
+                    pass,
                     &ids(&[1, 2]),
                     Some(&rejected),
                 )
@@ -677,33 +642,12 @@ fn a_prefix_with_no_successor_is_skipped_to_the_end() {
     let dlt = memory_run(&[row(root_entry, 5, 1)]);
     let rejected = ids(&[9]);
     for pass in [Pass::Seek, Pass::Step] {
-        let (groups, counts) = run_session(
-            &TWO_LEVELS,
-            &old,
-            &dlt,
-            (pass, GroupStart::PrefixSeek),
-            &ids(&[1]),
-            Some(&rejected),
-        )
-        .unwrap();
+        let (groups, counts) =
+            run_session(&TWO_LEVELS, &old, &dlt, pass, &ids(&[1]), Some(&rejected)).unwrap();
         assert_eq!(groups[0].1.old(1).len(), 1);
         assert_eq!(counts.logical_seeks, u64::from(pass == Pass::Seek));
         assert_eq!(counts.logical_steps, u64::from(pass == Pass::Step));
     }
-}
-
-#[test]
-fn a_probe_is_made_only_when_the_trie_has_a_root_entry() {
-    run_in_circuit_with_storage(|| {
-        let old = snapshot(&[(vec![row(b_key(1, 1), 1, 1), row(b_key(3, 1), 1, 1)], true)]);
-        let dlt = memory_run(&[row(b_key(3, 1), 5, 1)]);
-        let probing = (Pass::Seek, GroupStart::ProbeThenRange);
-        let (_, counts) =
-            run_session(&NO_ROOT_ENTRY, &old, &dlt, probing, &ids(&[1]), None).unwrap();
-        assert_eq!(counts.probes, 0);
-        let (_, counts) = run_session(&TWO_LEVELS, &old, &dlt, probing, &ids(&[1]), None).unwrap();
-        assert_eq!(counts.probes, 1);
-    });
 }
 
 // ---- Errors ----
@@ -718,7 +662,7 @@ const TWO_ROOTS: KeyTrie = KeyTrie {
 fn a_trie_without_one_root_node_is_rejected() {
     let old = snapshot::<Vec<u8>>(&[]);
     let dlt = memory_run::<Vec<u8>>(&[]);
-    let error = ScanSession::new(&TWO_ROOTS, &old, &dlt, Pass::Seek, GroupStart::PrefixSeek)
+    let error = ScanSession::new(&TWO_ROOTS, &old, &dlt, Pass::Seek)
         .err()
         .unwrap();
     assert!(error.contains("one top-level node"), "{error}");
@@ -729,16 +673,9 @@ fn a_malformed_old_key_is_an_error() {
     // [1, 1, 5, 5] has no terminator before the id.
     let old = snapshot(&[(vec![row(vec![1, 1, 5, 5], 1, 1)], false)]);
     let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-    let error = run_session(
-        &TWO_LEVELS,
-        &old,
-        &dlt,
-        (Pass::Seek, GroupStart::PrefixSeek),
-        &ids(&[1]),
-        None,
-    )
-    .err()
-    .unwrap();
+    let error = run_session(&TWO_LEVELS, &old, &dlt, Pass::Seek, &ids(&[1]), None)
+        .err()
+        .unwrap();
     assert!(error.contains("malformed folded key"), "{error}");
 }
 
@@ -746,8 +683,7 @@ fn a_malformed_old_key_is_an_error() {
 fn a_decode_error_stops_the_session() {
     let old = snapshot(&[(vec![row(a_key(1), 1, 1)], false)]);
     let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-    let mut session =
-        ScanSession::new(&TWO_LEVELS, &old, &dlt, Pass::Seek, GroupStart::PrefixSeek).unwrap();
+    let mut session = ScanSession::new(&TWO_LEVELS, &old, &dlt, Pass::Seek).unwrap();
     let result = session.maintain(
         &ids(&[1]),
         |_, _| Err::<u8, _>("bad payload".to_string()),

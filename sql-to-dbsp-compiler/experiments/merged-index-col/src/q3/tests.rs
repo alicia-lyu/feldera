@@ -10,7 +10,7 @@ use dbsp::{
     dynamic::{DowncastTrait, DynData, Erase},
     storage::write_attribution::WriteOwner,
     trace::{
-        merged_index::{Entry, GroupBuffers, GroupStart, Pass, ScanSession, SessionCounts},
+        merged_index::{Entry, GroupBuffers, Pass, ScanSession, SessionCounts},
         Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
         WithSnapshot,
     },
@@ -706,12 +706,12 @@ type Groups = Vec<(Vec<u8>, GroupBuffers<Payload>)>;
 fn maintain_col(
     old: &SourceSnapshot,
     dlt: &MergedIndexBatch,
-    (pass, start): (Pass, GroupStart),
+    pass: Pass,
     reject: bool,
 ) -> ((Groups, SessionCounts), RunReads, RunReads) {
     run_reads_of(|| {
         with_read_owner(WriteOwner::MergedIndex, || {
-            let mut session = ScanSession::new(&TRIE, old, dlt, pass, start).unwrap();
+            let mut session = ScanSession::new(&TRIE, old, dlt, pass).unwrap();
             let mut groups = Vec::new();
             let mut reject_entry = outside_building_segment;
             session
@@ -761,8 +761,7 @@ fn reads(
     }
 }
 
-/// The scan session on the worked transaction, under `Seek` and
-/// `PrefixSeek`: one group, and the storage reads of the same index state as
+/// The scan session on the worked transaction, under `Seek`: one group, and the storage reads of the same index state as
 /// `todays_readers_run_reads_on_the_worked_transaction` (22 value decodes
 /// there, against 6 here).
 #[test]
@@ -779,8 +778,7 @@ fn session_run_reads_on_the_worked_transaction() {
             vec![Arc::new(old_file), Arc::new(old_memory)],
         );
 
-        let ((groups, counts), index, other) =
-            maintain_col(&old, &dlt, (Pass::Seek, GroupStart::PrefixSeek), false);
+        let ((groups, counts), index, other) = maintain_col(&old, &dlt, Pass::Seek, false);
 
         // One group, c5, with the buffers of the worked transaction: the old
         // entries c5, o3, o4, l7, l8, l9, and the delta's two entries of c5
@@ -803,7 +801,6 @@ fn session_run_reads_on_the_worked_transaction() {
                 groups: 1,
                 cursor_opens: 2,
                 logical_seeks: 0,
-                probes: 0,
                 logical_steps: 6,
                 positions: 7,
                 payload_decodes_old: 6,
@@ -821,7 +818,7 @@ fn session_run_reads_on_the_worked_transaction() {
     });
 }
 
-/// The A/B of the two knobs on one transaction with untouched customers
+/// The A/B of the `Pass` knob on one transaction with untouched customers
 /// between the touched ones and a segment filter.
 ///
 /// `Old` holds, in key order (file run `F`, but `c7` in memory run `M`):
@@ -840,7 +837,7 @@ fn session_run_reads_on_the_worked_transaction() {
 /// of `Old`). Streams customer, orders, and line items are all inputs. The
 /// filter rejects c8, so its order and line item are passed unread.
 #[test]
-fn the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
+fn the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
     in_storage_runtime(|| {
         let old_file = file_run(
             &build_batch(vec![
@@ -886,23 +883,16 @@ fn the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
             vec![Arc::new(old_file), Arc::new(old_memory)],
         );
 
-        let run = |knobs| maintain_col(&old, &dlt, knobs, true);
         let ((seek_groups, seek), seek_reads, seek_other) =
-            run((Pass::Seek, GroupStart::PrefixSeek));
-        let ((probe_groups, probe), probe_reads, probe_other) =
-            run((Pass::Seek, GroupStart::ProbeThenRange));
+            maintain_col(&old, &dlt, Pass::Seek, true);
         let ((step_groups, step), step_reads, step_other) =
-            run((Pass::Step, GroupStart::PrefixSeek));
-        let ((both_groups, both), both_reads, both_other) =
-            run((Pass::Step, GroupStart::ProbeThenRange));
+            maintain_col(&old, &dlt, Pass::Step, true);
 
         // The outputs are equal, and are the three touched groups. c5 buffers
         // its old entries and the delta's. c8's customer stays buffered
         // though rejected, and its order and line item are never read; its
         // delta line item is. c10 has no old entry.
-        for groups in [&probe_groups, &step_groups, &both_groups] {
-            assert_eq!(groups, &seek_groups);
-        }
+        assert_eq!(step_groups, seek_groups);
         let touched: Vec<_> = seek_groups.iter().map(|(group, _)| group.clone()).collect();
         assert_eq!(touched, [5, 8, 10].map(prefix_custkey));
         let shapes: Vec<_> = seek_groups.iter().map(|(_, b)| buffered(b)).collect();
@@ -914,25 +904,25 @@ fn the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
                 [(0, 1), (0, 1), (0, 0)],
             ]
         );
-        for other in [seek_other, probe_other, step_other, both_other] {
+        for other in [seek_other, step_other] {
             assert_eq!(other, RunReads::default());
         }
 
-        // Every knob combination decodes the same payloads and the same
+        // Both passes decode the same payloads and the same
         // values and weights: the seven buffered old entries (c5, o3, l7, l8,
         // o4, l9, and the rejected c8), and the eight delta entries.
-        for counts in [seek, probe, step, both] {
+        for counts in [seek, step] {
             assert_eq!(counts.groups, 3);
             assert_eq!(counts.cursor_opens, 2);
             assert_eq!(counts.payload_decodes_old, 7);
             assert_eq!(counts.payload_decodes_dlt, 8);
             assert_eq!(counts.cancelled, 0);
         }
-        for reads in [seek_reads, probe_reads, step_reads, both_reads] {
+        for reads in [seek_reads, step_reads] {
             assert_eq!((reads.value_decodes, reads.weight_decodes), (7, 7));
         }
 
-        // Seek + PrefixSeek. Open on c3 (position 1).
+        // Seek. Open on c3 (position 1).
         // - c5: the seek moves F from c3 to c5 (run seek 1, position 2).
         //   Collect takes c5 and steps through o3, l7, l8, o4, l9 (positions
         //   3-7) to c6 (8), which ends the group: 6 steps.
@@ -944,68 +934,18 @@ fn the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
         // of them (the memory run decodes nothing, and the seek past the end
         // lands on no key).
         assert_eq!(
-            (
-                seek.logical_seeks,
-                seek.probes,
-                seek.logical_steps,
-                seek.positions
-            ),
-            (4, 0, 6, 10)
+            (seek.logical_seeks, seek.logical_steps, seek.positions),
+            (4, 6, 10)
         );
         assert_eq!(seek_reads, reads(5, 0, 10, 7, 7));
 
-        // Seek + ProbeThenRange. Open on c3 (1).
-        // - c5: the probe of c5's root entry finds it in F through the filter
-        //   (run seek 1, position 2); M is above the probe. The prefix seek
-        //   then finds nothing to move. Collect as above: 6 steps, 8.
-        // - c8: the probe moves F to c8 (run seek 2) and M past c7 (run seek
-        //   3), position 9. The prefix seek moves nothing. The skip seeks F
-        //   past [1, c8] to c9 (run seek 4, position 10): 1 logical seek.
-        // - c10: the probe of c10's root entry is ruled out by F's filter (a
-        //   filter rejection, no seek); F stays on c9, and the prefix seek
-        //   moves it past the end (run seek 5): 1 logical seek.
-        // So 3 probes and 2 logical seeks; the same 5 run seeks, 10
-        // positions, and key decodes, plus one filter rejection.
-        assert_eq!(
-            (
-                probe.logical_seeks,
-                probe.probes,
-                probe.logical_steps,
-                probe.positions
-            ),
-            (2, 3, 6, 10)
-        );
-        assert_eq!(probe_reads, reads(5, 1, 10, 7, 7));
-
-        // Step + PrefixSeek. Every key of the index is a position, 18 in
+        // Step. Every key of the index is a position, 18 in
         // all, and every one is stepped past once: 18 steps and, F having 17
         // of the keys, 17 key decodes (c7 is in memory). No seek.
         assert_eq!(
-            (
-                step.logical_seeks,
-                step.probes,
-                step.logical_steps,
-                step.positions
-            ),
-            (0, 0, 18, 18)
+            (step.logical_seeks, step.logical_steps, step.positions),
+            (0, 18, 18)
         );
         assert_eq!(step_reads, reads(0, 0, 17, 7, 7));
-
-        // Step + ProbeThenRange. The probes of c5 and c8 land on their root
-        // entries (run seeks 1, 2, and 3 as above), so the untouched groups
-        // c3, c6, and c7 are not stepped; the probe of c10 is ruled out.
-        // Steps: 6 in c5, 3 for the rejected c8 subtree (o8, l13, c9), then
-        // c9 and o9 before c10: 11 steps. Positions: c3, c5 through c6 (7),
-        // c8 through c9 (4), and o9: 13, with a key decode in F for each.
-        assert_eq!(
-            (
-                both.logical_seeks,
-                both.probes,
-                both.logical_steps,
-                both.positions
-            ),
-            (0, 3, 11, 13)
-        );
-        assert_eq!(both_reads, reads(3, 1, 13, 7, 7));
     });
 }

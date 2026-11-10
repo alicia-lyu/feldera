@@ -29,12 +29,13 @@
 //! A position of `Old` whose stream is not requested costs a key decode and
 //! nothing else, as does the position that ends a group.
 //!
-//! # Knobs
+//! # Knob
 //!
-//! Two knobs choose between ways of doing the same work, for A/B tests:
-//! [`Pass`] (seek against step, for untouched groups and rejected subtrees)
-//! and [`GroupStart`] (seek to the group against probing its root entry first).
-//! All four combinations buffer the same entries.
+//! [`Pass`] chooses between two ways of doing the same work, for A/B tests:
+//! seek against step, for untouched groups and rejected subtrees. Both buffer
+//! the same entries. A group read has no exact-key probe: a run whose filter
+//! rejects the group's root key can still hold entries below it, so the run
+//! must be sought anyway (decision of 2026-11-09).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,19 +57,6 @@ pub enum Pass {
     Seek,
     /// Steps through them, one position at a time.
     Step,
-}
-
-/// How the session begins a group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GroupStart {
-    /// Passes straight to the group's prefix.
-    PrefixSeek,
-    /// First probes for the group's root entry by its exact key, so that each
-    /// run's filters answer before any seek, and then passes to the prefix as
-    /// `PrefixSeek` does. The probe is a hint: it never changes what is
-    /// buffered. It uses the first placement at the root node, and no probe is
-    /// made if the root node has none.
-    ProbeThenRange,
 }
 
 /// One entry of the index: a folded key, its decoded payload, and its weight.
@@ -158,13 +146,10 @@ pub struct SessionCounts {
     /// at or past its target moves nothing and counts nothing. One logical
     /// seek costs one run seek for each run that it moves.
     pub logical_seeks: u64,
-    /// Exact-key probes over `Old` ([`GroupStart::ProbeThenRange`]) made while
-    /// some run was below the probed key.
-    pub probes: u64,
     /// Steps over `Old`, past one position each.
     pub logical_steps: u64,
     /// Positions of `Old` that the session reached: its first key, and each
-    /// key a step, seek, or probe landed on. Each costs one key decode in a
+    /// key a step or seek landed on. Each costs one key decode in a
     /// file run.
     pub positions: u64,
     /// Payloads of `Old` decoded: one per buffered old entry.
@@ -181,14 +166,9 @@ pub struct ScanSession<'a> {
     old: RunMerge<'a>,
     dlt: DeltaCursor<'a>,
     pass: Pass,
-    start: GroupStart,
 
     /// The length of a group's prefix: the root domain's tag and value.
     group_width: usize,
-
-    /// The id of the first placement at the root node, whose exact key the
-    /// probe of [`GroupStart::ProbeThenRange`] asks for.
-    root_placement_id: Option<u8>,
 
     counts: SessionCounts,
 }
@@ -202,7 +182,6 @@ impl<'a> ScanSession<'a> {
         old: &'a SpineSnapshot<MergedIndexBatch>,
         dlt: &'a MergedIndexBatch,
         pass: Pass,
-        start: GroupStart,
     ) -> Result<Self, String> {
         let root_width = trie.root_width().ok_or_else(|| {
             format!(
@@ -211,14 +190,6 @@ impl<'a> ScanSession<'a> {
                 trie.name
             )
         })?;
-        // Placements come in pre-order, so a placement at the root node comes
-        // first, and its path is the root domain alone.
-        let root_placement_id = trie
-            .placements()
-            .first()
-            .filter(|placed| placed.path.len() == 1)
-            .map(|placed| placed.id);
-
         let old = RunMerge::new(old);
         let mut counts = SessionCounts {
             cursor_opens: 2,
@@ -229,9 +200,7 @@ impl<'a> ScanSession<'a> {
             old,
             dlt: dlt.cursor(),
             pass,
-            start,
             group_width: 1 + root_width,
-            root_placement_id,
             counts,
         })
     }
@@ -289,9 +258,6 @@ impl<'a> ScanSession<'a> {
     /// Brings `Old` to the first key at or past `group`. The untouched groups
     /// in between are never buffered.
     fn pass_to(&mut self, group: &[u8]) {
-        if let (GroupStart::ProbeThenRange, Some(id)) = (self.start, self.root_placement_id) {
-            self.probe_root_entry(group, id);
-        }
         match self.pass {
             Pass::Seek => self.seek_old(group),
             Pass::Step => {
@@ -299,24 +265,6 @@ impl<'a> ScanSession<'a> {
                     self.step_old();
                 }
             }
-        }
-    }
-
-    /// Probes `Old` for the group's root entry. A run that its filter rules
-    /// out stays behind, and the pass that follows aligns it.
-    fn probe_root_entry(&mut self, group: &[u8], root_placement_id: u8) {
-        let mut probe = group.to_vec();
-        probe.extend([INDEX_TAG, root_placement_id]);
-        let before = self.old.key().map(<[u8]>::to_vec);
-        // With every run at or past the probe, there is nothing to ask.
-        if before.as_deref().is_none_or(|key| key >= probe.as_slice()) {
-            return;
-        }
-        self.counts.probes += 1;
-        self.old.seek_exact(&probe);
-        // A run that found the key moved, which may have changed the position.
-        if self.old.key().is_some() && self.old.key() != before.as_deref() {
-            self.counts.positions += 1;
         }
     }
 

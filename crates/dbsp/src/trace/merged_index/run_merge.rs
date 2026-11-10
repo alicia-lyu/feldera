@@ -116,33 +116,6 @@ impl<'a> RunMerge<'a> {
         moved
     }
 
-    /// Probes for exactly `key` in every run whose key is below it, through
-    /// `seek_key_exact`: a file run whose filter rules `key` out is not
-    /// sought, nor decoded. Returns whether any run holds `key`.
-    ///
-    /// A run that the filter rules out stays where it was, below `key`, so
-    /// afterwards [`key`](Self::key) may be smaller than `key`. Call
-    /// [`seek`](Self::seek) next to align the runs.
-    pub fn seek_exact(&mut self, key: &[u8]) -> bool {
-        if self.exhausted {
-            return false;
-        }
-        let probe = key.to_vec();
-        let mut found = false;
-        for run in &mut self.runs {
-            if !run.key_valid() {
-                continue;
-            }
-            match key_of(run).cmp(key) {
-                Ordering::Less => found |= run.seek_key_exact(probe.erase(), None),
-                Ordering::Equal => found = true,
-                Ordering::Greater => {}
-            }
-        }
-        self.find_smallest_key();
-        found
-    }
-
     /// Moves past every key, as a seek to a target above all keys would. No
     /// such target can be named for a prefix of `0xFF` bytes, whose range
     /// runs to the end of the index (see
@@ -487,30 +460,6 @@ pub(crate) mod tests {
         });
     }
 
-    /// A probe for `key`, then a seek to it, lands where the seek alone does.
-    #[test]
-    fn a_probe_then_a_seek_lands_where_the_seek_alone_does() {
-        run_in_circuit_with_storage(|| {
-            let mut runner = TestRunner::new(Config::with_cases(96));
-            let strategy = (runs(), vec(0u8..5, 0..3));
-            runner
-                .run(&strategy, |(runs, target)| {
-                    let snapshot = snapshot(&runs);
-                    let union = brute_force_taken(&runs);
-                    let mut probed = RunMerge::new(&snapshot);
-                    let found = probed.seek_exact(&target);
-                    // Admitted runs advance to `target`; the filtered ones wait.
-                    prop_assert_eq!(found, union.contains_key(&target));
-                    probed.seek(&target);
-                    let mut sought = RunMerge::new(&snapshot);
-                    sought.seek(&target);
-                    prop_assert_eq!(probed.key(), sought.key());
-                    Ok(())
-                })
-                .unwrap_or_else(|failure| panic!("{failure}"));
-        });
-    }
-
     fn row(key: &[u8], payload: u8, weight: ZWeight) -> Row {
         (key.to_vec(), payload, weight)
     }
@@ -565,7 +514,6 @@ pub(crate) mod tests {
         assert_eq!(merge.key(), None);
         merge.step();
         assert!(!merge.seek(b"a"));
-        assert!(!merge.seek_exact(b"a"));
         assert!(take_all(&mut merge).is_empty());
     }
 
@@ -581,7 +529,6 @@ pub(crate) mod tests {
             // Nothing moves an exhausted merge.
             merge.step();
             assert!(!merge.seek(b"a"));
-            assert!(!merge.seek_exact(b"a"));
             assert_eq!(merge.key(), None);
             assert!(take_all(&mut merge).is_empty());
         });
