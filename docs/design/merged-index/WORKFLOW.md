@@ -66,9 +66,11 @@ cargo +1.96.1 test --offline --locked
 cargo +1.96.1 test --offline -p dbsp --lib merged_index
 cargo +1.96.1 test --offline -p dbsp --lib supplied_snapshot_join
 cargo +1.96.1 test --offline -p dbsp --lib run_reads
+cargo +1.96.1 test --offline -p dbsp --lib merged_index::run_merge
+cargo +1.96.1 test --offline -p dbsp --lib merged_index::session
 ```
 
-The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`.
+The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`. The `run_merge` and `session` filters cover the merging cursor and the scan session. The session's counters on the COL data are `session_run_reads_on_the_worked_transaction` and `the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways` (filter `session_run_reads` and `the_knobs`) in the COL suite.
 
 The merged-index spec parser, validator, and emitter test in the SQL compiler, with Java 21 configured:
 

@@ -198,7 +198,7 @@ The counters count each level separately, together with logical seeks and per-ru
 - value, weight, and payload decodes from `Old` equal the number of buffered old entries, plus the counted cancelled entries;
 - key decodes are at most the positions reached, plus one per run per seek.
 
-On the worked transaction, with one group under `Seek` and `PrefixSeek` (the session's knobs, below), this means one logical seek, two per-run seeks, seven key decodes (`c5` at open, then `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`), and six value, six weight, and six payload decodes from `Old`.
+On the worked transaction, with one group under `Seek` and `PrefixSeek` (the session's knobs, below), this means seven key decodes (`c5` at open, then `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`), and six value, six weight, and six payload decodes from `Old`. It means no seek: `Old` opens on `c5`, so the pass to `c5`'s prefix finds every run at or past it and moves nothing. The plan expected one logical seek and two per-run seeks, but a seek that moves no run costs nothing and counts nothing. The A/B below pins seeks that do move runs.
 
 ## The scan session
 
@@ -354,7 +354,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
      Six old entries are taken (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`), against 22 value decodes. `O⁻` alone reads all seven file keys, and `c6` is decoded three times, as the end of `O⁻`'s range and as `L⁻`'s landing for `o4` and `o5`.
    - The path reads, `C⁺` and `J⁺`, probe their one exact key with `seek_key_exact` (`scan_entry`), as a native join probes its trace: a file run whose filter excludes the key is neither sought nor decoded, and nothing past the entry is read. `J⁺`'s probe of `(c5, o5)`, which only `Dlt` holds, is the one rejection. The range reads, `O⁻` and `L⁻`, keep `scan`, since the filters answer whole keys, not prefixes. Each probe still opens a cursor, which decodes the file run's first key, and its first value through `CursorList`. *Changed on 2026-11-04;* before, the path reads also used `scan`, and the totals were 17 seeks and 22, 25 and 21 decodes.
-2. **Decode-free storage and the buffered scan session.** *Planned 2026-11-09.* The sub-steps commit one by one:
+2. **Decode-free storage and the buffered scan session.** *Done 2026-11-09.* The sub-steps committed one by one:
    - **Prefix successor and per-domain width.**
      - `prefix_successor(prefix) -> Option<Vec<u8>>` in `merged_index/mod.rs`. It drops trailing `0xFF` bytes and increments the last remaining byte. It returns `None` when every byte is `0xFF`, meaning the range runs to the end of the index.
      - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0. `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
@@ -364,10 +364,39 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - *Exit:* a landing alone decodes no value; the first `val()` counts one value decode and a second counts none; `step_val`, `seek_val`, and `weight` before `val` work; a clone works before and after the fill. The pinned counts of `todays_readers_run_reads_on_the_worked_transaction` are recomputed with each derivation in its comment, and the baseline table above is updated. The existing trace tests pass unchanged.
    - **`RunMerge`** in `merged_index/run_merge.rs`. *Done 2026-11-09.* `key`, `step`, `seek`, `seek_exact`, and `take`. `step` and `seek` read no value or weight; `take` sums weights per value and counts cancelled values. `seek` moves only the runs below its target and reports whether any moved. `seek_exact` probes through `seek_key_exact`, so a run its filter rules out stays behind and a `seek` must follow to align the runs. `exhaust` moves past every key without a read, for a skipped prefix that has no successor.
      - *Exit:* a property test against a consolidated brute force over several runs, file runs among them, with cross-run cancellations and replaced payloads; a counter test that stepping past entries counts no value or weight decode.
-   - **`ScanSession`** in `merged_index/session.rs`, with `Maintain`, `PassTo`, `Collect`, `Skip`, the two knobs, and `SessionCounts` ([The scan session](#the-scan-session)).
-     - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over random small tries (with `0xFF…` values to force carry), multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and all four knob combinations. A counter test shows that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode.
-   - **COL counter tests, the A/B, and docs.** On the worked transaction in `merged-index-col/src/q3/tests.rs`, `Maintain({C, O, L})` with `decode_payload` under `Seek` and `PrefixSeek` pins the counts of [How the counters check the rules](#how-the-counters-check-the-rules). An A/B test on the same data, extended with untouched customers between touched ones and a synthetic segment filter, pins the run and session counters of all four knob combinations, derives each in a comment, and checks equal outputs.
-     - *Exit:* this step is marked done here with the pinned tables. `CLAUDE.md` and `WORKFLOW.md` gain the new files, knobs, and test filters. The version-6 measurements predate lazy values; R5 timing of the knobs belongs to step 6.
+   - **`ScanSession`** in `merged_index/session.rs`, with `Maintain`, `PassTo`, `Collect`, `Skip`, the two knobs, and `SessionCounts` ([The scan session](#the-scan-session)). *Done 2026-11-09.* `RunMerge` gained `exhaust` for a skipped prefix with no successor.
+     - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over three small tries (one with a two-byte root and two placements at the root node, one with no root placement), values near `0x00`, `0x01`, `0xFE`, and `0xFF` to force carry, multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and all four knob combinations. Counter tests show that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode; and pin the seek and step counts of the knobs on a six-group layout and on a rejected subtree.
+   - **COL counter tests, the A/B, and docs.** *Done 2026-11-09.* On the worked transaction in `merged-index-col/src/q3/tests.rs`, `Maintain({C, O, L})` with `decode_payload` under `Seek` and `PrefixSeek` pins the counts of [How the counters check the rules](#how-the-counters-check-the-rules) (`session_run_reads_on_the_worked_transaction`). An A/B test on the same kind of data, extended with untouched customers between touched ones and a synthetic segment filter, pins the run and session counters of all four knob combinations, derives each in a comment, and checks equal outputs (`the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways`).
+     - *Exit:* `CLAUDE.md` and `WORKFLOW.md` gain the new files, knobs, and test filters. The version-6 measurements predate lazy values; R5 timing of the knobs belongs to step 6.
+
+     **Pinned: the worked transaction**, one group (`c5`), `Seek` + `PrefixSeek`, with `Old` as in the step 1 baseline (a file run holding `c5` through `c6`, a memory run holding `c7`) and `Dlt` as in the worked transaction:
+
+     | Count | Session reading | Today's four readers (step 1) |
+     | --- | --- | --- |
+     | Per-run seeks | 0 | 16 |
+     | Key decodes | 7 | 19 |
+     | Value decodes | 6 | 22 |
+     | Weight decodes | 6 | 19 |
+     | Payload decodes from `Old` | 6 | |
+     | Payload decodes from `Dlt` | 5 | |
+     | Logical seeks, steps, positions | 0, 6, 7 | |
+
+     **Pinned: the A/B.** `Old` has 18 keys (17 in a file run, `c7` in a memory run) over customers `c3`, `c5`, `c6`, `c7`, `c8`, `c9`. `Dlt` touches `c5` (old entries `c5`, `o3`, `l7`, `l8`, `o4`, `l9`; delta entries `-c5`, `+c5'`, `o5`, `l10`, `l11`), `c8` (a delta line item; its old customer is rejected by the segment filter, so its order and line item are passed unread), and `c10` (past the end of `Old`). Every combination buffers the same entries, and decodes seven old payloads, eight delta payloads, seven values, and seven weights:
+
+     | Pass | GroupStart | Logical seeks | Probes | Logical steps | Positions | Run seeks | Filter rejections | Key decodes |
+     | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+     | `Seek` | `PrefixSeek` | 4 | 0 | 6 | 10 | 5 | 0 | 10 |
+     | `Seek` | `ProbeThenRange` | 2 | 3 | 6 | 10 | 5 | 1 | 10 |
+     | `Step` | `PrefixSeek` | 0 | 0 | 18 | 18 | 0 | 0 | 17 |
+     | `Step` | `ProbeThenRange` | 0 | 3 | 11 | 13 | 3 | 1 | 13 |
+
+     What the table shows:
+
+     - Seeking and stepping buffer the same entries. Stepping decodes seven more keys here, one for each key that seeking jumps over (`o1` and `l1`; `o6` and `l12`; `o8` and `l13`; `o9`), and takes 18 steps against 6.
+     - `ProbeThenRange` replaces two prefix seeks by two exact probes that land on the same keys, since a probe that finds its key moves the run there. It saves no key decode or run seek here. It adds the probe of `c10`, which the file run's filter rules out (one filter rejection) before the prefix seek moves the run past the end. A run that the filter rules out stays behind, so a seek or step must follow every probe.
+     - Under `Step`, a probe lets the session skip stepping through untouched groups, since the runs it finds jump to the group (11 steps against 18).
+     - Memory runs add seeks but no decodes, so the key decodes of a combination equal its file-run positions.
+
 3. **Publish `(Old, Dlt)`, and read the after state as the overlay.**
    - Rewrite the four readers to read `Old ⊎ Dlt` for the after state.
    - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone.
@@ -408,3 +437,9 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - The read owner reuses the `WriteOwner` enum, so one list names the components for reads and writes. It is a separate thread-local from the write owner, so a read scope never changes who owns files created inside it. `RunReads::current` stays the total over all owners.
 - A `filter_rejections` run counter, so that native join probes that a file filter answers stay visible.
 - A separate `weight_decodes` run counter. The file format stores a value and its weight apart: landing on a value deserializes the value, and the weight is deserialized only when `weight`, `map_times`, or `map_values` asks. `CursorList`'s zero-weight skip reads weights at entries that no reader takes, so a separate counter shows that cost. Folding weights into value decodes would hide it.
+- The session's counters: `logical_seeks` counts only seeks that move some run, `probes` is an extra counter beside the planned ones, and `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
+- `Maintain` takes `decode` per call rather than at construction, since the payload type is the caller's; `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
+- `reject` judges old entries only, and a key is rejected when any of its entries is. The `Dlt` is read whole.
+- `ProbeThenRange` probes the first placement at the root node, and nothing when the root node has no placement.
+- `Maintain` runs once per session: it reads `Dlt` once, so a second call finds no group.
+- `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.

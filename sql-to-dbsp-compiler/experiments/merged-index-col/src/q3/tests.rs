@@ -1,13 +1,16 @@
 use super::*;
 use crate::{
-    build_batch, CustomerByCustkeyPayload, LineitemByCustkeyOrderkeyLinenumberPayload,
-    OrdersByCustkeyOrderkeyPayload,
+    build_batch, prefix_custkey, CustomerByCustkeyPayload,
+    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyPayload,
+    INDEX_ID_CUSTOMER_BY_CUSTKEY, INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+    INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY, TRIE,
 };
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DowncastTrait, DynData, Erase},
     storage::write_attribution::WriteOwner,
     trace::{
+        merged_index::{Entry, GroupBuffers, GroupStart, Pass, ScanSession, SessionCounts},
         Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
         WithSnapshot,
     },
@@ -449,41 +452,47 @@ fn run_reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads, RunReads) {
     (result, index_reads, total_reads.since(index_reads))
 }
 
+/// The worked transaction's `Old` and `Dlt` runs. Needs a runtime with
+/// storage, since `Old`'s first run is in a file.
+fn worked_runs() -> (MergedIndexBatch, MergedIndexBatch, MergedIndexBatch) {
+    // `Old`: a file run with customer 5 (orders 3 and 4, line items 7, 8,
+    // and 9) and customer 6, plus an in-memory run with customer 7.
+    let old_file = file_run(
+        &build_batch(vec![
+            customer(5, "old", 1),
+            order(5, 3, 10, 1),
+            line(5, 3, 7, 100, 1),
+            line(5, 3, 8, 100, 1),
+            order(5, 4, 10, 1),
+            line(5, 4, 9, 100, 1),
+            customer(6, "other", 1),
+        ])
+        .unwrap(),
+    );
+    let old_memory = build_batch(vec![customer(7, "later", 1)]).unwrap();
+    // `Dlt`: customer 5 replaced, and order 5 inserted with line items 10
+    // and 11.
+    let dlt = build_batch(vec![
+        customer(5, "old", -1),
+        customer(5, "new", 1),
+        order(5, 5, 11, 1),
+        line(5, 5, 10, 200, 1),
+        line(5, 5, 11, 200, 1),
+    ])
+    .unwrap();
+    assert_eq!(old_file.location(), BatchLocation::Storage);
+    assert_eq!(old_memory.location(), BatchLocation::Memory);
+    assert_eq!(dlt.location(), BatchLocation::Memory);
+    (old_file, old_memory, dlt)
+}
+
 /// The storage-level baseline of today's four readers on the worked
 /// transaction of `docs/design/merged-index/shared-traversal.md`, without
 /// its invoices, since COL has none.
 #[test]
 fn todays_readers_run_reads_on_the_worked_transaction() {
     in_storage_runtime(|| {
-        // `Old`: a file run with customer 5 (orders 3 and 4, line items 7, 8,
-        // and 9) and customer 6, plus an in-memory run with customer 7.
-        let old_file = file_run(
-            &build_batch(vec![
-                customer(5, "old", 1),
-                order(5, 3, 10, 1),
-                line(5, 3, 7, 100, 1),
-                line(5, 3, 8, 100, 1),
-                order(5, 4, 10, 1),
-                line(5, 4, 9, 100, 1),
-                customer(6, "other", 1),
-            ])
-            .unwrap(),
-        );
-        let old_memory = build_batch(vec![customer(7, "later", 1)]).unwrap();
-        // `Dlt`: customer 5 replaced, and order 5 inserted with line items 10
-        // and 11.
-        let dlt = build_batch(vec![
-            customer(5, "old", -1),
-            customer(5, "new", 1),
-            order(5, 5, 11, 1),
-            line(5, 5, 10, 200, 1),
-            line(5, 5, 11, 200, 1),
-        ])
-        .unwrap();
-        assert_eq!(old_file.location(), BatchLocation::Storage);
-        assert_eq!(old_memory.location(), BatchLocation::Memory);
-        assert_eq!(dlt.location(), BatchLocation::Memory);
-
+        let (old_file, old_memory, dlt) = worked_runs();
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
             StoredPayload,
@@ -671,4 +680,332 @@ fn finish_returns_each_transactions_index_reads() {
         .publish(one_run(), one_run(), BTreeMap::new())
         .unwrap();
     assert_eq!(state.finish().unwrap(), IndexReads::default());
+}
+
+/// The client side of the scan session: unfolds the key, which names the
+/// placement, and decodes the stored payload with it.
+fn decode_col_payload(key: &[u8], stored: &[u8]) -> Result<Payload, String> {
+    let key = CustomerOrdersLineitemDefinition::unfold(key)?;
+    decode_payload(&key, stored)
+}
+
+/// A synthetic segment filter: rejects an old customer outside `BUILDING`.
+fn outside_building_segment(entry: &Entry<Payload>) -> bool {
+    matches!(
+        &entry.payload,
+        Payload::CustomerByCustkey(customer)
+            if customer.c_mktsegment != SqlString::from("BUILDING")
+    )
+}
+
+type Groups = Vec<(Vec<u8>, GroupBuffers<Payload>)>;
+
+/// Runs `Maintain` over the three COL streams, returning the groups and the
+/// session counts, with the run reads of the merged index and of every other
+/// owner.
+fn maintain_col(
+    old: &SourceSnapshot,
+    dlt: &MergedIndexBatch,
+    (pass, start): (Pass, GroupStart),
+    reject: bool,
+) -> ((Groups, SessionCounts), RunReads, RunReads) {
+    run_reads_of(|| {
+        with_read_owner(WriteOwner::MergedIndex, || {
+            let mut session = ScanSession::new(&TRIE, old, dlt, pass, start).unwrap();
+            let mut groups = Vec::new();
+            let mut reject_entry = outside_building_segment;
+            session
+                .maintain(
+                    &BTreeSet::from([
+                        INDEX_ID_CUSTOMER_BY_CUSTKEY,
+                        INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+                        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+                    ]),
+                    decode_col_payload,
+                    reject.then_some(&mut reject_entry as &mut dyn FnMut(&Entry<Payload>) -> bool),
+                    |group, buffers| {
+                        groups.push((group.to_vec(), buffers.clone()));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            (groups, session.counts())
+        })
+    })
+}
+
+/// How many `(old, dlt)` entries a group buffers for customers, orders, and
+/// line items.
+fn buffered(buffers: &GroupBuffers<Payload>) -> [(usize, usize); 3] {
+    [
+        INDEX_ID_CUSTOMER_BY_CUSTKEY,
+        INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+    ]
+    .map(|id| (buffers.old(id).len(), buffers.dlt(id).len()))
+}
+
+fn reads(
+    seeks: u64,
+    filter_rejections: u64,
+    key_decodes: u64,
+    value_decodes: u64,
+    weight_decodes: u64,
+) -> RunReads {
+    RunReads {
+        seeks,
+        filter_rejections,
+        key_decodes,
+        value_decodes,
+        weight_decodes,
+    }
+}
+
+/// The scan session on the worked transaction, under `Seek` and
+/// `PrefixSeek`: one group, and the storage reads of the same index state as
+/// `todays_readers_run_reads_on_the_worked_transaction` (22 value decodes
+/// there, against 6 here).
+#[test]
+fn session_run_reads_on_the_worked_transaction() {
+    in_storage_runtime(|| {
+        let (old_file, old_memory, dlt) = worked_runs();
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            StoredPayload,
+            i64,
+        >();
+        let old = SourceSnapshot::with_batches(
+            &factories,
+            vec![Arc::new(old_file), Arc::new(old_memory)],
+        );
+
+        let ((groups, counts), index, other) =
+            maintain_col(&old, &dlt, (Pass::Seek, GroupStart::PrefixSeek), false);
+
+        // One group, c5, with the buffers of the worked transaction: the old
+        // entries c5, o3, o4, l7, l8, l9, and the delta's two entries of c5
+        // (-old, +new), o5, l10, and l11.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, prefix_custkey(5));
+        assert_eq!(buffered(&groups[0].1), [(1, 2), (2, 1), (3, 2)]);
+
+        // The write-up predicted one logical seek and two per-run seeks, for
+        // the pass to c5. There are none: `Old` opens on c5, the smallest key
+        // of both runs, so the seek to c5's prefix finds every run at or past
+        // it and moves nothing. The A/B test below pins seeks that move runs.
+        //
+        // The positions are the seven the index has up to c6: c5 at open,
+        // then o3, l7, l8, o4, l9, and c6, which ends the group. Six steps
+        // reach them. c7, in the memory run, is never reached.
+        assert_eq!(
+            counts,
+            SessionCounts {
+                groups: 1,
+                cursor_opens: 2,
+                logical_seeks: 0,
+                probes: 0,
+                logical_steps: 6,
+                positions: 7,
+                payload_decodes_old: 6,
+                payload_decodes_dlt: 5,
+                cancelled: 0,
+            }
+        );
+
+        // Seven key decodes, one for each position (the memory run decodes
+        // nothing). Six value and six weight decodes, for the six old entries
+        // taken; c6, which only ends the group, costs none of them. No seek.
+        assert_eq!(index, reads(0, 0, 7, 6, 6));
+        // `Dlt` is in memory and the session reads nothing else.
+        assert_eq!(other, RunReads::default());
+    });
+}
+
+/// The A/B of the two knobs on one transaction with untouched customers
+/// between the touched ones and a segment filter.
+///
+/// `Old` holds, in key order (file run `F`, but `c7` in memory run `M`):
+///
+/// ```text
+///  1 c3   2 o1   3 l1                                   untouched
+///  4 c5   5 o3   6 l7   7 l8   8 o4   9 l9              touched
+/// 10 c6  11 o6  12 l12                                  untouched
+/// 13 c7 (M)                                             untouched
+/// 14 c8  15 o8  16 l13                                  touched, segment AUTO
+/// 17 c9  18 o9                                          untouched
+/// ```
+///
+/// `Dlt` touches c5 (its segment changes, and order 5 gains two line items),
+/// c8 (a new line item), and c10 (a new customer with an order, past the end
+/// of `Old`). Streams customer, orders, and line items are all inputs. The
+/// filter rejects c8, so its order and line item are passed unread.
+#[test]
+fn the_knobs_pass_untouched_groups_and_rejected_subtrees_in_different_ways() {
+    in_storage_runtime(|| {
+        let old_file = file_run(
+            &build_batch(vec![
+                customer(3, "AUTO", 1),
+                order(3, 1, 10, 1),
+                line(3, 1, 1, 100, 1),
+                customer(5, "BUILDING", 1),
+                order(5, 3, 10, 1),
+                line(5, 3, 7, 100, 1),
+                line(5, 3, 8, 100, 1),
+                order(5, 4, 10, 1),
+                line(5, 4, 9, 100, 1),
+                customer(6, "AUTO", 1),
+                order(6, 6, 10, 1),
+                line(6, 6, 12, 100, 1),
+                customer(8, "AUTO", 1),
+                order(8, 8, 10, 1),
+                line(8, 8, 13, 100, 1),
+                customer(9, "BUILDING", 1),
+                order(9, 9, 10, 1),
+            ])
+            .unwrap(),
+        );
+        let old_memory = build_batch(vec![customer(7, "AUTO", 1)]).unwrap();
+        let dlt = build_batch(vec![
+            customer(5, "BUILDING", -1),
+            customer(5, "MACHINERY", 1),
+            order(5, 5, 11, 1),
+            line(5, 5, 10, 200, 1),
+            line(5, 5, 11, 200, 1),
+            line(8, 8, 14, 200, 1),
+            customer(10, "BUILDING", 1),
+            order(10, 10, 12, 1),
+        ])
+        .unwrap();
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            StoredPayload,
+            i64,
+        >();
+        let old = SourceSnapshot::with_batches(
+            &factories,
+            vec![Arc::new(old_file), Arc::new(old_memory)],
+        );
+
+        let run = |knobs| maintain_col(&old, &dlt, knobs, true);
+        let ((seek_groups, seek), seek_reads, seek_other) =
+            run((Pass::Seek, GroupStart::PrefixSeek));
+        let ((probe_groups, probe), probe_reads, probe_other) =
+            run((Pass::Seek, GroupStart::ProbeThenRange));
+        let ((step_groups, step), step_reads, step_other) =
+            run((Pass::Step, GroupStart::PrefixSeek));
+        let ((both_groups, both), both_reads, both_other) =
+            run((Pass::Step, GroupStart::ProbeThenRange));
+
+        // The outputs are equal, and are the three touched groups. c5 buffers
+        // its old entries and the delta's. c8's customer stays buffered
+        // though rejected, and its order and line item are never read; its
+        // delta line item is. c10 has no old entry.
+        for groups in [&probe_groups, &step_groups, &both_groups] {
+            assert_eq!(groups, &seek_groups);
+        }
+        let touched: Vec<_> = seek_groups.iter().map(|(group, _)| group.clone()).collect();
+        assert_eq!(touched, [5, 8, 10].map(prefix_custkey));
+        let shapes: Vec<_> = seek_groups.iter().map(|(_, b)| buffered(b)).collect();
+        assert_eq!(
+            shapes,
+            [
+                [(1, 2), (2, 1), (3, 2)],
+                [(1, 0), (0, 0), (0, 1)],
+                [(0, 1), (0, 1), (0, 0)],
+            ]
+        );
+        for other in [seek_other, probe_other, step_other, both_other] {
+            assert_eq!(other, RunReads::default());
+        }
+
+        // Every knob combination decodes the same payloads and the same
+        // values and weights: the seven buffered old entries (c5, o3, l7, l8,
+        // o4, l9, and the rejected c8), and the eight delta entries.
+        for counts in [seek, probe, step, both] {
+            assert_eq!(counts.groups, 3);
+            assert_eq!(counts.cursor_opens, 2);
+            assert_eq!(counts.payload_decodes_old, 7);
+            assert_eq!(counts.payload_decodes_dlt, 8);
+            assert_eq!(counts.cancelled, 0);
+        }
+        for reads in [seek_reads, probe_reads, step_reads, both_reads] {
+            assert_eq!((reads.value_decodes, reads.weight_decodes), (7, 7));
+        }
+
+        // Seek + PrefixSeek. Open on c3 (position 1).
+        // - c5: the seek moves F from c3 to c5 (run seek 1, position 2).
+        //   Collect takes c5 and steps through o3, l7, l8, o4, l9 (positions
+        //   3-7) to c6 (8), which ends the group: 6 steps.
+        // - c8: the seek moves F from c6 and M from c7 (run seeks 2 and 3),
+        //   landing on c8 (9); M is exhausted. c8 is rejected, so the skip
+        //   seeks past [1, c8] (run seek 4) to c9 (10), with no step.
+        // - c10: the seek moves F from c9 (run seek 5) past the end.
+        // 4 logical seeks, 5 run seeks, 10 positions; F decodes a key for each
+        // of them (the memory run decodes nothing, and the seek past the end
+        // lands on no key).
+        assert_eq!(
+            (
+                seek.logical_seeks,
+                seek.probes,
+                seek.logical_steps,
+                seek.positions
+            ),
+            (4, 0, 6, 10)
+        );
+        assert_eq!(seek_reads, reads(5, 0, 10, 7, 7));
+
+        // Seek + ProbeThenRange. Open on c3 (1).
+        // - c5: the probe of c5's root entry finds it in F through the filter
+        //   (run seek 1, position 2); M is above the probe. The prefix seek
+        //   then finds nothing to move. Collect as above: 6 steps, 8.
+        // - c8: the probe moves F to c8 (run seek 2) and M past c7 (run seek
+        //   3), position 9. The prefix seek moves nothing. The skip seeks F
+        //   past [1, c8] to c9 (run seek 4, position 10): 1 logical seek.
+        // - c10: the probe of c10's root entry is ruled out by F's filter (a
+        //   filter rejection, no seek); F stays on c9, and the prefix seek
+        //   moves it past the end (run seek 5): 1 logical seek.
+        // So 3 probes and 2 logical seeks; the same 5 run seeks, 10
+        // positions, and key decodes, plus one filter rejection.
+        assert_eq!(
+            (
+                probe.logical_seeks,
+                probe.probes,
+                probe.logical_steps,
+                probe.positions
+            ),
+            (2, 3, 6, 10)
+        );
+        assert_eq!(probe_reads, reads(5, 1, 10, 7, 7));
+
+        // Step + PrefixSeek. Every key of the index is a position, 18 in
+        // all, and every one is stepped past once: 18 steps and, F having 17
+        // of the keys, 17 key decodes (c7 is in memory). No seek.
+        assert_eq!(
+            (
+                step.logical_seeks,
+                step.probes,
+                step.logical_steps,
+                step.positions
+            ),
+            (0, 0, 18, 18)
+        );
+        assert_eq!(step_reads, reads(0, 0, 17, 7, 7));
+
+        // Step + ProbeThenRange. The probes of c5 and c8 land on their root
+        // entries (run seeks 1, 2, and 3 as above), so the untouched groups
+        // c3, c6, and c7 are not stepped; the probe of c10 is ruled out.
+        // Steps: 6 in c5, 3 for the rejected c8 subtree (o8, l13, c9), then
+        // c9 and o9 before c10: 11 steps. Positions: c3, c5 through c6 (7),
+        // c8 through c9 (4), and o9: 13, with a key decode in F for each.
+        assert_eq!(
+            (
+                both.logical_seeks,
+                both.probes,
+                both.logical_steps,
+                both.positions
+            ),
+            (0, 3, 11, 13)
+        );
+        assert_eq!(both_reads, reads(3, 1, 13, 7, 7));
+    });
 }
