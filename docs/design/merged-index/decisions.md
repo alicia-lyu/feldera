@@ -402,8 +402,7 @@ The user confirmed on 2026-11-10:
 - The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads, and checks that files exist.
 - `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB) is a public constant, so that the harness can report the resolved default (see "2026-11-09: DBSP's default placement in both modes").
 - The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
-
-Not a decision: the native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
+- The native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
 
 ## Superseded and withdrawn
 
