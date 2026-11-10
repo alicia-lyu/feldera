@@ -209,12 +209,16 @@ One scan session executes buffered execution. It is schema-independent, and it d
 - `Old`, one pinned snapshot, read through `RunMerge`.
 - `Dlt`, the transaction's sorted run, read once by one forward cursor.
 - The trie, for the root domain's width.
-- `decode(key, payload bytes) -> P`, supplied by the caller (COL's `decode_payload`) to each `Maintain` call, since `P` is the caller's type.
-- Two knobs, below.
+- `decode(key, payload bytes) -> P`, supplied by the caller (COL's `decode_payload`) to each `Maintain` call, since `P` is the caller's type. Planned 2026-11-09 (see [decisions.md](decisions.md)): the session is bound to its index definition and takes `D::TRIE` and `D::decode_payload(stream_id, bytes)`; nothing is passed.
+- Two knobs, below. Planned 2026-11-09: one knob, `Pass`.
+
+A trie has exactly one root domain (planned 2026-11-09; see [decisions.md](decisions.md)).
 
 The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
 
 ### Operations
+
+The pseudocode shows the current code. The `start` knob and the `ProbeThenRange` arm are to be removed (planned 2026-11-09; see [decisions.md](decisions.md)).
 
 ```text
 ScanSession(trie, Old: snapshot → RunMerge, Dlt run, pass: Seek|Step, start: PrefixSeek|ProbeThenRange)
@@ -248,7 +252,7 @@ The code differs from the write-up's pseudocode in three details:
 
 - `Skip` ends on the first key outside the node, so `Collect` steps only when no skip happened. A step after a `Seek` skip would pass an unread key.
 - A key's entries are judged together: `Skip` runs when any entry of the key is rejected. `reject` sees only old entries; `Dlt` is read whole.
-- `ProbeThenRange` probes the first placement at the root node (the lowest id), and only when some run is still below the probe key. A trie whose root node has no placement is never probed. The probe is a hint: a run its filter rules out stays behind, so the pass that follows aligns it.
+- `ProbeThenRange` (to be removed (planned 2026-11-09; see [decisions.md](decisions.md))) probes the first placement at the root node (the lowest id), and only when some run is still below the probe key. A trie whose root node has no placement is never probed. The probe is a hint: a run its filter rules out stays behind, so the pass that follows aligns it.
 
 The traversal mirrors the write-up: `Maintain` is `alg:ivm-buffered`'s loop over touched groups, `Collect` is `alg:session`'s, and `Skip` is `alg:skip`'s. `Old.key()` is the merged key `RunMerge` has already read, which plays the role of `Peek`'s kept `next_entry`.
 
@@ -267,7 +271,7 @@ Two knobs choose between ways of doing the same work. Both are A/B tests with eq
 | Knob | Values | Compares |
 | --- | --- | --- |
 | `Pass` | `Seek`, `Step` | Passing an untouched group, or a rejected subtree, by one logical seek against stepping through its entries. One knob governs both. |
-| `GroupStart` | `PrefixSeek`, `ProbeThenRange` | Seeking to the group's prefix against probing the customer's exact key with `seek_key_exact` before the range read (the root probe of 2026-11-04). The probe lets each run's filters answer before any seek. |
+| `GroupStart` | `PrefixSeek`, `ProbeThenRange` | Seeking to the group's prefix against probing the customer's exact key with `seek_key_exact` before the range read (the root probe of 2026-11-04). The probe lets each run's filters answer before any seek. **To be removed (planned 2026-11-09; see [decisions.md](decisions.md)):** a run whose filter rejects the root key stays behind and the range scan must seek it anyway, so per-run seeks equal a prefix seek's plus filter checks. Group reads seek by prefix; path reads keep `seek_key_exact`. |
 
 ### Counters
 
@@ -276,13 +280,13 @@ Two knobs choose between ways of doing the same work. Both are A/B tests with eq
 - `groups`;
 - `cursor_opens` (two: one logical cursor over `Old`, one over `Dlt`);
 - `logical_seeks`: seeks over `Old` that moved some run. A seek that finds `Old` already at or past its target costs nothing and counts nothing, so a first group that `Old` starts on counts no seek;
-- `probes`: exact-key probes made while some run was below the probed key;
+- `probes`: exact-key probes made while some run was below the probed key (to be removed with `GroupStart` (planned 2026-11-09; see [decisions.md](decisions.md)));
 - `logical_steps`;
 - `positions`: the first key of `Old`, and each key that a step, seek, or probe landed on. Each costs one key decode in a file run;
 - `payload_decodes_old` and `payload_decodes_dlt`: one per buffered entry;
 - `cancelled`: values whose weights cancelled across runs.
 
-DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes.
+DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes. In-memory runs will count their key, value, and weight accesses in separate fields (`memory_key_reads`, `memory_value_reads`, `memory_weight_reads`; names unconfirmed) (planned 2026-11-09; see [decisions.md](decisions.md)); today they count seeks only.
 
 ### Ownership
 
@@ -357,7 +361,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 2. **Decode-free storage and the buffered scan session.** *Done 2026-11-09.* The sub-steps committed one by one:
    - **Prefix successor and per-domain width.**
      - `prefix_successor(prefix) -> Option<Vec<u8>>` in `merged_index/mod.rs`. It drops trailing `0xFF` bytes and increments the last remaining byte. It returns `None` when every byte is `0xFF`, meaning the range runs to the end of the index.
-     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0. `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
+     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0 (it will also reject a trie without exactly one top-level node (planned 2026-11-09; see [decisions.md](decisions.md))). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
      - Regenerate `merged-index-col/src/generated.rs`.
      - *Exit:* unit tests for the empty prefix, carry, and all-`0xFF`; a property test that `k.starts_with(p)` holds exactly when `p <= k < succ(p)`; COL's widths are 8, 8, and 4.
    - **Lazy value positioning** in `FileIndexedWSetCursor` ([Remedies](#remedies)). *Done 2026-11-09.* The value cursor becomes a once-filled slot (`OnceCell`), and `count_value_decode` moves to where it is filled. A landing reads the key only; the first `val`, `val_valid`, `weight`, `map_times`, or value move fills the slot. A key move keeps the emptied cursor as the hint for the next first value. The `run_reads` tests pin the lazy counts; the COL baseline is unchanged (see the note under its table).
@@ -389,6 +393,8 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      | `Seek` | `ProbeThenRange` | 2 | 3 | 6 | 10 | 5 | 1 | 10 |
      | `Step` | `PrefixSeek` | 0 | 0 | 18 | 18 | 0 | 0 | 17 |
      | `Step` | `ProbeThenRange` | 0 | 3 | 11 | 13 | 3 | 1 | 13 |
+
+     This A/B is withdrawn with the `GroupStart` knob (planned 2026-11-09; see [decisions.md](decisions.md)); its `ProbeThenRange` rows go when the code changes.
 
      What the table shows:
 
@@ -432,14 +438,11 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `prefix_successor` returning `Option`, with `None` meaning the range runs to the end of the index, rather than a sentinel key.
 - `RunMerge` finding the minimum key by linear scan over its run cursors, not a heap. Snapshots hold few runs.
 - The once-filled value slot as the shape of lazy values in the file cursor (a `OnceCell`), with a hint field that keeps the last value cursor for `first_with_hint`.
-- `Maintain`'s `reject` as an optional per-entry test, and `decode` supplied by the caller rather than by the trie.
+- `Maintain`'s `reject` as an optional per-entry test.
 - The counting rules of `RunReads`: opening a cursor counts the key and value it lands on; value seeks count no seek; each probe of a predicate seek counts a key or value decode; a reverse seek counts one key decode, though the file reader may read the key twice. Lazy values (step 2) change the first of these: a landing counts the key only.
 - The read owner reuses the `WriteOwner` enum, so one list names the components for reads and writes. It is a separate thread-local from the write owner, so a read scope never changes who owns files created inside it. `RunReads::current` stays the total over all owners.
 - A `filter_rejections` run counter, so that native join probes that a file filter answers stay visible.
 - A separate `weight_decodes` run counter. The file format stores a value and its weight apart: landing on a value deserializes the value, and the weight is deserialized only when `weight`, `map_times`, or `map_values` asks. `CursorList`'s zero-weight skip reads weights at entries that no reader takes, so a separate counter shows that cost. Folding weights into value decodes would hide it.
-- The session's counters: `logical_seeks` counts only seeks that move some run, `probes` is an extra counter beside the planned ones, and `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
-- `Maintain` takes `decode` per call rather than at construction, since the payload type is the caller's; `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
-- `reject` judges old entries only, and a key is rejected when any of its entries is. The `Dlt` is read whole.
-- `ProbeThenRange` probes the first placement at the root node, and nothing when the root node has no placement.
-- `Maintain` runs once per session: it reads `Dlt` once, so a second call finds no group.
+- `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
+- `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
