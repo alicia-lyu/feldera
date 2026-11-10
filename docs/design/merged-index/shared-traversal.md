@@ -388,21 +388,76 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
      *Added 2026-11-10:* the memory reads. The session reads `M`'s key at the opening and `Dlt` whole (4 keys, 5 values, 5 weights).
 
-     **Pinned: native and the session on the same rows** (*added 2026-11-10*). The native side is the view worker's run reads in the worked transaction, in the harness's native build (`native_worked_transaction_tests` in `q3-ivm-baseline/src/main.rs`): the old state is loaded (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`, `c6`, `c7`) and the transaction replaces `c5` and adds `o5` with `l10` and `l11`. The session side is `Maintain` over an `Old` of one run holding the same eight keys, which is the layout of a native trace after one load transaction (`session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file` in `merged-index-col/src/q3/tests.rs`). Both arms use DBSP's default placement. The memory arm runs at low memory pressure, where every run is in memory (the storage directory gains no file). The file arm waits until the runtime reports high memory pressure before the load, as `append_one_file_run_to_the_index` does, so that the runs are files (the directory gains files in the load and in the transaction).
+     **Pinned: native and the session on the same rows** (*added 2026-11-10; rewritten the same day under one pressure mechanism, see [decisions.md](decisions.md#2026-11-10-one-memory-pressure-mechanism-for-both-sides-of-the-worked-transaction-comparison)*). Both sides run the same rows, the same `runtime_config`, and the same two arms (`worked_transaction::Arm` in `q3-ivm-baseline/src/main.rs`):
 
-     | Reading | Layout | Seeks | Filter rejections | Key | Value | Weight | Memory key | Memory value | Memory weight |
+     - *Default:* no memory target, so the pressure stays low.
+     - *Pressured:* a 1 MiB memory target, and a wait until the runtime reports high pressure before the load.
+
+     Nothing relieves the pressure by hand, and the runs are wherever the runtime's mechanism puts them. The old state is loaded through `transact` (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`, `c6`, `c7`), and the transaction replaces `c5` and adds `o5` with `l10` and `l11`.
+
+     - The native side is the view worker's run reads (`native_worked_transaction_tests`, native build only, since the `merged-index` build's view circuit reads the index). The transaction goes through `transact`.
+     - The session side is `Maintain` over the index's `Old` and `Dlt` (`session_worked_transaction_tests`, `merged-index` build). `Old` is the index's snapshot before the transaction, which `ManualIndex`'s `Spine` placed. `Dlt` is built by `build_batch` with no fixed location, so it follows `min_step_storage_bytes` like a native operator's output. The transaction runs on the base circuit and the index only: the reconstructed readers take placements from the Orders rows of the same delta, and this transaction changes `c5` without any, a change outside RF1/RF2 that they reject by design.
+
+     The pressure and the layout each side got, in five repeats of each test (identical every time):
+
+     | Side | Arm | Memory pressure (start, after load, after transaction) | Layout |
+     | --- | --- | --- | --- |
+     | Native | default | Low, Low, Low | Every read is a memory read, and the storage directory gains no file. |
+     | Native | pressured | Critical, Critical, Critical | Every read is a decode, so every run is in a file (the directory gains 8 files in the load and 8 in the transaction). Whether a trace's run or an operator's delta batch is which file is not reported. |
+     | Session | default | Low, Low, Low | `Old` is one memory run (8 entries) and `Dlt` a memory run (5 entries). |
+     | Session | pressured | Critical, Critical, Critical | `Old` is one file run (8 entries) and `Dlt` a file run (5 entries); the directory gains 5 files in the load and 5 in the transaction. |
+
+     The file counts of the two sides are not comparable: they include the base circuit's files and the operators' delta batches, and the session's transaction does not run the view circuit.
+
+     What each side read, over the transaction:
+
+     | Reading | Arm | Seeks | Filter rejections | Key decodes | Value decodes | Weight decodes | Memory key | Memory value | Memory weight |
      | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-     | Native, view worker | memory | 7 | 0 | 0 | 0 | 0 | 16 | 41 | 38 |
-     | Native, view worker | files | 6 | 1 | 16 | 41 | 38 | 0 | 0 | 0 |
-     | Session | memory | 0 | 0 | 0 | 0 | 0 | 11 | 11 | 11 |
-     | Session | `Old` in a file, `Dlt` in memory | 0 | 0 | 7 | 6 | 6 | 4 | 5 | 5 |
+     | Native, view worker | default | 7 | 0 | 0 | 0 | 0 | 16 | 41 | 38 |
+     | Native, view worker | pressured | 6 | 1 | 16 | 41 | 38 | 0 | 0 | 0 |
+     | Session | default | 0 | 0 | 0 | 0 | 0 | 11 | 11 | 11 |
+     | Session | pressured | 0 | 0 | 11 | 11 | 11 | 0 | 0 | 0 |
 
-     How to read the table:
+     Native's reads, derived per operator by a scout with no code run, and equal to the pins (7 probes; 16, 41, and 38 reads). The "after" trace of a join is the old run plus the transaction's delta run, so it has two runs; the "before" trace has the old run.
 
-     - *Native counts the whole of `V`'s maintenance*: both joins, all four traces. Each join probes the other side's trace once for each key of each delta: `ΔC` (`c5`) into O, `ΔO` (`c5`) into C, `ΔJ` (`o3`, `o4`, `o5`) into L, and `ΔL` (`o5`) into J. That is 1 + 1 + 3 + 1 = 7 probes, and the measured seeks are 7 in memory. In files one probe is answered by a run's filter (it counts a rejection and no seek, so 6 + 1); it is probably `ΔJ`'s probe of `o5` in L, which has no line item of `o5` yet, but the test does not check which one. The key, value, and weight counts (16, 41, 38) are the totals that the traces' cursors make, pinned as measured. They are not derived per operation.
-     - *The session counts only the traversal*: the old entries of the one touched group (7 positions, 6 entries taken) and the delta. Evaluating the delta rules over the buffers reads nothing more.
-     - *Placement does not change the counts*, only their kind: native's file arm decodes exactly the numbers that its memory arm reads (16, 41, 38), and the session's `Old` decodes in a file (7, 6, 6) what it reads in memory (7, 6, 6, inside the 11, 11, 11). The delta stays in memory in both of the session's arms, and native's step batches are not counted, since they are not indexed Z-set runs of a trace.
-     - *Native reads 16 keys, 41 values, and 38 weights, against the session's 7, 6, and 6 old reads* (11 keys, 11 values, and 11 weights, with `Dlt`). The comparison is of the two designs on one transaction at this tiny scale, not a claim about a workload: a measurement needs a raw artifact (see CLAUDE.md).
+     | Operator | Probes | Key | Value | Weight |
+     | --- | --- | --- | --- | --- |
+     | `ΔO ⋈ C` after the insert | 2 | 3 | 8 | 6 |
+     | `ΔC ⋈ O` before the insert | 1 | 2 | 8 | 8 |
+     | `J`'s `plus`, merging the two join outputs | 0 | 3 | 5 | 5 |
+     | `ΔL ⋈ J` after the insert | 2 | 4 | 7 | 6 |
+     | `ΔJ ⋈ L` before the insert (swapped: `L` drives and `ΔJ` is sought) | 2 | 4 | 13 | 13 |
+     | Total | 7 | 16 | 41 | 38 |
+
+     Values and weights exceed keys for four reasons: each delta value makes a full pass over the trace's values and then rewinds; `CursorList` reads a weight at each value landing, for its zero-weight skip; a seek that stays on the same key counts that key's value again; and `J`'s `plus` reads every output row. In the pressured arm one of the seven probes is answered by a run's filter, which counts a filter rejection and no seek (6 + 1). It is `ΔL`'s probe of `o5` into `J`'s old run, which has no entry of `o5`.
+
+     The session's reads, derived in a comment of `check` in `session_worked_transaction_tests`:
+
+     | Part | Reads |
+     | --- | --- |
+     | `Old`, one run | 7 key reads (the positions `c5`, `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`, which ends the group), and 6 value and 6 weight reads (the six entries taken; `c7` is never reached) |
+     | `Dlt`, read whole | 4 key reads (`c5`, `o5`, `l10`, `l11`), and 5 value and 5 weight reads (`c5` has two entries) |
+     | Seeks | None reach a run: `Old` opens on `c5`, the smallest key, so the seek to `c5`'s prefix moves nothing |
+
+     How to read the numbers:
+
+     - *Placement changes the kind of the counts, not the counts.* Native decodes in files exactly what it reads in memory (16, 41, 38), apart from the one rejected probe, and the session decodes 11, 11, 11 where it reads 11, 11, 11. The test pins the totals in every layout (`Totals`), and the split between memory reads and decodes by the layout it observed, so that it does not choose a layout.
+     - *Where native's reads go.* Five operators make them (the table above), each probing a trace, and every probe is a seek into a run. Both sides read the old entries that the transaction touches (`c5`, `o3`, `o4`, `l7`, `l8`, `l9`) and the transaction's delta. Native reads them through the cursors of its traces, one probe at a time, and the session in one pass over the index in key order.
+     - *Part of native's count computes the view change from the circuit's own intermediate results*, which the session does not do (it hands the buffers to `on_group` and evaluates the delta rules over them, with no run cursor; this test does not run that evaluation). That part is:
+       - `J`'s `plus`: 3 keys, 5 values, and 5 weights, with no probe. The rest of native's count, 13 keys, 36 values, and 33 weights, still includes the next two items.
+       - The sought `ΔJ`, in `ΔJ ⋈ L`: `L` drives and `ΔJ`, an intermediate result, is sought, so part of that row reads `ΔJ` and part reads `L`'s old entries. The counters do not separate them, so the row's 2 probes and 4, 13, and 13 reads are not split.
+       - The delta runs that the after traces re-read, in `ΔO ⋈ C` and `ΔL ⋈ J`. Each after trace holds the delta run beside the old run, and the counters do not separate that run's reads either.
+     - *What the session reads that native does not*: the position `c6` that ends the group (one key read, with no value or weight), and the index's one key per entry (7 positions for 6 old entries, where a native trace groups values under one key). It also reads `Dlt` once, whole, as one run holding all three streams' deltas.
+     - *What native reads that the session does not*: `J`'s `plus` and the intermediate `ΔJ` (above), each delta's reads by each operator that uses it, the passes over a trace's values per delta value (the values and weights exceed the keys for this reason), and seven probes where the session makes none.
+     - *The totals favor the session at this scale* (11 keys, 11 values, 11 weights, no seek, against 16, 41, 38, and 7 probes), but the comparison does not yet isolate the design: the session's count lacks the evaluation of the delta rules, and native's includes the part above. The pinned numbers show only that, for these eight old and five delta rows, the session traverses the index once and reads those totals.
+
+     Caveats:
+
+     - Eight old rows and five delta rows: the counts show the mechanism, not a scale.
+     - The placement is whatever each arm's pressure produced (Critical in every sample, in 5 of 5 repeats), not a typical workload's. At Critical pressure every run, the delta batches included, is in a file, so the old state is not in files with the delta in memory as a long-running pipeline would have it. The user decided on 2026-11-10 not to imitate that placement.
+     - The session does not compute the view change yet, and its transaction does not run the view circuit.
+     - Pressure is sampled. The tests print the level at three points and pin counts, never a level or a layout, except that a native run whose reads are all decodes pins the 6 + 1 split.
+     - Real conclusions wait for a full realistic workload.
 
      **Pinned: the A/B.** `Old` has 18 keys (17 in a file run, `c7` in a memory run) over customers `c3`, `c5`, `c6`, `c7`, `c8`, `c9`. `Dlt` touches `c5` (old entries `c5`, `o3`, `l7`, `l8`, `o4`, `l9`; delta entries `-c5`, `+c5'`, `o5`, `l10`, `l11`), `c8` (a delta line item; its old customer is rejected by the segment filter, so its order and line item are passed unread), and `c10` (past the end of `Old`). Both passes buffer the same entries, and decode seven old payloads, eight delta payloads, seven values, and seven weights:
 
