@@ -7,10 +7,6 @@
 //! pre-order. Tries are three or four levels deep, so clarity beats speed
 //! here. The hot path, folding, uses constants instead.
 
-/// The most domains and the most placements a trie may have.
-/// Tags and ids are one byte each, and tag 0 is reserved for the terminator.
-const MAX_TAGS: usize = u8::MAX as usize;
-
 /// A column of a base relation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnRef {
@@ -63,9 +59,15 @@ pub struct Node {
     pub children: &'static [Node],
 }
 
-/// A merged index's trie. The root is implicit and has `children`, which
-/// [`validate`](KeyTrie::validate) requires to be exactly one node: the root
-/// domain.
+/// A merged index's trie. The root is implicit and has `children`, which must be
+/// exactly one node: the root domain, so that a key's group is its first bytes.
+/// Two root domains need two key tries, each stored as its own merged index.
+/// Several streams may still reside at the root domain's node.
+///
+/// A trie comes from the compiler's emitter, which emits only specs that the
+/// compiler's validator (`MergedIndexValidator`) accepted. The validator checks
+/// every rule, so this type does not: a trie built by hand that breaks one makes
+/// the accessors below panic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyTrie {
     pub name: &'static str,
@@ -103,8 +105,8 @@ impl PlacedIndex {
     ///
     /// # Panics
     ///
-    /// Panics if some path domain does not resolve, which
-    /// [`KeyTrie::validate`] rejects.
+    /// Panics if some path domain does not resolve, which the compiler's
+    /// validator rejects.
     pub fn key_columns(&self, trie: &KeyTrie) -> Vec<ColumnRef> {
         self.path
             .iter()
@@ -134,8 +136,8 @@ impl KeyTrie {
     ///
     /// # Panics
     ///
-    /// Panics if there are more than 255 placements, which
-    /// [`validate`](Self::validate) rejects.
+    /// Panics if there are more than 255 placements, which the compiler's
+    /// validator rejects.
     pub fn placements(&self) -> Vec<PlacedIndex> {
         let mut placed = Vec::new();
         visit_preorder(self.children, &mut Vec::new(), &mut |path, node| {
@@ -177,7 +179,7 @@ impl KeyTrie {
     /// # Panics
     ///
     /// Panics unless the trie has one top-level node whose domain is declared.
-    /// [`validate`](Self::validate) rejects any other trie.
+    /// The compiler's validator rejects any other trie.
     pub fn root_width(&self) -> usize {
         let [root] = self.children else {
             panic!(
@@ -191,137 +193,8 @@ impl KeyTrie {
             .width
     }
 
-    /// Checks the rules that need no schema. Type, NOT NULL, and primary-key
-    /// checks belong to the SQL compiler, which knows the schema.
-    pub fn validate(&self) -> Result<(), String> {
-        self.check_declared_domains()?;
-        self.check_counts()?;
-        self.check_one_root()?;
-        self.validate_level(self.children, &mut Vec::new())
-    }
-
     fn domain(&self, name: &str) -> Option<&'static Domain> {
         self.domains.iter().find(|domain| domain.name == name)
-    }
-
-    fn check_declared_domains(&self) -> Result<(), String> {
-        for (position, domain) in self.domains.iter().enumerate() {
-            if self.domains[..position]
-                .iter()
-                .any(|earlier| earlier.name == domain.name)
-            {
-                return Err(format!("domain `{}` is declared twice", domain.name));
-            }
-            if domain.width == 0 {
-                return Err(format!("domain `{}` has width 0", domain.name));
-            }
-        }
-        Ok(())
-    }
-
-    /// A key trie has exactly one root domain, so that a key's group is its
-    /// first bytes. Two root domains need two key tries, each stored as its own
-    /// merged index. Several streams may still reside at the root node.
-    fn check_one_root(&self) -> Result<(), String> {
-        match self.children.len() {
-            1 => Ok(()),
-            0 => Err(format!(
-                "key trie `{}` has no top-level node; it needs exactly one root domain",
-                self.name
-            )),
-            count => Err(format!(
-                "key trie `{}` has {count} top-level nodes; it needs exactly one root domain, \
-                 so use one key trie for each root domain",
-                self.name
-            )),
-        }
-    }
-
-    fn check_counts(&self) -> Result<(), String> {
-        if self.domains.len() > MAX_TAGS {
-            return Err(format!("more than {MAX_TAGS} domains"));
-        }
-        let mut placement_count = 0;
-        visit_preorder(self.children, &mut Vec::new(), &mut |_, node| {
-            placement_count += node.placements.len();
-        });
-        if placement_count > MAX_TAGS {
-            return Err(format!("more than {MAX_TAGS} placements"));
-        }
-        Ok(())
-    }
-
-    /// Checks the sibling nodes in `nodes`, then recurses into each of them.
-    /// `path` holds the domains above `nodes`.
-    fn validate_level(
-        &self,
-        nodes: &'static [Node],
-        path: &mut Vec<&'static str>,
-    ) -> Result<(), String> {
-        for (position, node) in nodes.iter().enumerate() {
-            if self.domain(node.domain).is_none() {
-                return Err(format!("node domain `{}` is not declared", node.domain));
-            }
-            if nodes[..position]
-                .iter()
-                .any(|sibling| sibling.domain == node.domain)
-            {
-                return Err(format!(
-                    "sibling nodes repeat domain `{}` below {path:?}",
-                    node.domain
-                ));
-            }
-            if path.contains(&node.domain) {
-                return Err(format!(
-                    "domain `{}` repeats on the path {path:?}",
-                    node.domain
-                ));
-            }
-            path.push(node.domain);
-            self.validate_placements(node, path)?;
-            self.validate_level(node.children, path)?;
-            path.pop();
-        }
-        Ok(())
-    }
-
-    /// Checks the placements of `node`, whose path from the root is `path`.
-    fn validate_placements(&self, node: &Node, path: &[&'static str]) -> Result<(), String> {
-        for (position, placement) in node.placements.iter().enumerate() {
-            if node.placements[..position]
-                .iter()
-                .any(|earlier| earlier.relation == placement.relation)
-            {
-                return Err(format!(
-                    "relation `{}` is placed twice at {path:?}",
-                    placement.relation
-                ));
-            }
-            for (via_position, via) in placement.via.iter().enumerate() {
-                if self.domain(via.domain).is_none() {
-                    return Err(format!("via domain `{}` is not declared", via.domain));
-                }
-                if !path.contains(&via.domain) {
-                    return Err(format!(
-                        "via domain `{}` of `{}` is not on the path {path:?}",
-                        via.domain, placement.relation
-                    ));
-                }
-                if placement.via[..via_position]
-                    .iter()
-                    .any(|earlier| earlier.domain == via.domain)
-                {
-                    return Err(format!(
-                        "`{}` has two vias for domain `{}`",
-                        placement.relation, via.domain
-                    ));
-                }
-            }
-            for domain in path {
-                self.resolve_column(placement, domain)?;
-            }
-        }
-        Ok(())
     }
 
     /// The key column that gives `placement` its value in `domain`.

@@ -212,7 +212,7 @@ One scan session executes buffered execution. It is schema-independent, and it d
 - The index definition `D` (`MergedIndexDefinition`), which supplies the trie (`D::TRIE`) and the payload decoder (`D::decode_payload(stream_id, bytes)`). The stream id selects the payload type, so decoding needs no `unfold`. The session is bound to `D`: `ScanSession<D>`, and nothing else is passed.
 - One knob, below.
 
-A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. `KeyTrie::validate` and the Java `MergedIndexValidator` reject any other trie, so `root_width()` is a plain `usize` and the session cannot be built over a trie with no single root.
+A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. The Java `MergedIndexValidator` rejects any other trie, so `root_width()` is a plain `usize`; it panics on a hand-built trie with no single root, and so does the session (decision of 2026-11-10: the compiler's validator is the only trie check).
 
 The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
 
@@ -359,7 +359,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 2. **Decode-free storage and the buffered scan session.** *Done 2026-11-09.* The sub-steps committed one by one:
    - **Prefix successor and per-domain width.**
      - `prefix_successor(prefix) -> Option<Vec<u8>>` in `merged_index/mod.rs`. It drops trailing `0xFF` bytes and increments the last remaining byte. It returns `None` when every byte is `0xFF`, meaning the range runs to the end of the index.
-     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0 and any trie without exactly one top-level node (*changed on 2026-11-09*; `root_width()` returned an `Option` before). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
+     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `root_width()` that panics on any trie without exactly one top-level node (*changed on 2026-11-09*; it returned an `Option` before, and a Rust `validate()` rejected such tries until 2026-11-10, when the compiler's validator became the only check). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
      - Regenerate `merged-index-col/src/generated.rs`.
      - *Exit:* unit tests for the empty prefix, carry, and all-`0xFF`; a property test that `k.starts_with(p)` holds exactly when `p <= k < succ(p)`; COL's widths are 8, 8, and 4.
    - **Lazy value positioning** in `FileIndexedWSetCursor` ([Remedies](#remedies)). *Done 2026-11-09.* The value cursor becomes a once-filled slot (`OnceCell`), and `count_value_decode` moves to where it is filled. A landing reads the key only; the first `val`, `val_valid`, `weight`, `map_times`, or value move fills the slot. A key move keeps the emptied cursor as the hint for the next first value. The `run_reads` tests pin the lazy counts; the COL baseline is unchanged (see the note under its table).
@@ -440,4 +440,3 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
 - `decode_payload` keys on the stream id, not on the unfolded key.
-- `ScanSession::new` and `KeyTrie::root_width` panic on a trie without one root domain, which `validate` rejects, instead of returning an error.

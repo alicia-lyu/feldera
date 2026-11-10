@@ -155,7 +155,7 @@ The tree stores no indices, parent links, tags, ids, or paths. Each query walks 
 - `placements()` returns each placement with its id (visit position + 1) and its path of domain names;
 - `domain_tag(name)` returns the position of the domain's first appearance in the walk, + 1;
 - `PlacedIndex` derives `name()`, `is_primary()`, and `key_columns(&trie)`;
-- `validate()` checks the schema-free rules of the Validation section: declared and distinct domains, exactly one top-level node, no repeat on a path, one placement per relation per node, at most 255 domains and 255 placements, and that every path domain resolves through an own column or a valid `via`. Type, NOT NULL, and primary-key checks need the schema, so they stay in the compiler.
+- The trie has no validator of its own. The compiler's `MergedIndexValidator` checks every rule of the Validation section before the emitter prints a trie, so a `KeyTrie` that the emitter produced is valid. A trie built by hand that breaks a rule makes `root_width`, `placements`, or `key_columns` panic (decision of 2026-11-10).
 
 Tries are three or four levels deep, so this favors clean code over speed. Folding does not walk the tree: it uses constants, which `testing::check_against_trie` ties to the trie.
 
