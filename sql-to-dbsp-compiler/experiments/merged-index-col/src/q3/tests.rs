@@ -72,6 +72,11 @@ fn source(batches: Vec<Vec<SourceRow>>) -> SourceSnapshot {
     )
 }
 
+/// One `Dlt` run of `rows`.
+fn run(rows: Vec<SourceRow>) -> Arc<MergedIndexBatch> {
+    Arc::new(build_batch(rows).unwrap())
+}
+
 fn delta<K: DBData, V: DBData>(rows: Vec<(K, V, i64)>) -> SpineSnapshot<OrdIndexedZSet<K, V>> {
     let batch = OrdIndexedZSet::from_tuples(
         (),
@@ -123,8 +128,8 @@ fn four_readers_preserve_weighted_before_after_relations() {
     let state = Q3State::default();
     state
         .publish(
-            source(vec![initial.clone()]),
-            source(vec![initial, changes]),
+            source(vec![initial]),
+            run(changes),
             BTreeMap::from([(20, BTreeSet::from([2]))]),
         )
         .unwrap();
@@ -210,8 +215,8 @@ fn candidate_locations_follow_each_snapshot_without_duplicating_rows() {
     let state = Q3State::default();
     state
         .publish(
-            source(vec![initial.clone()]),
-            source(vec![initial, changes]),
+            source(vec![initial]),
+            run(changes),
             BTreeMap::from([
                 (20, BTreeSet::from([2, 3, 2, 9, 3])),
                 (99, BTreeSet::from([2, 3])),
@@ -278,7 +283,7 @@ fn requested_orders_require_nonempty_candidate_locations() {
     for locations in [BTreeMap::new(), BTreeMap::from([(20, BTreeSet::new())])] {
         let state = Q3State::default();
         state
-            .publish(source(vec![]), source(vec![]), locations)
+            .publish(source(vec![]), run(vec![]), locations)
             .unwrap();
         assert!(state
             .joined_orders_after(&line_request)
@@ -297,13 +302,13 @@ fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() 
     state
         .publish(
             source(vec![]),
-            source(vec![vec![
+            run(vec![
                 customer(2, "A", -2),
                 order(2, 20, 10, 3),
                 order(2, 21, 10, 7),
                 customer(9, "unused", 100),
                 order(9, 90, 10, 100),
-            ]]),
+            ]),
             BTreeMap::from([(20, BTreeSet::from([2]))]),
         )
         .unwrap();
@@ -332,8 +337,8 @@ fn cancelled_and_missing_keys_have_no_values() {
     let state = Q3State::default();
     state
         .publish(
-            source(vec![]),
-            source(vec![vec![customer(2, "A", 1)], vec![customer(2, "A", -1)]]),
+            source(vec![vec![customer(2, "A", 1)]]),
+            run(vec![customer(2, "A", -1)]),
             BTreeMap::new(),
         )
         .unwrap();
@@ -350,6 +355,38 @@ fn cancelled_and_missing_keys_have_no_values() {
     .is_empty());
 }
 
+/// The after reads take `Old ⊎ Dlt`: `Old`'s runs with `Dlt` as one more
+/// run, unless `Dlt` is empty. The published runs are the caller's own.
+#[test]
+fn after_reads_overlay_dlt_on_old() {
+    let state = Q3State::default();
+    assert!(state.old().unwrap_err().contains("publish"));
+    let old = source(vec![vec![customer(2, "old", 1)]]);
+    let dlt = run(vec![customer(2, "old", -1), customer(2, "new", 1)]);
+    state
+        .publish(old.clone(), dlt.clone(), BTreeMap::new())
+        .unwrap();
+    assert!(Arc::ptr_eq(&state.dlt().unwrap(), &dlt));
+    assert!(Arc::ptr_eq(
+        &state.old().unwrap().batches()[0],
+        &old.batches()[0]
+    ));
+    let request = delta(vec![(Tup1(2), Tup3(20, Date::from_days(0), 0), 1)]);
+    assert_eq!(
+        tuples(&state.customers_after(&request).unwrap()),
+        vec![(Tup1(2), Tup1(SqlString::from("new")), 1)]
+    );
+    state.finish().unwrap();
+
+    // An empty `Dlt` adds no run: the after state is `Old`.
+    state.publish(old, run(vec![]), BTreeMap::new()).unwrap();
+    assert_eq!(state.views().unwrap().after.batches().len(), 1);
+    assert_eq!(
+        tuples(&state.customers_after(&request).unwrap()),
+        vec![(Tup1(2), Tup1(SqlString::from("old")), 1)]
+    );
+}
+
 #[test]
 fn publication_and_batch_local_placement_are_required() {
     let state = Q3State::default();
@@ -363,10 +400,10 @@ fn publication_and_batch_local_placement_are_required() {
         .unwrap_err()
         .contains("publish"));
     state
-        .publish(source(vec![]), source(vec![]), BTreeMap::new())
+        .publish(source(vec![]), run(vec![]), BTreeMap::new())
         .unwrap();
     assert!(state
-        .publish(source(vec![]), source(vec![]), BTreeMap::new())
+        .publish(source(vec![]), run(vec![]), BTreeMap::new())
         .is_err());
     assert!(state
         .lineitems_before(&request)
@@ -499,16 +536,14 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
             i64,
         >();
         let (old_file, old_memory, dlt) = (Arc::new(old_file), Arc::new(old_memory), Arc::new(dlt));
-        let before =
-            SourceSnapshot::with_batches(&factories, vec![old_file.clone(), old_memory.clone()]);
-        let after = SourceSnapshot::with_batches(&factories, vec![old_file, old_memory, dlt]);
+        let old = SourceSnapshot::with_batches(&factories, vec![old_file, old_memory]);
         // Today's harness takes placements from the Orders delta alone and
         // would reject this `ΔC`; the readers accept any placements.
         let state = Q3State::default();
         state
             .publish(
-                before,
-                after,
+                old,
+                dlt,
                 BTreeMap::from([3, 4, 5].map(|order| (order, BTreeSet::from([5])))),
             )
             .unwrap();
@@ -704,7 +739,7 @@ fn finish_returns_each_transactions_index_reads() {
     // again after the seek empties the value (2 and 2). So the two calls make
     // 2 seeks, 2 key reads, 4 value reads, and 4 weight reads, and no decode.
     state
-        .publish(one_run(), one_run(), BTreeMap::new())
+        .publish(one_run(), run(vec![]), BTreeMap::new())
         .unwrap();
     state.customers_after(&orders_delta).unwrap();
     state.customers_after(&orders_delta).unwrap();
@@ -731,7 +766,7 @@ fn finish_returns_each_transactions_index_reads() {
 
     // The next transaction starts from zero.
     state
-        .publish(one_run(), one_run(), BTreeMap::new())
+        .publish(one_run(), run(vec![]), BTreeMap::new())
         .unwrap();
     assert_eq!(state.finish().unwrap(), IndexReads::default());
 }

@@ -7,7 +7,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10); nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, and 2026-11-09.
+> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10); nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, and 2026-11-09.
 
 This doc covers:
 
@@ -148,7 +148,7 @@ The facts were checked against the code on 2026-11-09.
 | Concept | Feldera today | Gap |
 | --- | --- | --- |
 | `Old` | `ManualIndex::append` takes `before` from `trace.ro_snapshot()`. A `SpineSnapshot` holds shared references to its runs, so a later compaction does not change it (`prop:overlay`(iii)). | None. |
-| `Dlt` | `ManualIndex`'s `Request::Append` handler builds the run with `build_batch`, moves it into `trace.insert`, and keeps no copy. | Keep the run and publish it (roadmap step 3). |
+| `Dlt` | `ManualIndex`'s `Request::Append` handler builds the run with `build_batch`, inserts a shared reference into the spine, and returns the run; `Q3State::publish` takes it beside `Old`. | None. |
 | a node's prefix; a child domain's prefix | `KeyEncoder::prefix` and `then_tag` in `crates/dbsp/src/trace/merged_index/mod.rs`. The folded key is `[tag enc(value)]* 0 id`. | None. |
 | `SkipPrefix`: seek past a prefix | Only `Cursor::seek_key`, which is forward-only. No prefix successor exists. | A byte-string successor, with carry and the all-`0xFF` case. |
 | the root prefix of a `Dlt` key | Value widths exist only as `OrderedKey::WIDTH` on Rust types. `Domain` has a name and columns only. | A width per domain in `KeyTrie` and `MergedIndexRustEmitter`. Only the root's is used: a group is the first `1 + root_width` bytes of a key. |
@@ -158,9 +158,9 @@ The facts were checked against the code on 2026-11-09.
 | decode | `unfold` and `decode_payload` in the client crate. | Decode only buffered entries, from key bytes ([No extra decoding](#no-extra-decoding)). |
 | the four readers | The four functions in `merged-index-col/src/q3.rs`. Each opens its own cursor for every requested key; no two readers share a cursor. | Replaced by the session and the operator's callback (roadmap step 5). |
 | session operator | `add_ternary_operator` and `add_quaternary_operator` (`circuit_builder.rs`). Existing users include `GroupTransform` (ternary) and `AsofJoin` (quaternary). Accumulators in front supply each whole delta at the flush. Output is chunked by `splitter_output_chunk_size`. | A new operator. |
-| snapshot input | Before each transaction the harness puts the snapshots in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush. | The same pattern, holding `(Old, Dlt)`. |
+| snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush, and `Q3State::old` and `dlt` return them. | None. |
 | joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. | One operator whose callback evaluates both joins per group. Separate operators sharing the buffers would hold every touched group until `V` finishes. |
-| `Dlt` complete under (A2) | The base transaction runs first. `prepare` folds its net delta, and `ManualIndex::append` builds the run before the view transaction starts. For RF1/RF2 each line item finds its customer through its order's row in the same transaction. | The run is not published, and the view circuit reads the SQL net delta instead. Feed the view side from `Dlt`; no extra owner lookup is needed. |
+| `Dlt` complete under (A2) | The base transaction runs first. `prepare` folds its net delta, and `ManualIndex::append` builds the run before the view transaction starts. For RF1/RF2 each line item finds its customer through its order's row in the same transaction. | The run is published, but the view circuit still reads the SQL net delta. Feed the view side from `Dlt` (roadmap step 4); no extra owner lookup is needed. |
 | counters | Buffer-cache hits and misses, and Bloom and range filter statistics. `RunReads` (`trace/cursor/run_reads.rs`) counts per-run seeks in both run cursors, and filter rejections and key, value, and weight decodes in the file cursor, as per-thread running totals split by read owner (`with_read_owner`). `DBSPHandle::run_reads` reports the workers' totals. `SessionCounts` (`merged_index/session.rs`) counts the session's logical moves and payload decodes. | None. |
 
 ## No extra decoding
@@ -302,7 +302,7 @@ This table refreshes `tab:prototype`.
 | `V`'s key | `orderkey` alone, so (A1) fails | `(custkey, orderkey)` |
 | Delta delivery | Each reader receives its whole driving delta once, at the transaction's flush | Per touched group, from its buffers |
 | Base deltas | SQL net deltas, plus the order → customer placements from the same transaction's Orders rows; RF1/RF2 only | The complete changes of the stored entries, `Dlt`, from index maintenance (A2) |
-| Versions | Two snapshots, `before` and `after` | `Old`, overlaid with `Dlt` |
+| Versions | `Old`, and `Old`'s runs with `Dlt` as one more run, which a merged cursor consolidates | `Old`, overlaid with `Dlt`, unconsolidated |
 | Owner-key change | Rejected, as are replacement Orders deltas; customers change only at the initial load, so no line item moves in the validated workloads | Both folded keys of each moved entry, in `Dlt` |
 | Cursors and seeks | A fresh cursor and seek per requested key; `O⁻` decodes the customer's whole subtree and discards all but Orders; `J⁺` reads the customer again for each pair of order and placement customer; `J⁺` and `L⁻` request by `orderkey`, which is not index order; a seek visits every run, and a file-backed run decodes the first value on every landing | One forward seek per touched group, each old entry read once; untouched groups not read |
 | Key order | Folded byte keys compared as bytes; signed integers in value order, tested | Folded order |
@@ -312,7 +312,7 @@ This table refreshes `tab:prototype`.
 
 These are implementation questions, not algorithm questions:
 
-- **Publishing `Dlt`.** Keep the run that the base phase already builds, publish it with `Old`, and feed the view side from it.
+- **Feeding the view side from `Dlt`.** The run is published with `Old` (roadmap step 3); step 4 feeds the view side from it.
 - **The cost model.** A logical seek costs one seek per run of the snapshot. Decoding has four levels: key, value, weight, and payload. [No extra decoding](#no-extra-decoding) sets the rules and the counters that check them.
 - **The join-plan type.** The operator interprets it: the joins with their keys and delta terms, each term's version and kind (path or range), and any selections and projections between them. The callback evaluates it over a group's buffers.
 - **Output.** Emit chunks of the size DBSP expects, and leave consolidation to DBSP's batcher.
@@ -396,9 +396,11 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - Memory runs add seeks but no decodes, so the key decodes of a pass equal its file-run positions.
      - *Before 2026-11-09* a second knob, `GroupStart::ProbeThenRange`, probed the root entry first. It replaced two prefix seeks by exact probes landing on the same keys, saved no key decode or run seek, and added one filter rejection (the probe of `c10`). It was removed.
 
-3. **Publish `(Old, Dlt)`, and read the after state as the overlay.**
-   - Rewrite the four readers to read `Old ⊎ Dlt` for the after state.
-   - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone.
+3. **Publish `(Old, Dlt)`, and read the after state as the overlay.** *Done 2026-11-10.*
+   - `ManualIndex::append` returns `(Old, Dlt)`: the snapshot before the append and the appended run, which the spine shares. `Q3State::publish(old, dlt, placements)` replaces the two snapshots.
+   - The four readers are not rewritten, since step 5 replaces them. `Q3State` builds their after view as `Old`'s runs with `Dlt` as one more run (none when `Dlt` is empty), and the after readers read it through `CursorList`, which consolidates across runs. That gives the same Z-set as `Old ⊎ Dlt` (`prop:overlay`). The session reads the two apart.
+   - The COL baseline already modeled the after state as `Old` plus `Dlt`, so its counts are unchanged. In the harness, the after reads now take `Dlt` from memory, never from a file the spine spilled, so the after readers' counts can move from file decodes to `memory_*` reads (measurement version 7).
+   - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone. `after_reads_overlay_dlt_on_old` (COL) pins the overlay and the accessors.
 4. **Hand-written view circuit.**
    - The view side reads its inputs from `Dlt` (still RF1/RF2), each row keyed by its full trie path.
    - The joins are keyed by `(custkey)` and `(custkey, orderkey)`, still on today's snapshot-reader joins.

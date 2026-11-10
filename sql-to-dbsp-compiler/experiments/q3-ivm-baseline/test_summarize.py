@@ -63,7 +63,7 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                                                10 * refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 6, "os": "linux",
+        "measurement_version": 7, "os": "linux",
         "refreshes": refreshes,
         "sequence": {
             "index_run_reads": None if native else index_reads(int(3 * scale)),
@@ -292,17 +292,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 6")
+        self.failing(content, "native run 1: measurement_version is 2, not 7")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 6")
+        self.failing(content, "native run 1: measurement_version is 3, not 7")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 6")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 7")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 6")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 7")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")

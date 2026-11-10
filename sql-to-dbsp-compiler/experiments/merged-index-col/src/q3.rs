@@ -44,7 +44,10 @@ pub type LineitemBatch =
 pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 
 struct ReadViews {
-    before: SourceSnapshot,
+    old: SourceSnapshot,
+    dlt: Arc<MergedIndexBatch>,
+    /// `Old ⊎ Dlt`: `Old`'s runs with `Dlt` as one more run. A cursor over
+    /// it sums each entry's weights across runs, which gives the after state.
     after: SourceSnapshot,
     order_customers: BTreeMap<i64, BTreeSet<i64>>,
     reads: Mutex<IndexReads>,
@@ -71,7 +74,10 @@ impl AddAssign for IndexReads {
 
 /// One externally prepared transaction's read views, shared by the generated joins.
 ///
-/// Publish after complete index maintenance and before starting Q3. Keep the
+/// Publish `Old`, the index snapshot before the transaction, and `Dlt`, the
+/// run of the transaction's signed index changes, after index maintenance and
+/// before starting Q3. Before reads take `Old`; after reads take `Old ⊎ Dlt`
+/// (`prop:overlay`), so no after snapshot is published. Keep the
 /// publication unchanged until `DBSPHandle::transaction` or the equivalent
 /// multi-step commit has completed, then call [`Self::finish`]. The caller must
 /// restore the index, base state, and Q3 at the same completed transaction.
@@ -86,16 +92,22 @@ pub struct Q3State {
 impl Q3State {
     pub fn publish(
         &self,
-        before: SourceSnapshot,
-        after: SourceSnapshot,
+        old: SourceSnapshot,
+        dlt: Arc<MergedIndexBatch>,
         order_customers: BTreeMap<i64, BTreeSet<i64>>,
     ) -> Result<(), String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
         if views.is_some() {
             return Err("finish the previous Q3 transaction before publishing another".into());
         }
+        let mut after = old.clone();
+        // An empty run would add a cursor that reads nothing but may still seek.
+        if !dlt.is_empty() {
+            after.extend_with_batches([dlt.clone()]);
+        }
         *views = Some(Arc::new(ReadViews {
-            before,
+            old,
+            dlt,
             after,
             order_customers,
             reads: Mutex::default(),
@@ -112,6 +124,16 @@ impl Q3State {
             .ok_or("no Q3 transaction views were published")?;
         let reads = *views.reads.lock().map_err(|_| "Q3 reads lock poisoned")?;
         Ok(reads)
+    }
+
+    /// The published `Old` snapshot.
+    pub fn old(&self) -> Result<SourceSnapshot, String> {
+        Ok(self.views()?.old.clone())
+    }
+
+    /// The published `Dlt` run.
+    pub fn dlt(&self) -> Result<Arc<MergedIndexBatch>, String> {
+        Ok(self.views()?.dlt.clone())
     }
 
     fn views(&self) -> Result<Arc<ReadViews>, String> {
@@ -164,7 +186,7 @@ impl Q3State {
                 let mut output = RequestedRows::new();
                 for customer in requested_keys(delta) {
                     scan(
-                        &views.before,
+                        &views.old,
                         &prefix_custkey(customer),
                         |key, payload, weight| {
                             if let (
@@ -274,7 +296,7 @@ impl Q3State {
                 for order in requested_keys(delta) {
                     for &customer in placements(&views, order)? {
                         scan(
-                            &views.before,
+                            &views.old,
                             &prefix_custkey_orderkey_then_linenumber(customer, order),
                             |key, payload, weight| {
                                 if let (

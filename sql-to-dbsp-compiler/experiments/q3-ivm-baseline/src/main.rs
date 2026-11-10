@@ -564,16 +564,17 @@ fn transact_inner(
         let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
         stats.preparation += preparation_started.elapsed();
         let index_started = Instant::now();
-        let (before_index, after_index) = pipeline.index.append(index_rows)?;
+        let (old, dlt) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         let publish_started = Instant::now();
+        // The after reads take `Old`'s runs and `Dlt`, which is in memory.
         stats.index_layout = Some(json!({
-            "before": reconstruction::snapshot_layout(&before_index),
-            "after": reconstruction::snapshot_layout(&after_index),
+            "before": reconstruction::runs_layout(old.batches()),
+            "after": reconstruction::runs_layout(old.batches().iter().chain([&dlt])),
         }));
         pipeline
             .q3_state
-            .publish(before_index, after_index, placements)
+            .publish(old, dlt, placements)
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
@@ -749,15 +750,15 @@ fn run_base(
     workload::net_delta(&pipeline.base.catalog)
 }
 
-/// Appends the net delta to the merged index and publishes the before and after snapshots,
-/// as `transact_inner` does before the view circuit runs.
+/// Appends the net delta to the merged index and publishes `Old` and `Dlt`, as
+/// `transact_inner` does before the view circuit runs.
 #[cfg(all(test, feature = "merged-index"))]
 fn publish_net_delta(pipeline: &Pipeline, net_delta: &Change) -> Result<()> {
     let (placements, index_rows) = reconstruction::prepare(net_delta)?;
-    let (before, after) = pipeline.index.append(index_rows)?;
+    let (old, dlt) = pipeline.index.append(index_rows)?;
     pipeline
         .q3_state
-        .publish(before, after, placements)
+        .publish(old, dlt, placements)
         .map_err(anyhow::Error::msg)
 }
 
@@ -1380,7 +1381,7 @@ fn finish_loading(
         let snapshot = pipeline.index.snapshot()?;
         pipeline
             .q3_state
-            .publish(snapshot.clone(), snapshot, BTreeMap::new())
+            .publish(snapshot, reconstruction::empty_run()?, BTreeMap::new())
             .map_err(anyhow::Error::msg)?;
     }
     let base_transaction = pipeline.base.circuit.transaction();
@@ -1817,7 +1818,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 6,
+        "measurement_version": 7,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2523,8 +2524,10 @@ mod reconstructed_tests {
         };
         let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
         let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
-        let (_before, after) = pipeline.index.append(index_rows)?;
-        let runs: Vec<_> = after
+        pipeline.index.append(index_rows)?;
+        let runs: Vec<_> = pipeline
+            .index
+            .snapshot()?
             .batches()
             .iter()
             .filter(|run| !run.is_empty())
@@ -2753,7 +2756,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 6);
+        assert_eq!(output["measurement_version"], 7);
         // Version 5 adds the merged index's run reads per reader, and where its runs were.
         const READERS: [&str; 4] = [
             "customers_after",
