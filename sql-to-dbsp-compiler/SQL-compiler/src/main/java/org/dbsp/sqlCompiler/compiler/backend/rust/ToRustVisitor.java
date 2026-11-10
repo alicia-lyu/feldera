@@ -345,7 +345,18 @@ public class ToRustVisitor extends CircuitVisitor {
         // cannot shadow or duplicate a user function named `build`, which the generated code calls
         // by its bare name. The type is an empty enum, not a unit struct: a unit struct also
         // defines a value of the same name, which would shadow a user function named `SqlCircuit`.
-        this.builder.append("pub enum " + CIRCUIT_TYPE_NAME + " {}")
+        // The type sits in a module named after the circuit, because a crate can hold several
+        // circuits (the compiler's tests concatenate them) and each defines `SqlCircuit`. The
+        // module and the entry point below have the same name, which Rust allows: a module is in
+        // the type namespace and a function in the value namespace. `use super::*` gives the
+        // module the crate root's items, including its private items and imports, which a child
+        // module can see. A caller reaches the constructor as `<crate>::<circuit>::SqlCircuit::build`.
+        this.builder.append("pub mod " + circuit.getName() + " {")
+                .increase()
+                .append("use super::*;")
+                .newline()
+                .newline()
+                .append("pub enum " + CIRCUIT_TYPE_NAME + " {}")
                 .newline()
                 .newline()
                 .append("impl " + CIRCUIT_TYPE_NAME + " {")
@@ -426,6 +437,9 @@ public class ToRustVisitor extends CircuitVisitor {
                 .decrease()
                 .append("}")
                 .newline()
+                .decrease()
+                .append("}")
+                .newline()
                 .newline();
 
         // The entry point for a caller that wants a circuit in a runtime of its own.
@@ -450,8 +464,9 @@ public class ToRustVisitor extends CircuitVisitor {
                         "let (mut circuit, streams) = Runtime::init_circuit(cconf, move |circuit| {")
                 .increase()
                 .append(this.q3MergedIndexBinding == null ?
-                        CIRCUIT_TYPE_NAME + "::build(circuit).map_err(Into::into)" :
-                        CIRCUIT_TYPE_NAME + "::build(circuit, q3_state).map_err(Into::into)")
+                        circuit.getName() + "::" + CIRCUIT_TYPE_NAME + "::build(circuit).map_err(Into::into)" :
+                        circuit.getName() + "::" + CIRCUIT_TYPE_NAME +
+                                "::build(circuit, q3_state).map_err(Into::into)")
                 .newline()
                 .decrease()
                 .append("})?;")

@@ -14,8 +14,10 @@ public final class GeneratedRustNames {
     private GeneratedRustNames() {}
 
     /** Name of the generated type whose associated function `build` constructs the circuit.
-     * The compiler does not otherwise generate Rust items with this name (user types are named
-     * after a hash), and a user function cannot clash with a type that has no value. */
+     * The type lives in a module named after the circuit (see {@link #ENTRY_POINT}), so that
+     * several circuits in one crate do not define it twice. The compiler does not otherwise
+     * generate Rust items with this name (user types are named after a hash), and a user function
+     * cannot clash with a type that has no value. */
     public static final String CIRCUIT_TYPE_NAME = "SqlCircuit";
 
     /** Name of the circuit parameter of the generated constructor `SqlCircuit::build`. A function
@@ -24,7 +26,11 @@ public final class GeneratedRustNames {
      * `circuit`. The leading underscores keep it clear of the compiler's other generated names. */
     public static final String CIRCUIT_VARIABLE = "__circuit";
 
-    /** Name of the generated entry point, a free function of the crate root. */
+    /** Name of the generated entry point, a free function of the crate root. The module that holds
+     * {@link #CIRCUIT_TYPE_NAME} has the same name, which does not clash with it: a module is in
+     * the type namespace and a function in the value namespace. So a user function of this name
+     * never clashes with the module, and is reserved only because a Rust UDF of this name is
+     * hidden by the entry point. */
     public static final String ENTRY_POINT = "circuit";
 
     /** How a reserved name is matched against a function name. */
@@ -70,8 +76,9 @@ public final class GeneratedRustNames {
 
     /** Names that the generated crate root defines in the value namespace, where a function lives.
      * A Rust UDF is imported there by a glob, so a crate-root item of the same name hides it.
-     * The type `SqlCircuit` and the modules `stubs` and `udf` are in the type namespace, so
-     * a function of that name does not clash with them (a UDF named `udf` compiles). */
+     * The type `SqlCircuit`, the circuit's module, and the modules `stubs` and `udf` are in the
+     * type namespace, so a function of that name does not clash with them (a UDF named `udf`
+     * compiles). */
     private static final List<Reserved> CRATE_ROOT_NAMES = List.of(
             new Reserved(ENTRY_POINT, Match.EXACT));
 

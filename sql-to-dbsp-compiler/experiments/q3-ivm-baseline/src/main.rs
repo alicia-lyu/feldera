@@ -328,7 +328,7 @@ impl Pipeline {
         #[cfg(feature = "merged-index")]
         let q3_state = Q3State::default();
         let base_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
-            q3_base_circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
+            q3_base_circuit::circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
         });
         #[cfg(feature = "merged-index")]
         let view_state = q3_state.clone();
@@ -343,12 +343,12 @@ impl Pipeline {
             probe
                 .set(Runtime::buffer_cache().expect("the worker has a buffer cache"))
                 .expect("the view circuit is built once");
-            q3_view_circuit::SqlCircuit::build(circuit, view_state.clone())
+            q3_view_circuit::circuit::SqlCircuit::build(circuit, view_state.clone())
                 .map_err(anyhow::Error::from)
         });
         #[cfg(not(feature = "merged-index"))]
         let view_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
-            q3_view_circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
+            q3_view_circuit::circuit::SqlCircuit::build(circuit).map_err(anyhow::Error::from)
         });
         let mut circuits =
             Runtime::init_circuits(config, vec![base_constructor, view_constructor])?;
