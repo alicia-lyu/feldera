@@ -86,7 +86,7 @@ The archives were `Archived<SourcePayload>` 64 B (align 16), `Archived<CustomerP
 `batch::build_batch::<P>` in DBSP turns `(FoldedKey, P, ZWeight)` rows into one immutable `MergedIndexBatch`, an `OrdIndexedWSet` over byte keys and values of a stored value type `P` (`Vec<u8>` for COL, the packed payload):
 
 - It sorts by `(K, payload)`, adds the weights of equal pairs, reports overflow as an error, and omits zero totals.
-- It requests `BatchLocation::Memory` for the initial run. Feldera's generic builders can choose a file during construction; this explicit request keeps the initial run in memory (test `initial_col_run_stays_in_memory_when_runtime_selects_files`).
+- It fixes no location (user decision of 2026-11-10). The run is placed as an operator's output is: by `min_step_storage_bytes`, which is zero at Critical memory pressure and unset otherwise, so a run is in memory unless the runtime is at Critical pressure (tests `build_batch_follows_the_runtimes_step_placement_in_files` and `..._in_memory`).
 - COL's typed `build_batch` also checks that each payload matches its key's placement.
 
 The batch is inserted once into a native `Spine` created with `TraceRole::Integral`. Persistence and compaction then follow Feldera's native placement policy. There is no custom merger, cursor framework, or staging area.

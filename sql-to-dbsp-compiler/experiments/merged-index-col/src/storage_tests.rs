@@ -423,39 +423,63 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
     });
 }
 
-#[test]
-fn initial_col_run_stays_in_memory_when_runtime_selects_files() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    // This test keeps its own placement setting, unlike the R5 harness, which uses DBSP's
-    // defaults (user decision of 2026-11-09): it builds file runs on purpose, so it asks the
-    // runtime to put every batch in a file.
-    let config = CircuitConfig::with_workers(1).with_storage(Some(
+/// A runtime with storage whose step threshold is `min_step_storage_bytes`, stored under `storage_dir`.
+fn storage_config_with_step_threshold(
+    storage_dir: &tempfile::TempDir,
+    min_step_storage_bytes: Option<usize>,
+) -> CircuitConfig {
+    CircuitConfig::with_workers(1).with_storage(Some(
         CircuitStorageConfig::for_config(
             StorageConfig {
                 path: storage_dir.path().to_string_lossy().into_owned(),
                 cache: Default::default(),
             },
             StorageOptions {
-                min_storage_bytes: Some(0),
-                min_step_storage_bytes: Some(0),
+                min_step_storage_bytes,
                 ..Default::default()
             },
         )
         .unwrap(),
-    ));
-    run_in_circuit_with_storage_config(config, || {
-        assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
-        for rows in [Vec::new(), customer_group(1)] {
+    ))
+}
+
+/// `build_batch` leaves the placement to the runtime, as it does for an operator's output
+/// (user decision of 2026-11-10): a step threshold of zero, as at Critical memory pressure,
+/// puts a nonempty batch in a file, and an empty batch holds nothing to spill.
+#[test]
+fn build_batch_follows_the_runtimes_step_placement_in_files() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    run_in_circuit_with_storage_config(
+        storage_config_with_step_threshold(&storage_dir, Some(0)),
+        || {
+            assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
+            let empty = build_batch(Vec::new()).unwrap();
+            assert_eq!(empty.location(), BatchLocation::Memory);
+            assert_eq!(read_rows(&empty), Vec::new());
+
+            let rows = customer_group(1);
+            let batch = build_batch(rows.clone()).unwrap();
+            assert_eq!(batch.location(), BatchLocation::Storage);
+            let expected: Vec<_> = rows.iter().map(encoded_row).collect();
+            assert_eq!(read_rows(&batch), expected);
+        },
+    );
+}
+
+/// The control of the test above: with no step threshold (storage is available but not asked
+/// for) the batch is built in memory.
+#[test]
+fn build_batch_follows_the_runtimes_step_placement_in_memory() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    run_in_circuit_with_storage_config(
+        storage_config_with_step_threshold(&storage_dir, None),
+        || {
+            assert_eq!(Runtime::min_step_storage_bytes(), Some(usize::MAX));
+            let rows = customer_group(1);
             let batch = build_batch(rows.clone()).unwrap();
             assert_eq!(batch.location(), BatchLocation::Memory);
             let expected: Vec<_> = rows.iter().map(encoded_row).collect();
             assert_eq!(read_rows(&batch), expected);
-        }
-        // Confirm this runtime would place a generic nonempty builder on disk.
-        let factories = OrdIndexedWSetFactories::new::<Vec<u8>, StoredPayload, ZWeight>();
-        let mut generic = <IndexBatch as Batch>::Builder::with_capacity(&factories, 1, 1);
-        generic.push_val_diff(StoredPayload::default().erase(), 1_i64.erase());
-        generic.push_key(vec![1_u8].erase());
-        assert_eq!(generic.done().location(), BatchLocation::Storage);
-    });
+        },
+    );
 }

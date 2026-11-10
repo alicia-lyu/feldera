@@ -564,16 +564,16 @@ fn transact_inner(
         let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
         stats.preparation += preparation_started.elapsed();
         let index_started = Instant::now();
-        let (before_index, after_index) = pipeline.index.append(index_rows)?;
+        let appended = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         let publish_started = Instant::now();
         stats.index_layout = Some(json!({
-            "before": reconstruction::snapshot_layout(&before_index),
-            "after": reconstruction::snapshot_layout(&after_index),
+            "before": reconstruction::snapshot_layout(&appended.before),
+            "after": reconstruction::snapshot_layout(&appended.after),
         }));
         pipeline
             .q3_state
-            .publish(before_index, after_index, placements)
+            .publish(appended.before, appended.after, placements)
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
@@ -754,10 +754,10 @@ fn run_base(
 #[cfg(all(test, feature = "merged-index"))]
 fn publish_net_delta(pipeline: &Pipeline, net_delta: &Change) -> Result<()> {
     let (placements, index_rows) = reconstruction::prepare(net_delta)?;
-    let (before, after) = pipeline.index.append(index_rows)?;
+    let appended = pipeline.index.append(index_rows)?;
     pipeline
         .q3_state
-        .publish(before, after, placements)
+        .publish(appended.before, appended.after, placements)
         .map_err(anyhow::Error::msg)
 }
 
@@ -2486,6 +2486,33 @@ mod reconstructed_tests {
         Ok(())
     }
 
+    /// An append returns the run it appended, beside the snapshots around it: the snapshot
+    /// before lacks the rows, the one after has them, and with no memory pressure the run is
+    /// built in memory.
+    #[test]
+    fn append_returns_the_appended_run_as_dlt() -> Result<()> {
+        use dbsp::trace::{BatchLocation, BatchReader};
+
+        let mut pipeline = Pipeline::with_workers(1)?;
+        let refresh = Change {
+            customers: vec![(customer(2), true)],
+            orders: vec![(order(20, 2), true)],
+            lines: vec![(line(20, 1), true), (line(20, 2), true)],
+        };
+        let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
+        let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
+        let appended = pipeline.index.append(index_rows)?;
+        let rows = |snapshot: &reconstruction::Snapshot| -> usize {
+            snapshot.batches().iter().map(|run| run.len()).sum()
+        };
+        assert_eq!(rows(&appended.before), 0);
+        // One customer, one order, and two line items.
+        assert_eq!(appended.dlt.len(), 4);
+        assert_eq!(rows(&appended.after), 4);
+        assert_eq!(appended.dlt.location(), BatchLocation::Memory);
+        Ok(())
+    }
+
     /// What the index's thread and the view worker make of the buffer cache once the index's
     /// thread has written a file run.
     struct IndexFileRun {
@@ -2542,8 +2569,9 @@ mod reconstructed_tests {
         };
         let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
         let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
-        let (_before, after) = pipeline.index.append(index_rows)?;
-        let runs: Vec<_> = after
+        let appended = pipeline.index.append(index_rows)?;
+        let runs: Vec<_> = appended
+            .after
             .batches()
             .iter()
             .filter(|run| !run.is_empty())

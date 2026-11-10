@@ -30,13 +30,28 @@ use crate::Change;
 type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
 type SourceRow = (Key, Payload, ZWeight);
+
+/// What one append left the index: the snapshots around it, and the appended run itself.
+pub(crate) struct Appended {
+    pub(crate) before: Snapshot,
+    pub(crate) after: Snapshot,
+    /// The transaction's delta, `Dlt` of the scan session. It is not the newest run of `after`:
+    /// the insert may rebuild that run, and a merge may fold it into another.
+    pub(crate) dlt: IndexBatch,
+}
+
+/// The snapshot after an append, and the run appended.
+type AppendedRuns = (Snapshot, IndexBatch);
 type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
     BackgroundIdle(mpsc::SyncSender<bool>),
     StorageEvidence(mpsc::SyncSender<serde_json::Value>),
     Snapshot(mpsc::SyncSender<Snapshot>),
-    Append(Vec<SourceRow>, mpsc::SyncSender<Result<Snapshot, String>>),
+    Append(
+        Vec<SourceRow>,
+        mpsc::SyncSender<Result<AppendedRuns, String>>,
+    ),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
     Restore(StoragePath, mpsc::SyncSender<Result<(), String>>),
     /// The buffer cache bound to the index's thread. Tests compare it with the view worker's.
@@ -149,8 +164,9 @@ impl ManualIndex {
                             }
                             Ok(Request::Append(rows, reply)) => {
                                 let result = build_batch(rows).map(|batch| {
+                                    let dlt = batch.clone();
                                     feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
-                                    trace.ro_snapshot()
+                                    (trace.ro_snapshot(), dlt)
                                 });
                                 let _ = reply.send(result);
                             }
@@ -206,10 +222,11 @@ impl ManualIndex {
         self.request(Request::Snapshot)
     }
 
-    pub(crate) fn append(&self, rows: Vec<SourceRow>) -> Result<(Snapshot, Snapshot)> {
+    pub(crate) fn append(&self, rows: Vec<SourceRow>) -> Result<Appended> {
         let before = self.snapshot()?;
-        let after = self.request(|reply| Request::Append(rows, reply))?;
-        Ok((before, after.map_err(anyhow::Error::msg)?))
+        let appended = self.request(|reply| Request::Append(rows, reply))?;
+        let (after, dlt) = appended.map_err(anyhow::Error::msg)?;
+        Ok(Appended { before, after, dlt })
     }
 
     pub(crate) fn is_background_merge_idle(&self) -> Result<bool> {

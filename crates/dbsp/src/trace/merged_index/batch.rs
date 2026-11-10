@@ -5,7 +5,7 @@ use crate::{
     algebra::ZWeight,
     dynamic::{DynData, Erase},
     trace::{
-        BatchLocation, BatchReader, BatchReaderFactories, Builder,
+        BatchReader, BatchReaderFactories, Builder,
         cursor::CursorList,
         ord::{OrdIndexedWSet, OrdIndexedWSetFactories},
     },
@@ -41,12 +41,14 @@ pub fn build_batch<P: DBData>(
     }
 
     let factories = OrdIndexedWSetFactories::new::<Vec<u8>, P, ZWeight>();
-    // Generic builders may select file storage during construction. L0 runs start in memory.
+    // No fixed location: the batch is placed as an operator's output is, by the runtime's step
+    // storage threshold (`min_step_storage_bytes`; zero at Critical memory pressure). Outside a
+    // runtime with storage, or without a threshold, it is built in memory.
     let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity_in_location(
         &factories,
         consolidated.len(),
         consolidated.len(),
-        Some(BatchLocation::Memory),
+        None,
     );
     let mut pending_key: Option<FoldedKey> = None;
     for (key, payload, weight) in consolidated {
