@@ -256,7 +256,7 @@ Fixes found by auditing the write-up against the code are recorded as dated entr
 
 ### 2026-11-03: Counters live at two levels
 
-The scan session counts the write-up's units: cursor opens, logical seeks, and payload decodes. DBSP's run cursors count the storage costs. Both the in-memory cursor (`VecIndexedWSetCursor`) and the file cursor (`FileIndexedWSetCursor`) count per-run seeks. Only the file cursor counts key reads and value reads, since only file runs deserialize. The generic `Cursor` trait gains no counters. (Amended on 2026-11-03: per-run seeks were first counted in the file cursor only, and the logical counters were first placed in an instance-node cursor.)
+The scan session counts the write-up's units: cursor opens, logical seeks, and payload decodes. DBSP's run cursors count the storage costs. Both the in-memory cursor (`VecIndexedWSetCursor`) and the file cursor (`FileIndexedWSetCursor`) count per-run seeks. Only the file cursor counts key reads and value reads, since only file runs deserialize. The generic `Cursor` trait gains no counters. (Amended on 2026-11-03: per-run seeks were first counted in the file cursor only, and the logical counters were first placed in an instance-node cursor. Amended on 2026-11-09: in-memory runs also count key, value, and weight accesses, in fields apart from file decodes; see "2026-11-09: In-memory runs count their accesses".)
 
 ### 2026-11-03: One scan session serves both executions
 
@@ -272,7 +272,7 @@ Run reads are attributed to a component through a read scope, `with_read_owner`,
 
 ### 2026-11-04: Path reads and subtree roots probe exact keys
 
-Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this. (Amended on 2026-11-09: the root probe is now the `ProbeThenRange` mode of the `GroupStart` knob, an A/B against `PrefixSeek`, not a fixed rule. Path reads keep their exact probes.)
+Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this. (Amended on 2026-11-09: the root probe is now the `ProbeThenRange` mode of the `GroupStart` knob, an A/B against `PrefixSeek`, not a fixed rule. Path reads keep their exact probes. Amended again on 2026-11-09: the group-read probe is dropped altogether; see "2026-11-09: Group reads use no exact probe".)
 
 ### 2026-11-04: Native joins read through run cursors
 
@@ -322,6 +322,8 @@ The session infers the touched customers from `Dlt`: a group is the first `1 + r
 
 `GroupStart::{PrefixSeek, ProbeThenRange}` tests probing the customer's exact key before the range read, the decision of 2026-11-04, against seeking to the group's prefix.
 
+*Superseded on 2026-11-09 (later the same day).* See "2026-11-09: Group reads use no exact probe".
+
 ### 2026-11-09: Maintain takes an `on_group` callback
 
 `Maintain` takes `on_group: (group, buffers) -> ()`, and this is the permanent interface, not a stopgap. The session drives the traversal and hands each group's buffers to the execution; it then releases them. In roadmap step 2 the callbacks are tests. In roadmap step 5 the buffered-execution operator supplies the callback that evaluates `ΔJ` and `ΔV` over the buffers and emits rows.
@@ -349,10 +351,46 @@ A user function whose name collides with a name that the generated Rust code use
 
 The user's decision: "give each circuit its own module". The generated crate holds `SqlCircuit` and its constructor `build` inside `pub mod <circuit name> { use super::*; ... }`, beside the entry-point function of the same name (a module and a function live in different Rust namespaces). A caller reaches the constructor as `<crate>::<circuit name>::SqlCircuit::build`, which is `q3_base_circuit::circuit::SqlCircuit::build` in the harness. Without the module, a crate that holds several circuits, as the compiler's `BaseSQLTests` runner builds, defined `SqlCircuit` more than once (error E0428). The check is `SqlCircuitConstructorTest`.
 
+### 2026-11-09: DBSP's default placement in both modes
+
+The harness's `runtime_config` (`q3-ivm-baseline/src/main.rs`) has set `min_storage_bytes: Some(0)` since commit `5ac3a8769` (2026-10-01, "Add native Q3 incremental join baseline experiment"). No decision recorded it. The setting is the merge threshold (`Runtime::min_merge_storage_bytes`; default 10 MiB at low memory pressure, 0 at Moderate and above), so every merge output went to a file, however small. Inserted runs follow `min_insert_storage_bytes` (memory at low pressure; `min_storage_bytes.unwrap_or(10 MiB)` at Moderate; 0 at High), so they stayed in memory at low pressure. No deployment would choose this combination.
+
+The user decided to use DBSP's default placement in both modes. Memory pressure, from the cgroup and RSS targets, decides what reaches disk. The harness drops the override and reports the resolved defaults; the measurement version is bumped when the code changes. [native-run-placement.md](native-run-placement.md#the-harnesss-override) records the override and its planned removal.
+
+### 2026-11-09: In-memory runs count their accesses
+
+In-memory runs count key, value, and weight accesses in fields of their own, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (names unconfirmed), apart from the file decodes. A memory access is never counted as a deserialization. This amends "2026-11-03: Counters live at two levels", which let memory runs count only seeks because they deserialize nothing.
+
+Why: seeks alone hide the key, value, and weight accesses of native traces, of the index's memory runs, and of `Dlt`, so a comparison across layouts would favor whichever mode keeps more state in memory.
+
+### 2026-11-09: Group reads use no exact probe
+
+A group read seeks to the group's prefix. It does not probe the root key with `seek_key_exact` first. This supersedes "2026-11-09: `GroupStart` A/B-tests the root probe" and amends the buffered part of "2026-11-04: Path reads and subtree roots probe exact keys".
+
+Why: a run whose filter admits the root key is sought onto it. A run whose filter rejects it stays behind, and the range scan must seek it anyway. The per-run seeks are therefore those of a prefix seek, plus the filter checks. The saving of 2026-11-04 holds for path reads, which need one record; they keep `seek_key_exact`. `GroupStart`, the probe, and `RunMerge::seek_exact` are removed; `Pass::{Seek, Step}` stays.
+
+### 2026-11-09: The session is bound to its index definition
+
+`ScanSession<D: MergedIndexDefinition>` takes its trie from `D::TRIE` and decodes payloads through `D::decode_payload(stream_id, bytes)`. No trie or decode function is passed to it. The stream id selects the payload type, so decoding needs no `unfold`. This replaces the per-call `decode` argument; the `on_group` callback of 2026-11-09 stands.
+
+### 2026-11-09: A key trie has exactly one root domain
+
+Two root domains mean two key tries, each stored as its own merged index. Several streams may still reside at the root domain's node. `KeyTrie::validate` and the Java `MergedIndexValidator` reject a trie with no top-level node or with more than one. The write-up fix is queued in the thesis `BUFFER.md` (entry of 2026-11-09, commit `720412c` in `merged_index_vldb2026_slides`), following the rule of 2026-11-03.
+
+### 2026-11-09: The session's step-2 choices
+
+The user confirmed these choices of the scan session:
+
+- `reject` judges old entries only, and a key is rejected when any of its entries is. `Dlt` is read whole.
+- `logical_seeks` counts only seeks that move some run.
+- One session serves one transaction, and `Maintain` runs once per session, since it reads `Dlt` once.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-11-09 | `GroupStart::{PrefixSeek, ProbeThenRange}` A/B-tests the root probe; the 2026-11-04 root probe applies to buffered group reads. | 2026-11-09: group reads use no exact probe; path reads keep `seek_key_exact`. |
+| 2026-10-01 | `min_storage_bytes: Some(0)` in the harness's `runtime_config` (never recorded as a decision). | 2026-11-09: DBSP's default placement in both modes. |
 | 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |
 | 2026-10-22 | Keep `--setup-full-compaction` in both arms of the Linux front-coding A/B. | 2026-11-09: the campaign runs without setup compaction. |
 | 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |

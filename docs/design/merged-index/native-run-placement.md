@@ -141,6 +141,12 @@ in files. Two kinds of run cross the line: a large inserted run stays in
 memory at Low pressure until a merge rewrites it, and snapshots can pin
 obsolete memory runs.
 
+### The harness's override
+
+The R5 harness's `runtime_config` (`sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs`) sets `min_storage_bytes: Some(0)`. It dates from commit `5ac3a8769` (2026-10-01) and was not recorded as a decision until 2026-11-09. It sets the merge threshold to 0, so every merge output goes to a file, however small, while inserted runs follow `min_insert_storage_bytes` and stay in memory at low pressure. Measurements through version 6 therefore ran with a placement that default DBSP never produces at low pressure.
+
+The user decided on 2026-11-09 to use the default placement in both modes; see [decisions.md](decisions.md). The harness will drop the override (planned, with measurement version 7), and memory pressure will decide what reaches disk. `merged-index-col/src/storage_tests.rs` keeps its own setting because it builds file runs on purpose.
+
 ## Memory pressure
 
 A runtime thread samples the process resident set size (RSS) about once a
