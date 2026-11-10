@@ -375,7 +375,8 @@ public final class MergedIndexRustEmitter {
                 .append("pub struct ").append(definition).append(";").newline().newline()
                 .append("impl ").append(MI).append("MergedIndexDefinition for ").append(definition).append(" {")
                 .increase()
-                .append("type Key = Key;").newline().newline()
+                .append("type Key = Key;").newline()
+                .append("type Payload = Payload;").newline().newline()
                 .append("const TRIE: ").append(MI).append("KeyTrie = TRIE;").newline().newline()
                 .append("fn fold(key: &Key) -> ").append(MI).append("FoldedKey {").increase()
                 .append("match key {").increase();
@@ -406,6 +407,16 @@ public final class MergedIndexRustEmitter {
                 .decrease().append("};").newline()
                 .append("fields.finish()?;").newline()
                 .append("Ok(key)").newline()
+                .decrease().append("}").newline().newline()
+                .append("fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Payload, String> {").increase()
+                .append("match stream_id {").increase();
+        for (ResolvedPlacement resolved : this.index.placements()) {
+            PlacedIndex placed = resolved.placed();
+            this.out.append(indexIdConstant(placed)).append(" => ").append(placed.name())
+                    .append("Payload::decode(bytes).map(Payload::").append(placed.name()).append("),").newline();
+        }
+        this.out.append("_ => Err(format!(\"unknown index id {stream_id}\")),").newline()
+                .decrease().append("}").newline()
                 .decrease().append("}").newline()
                 .decrease().append("}").newline().newline();
     }

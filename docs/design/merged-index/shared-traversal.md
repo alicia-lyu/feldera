@@ -209,20 +209,20 @@ One scan session executes buffered execution. It is schema-independent, and it d
 - `Old`, one pinned snapshot, read through `RunMerge`.
 - `Dlt`, the transaction's sorted run, read once by one forward cursor.
 - The trie, for the root domain's width.
-- `decode(key, payload bytes) -> P`, supplied by the caller (COL's `decode_payload`) to each `Maintain` call, since `P` is the caller's type. Planned 2026-11-09 (see [decisions.md](decisions.md)): the session is bound to its index definition and takes `D::TRIE` and `D::decode_payload(stream_id, bytes)`; nothing is passed.
+- The index definition `D` (`MergedIndexDefinition`), which supplies the trie (`D::TRIE`) and the payload decoder (`D::decode_payload(stream_id, bytes)`). The stream id selects the payload type, so decoding needs no `unfold`. The session is bound to `D`: `ScanSession<D>`, and nothing else is passed.
 - One knob, below.
 
-A trie has exactly one root domain (planned 2026-11-09; see [decisions.md](decisions.md)).
+A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. `KeyTrie::validate` and the Java `MergedIndexValidator` reject any other trie, so `root_width()` is a plain `usize` and the session cannot be built over a trie with no single root.
 
 The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
 
 ### Operations
 
 ```text
-ScanSession(trie, Old: snapshot → RunMerge, Dlt run, pass: Seek|Step)
+ScanSession<D>(Old: snapshot → RunMerge, Dlt run, pass: Seek|Step)      trie = D::TRIE
 
-  Maintain(inputs: set of index ids, decode, reject?, on_group: (group, buffers) -> ()):
-    for each group g in Dlt, in order:     g = first 1 + trie.root_width() bytes of a Dlt key
+  Maintain(inputs: set of index ids, reject?, on_group: (group, buffers) -> ()):
+    for each group g in Dlt, in order:     g = first 1 + D::TRIE.root_width() bytes of a Dlt key
       PassTo(g)
       buffers ← Collect(g, inputs, reject), plus Dlt's entries under g (version Dlt)
       on_group(g, buffers); release buffers
@@ -235,7 +235,7 @@ ScanSession(trie, Old: snapshot → RunMerge, Dlt run, pass: Seek|Step)
     while Old.key() starts with g:         Peek is the merged key, already read
       id ← last byte of the key
       if id ∉ inputs: Old.step()
-      else: Old.take → decode each payload → buffer[id] (version Old)
+      else: Old.take → D::decode_payload(id, bytes) for each → buffer[id] (version Old)
             if reject(any entry of the key): Skip(key without its trailing [0, id])
             else: Old.step()
 
@@ -357,7 +357,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 2. **Decode-free storage and the buffered scan session.** *Done 2026-11-09.* The sub-steps committed one by one:
    - **Prefix successor and per-domain width.**
      - `prefix_successor(prefix) -> Option<Vec<u8>>` in `merged_index/mod.rs`. It drops trailing `0xFF` bytes and increments the last remaining byte. It returns `None` when every byte is `0xFF`, meaning the range runs to the end of the index.
-     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0 (it will also reject a trie without exactly one top-level node (planned 2026-11-09; see [decisions.md](decisions.md))). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
+     - `width` on `Domain` in `trie.rs`, `KeyTrie::root_width()`, and a `validate()` that rejects width 0 and any trie without exactly one top-level node (*changed on 2026-11-09*; `root_width()` returned an `Option` before). `MergedIndexRustEmitter` derives the width from the domain's Rust type (`OrderedKey::WIDTH`); Java's `KeyTrie` stores none. DECIMAL key domains keep failing to compile.
      - Regenerate `merged-index-col/src/generated.rs`.
      - *Exit:* unit tests for the empty prefix, carry, and all-`0xFF`; a property test that `k.starts_with(p)` holds exactly when `p <= k < succ(p)`; COL's widths are 8, 8, and 4.
    - **Lazy value positioning** in `FileIndexedWSetCursor` ([Remedies](#remedies)). *Done 2026-11-09.* The value cursor becomes a once-filled slot (`OnceCell`), and `count_value_decode` moves to where it is filled. A landing reads the key only; the first `val`, `val_valid`, `weight`, `map_times`, or value move fills the slot. A key move keeps the emptied cursor as the hint for the next first value. The `run_reads` tests pin the lazy counts; the COL baseline is unchanged (see the note under its table).
@@ -365,8 +365,8 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - **`RunMerge`** in `merged_index/run_merge.rs`. *Done 2026-11-09.* `key`, `step`, `seek`, and `take`. `step` and `seek` read no value or weight; `take` sums weights per value and counts cancelled values. `seek` moves only the runs below its target and reports whether any moved. `exhaust` moves past every key without a read, for a skipped prefix that has no successor.
      - *Exit:* a property test against a consolidated brute force over several runs, file runs among them, with cross-run cancellations and replaced payloads; a counter test that stepping past entries counts no value or weight decode.
    - **`ScanSession`** in `merged_index/session.rs`, with `Maintain`, `PassTo`, `Collect`, `Skip`, the `Pass` knob, and `SessionCounts` ([The scan session](#the-scan-session)). *Done 2026-11-09.* `RunMerge` gained `exhaust` for a skipped prefix with no successor.
-     - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over three small tries (one with a two-byte root and two placements at the root node, one with no root placement), values near `0x00`, `0x01`, `0xFE`, and `0xFF` to force carry, multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and both passes. Counter tests show that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode; and pin the seek and step counts of the two passes on a six-group layout and on a rejected subtree. *Changed on 2026-11-09:* the `GroupStart` knob and the root probe were removed, and the proptest ran four knob combinations before.
-   - **COL counter tests, the A/B, and docs.** *Done 2026-11-09.* On the worked transaction in `merged-index-col/src/q3/tests.rs`, `Maintain({C, O, L})` with `decode_payload` under `Seek` pins the counts of [How the counters check the rules](#how-the-counters-check-the-rules) (`session_run_reads_on_the_worked_transaction`). An A/B test on the same kind of data, extended with untouched customers between touched ones and a synthetic segment filter, pins the run and session counters of both passes, derives each in a comment, and checks equal outputs (`the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways`).
+     - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over three small tries (one with a two-byte root and two placements at the root node, one with no root placement), values near `0x00`, `0x01`, `0xFE`, and `0xFF` to force carry, multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and both passes. Counter tests show that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode; and pin the seek and step counts of the two passes on a six-group layout and on a rejected subtree. *Changed on 2026-11-09:* the `GroupStart` knob and the root probe were removed, and the proptest ran four knob combinations before. The session became `ScanSession<D: MergedIndexDefinition>`, and the proptest's three fixture tries became small definition types.
+   - **COL counter tests, the A/B, and docs.** *Done 2026-11-09.* On the worked transaction in `merged-index-col/src/q3/tests.rs`, `Maintain({C, O, L})` over `CustomerOrdersLineitemDefinition`, which decodes through its `decode_payload`, under `Seek` pins the counts of [How the counters check the rules](#how-the-counters-check-the-rules) (`session_run_reads_on_the_worked_transaction`). An A/B test on the same kind of data, extended with untouched customers between touched ones and a synthetic segment filter, pins the run and session counters of both passes, derives each in a comment, and checks equal outputs (`the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways`).
      - *Exit:* `CLAUDE.md` and `WORKFLOW.md` gain the new files, the knob, and test filters. The version-6 measurements predate lazy values; R5 timing of the passes belongs to step 6.
 
      **Pinned: the worked transaction**, one group (`c5`), `Seek`, with `Old` as in the step 1 baseline (a file run holding `c5` through `c6`, a memory run holding `c7`) and `Dlt` as in the worked transaction:
@@ -437,3 +437,5 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
+- `decode_payload` keys on the stream id, not on the unfolded key.
+- `ScanSession::new` and `KeyTrie::root_width` panic on a trie without one root domain, which `validate` rejects, instead of returning an error.

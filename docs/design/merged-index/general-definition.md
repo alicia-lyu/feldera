@@ -101,6 +101,7 @@ Each failure is a compiler error that names the spec line.
    - A `via` is an error if the relation already has a column in that domain, or if the domain is not on the path.
 5. **Keys are unique.** The resolved key columns contain the relation's primary key, and a relation without one is rejected. This is the condition that makes folded keys unique (see [col-storage.md](col-storage.md)).
 6. **The trie is well formed.**
+   - The trie has exactly one top-level node, its root domain. Two root domains need two merged indexes. Several relations may still be placed at the root node.
    - A node's child domains are distinct.
    - No domain repeats on one path.
    - A relation is placed at a node at most once.
@@ -154,7 +155,7 @@ The tree stores no indices, parent links, tags, ids, or paths. Each query walks 
 - `placements()` returns each placement with its id (visit position + 1) and its path of domain names;
 - `domain_tag(name)` returns the position of the domain's first appearance in the walk, + 1;
 - `PlacedIndex` derives `name()`, `is_primary()`, and `key_columns(&trie)`;
-- `validate()` checks the schema-free rules of the Validation section: declared and distinct domains, no repeat on a path, one placement per relation per node, at most 255 domains and 255 placements, and that every path domain resolves through an own column or a valid `via`. Type, NOT NULL, and primary-key checks need the schema, so they stay in the compiler.
+- `validate()` checks the schema-free rules of the Validation section: declared and distinct domains, exactly one top-level node, no repeat on a path, one placement per relation per node, at most 255 domains and 255 placements, and that every path domain resolves through an own column or a valid `via`. Type, NOT NULL, and primary-key checks need the schema, so they stay in the compiler.
 
 Tries are three or four levels deep, so this favors clean code over speed. Folding does not walk the tree: it uses constants, which `testing::check_against_trie` ties to the trie.
 
@@ -173,6 +174,7 @@ For one spec, `MergedIndexRustEmitter` (in the compiler's `backend/rust` package
 - **`Key` and `Payload` enums,** with one variant per placement, named by the placement. `Payload` is the in-memory input and output type only: the stored value is opaque bytes, readable only with its key.
   - `Payload::matches(&Key)` checks that a payload belongs to its key's placement.
   - `encode_payload` and `decode_payload(&Key, &[u8])` dispatch on the placement.
+  - `Payload` is also the definition's `type Payload`, and `<IndexName>Definition::decode_payload(stream_id, &[u8])` dispatches on the stream id, which the scan session calls.
 - **`<IndexName>Definition`,** an implementation of `MergedIndexDefinition`. Its `fold` and `unfold` are straight-line code: constant tags, and one key encoder call per domain in path order. `unfold` selects the placement from the last byte, then checks length and tags.
 - **Typed prefix functions,** with one parameter per path domain:
   - `prefix_<path>` per node: the bytes shared by every key in that node's sort range, the note's β(v, a);
@@ -194,13 +196,14 @@ Implemented, for keys only. The trait now has these items:
 
 - `type Key`;
 - `const TRIE: KeyTrie`;
-- typed `fold` and `unfold`. `fold` cannot fail, because the key's fields are typed.
+- typed `fold` and `unfold`. `fold` cannot fail, because the key's fields are typed;
+- `type Payload` and `decode_payload(stream_id, bytes)`, which decode a stored payload by its stream id (the last byte of a folded key). The scan session calls it, so the session needs no decode function.
 
 Two helpers own the folded-key byte layout, `[tag value]* 0 id`. `KeyEncoder` writes `(tag, value)` pairs in path order and ends a key with `finish(id)`, `prefix()`, or `then_tag(tag)`. `KeyDecoder` checks the terminator, splits off the id, and reads one tagged field at a time. A generated definition is straight-line code over them.
 
 This replaced the four flat tables (`KEY_DOMAINS`, `SOURCE_INDEX_SPECS`, `DOMAIN_BYTE_TAGS`, `SOURCE_BYTE_TAGS`), the `i64` `project` and `construct`, and the run-time tag scans in `MergedIndex<D>`.
 
-Payloads are not part of the trait. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL's `build_batch` rejects a payload of the wrong variant with the generated `Payload::matches` before it encodes. Adding `type Payload` and placement functions to the trait remains open.
+The trait decodes payloads but does not encode them. `build_batch`, `batch_cursor`, and `write_parent` are generic over a stored value type `P: DBData`, which for COL is `Vec<u8>`: the packed encoding of one payload, readable only together with its key. COL's `build_batch` rejects a payload of the wrong variant with the generated `Payload::matches` before it encodes.
 
 ### Packed payload fields
 

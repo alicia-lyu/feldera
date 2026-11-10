@@ -3,7 +3,7 @@ use crate::{
     build_batch, prefix_custkey, CustomerByCustkeyPayload,
     LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyPayload,
     INDEX_ID_CUSTOMER_BY_CUSTKEY, INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
-    INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY, TRIE,
+    INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
 };
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
@@ -682,13 +682,6 @@ fn finish_returns_each_transactions_index_reads() {
     assert_eq!(state.finish().unwrap(), IndexReads::default());
 }
 
-/// The client side of the scan session: unfolds the key, which names the
-/// placement, and decodes the stored payload with it.
-fn decode_col_payload(key: &[u8], stored: &[u8]) -> Result<Payload, String> {
-    let key = CustomerOrdersLineitemDefinition::unfold(key)?;
-    decode_payload(&key, stored)
-}
-
 /// A synthetic segment filter: rejects an old customer outside `BUILDING`.
 fn outside_building_segment(entry: &Entry<Payload>) -> bool {
     matches!(
@@ -711,7 +704,7 @@ fn maintain_col(
 ) -> ((Groups, SessionCounts), RunReads, RunReads) {
     run_reads_of(|| {
         with_read_owner(WriteOwner::MergedIndex, || {
-            let mut session = ScanSession::new(&TRIE, old, dlt, pass).unwrap();
+            let mut session = ScanSession::<CustomerOrdersLineitemDefinition>::new(old, dlt, pass);
             let mut groups = Vec::new();
             let mut reject_entry = outside_building_segment;
             session
@@ -721,7 +714,6 @@ fn maintain_col(
                         INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
                         INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
                     ]),
-                    decode_col_payload,
                     reject.then_some(&mut reject_entry as &mut dyn FnMut(&Entry<Payload>) -> bool),
                     |group, buffers| {
                         groups.push((group.to_vec(), buffers.clone()));

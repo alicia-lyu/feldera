@@ -45,10 +45,23 @@ const FIXTURE_TRIE: KeyTrie = KeyTrie {
 
 struct Definition;
 
+/// The fixtures keep their payloads as the stored bytes, and have one stream.
+fn decode_fixture_payload(stream_id: u8, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    match stream_id {
+        1 => Ok(bytes.to_vec()),
+        _ => Err(format!("unknown index id {stream_id}")),
+    }
+}
+
 impl MergedIndexDefinition for Definition {
     type Key = (i64, i32);
+    type Payload = Vec<u8>;
 
     const TRIE: KeyTrie = FIXTURE_TRIE;
+
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Self::Payload, String> {
+        decode_fixture_payload(stream_id, bytes)
+    }
 
     fn fold(&(root, child): &Self::Key) -> FoldedKey {
         KeyEncoder::new().field(1, &root).field(2, &child).finish(1)
@@ -169,7 +182,11 @@ struct WrongId;
 
 impl MergedIndexDefinition for WrongId {
     type Key = (i64, i32);
+    type Payload = Vec<u8>;
     const TRIE: KeyTrie = FIXTURE_TRIE;
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Self::Payload, String> {
+        decode_fixture_payload(stream_id, bytes)
+    }
     fn fold(&(root, child): &Self::Key) -> FoldedKey {
         KeyEncoder::new().field(1, &root).field(2, &child).finish(2)
     }
@@ -186,7 +203,11 @@ struct WrongTags;
 
 impl MergedIndexDefinition for WrongTags {
     type Key = (i64, i32);
+    type Payload = Vec<u8>;
     const TRIE: KeyTrie = FIXTURE_TRIE;
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Self::Payload, String> {
+        decode_fixture_payload(stream_id, bytes)
+    }
     fn fold(&(root, child): &Self::Key) -> FoldedKey {
         KeyEncoder::new().field(2, &root).field(1, &child).finish(1)
     }
@@ -350,6 +371,14 @@ fn tags_follow_first_appearance_and_ids_follow_visit_order() {
         name: "Siblings",
         domains: &[
             Domain {
+                name: "r",
+                width: 8,
+                columns: &[ColumnRef {
+                    relation: "R",
+                    column: "r_r",
+                }],
+            },
+            Domain {
                 name: "c",
                 width: 8,
                 columns: &[ColumnRef {
@@ -374,45 +403,50 @@ fn tags_follow_first_appearance_and_ids_follow_visit_order() {
                 }],
             },
         ],
-        // a { c { R } }  b { c { R } }  in written order.
-        children: &[
-            Node {
-                domain: "a",
-                placements: &[],
-                children: &[Node {
-                    domain: "c",
-                    placements: &[Placement {
-                        relation: "R",
-                        via: &[],
-                        payload: Payload::All,
+        // r { a { c { R } }  b { c { R } } }, branches in written order.
+        children: &[Node {
+            domain: "r",
+            placements: &[],
+            children: &[
+                Node {
+                    domain: "a",
+                    placements: &[],
+                    children: &[Node {
+                        domain: "c",
+                        placements: &[Placement {
+                            relation: "R",
+                            via: &[],
+                            payload: Payload::All,
+                        }],
+                        children: &[],
                     }],
-                    children: &[],
-                }],
-            },
-            Node {
-                domain: "b",
-                placements: &[],
-                children: &[Node {
-                    domain: "c",
-                    placements: &[Placement {
-                        relation: "R",
-                        via: &[],
-                        payload: Payload::All,
+                },
+                Node {
+                    domain: "b",
+                    placements: &[],
+                    children: &[Node {
+                        domain: "c",
+                        placements: &[Placement {
+                            relation: "R",
+                            via: &[],
+                            payload: Payload::All,
+                        }],
+                        children: &[],
                     }],
-                    children: &[],
-                }],
-            },
-        ],
+                },
+            ],
+        }],
     };
-    // Tags: a = 1, c = 2, b = 3. A repeated domain keeps its first tag.
-    assert_eq!(SIBLINGS.domain_tag("a"), Some(1));
-    assert_eq!(SIBLINGS.domain_tag("c"), Some(2));
-    assert_eq!(SIBLINGS.domain_tag("b"), Some(3));
+    // Tags: r = 1, a = 2, c = 3, b = 4. A repeated domain keeps its first tag.
+    assert_eq!(SIBLINGS.domain_tag("r"), Some(1));
+    assert_eq!(SIBLINGS.domain_tag("a"), Some(2));
+    assert_eq!(SIBLINGS.domain_tag("c"), Some(3));
+    assert_eq!(SIBLINGS.domain_tag("b"), Some(4));
     let placements = SIBLINGS.placements();
-    assert_eq!(placements[0].path, ["a", "c"]);
-    assert_eq!(placements[1].path, ["b", "c"]);
+    assert_eq!(placements[0].path, ["r", "a", "c"]);
+    assert_eq!(placements[1].path, ["r", "b", "c"]);
     assert_eq!(placements[1].id, 2);
-    assert_eq!(placements[1].name(), "RByBC");
+    assert_eq!(placements[1].name(), "RByRBC");
 }
 
 #[test]
@@ -512,16 +546,28 @@ fn validate_rejects_a_domain_of_width_zero() {
 
 #[test]
 fn root_width_is_the_width_of_the_only_top_level_domain() {
-    assert_eq!(FIXTURE_TRIE.root_width(), Some(8));
-    assert_eq!(COL_TRIE.root_width(), Some(8));
+    assert_eq!(FIXTURE_TRIE.root_width(), 8);
+    assert_eq!(COL_TRIE.root_width(), 8);
 }
 
 #[test]
-fn root_width_is_none_without_exactly_one_top_level_node() {
+#[should_panic(expected = "0 top-level nodes, not one")]
+fn root_width_panics_without_a_top_level_node() {
+    fixture_trie(&[]).root_width();
+}
+
+#[test]
+fn validate_rejects_a_trie_without_a_top_level_node() {
+    assert_invalid(fixture_trie(&[]), "no top-level node");
+}
+
+#[test]
+fn validate_rejects_two_top_level_nodes() {
+    // Two root domains would need two key tries, each its own merged index.
     const TWO_ROOTS: &[Node] = &[
         Node {
             domain: "root",
-            placements: &[],
+            placements: &[EMPTY_PLACEMENT],
             children: &[],
         },
         Node {
@@ -530,8 +576,53 @@ fn root_width_is_none_without_exactly_one_top_level_node() {
             children: &[],
         },
     ];
-    assert_eq!(fixture_trie(TWO_ROOTS).root_width(), None);
-    assert_eq!(fixture_trie(&[]).root_width(), None);
+    assert_invalid(fixture_trie(TWO_ROOTS), "2 top-level nodes");
+}
+
+#[test]
+fn several_streams_may_share_the_root_node() {
+    // Two relations placed at the one root node are two streams of one trie.
+    const SHARED_ROOT: KeyTrie = KeyTrie {
+        name: "SharedRoot",
+        domains: &[Domain {
+            name: "k",
+            width: 8,
+            columns: &[
+                ColumnRef {
+                    relation: "A",
+                    column: "a_k",
+                },
+                ColumnRef {
+                    relation: "B",
+                    column: "b_k",
+                },
+            ],
+        }],
+        children: &[Node {
+            domain: "k",
+            placements: &[
+                Placement {
+                    relation: "A",
+                    via: &[],
+                    payload: Payload::All,
+                },
+                Placement {
+                    relation: "B",
+                    via: &[],
+                    payload: Payload::All,
+                },
+            ],
+            children: &[],
+        }],
+    };
+    SHARED_ROOT.validate().unwrap();
+    assert_eq!(SHARED_ROOT.root_width(), 8);
+    let paths: Vec<_> = SHARED_ROOT
+        .placements()
+        .into_iter()
+        .map(|placed| (placed.id, placed.path))
+        .collect();
+    assert_eq!(paths, [(1, vec!["k"]), (2, vec!["k"])]);
 }
 
 #[test]
@@ -596,19 +687,23 @@ proptest::proptest! {
 #[test]
 fn validate_rejects_sibling_nodes_with_the_same_domain() {
     assert_invalid(
-        fixture_trie(&[
-            Node {
-                domain: "root",
-                placements: &[EMPTY_PLACEMENT],
-                children: &[],
-            },
-            Node {
-                domain: "root",
-                placements: &[],
-                children: &[],
-            },
-        ]),
-        "sibling nodes repeat domain `root`",
+        fixture_trie(&[Node {
+            domain: "root",
+            placements: &[],
+            children: &[
+                Node {
+                    domain: "child",
+                    placements: &[EMPTY_PLACEMENT],
+                    children: &[],
+                },
+                Node {
+                    domain: "child",
+                    placements: &[],
+                    children: &[],
+                },
+            ],
+        }]),
+        "sibling nodes repeat domain `child`",
     );
 }
 

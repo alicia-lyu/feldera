@@ -14,8 +14,10 @@
 //!   through [`RunMerge`].
 //! * `Dlt`, the transaction's signed changes to the index, one in-memory run,
 //!   read once by one forward cursor.
-//! * The trie, which gives the width of the root domain. A group is the first
-//!   `1 + root width` bytes of a key: the root domain's tag and value.
+//! * The index definition `D` ([`MergedIndexDefinition`]), which gives the trie
+//!   (`D::TRIE`) and the payload decoder (`D::decode_payload`). A trie has one
+//!   root domain, so a group is the first `1 + root width` bytes of a key: the
+//!   root domain's tag and value.
 //!
 //! The groups are inferred from `Dlt`: a touched group is one that has a `Dlt`
 //! entry, so the session needs no list of requests.
@@ -37,7 +39,10 @@
 //! rejects the group's root key can still hold entries below it, so the run
 //! must be sought anyway (decision of 2026-11-09).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use crate::{
     ZWeight,
@@ -45,7 +50,7 @@ use crate::{
     trace::{BatchReader, Cursor, SpineSnapshot},
 };
 
-use super::{INDEX_TAG, KeyTrie, MergedIndexBatch, RunMerge, prefix_successor};
+use super::{INDEX_TAG, MergedIndexBatch, MergedIndexDefinition, RunMerge, prefix_successor};
 
 type DeltaCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 
@@ -161,8 +166,9 @@ pub struct SessionCounts {
     pub cancelled: u64,
 }
 
-/// A forward pass over `Old` and `Dlt`; see the [module docs](self).
-pub struct ScanSession<'a> {
+/// A forward pass over `Old` and `Dlt` of the index that `D` defines; see the
+/// [module docs](self).
+pub struct ScanSession<'a, D: MergedIndexDefinition> {
     old: RunMerge<'a>,
     dlt: DeltaCursor<'a>,
     pass: Pass,
@@ -171,38 +177,36 @@ pub struct ScanSession<'a> {
     group_width: usize,
 
     counts: SessionCounts,
+    definition: PhantomData<D>,
 }
 
-impl<'a> ScanSession<'a> {
-    /// Opens the session's cursors over `old` and `dlt`. Fails if the trie has
-    /// no single root width (see [`KeyTrie::root_width`]), since then a key's
-    /// group cannot be read from its first bytes.
+impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
+    /// Opens the session's cursors over `old` and `dlt`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `D::TRIE` is not a valid trie (see [`KeyTrie::root_width`]).
+    ///
+    /// [`KeyTrie::root_width`]: super::KeyTrie::root_width
     pub fn new(
-        trie: &KeyTrie,
         old: &'a SpineSnapshot<MergedIndexBatch>,
         dlt: &'a MergedIndexBatch,
         pass: Pass,
-    ) -> Result<Self, String> {
-        let root_width = trie.root_width().ok_or_else(|| {
-            format!(
-                "trie `{}` does not have exactly one top-level node, so a key's group is not \
-                 its first bytes",
-                trie.name
-            )
-        })?;
+    ) -> Self {
         let old = RunMerge::new(old);
         let mut counts = SessionCounts {
             cursor_opens: 2,
             ..SessionCounts::default()
         };
         counts.positions += u64::from(old.key().is_some());
-        Ok(Self {
+        Self {
             old,
             dlt: dlt.cursor(),
             pass,
-            group_width: 1 + root_width,
+            group_width: 1 + D::TRIE.root_width(),
             counts,
-        })
+            definition: PhantomData,
+        }
     }
 
     /// What the session has done so far.
@@ -217,9 +221,9 @@ impl<'a> ScanSession<'a> {
     /// of the streams in `inputs` (index ids). Reads `Dlt` once, so a second
     /// call finds no group.
     ///
-    /// * `decode(key, payload bytes)` makes a payload of the caller's type
-    ///   from the folded key and the stored bytes. It runs once per buffered
-    ///   entry, and its error stops the session.
+    /// * Payloads are decoded by `D::decode_payload` from the stream id and the
+    ///   stored bytes, once per buffered entry. A decode error stops the
+    ///   session.
     /// * `reject`, if given, judges each buffered *old* entry. When some entry
     ///   of an old key is rejected, the entry stays in its buffer, and the
     ///   session passes the rest of the key's node and everything below it in
@@ -227,12 +231,11 @@ impl<'a> ScanSession<'a> {
     ///   never rejected: the delta is read whole.
     /// * `on_group(group prefix, buffers)` runs once per group. The buffers
     ///   are released when it returns.
-    pub fn maintain<P>(
+    pub fn maintain(
         &mut self,
         inputs: &BTreeSet<u8>,
-        mut decode: impl FnMut(&[u8], &[u8]) -> Result<P, String>,
-        mut reject: Option<&mut dyn FnMut(&Entry<P>) -> bool>,
-        mut on_group: impl FnMut(&[u8], &GroupBuffers<P>) -> Result<(), String>,
+        mut reject: Option<&mut dyn FnMut(&Entry<D::Payload>) -> bool>,
+        mut on_group: impl FnMut(&[u8], &GroupBuffers<D::Payload>) -> Result<(), String>,
     ) -> Result<(), String> {
         while self.dlt.key_valid() {
             let group = self.next_group()?;
@@ -240,8 +243,8 @@ impl<'a> ScanSession<'a> {
             self.pass_to(&group);
 
             let mut buffers = GroupBuffers::default();
-            self.collect_old(&group, inputs, &mut decode, &mut reject, &mut buffers)?;
-            self.collect_delta(&group, inputs, &mut decode, &mut buffers)?;
+            self.collect_old(&group, inputs, &mut reject, &mut buffers)?;
+            self.collect_delta(&group, inputs, &mut buffers)?;
             on_group(&group, &buffers)?;
         }
         Ok(())
@@ -271,13 +274,12 @@ impl<'a> ScanSession<'a> {
     /// `Collect`: buffers the entries of `Old` under `group` whose stream is in
     /// `inputs`, stepping through every position of the group. Ends on the
     /// first position past the group, whose key it has read and nothing more.
-    fn collect_old<P>(
+    fn collect_old(
         &mut self,
         group: &[u8],
         inputs: &BTreeSet<u8>,
-        decode: &mut impl FnMut(&[u8], &[u8]) -> Result<P, String>,
-        reject: &mut Option<&mut dyn FnMut(&Entry<P>) -> bool>,
-        buffers: &mut GroupBuffers<P>,
+        reject: &mut Option<&mut dyn FnMut(&Entry<D::Payload>) -> bool>,
+        buffers: &mut GroupBuffers<D::Payload>,
     ) -> Result<(), String> {
         loop {
             let Some(position) = self.old.key().filter(|key| key.starts_with(group)) else {
@@ -294,7 +296,7 @@ impl<'a> ScanSession<'a> {
             let payload_decodes = &mut self.counts.payload_decodes_old;
             self.old.take(|payload, weight| {
                 *payload_decodes += 1;
-                let payload = decode(&key, payload.downcast_checked::<Vec<u8>>())?;
+                let payload = D::decode_payload(id, payload.downcast_checked::<Vec<u8>>())?;
                 taken.push(Entry {
                     key: key.clone(),
                     payload,
@@ -340,12 +342,11 @@ impl<'a> ScanSession<'a> {
 
     /// Buffers the delta's entries under `group` whose stream is in `inputs`.
     /// The delta is sorted, so they are the next ones in its order.
-    fn collect_delta<P>(
+    fn collect_delta(
         &mut self,
         group: &[u8],
         inputs: &BTreeSet<u8>,
-        decode: &mut impl FnMut(&[u8], &[u8]) -> Result<P, String>,
-        buffers: &mut GroupBuffers<P>,
+        buffers: &mut GroupBuffers<D::Payload>,
     ) -> Result<(), String> {
         while self.dlt.key_valid() {
             let key = self.dlt.key().downcast_checked::<Vec<u8>>().clone();
@@ -357,7 +358,8 @@ impl<'a> ScanSession<'a> {
                 while self.dlt.val_valid() {
                     let weight = *self.dlt.weight().downcast_checked::<ZWeight>();
                     self.counts.payload_decodes_dlt += 1;
-                    let payload = decode(&key, self.dlt.val().downcast_checked::<Vec<u8>>())?;
+                    let payload =
+                        D::decode_payload(id, self.dlt.val().downcast_checked::<Vec<u8>>())?;
                     buffers.stream_mut(id).dlt.push(Entry {
                         key: key.clone(),
                         payload,

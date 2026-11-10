@@ -63,7 +63,9 @@ pub struct Node {
     pub children: &'static [Node],
 }
 
-/// A merged index's trie. The root is implicit and has `children`.
+/// A merged index's trie. The root is implicit and has `children`, which
+/// [`validate`](KeyTrie::validate) requires to be exactly one node: the root
+/// domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyTrie {
     pub name: &'static str,
@@ -168,27 +170,25 @@ impl KeyTrie {
             .find(|placed| placed.name() == name)
     }
 
-    /// The byte width of the value that follows the first tag of a key, or
-    /// `None` if the keys do not agree on one. They agree exactly when the
-    /// trie has one top-level node: sibling nodes have distinct domains, so
-    /// several top-level nodes begin keys with different tags, and possibly
-    /// different widths.
+    /// The byte width of the value that follows the first tag of a key: the
+    /// width of the one root domain. Every key begins with the root domain's
+    /// tag and value, so a key's group is its first `1 + root_width()` bytes.
     ///
     /// # Panics
     ///
-    /// Panics if the top-level node's domain is not declared, which
-    /// [`validate`](Self::validate) rejects.
-    pub fn root_width(&self) -> Option<usize> {
-        match self.children {
-            [only] => Some(
-                self.domain(only.domain)
-                    .unwrap_or_else(|| {
-                        panic!("invalid key trie: domain `{}` is not declared", only.domain)
-                    })
-                    .width,
-            ),
-            _ => None,
-        }
+    /// Panics unless the trie has one top-level node whose domain is declared.
+    /// [`validate`](Self::validate) rejects any other trie.
+    pub fn root_width(&self) -> usize {
+        let [root] = self.children else {
+            panic!(
+                "invalid key trie `{}`: {} top-level nodes, not one",
+                self.name,
+                self.children.len()
+            );
+        };
+        self.domain(root.domain)
+            .unwrap_or_else(|| panic!("invalid key trie: domain `{}` is not declared", root.domain))
+            .width
     }
 
     /// Checks the rules that need no schema. Type, NOT NULL, and primary-key
@@ -196,6 +196,7 @@ impl KeyTrie {
     pub fn validate(&self) -> Result<(), String> {
         self.check_declared_domains()?;
         self.check_counts()?;
+        self.check_one_root()?;
         self.validate_level(self.children, &mut Vec::new())
     }
 
@@ -216,6 +217,24 @@ impl KeyTrie {
             }
         }
         Ok(())
+    }
+
+    /// A key trie has exactly one root domain, so that a key's group is its
+    /// first bytes. Two root domains need two key tries, each stored as its own
+    /// merged index. Several streams may still reside at the root node.
+    fn check_one_root(&self) -> Result<(), String> {
+        match self.children.len() {
+            1 => Ok(()),
+            0 => Err(format!(
+                "key trie `{}` has no top-level node; it needs exactly one root domain",
+                self.name
+            )),
+            count => Err(format!(
+                "key trie `{}` has {count} top-level nodes; it needs exactly one root domain, \
+                 so use one key trie for each root domain",
+                self.name
+            )),
+        }
     }
 
     fn check_counts(&self) -> Result<(), String> {

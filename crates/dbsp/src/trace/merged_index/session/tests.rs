@@ -9,7 +9,7 @@ use super::*;
 use crate::trace::{
     RunReads,
     merged_index::{
-        ColumnRef, Domain, KeyEncoder, Node, Payload, Placement,
+        ColumnRef, Domain, FoldedKey, KeyEncoder, KeyTrie, Node, Payload, Placement,
         run_merge::tests::{memory_run, reads_of, snapshot},
     },
     test::run_in_circuit_with_storage,
@@ -145,6 +145,73 @@ const NO_ROOT_ENTRY: KeyTrie = KeyTrie {
 
 const TRIES: [KeyTrie; 3] = [TWO_LEVELS, BRANCHING, NO_ROOT_ENTRY];
 
+// ---- Fixture definitions ----
+
+/// Defines a test index over `$trie`. Its key is the folded bytes themselves,
+/// and its payload is the first stored byte, whatever the stream. The session
+/// never folds or unfolds, so `fold` and `unfold` only copy bytes.
+macro_rules! test_definition {
+    ($name:ident, $trie:expr) => {
+        struct $name;
+
+        impl MergedIndexDefinition for $name {
+            type Key = Vec<u8>;
+            type Payload = u8;
+
+            const TRIE: KeyTrie = $trie;
+
+            fn fold(key: &Vec<u8>) -> FoldedKey {
+                FoldedKey(key.clone())
+            }
+
+            fn unfold(bytes: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(bytes.to_vec())
+            }
+
+            fn decode_payload(_stream_id: u8, bytes: &[u8]) -> Result<u8, String> {
+                first_byte(bytes)
+            }
+        }
+    };
+}
+
+fn first_byte(bytes: &[u8]) -> Result<u8, String> {
+    bytes
+        .first()
+        .copied()
+        .ok_or_else(|| "empty payload".to_string())
+}
+
+test_definition!(TwoLevelsIndex, TWO_LEVELS);
+test_definition!(BranchingIndex, BRANCHING);
+test_definition!(NoRootEntryIndex, NO_ROOT_ENTRY);
+
+/// [`TWO_LEVELS`] again, but only stream 1 has a payload type: the decoder
+/// keys on the stream id.
+struct StreamOneIndex;
+
+impl MergedIndexDefinition for StreamOneIndex {
+    type Key = Vec<u8>;
+    type Payload = u8;
+
+    const TRIE: KeyTrie = TWO_LEVELS;
+
+    fn fold(key: &Vec<u8>) -> FoldedKey {
+        FoldedKey(key.clone())
+    }
+
+    fn unfold(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(bytes.to_vec())
+    }
+
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<u8, String> {
+        match stream_id {
+            1 => first_byte(bytes),
+            _ => Err(format!("unknown stream {stream_id}")),
+        }
+    }
+}
+
 #[test]
 fn fixture_tries_are_valid() {
     for trie in TRIES {
@@ -173,33 +240,24 @@ fn row(key: Vec<u8>, payload: u8, weight: ZWeight) -> Row {
     (key, vec![payload], weight)
 }
 
-fn decode_byte(_key: &[u8], payload: &[u8]) -> Result<u8, String> {
-    payload
-        .first()
-        .copied()
-        .ok_or_else(|| "empty payload".to_string())
-}
-
 fn ids(ids: &[u8]) -> BTreeSet<u8> {
     ids.iter().copied().collect()
 }
 
 /// Runs a session over `old` and `dlt`, rejecting old entries whose payload
 /// byte is in `rejected`, and returns every group with the counts.
-fn run_session(
-    trie: &KeyTrie,
+fn run_session<D: MergedIndexDefinition<Payload = u8>>(
     old: &SpineSnapshot<MergedIndexBatch>,
     dlt: &MergedIndexBatch,
     pass: Pass,
     inputs: &BTreeSet<u8>,
     rejected: Option<&BTreeSet<u8>>,
 ) -> Result<(Groups, SessionCounts), String> {
-    let mut session = ScanSession::new(trie, old, dlt, pass)?;
+    let mut session = ScanSession::<D>::new(old, dlt, pass);
     let mut groups = Vec::new();
     let mut reject = rejected.map(|bytes| move |entry: &Entry<u8>| bytes.contains(&entry.payload));
     session.maintain(
         inputs,
-        decode_byte,
         reject
             .as_mut()
             .map(|reject| reject as &mut dyn FnMut(&Entry<u8>) -> bool),
@@ -398,9 +456,19 @@ fn case() -> impl Strategy<Value = Case> {
         })
 }
 
-/// Both passes hand over the buffers of the reference.
+/// Runs `case` over the definition that its trie index names.
 fn check_case(case: &Case) -> Result<(), TestCaseError> {
-    let trie = &TRIES[case.trie];
+    match case.trie {
+        0 => check_case_of::<TwoLevelsIndex>(case),
+        1 => check_case_of::<BranchingIndex>(case),
+        2 => check_case_of::<NoRootEntryIndex>(case),
+        other => unreachable!("trie index {other} is out of range"),
+    }
+}
+
+/// Both passes hand over the buffers of the reference.
+fn check_case_of<D: MergedIndexDefinition<Payload = u8>>(case: &Case) -> Result<(), TestCaseError> {
+    let trie = &D::TRIE;
     let old_runs: Vec<OldRun> = case
         .old_runs
         .iter()
@@ -410,7 +478,7 @@ fn check_case(case: &Case) -> Result<(), TestCaseError> {
 
     let old = snapshot::<Vec<u8>>(&old_runs);
     let dlt_run = memory_run::<Vec<u8>>(&dlt);
-    let group_width = 1 + trie.root_width().unwrap();
+    let group_width = 1 + trie.root_width();
     let expected = reference(
         group_width,
         &old_runs,
@@ -428,15 +496,9 @@ fn check_case(case: &Case) -> Result<(), TestCaseError> {
         .sum();
 
     for pass in PASSES {
-        let (groups, counts) = run_session(
-            trie,
-            &old,
-            &dlt_run,
-            pass,
-            &case.inputs,
-            case.rejected.as_ref(),
-        )
-        .map_err(TestCaseError::fail)?;
+        let (groups, counts) =
+            run_session::<D>(&old, &dlt_run, pass, &case.inputs, case.rejected.as_ref())
+                .map_err(TestCaseError::fail)?;
         let actual: Vec<_> = groups
             .iter()
             .map(|(group, buffers)| (group.clone(), expected_of(buffers)))
@@ -489,8 +551,9 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
         )]);
         let dlt = memory_run(&[row(a_key(1), 9, 1)]);
         for pass in PASSES {
-            let ((groups, counts), reads) =
-                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, pass, &ids(&[1]), None).unwrap());
+            let ((groups, counts), reads) = reads_of(|| {
+                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1]), None).unwrap()
+            });
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].1.old(1).len(), 1);
             assert_eq!(groups[0].1.dlt(1).len(), 1);
@@ -528,8 +591,9 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
         let mut outputs = Vec::new();
         let mut measured = Vec::new();
         for pass in PASSES {
-            let ((groups, counts), reads) =
-                reads_of(|| run_session(&TWO_LEVELS, &old, &dlt, pass, &inputs, None).unwrap());
+            let ((groups, counts), reads) = reads_of(|| {
+                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &inputs, None).unwrap()
+            });
             outputs.push(groups);
             measured.push((counts, reads));
         }
@@ -597,15 +661,8 @@ fn a_rejected_node_is_passed_by_one_seek_or_by_steps() {
 
         for pass in [Pass::Seek, Pass::Step] {
             let ((groups, counts), reads) = reads_of(|| {
-                run_session(
-                    &TWO_LEVELS,
-                    &old,
-                    &dlt,
-                    pass,
-                    &ids(&[1, 2]),
-                    Some(&rejected),
-                )
-                .unwrap()
+                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1, 2]), Some(&rejected))
+                    .unwrap()
             });
             // The rejected entry stays buffered; the B entries are not.
             assert_eq!(groups[0].1.old(1).len(), 1);
@@ -643,7 +700,7 @@ fn a_prefix_with_no_successor_is_skipped_to_the_end() {
     let rejected = ids(&[9]);
     for pass in [Pass::Seek, Pass::Step] {
         let (groups, counts) =
-            run_session(&TWO_LEVELS, &old, &dlt, pass, &ids(&[1]), Some(&rejected)).unwrap();
+            run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1]), Some(&rejected)).unwrap();
         assert_eq!(groups[0].1.old(1).len(), 1);
         assert_eq!(counts.logical_seeks, u64::from(pass == Pass::Seek));
         assert_eq!(counts.logical_steps, u64::from(pass == Pass::Step));
@@ -652,28 +709,12 @@ fn a_prefix_with_no_successor_is_skipped_to_the_end() {
 
 // ---- Errors ----
 
-/// Two top-level nodes, whose keys begin with different tags.
-const TWO_ROOTS: KeyTrie = KeyTrie {
-    children: &[leaf("a", &[placement("A")]), leaf("b", &[placement("B")])],
-    ..TWO_LEVELS
-};
-
-#[test]
-fn a_trie_without_one_root_node_is_rejected() {
-    let old = snapshot::<Vec<u8>>(&[]);
-    let dlt = memory_run::<Vec<u8>>(&[]);
-    let error = ScanSession::new(&TWO_ROOTS, &old, &dlt, Pass::Seek)
-        .err()
-        .unwrap();
-    assert!(error.contains("one top-level node"), "{error}");
-}
-
 #[test]
 fn a_malformed_old_key_is_an_error() {
     // [1, 1, 5, 5] has no terminator before the id.
     let old = snapshot(&[(vec![row(vec![1, 1, 5, 5], 1, 1)], false)]);
     let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-    let error = run_session(&TWO_LEVELS, &old, &dlt, Pass::Seek, &ids(&[1]), None)
+    let error = run_session::<TwoLevelsIndex>(&old, &dlt, Pass::Seek, &ids(&[1]), None)
         .err()
         .unwrap();
     assert!(error.contains("malformed folded key"), "{error}");
@@ -682,13 +723,25 @@ fn a_malformed_old_key_is_an_error() {
 #[test]
 fn a_decode_error_stops_the_session() {
     let old = snapshot(&[(vec![row(a_key(1), 1, 1)], false)]);
-    let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-    let mut session = ScanSession::new(&TWO_LEVELS, &old, &dlt, Pass::Seek).unwrap();
-    let result = session.maintain(
-        &ids(&[1]),
-        |_, _| Err::<u8, _>("bad payload".to_string()),
-        None,
-        |_, _| panic!("no group completes"),
-    );
-    assert_eq!(result, Err("bad payload".to_string()));
+    // The delta's payload is empty, which the decoder rejects.
+    let dlt = memory_run(&[(a_key(1), Vec::<u8>::new(), 1)]);
+    let mut session = ScanSession::<TwoLevelsIndex>::new(&old, &dlt, Pass::Seek);
+    let result = session.maintain(&ids(&[1]), None, |_, _| panic!("no group completes"));
+    assert_eq!(result, Err("empty payload".to_string()));
+}
+
+#[test]
+fn the_decoder_is_chosen_by_the_stream_id() {
+    // A(1) is stream 1 and B(1, 1) is stream 2, which the definition cannot
+    // decode. Asking for stream 1 alone never reaches that decoder.
+    let old = snapshot(&[(vec![row(a_key(1), 1, 1), row(b_key(1, 1), 1, 1)], false)]);
+    let dlt = memory_run(&[row(a_key(1), 5, 1), row(b_key(1, 1), 5, 1)]);
+    let (groups, _) =
+        run_session::<StreamOneIndex>(&old, &dlt, Pass::Seek, &ids(&[1]), None).unwrap();
+    assert_eq!(groups[0].1.old(1).len(), 1);
+    assert_eq!(groups[0].1.dlt(1).len(), 1);
+
+    let error =
+        run_session::<StreamOneIndex>(&old, &dlt, Pass::Seek, &ids(&[1, 2]), None).unwrap_err();
+    assert_eq!(error, "unknown stream 2");
 }

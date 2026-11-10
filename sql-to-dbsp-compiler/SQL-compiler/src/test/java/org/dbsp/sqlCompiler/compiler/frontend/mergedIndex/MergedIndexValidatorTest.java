@@ -203,12 +203,49 @@ public class MergedIndexValidatorTest {
     @Test
     public void rejectsRepeatedSiblingDomain() {
         String spec = """
-                domains { k = Customer.c_custkey; }
+                domains { k = Customer.c_custkey; j = Orders.o_orderkey; }
                 merged_index M {
-                  k { Customer: *; }
-                  k { Customer: *; }
+                  k {
+                    j { Orders: *; }
+                    j { Orders: *; }
+                  }
                 }""";
-        assertInvalid(Q3_SCHEMA, spec, 4, "sibling nodes repeat domain `k`");
+        assertInvalid(Q3_SCHEMA, spec, 5, "sibling nodes repeat domain `j`");
+    }
+
+    @Test
+    public void rejectsTwoTopLevelNodes() {
+        String spec = """
+                domains {
+                  custkey  = Customer.c_custkey;
+                  orderkey = Orders.o_orderkey;
+                }
+                merged_index M {
+                  custkey { Customer: *; }
+                  orderkey { Orders: *; }
+                }""";
+        assertInvalid(Q3_SCHEMA, spec, 7, "merged index `M` has 2 top-level nodes; a key trie has exactly one root domain");
+    }
+
+    @Test
+    public void rejectsATrieWithoutATopLevelNode() {
+        assertInvalid(Q3_SCHEMA, "domains { k = Customer.c_custkey; }\nmerged_index M { }", 2,
+                "merged index `M` has no top-level node");
+    }
+
+    @Test
+    public void acceptsSeveralRelationsAtTheRootNode() {
+        String sql = Q3_SCHEMA
+                + "CREATE TABLE Account (a_custkey BIGINT NOT NULL PRIMARY KEY, a_balance INT NOT NULL);";
+        String spec = """
+                domains { custkey = Customer.c_custkey, Account.a_custkey; }
+                merged_index M {
+                  custkey {
+                    Customer: *;
+                    Account: *;
+                  }
+                }""";
+        assertEquals(2, validate(sql, spec).placements().size());
     }
 
     @Test

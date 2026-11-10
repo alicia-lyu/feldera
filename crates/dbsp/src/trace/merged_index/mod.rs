@@ -47,6 +47,9 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 pub trait MergedIndexDefinition {
     type Key: Clone + Eq + std::fmt::Debug;
 
+    /// The decoded payload of any stream of the index.
+    type Payload;
+
     const TRIE: KeyTrie;
 
     /// Folds a key. Typed fields make this infallible.
@@ -55,6 +58,12 @@ pub trait MergedIndexDefinition {
     /// The inverse of [`fold`](Self::fold). Rejects bytes that `fold` could not
     /// have produced.
     fn unfold(bytes: &[u8]) -> Result<Self::Key, String>;
+
+    /// Decodes the stored payload `bytes` of the stream with id `stream_id`:
+    /// the last byte of a folded key. The id alone selects the payload type, so
+    /// the key need not be unfolded. Rejects an unknown id and bytes that the
+    /// stream's encoder could not have produced.
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Self::Payload, String>;
 }
 
 /// A complete folded key. Its byte ordering is its query ordering.

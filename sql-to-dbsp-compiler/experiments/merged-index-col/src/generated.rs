@@ -261,6 +261,7 @@ pub struct CustomerOrdersLineitemDefinition;
 
 impl merged_index::MergedIndexDefinition for CustomerOrdersLineitemDefinition {
     type Key = Key;
+    type Payload = Payload;
 
     const TRIE: merged_index::KeyTrie = TRIE;
 
@@ -304,6 +305,22 @@ impl merged_index::MergedIndexDefinition for CustomerOrdersLineitemDefinition {
         };
         fields.finish()?;
         Ok(key)
+    }
+
+    fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Payload, String> {
+        match stream_id {
+            INDEX_ID_CUSTOMER_BY_CUSTKEY => {
+                CustomerByCustkeyPayload::decode(bytes).map(Payload::CustomerByCustkey)
+            }
+            INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY => {
+                OrdersByCustkeyOrderkeyPayload::decode(bytes).map(Payload::OrdersByCustkeyOrderkey)
+            }
+            INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER => {
+                LineitemByCustkeyOrderkeyLinenumberPayload::decode(bytes)
+                    .map(Payload::LineitemByCustkeyOrderkeyLinenumber)
+            }
+            _ => Err(format!("unknown index id {stream_id}")),
+        }
     }
 }
 

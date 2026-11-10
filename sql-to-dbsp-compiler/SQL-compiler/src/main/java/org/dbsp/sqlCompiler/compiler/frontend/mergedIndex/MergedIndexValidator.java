@@ -73,6 +73,7 @@ public final class MergedIndexValidator {
         MergedIndexValidator validator = new MergedIndexValidator(trie, compiler);
         validator.checkDomains();
         validator.checkCounts();
+        validator.checkOneRoot();
         validator.checkLevel(trie.children(), new ArrayList<>());
         List<ResolvedPlacement> resolved = validator.resolvePlacements();
         if (!validator.errors.isEmpty())
@@ -144,6 +145,21 @@ public final class MergedIndexValidator {
             this.error(this.trie.position(), "more than " + KeyTrie.MAX_TAGS + " placements");
         if (placementCount == 0)
             this.error(this.trie.position(), "merged index `" + this.trie.name() + "` places no relation");
+    }
+
+    /** A key trie has exactly one root domain. A group is then the first bytes of a key, and
+     * the scan session reads it without a list of requests. Two root domains need two merged
+     * indexes. Several relations may still be placed at the root node. */
+    private void checkOneRoot() {
+        List<Node> roots = this.trie.children();
+        if (roots.isEmpty()) {
+            this.error(this.trie.position(), "merged index `" + this.trie.name()
+                    + "` has no top-level node; a key trie has exactly one root domain");
+        } else if (roots.size() > 1) {
+            this.error(roots.get(1).position(), "merged index `" + this.trie.name() + "` has "
+                    + roots.size() + " top-level nodes; a key trie has exactly one root domain, "
+                    + "so declare one merged index for each root domain");
+        }
     }
 
     /** Checks the sibling nodes in {@code nodes}, then recurses into each of them.

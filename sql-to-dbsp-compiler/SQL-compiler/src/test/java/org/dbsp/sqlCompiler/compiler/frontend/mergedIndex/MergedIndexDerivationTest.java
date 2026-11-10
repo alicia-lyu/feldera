@@ -17,19 +17,28 @@ import static org.junit.Assert.assertTrue;
 
 /** What the compiler derives from a spec: tags, ids, names, key and payload columns. */
 public class MergedIndexDerivationTest {
-    /** Two sibling nodes below the root, in the given order. */
+    private static final String SIBLING_SCHEMA = """
+            CREATE TABLE Par (k BIGINT NOT NULL PRIMARY KEY);
+            CREATE TABLE Alpha (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x INT NOT NULL, y INT NOT NULL);
+            CREATE TABLE Beta (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, w INT NOT NULL);
+            """;
+
+    /** Two sibling nodes below one root node, in the given order. */
     private static String siblings(String first, String second) {
         return """
                 domains {
-                  custkey  = Customer.c_custkey, Orders.o_custkey;
-                  orderkey = Orders.o_orderkey, Lineitem.l_orderkey;
+                  root = Par.k, Alpha.k, Beta.k;
+                  a = Alpha.id;
+                  b = Beta.id;
                 }
                 merged_index Siblings {
-                """ + first + second + "}";
+                  root {
+                    Par: *;
+                """ + first + second + "  }\n}";
     }
 
-    private static final String CUSTKEY_NODE = "  custkey { Customer: *; }\n";
-    private static final String ORDERKEY_NODE = "  orderkey { Orders: *; }\n";
+    private static final String A_NODE = "    a { Alpha: x, y; }\n";
+    private static final String B_NODE = "    b { Beta: w; }\n";
 
     @Test
     public void colTagsAndIdsAreOneTwoThree() {
@@ -51,17 +60,18 @@ public class MergedIndexDerivationTest {
 
     @Test
     public void siblingOrderFollowsTheSpec() {
-        KeyTrie customerFirst = validate(Q3_SCHEMA, siblings(CUSTKEY_NODE, ORDERKEY_NODE)).trie();
-        assertEquals(1, customerFirst.domainTag("custkey").orElseThrow());
-        assertEquals(2, customerFirst.domainTag("orderkey").orElseThrow());
-        assertEquals(List.of("CustomerByCustkey", "OrdersByOrderkey"),
-                customerFirst.placements().stream().map(PlacedIndex::name).toList());
+        KeyTrie aFirst = validate(SIBLING_SCHEMA, siblings(A_NODE, B_NODE)).trie();
+        assertEquals(1, aFirst.domainTag("root").orElseThrow());
+        assertEquals(2, aFirst.domainTag("a").orElseThrow());
+        assertEquals(3, aFirst.domainTag("b").orElseThrow());
+        assertEquals(List.of("ParByRoot", "AlphaByRootA", "BetaByRootB"),
+                aFirst.placements().stream().map(PlacedIndex::name).toList());
 
-        KeyTrie ordersFirst = validate(Q3_SCHEMA, siblings(ORDERKEY_NODE, CUSTKEY_NODE)).trie();
-        assertEquals(1, ordersFirst.domainTag("orderkey").orElseThrow());
-        assertEquals(2, ordersFirst.domainTag("custkey").orElseThrow());
-        assertEquals(List.of("OrdersByOrderkey", "CustomerByCustkey"),
-                ordersFirst.placements().stream().map(PlacedIndex::name).toList());
+        KeyTrie bFirst = validate(SIBLING_SCHEMA, siblings(B_NODE, A_NODE)).trie();
+        assertEquals(2, bFirst.domainTag("b").orElseThrow());
+        assertEquals(3, bFirst.domainTag("a").orElseThrow());
+        assertEquals(List.of("ParByRoot", "BetaByRootB", "AlphaByRootA"),
+                bFirst.placements().stream().map(PlacedIndex::name).toList());
     }
 
     @Test
@@ -103,7 +113,8 @@ public class MergedIndexDerivationTest {
         assertEquals(List.of("c_mktsegment"),
                 columnNames(col.placement("CustomerByCustkey").orElseThrow().payloadColumns()));
 
-        ValidatedMergedIndex orders = validate(Q3_SCHEMA, siblings(ORDERKEY_NODE, ""));
+        ValidatedMergedIndex orders = validate(Q3_SCHEMA,
+                "domains { orderkey = Orders.o_orderkey; }\nmerged_index M { orderkey { Orders: *; } }");
         assertEquals(List.of("o_custkey", "o_orderdate", "o_shippriority"),
                 columnNames(orders.placement("OrdersByOrderkey").orElseThrow().payloadColumns()));
 

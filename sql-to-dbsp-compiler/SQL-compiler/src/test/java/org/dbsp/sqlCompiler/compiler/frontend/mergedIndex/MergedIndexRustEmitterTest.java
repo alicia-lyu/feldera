@@ -104,6 +104,19 @@ public class MergedIndexRustEmitterTest {
     }
 
     @Test
+    public void emitsTheDefinitionsPayloadDecoderByStreamId() {
+        String rust = emit(Q3_SCHEMA, COL_SPEC);
+        assertContains(rust,
+                "type Payload = Payload;",
+                "fn decode_payload(stream_id: u8, bytes: &[u8]) -> Result<Payload, String> {",
+                "INDEX_ID_CUSTOMER_BY_CUSTKEY => CustomerByCustkeyPayload::decode(bytes)"
+                        + ".map(Payload::CustomerByCustkey),",
+                "INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER => LineitemByCustkeyOrderkeyLinenumberPayload"
+                        + "::decode(bytes).map(Payload::LineitemByCustkeyOrderkeyLinenumber),",
+                "_ => Err(format!(\"unknown index id {stream_id}\")),");
+    }
+
+    @Test
     public void emitsPayloadCodecInPayloadOrder() {
         String rust = emit(Q3_SCHEMA, COL_SPEC);
         assertContains(rust,
@@ -127,28 +140,41 @@ public class MergedIndexRustEmitterTest {
     }
 
     @Test
-    public void siblingRootsGetTheirOwnPrefixesAndVariants() {
+    public void siblingNodesGetTheirOwnPrefixesAndVariants() {
+        String sql = """
+                CREATE TABLE Par (k BIGINT NOT NULL PRIMARY KEY);
+                CREATE TABLE Alpha (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x INT NOT NULL, y INT NOT NULL);
+                CREATE TABLE Beta (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, w INT NOT NULL);
+                """;
         String spec = """
                 domains {
-                  custkey  = Customer.c_custkey, Orders.o_custkey;
-                  orderkey = Orders.o_orderkey;
+                  root = Par.k, Alpha.k, Beta.k;
+                  a = Alpha.id;
+                  b = Beta.id;
                 }
                 merged_index Siblings {
-                  orderkey { Orders: *; }
-                  custkey { Customer: *; }
+                  root {
+                    Par: *;
+                    b { Beta: w; }
+                    a { Alpha: x, y; }
+                  }
                 }""";
-        String rust = emit(Q3_SCHEMA, spec);
+        String rust = emit(sql, spec);
+        // Tags and ids follow the spec's order: the sibling written first comes first.
         assertContains(rust,
-                "pub const TAG_ORDERKEY: u8 = 1;",
-                "pub const TAG_CUSTKEY: u8 = 2;",
-                "pub const INDEX_ID_ORDERS_BY_ORDERKEY: u8 = 1;",
-                "pub fn prefix_orderkey(orderkey: i64, )",
-                "pub fn prefix_custkey(custkey: i64, )",
+                "pub const TAG_ROOT: u8 = 1;",
+                "pub const TAG_B: u8 = 2;",
+                "pub const TAG_A: u8 = 3;",
+                "pub const INDEX_ID_PAR_BY_ROOT: u8 = 1;",
+                "pub const INDEX_ID_BETA_BY_ROOT_B: u8 = 2;",
+                "pub const INDEX_ID_ALPHA_BY_ROOT_A: u8 = 3;",
+                "pub fn prefix_root_then_b(root: i64, )",
+                "pub fn prefix_root_then_a(root: i64, )",
+                "pub fn prefix_root_b(root: i64, b: i64, )",
+                "pub fn prefix_root_a(root: i64, a: i64, )",
                 "pub struct SiblingsDefinition;");
-        assertFalse(rust.contains("_then_"));
-        String orders = item(rust, "pub struct OrdersByOrderkeyPayload {");
-        assertTrue(orders, orders.indexOf("o_custkey") < orders.indexOf("o_orderdate"));
-        assertTrue(orders, orders.indexOf("o_orderdate") < orders.indexOf("o_shippriority"));
+        String alpha = item(rust, "pub struct AlphaByRootAPayload {");
+        assertTrue(alpha, alpha.indexOf("pub x:") < alpha.indexOf("pub y:"));
     }
 
     @Test
@@ -170,12 +196,14 @@ public class MergedIndexRustEmitterTest {
     public void rejectsCollidingRustNames() {
         String spec = """
                 domains {
-                  ab = Customer.c_custkey;
+                  ab = Customer.c_custkey, Orders.o_custkey;
                   aB = Orders.o_orderkey;
                 }
                 merged_index M {
-                  ab { Customer: *; }
-                  aB { Orders: *; }
+                  ab {
+                    Customer: *;
+                    aB { Orders: o_orderdate, o_shippriority; }
+                  }
                 }""";
         MergedIndexSpecException exception = assertThrows(MergedIndexSpecException.class,
                 () -> emit(Q3_SCHEMA, spec));
