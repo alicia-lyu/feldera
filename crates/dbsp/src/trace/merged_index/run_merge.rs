@@ -52,6 +52,10 @@ pub struct RunMerge<'a> {
 
     /// Values that [`RunMerge::take`] found to cancel across runs.
     cancelled: u64,
+
+    /// Set by [`RunMerge::exhaust`]: the position is past every key, though
+    /// the run cursors are not.
+    exhausted: bool,
 }
 
 impl<'a> RunMerge<'a> {
@@ -62,6 +66,7 @@ impl<'a> RunMerge<'a> {
             runs: snapshot.batches().iter().map(|run| run.cursor()).collect(),
             at_key: Vec::new(),
             cancelled: 0,
+            exhausted: false,
         };
         merge.find_smallest_key();
         merge
@@ -96,6 +101,9 @@ impl<'a> RunMerge<'a> {
     /// whether any run moved, so `false` means the position was already at or
     /// past `target`.
     pub fn seek(&mut self, target: &[u8]) -> bool {
+        if self.exhausted {
+            return false;
+        }
         let target = target.to_vec();
         let mut moved = false;
         for run in &mut self.runs {
@@ -116,6 +124,9 @@ impl<'a> RunMerge<'a> {
     /// afterwards [`key`](Self::key) may be smaller than `key`. Call
     /// [`seek`](Self::seek) next to align the runs.
     pub fn seek_exact(&mut self, key: &[u8]) -> bool {
+        if self.exhausted {
+            return false;
+        }
         let probe = key.to_vec();
         let mut found = false;
         for run in &mut self.runs {
@@ -130,6 +141,15 @@ impl<'a> RunMerge<'a> {
         }
         self.find_smallest_key();
         found
+    }
+
+    /// Moves past every key, as a seek to a target above all keys would. No
+    /// such target can be named for a prefix of `0xFF` bytes, whose range
+    /// runs to the end of the index (see
+    /// [`prefix_successor`](super::prefix_successor)). Reads nothing.
+    pub fn exhaust(&mut self) {
+        self.exhausted = true;
+        self.at_key.clear();
     }
 
     /// Visits each value at the current key in ascending order, with its
@@ -194,6 +214,9 @@ impl<'a> RunMerge<'a> {
     /// Finds the runs at the smallest key, by a linear scan over the runs.
     fn find_smallest_key(&mut self) {
         self.at_key.clear();
+        if self.exhausted {
+            return;
+        }
         let mut smallest: Option<&[u8]> = None;
         for (index, run) in self.runs.iter().enumerate() {
             if !run.key_valid() {
@@ -219,7 +242,7 @@ fn key_of<'c>(run: &'c RunCursor<'_>) -> &'c [u8] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use proptest::{
@@ -230,7 +253,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        DynZWeight,
+        DBData, DynZWeight,
         dynamic::DynData,
         storage::write_attribution::WriteOwner,
         trace::{
@@ -248,18 +271,20 @@ mod tests {
     /// What `take` reports for one key: payloads with their summed weights.
     type Taken = BTreeMap<Vec<u8>, Vec<(u8, ZWeight)>>;
 
-    fn memory_run(rows: &[Row]) -> MergedIndexBatch {
+    /// Builds one in-memory run from rows of payload type `P`.
+    pub(crate) fn memory_run<P: DBData>(rows: &[(Vec<u8>, P, ZWeight)]) -> MergedIndexBatch {
         build_batch(
             rows.iter()
-                .map(|(key, payload, weight)| (FoldedKey(key.clone()), *payload, *weight)),
+                .map(|(key, payload, weight)| (FoldedKey(key.clone()), payload.clone(), *weight)),
         )
         .unwrap()
     }
 
-    /// Copies `run` into a batch in a file. Needs a runtime with storage.
-    fn file_run(run: &MergedIndexBatch) -> MergedIndexBatch {
+    /// Copies `run`, whose payloads have type `P`, into a batch in a file.
+    /// Needs a runtime with storage.
+    pub(crate) fn file_run<P: DBData>(run: &MergedIndexBatch) -> MergedIndexBatch {
         let factories =
-            OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, u8, ZWeight>();
+            OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, P, ZWeight>();
         let mut builder = <MergedIndexBatch as Batch>::Builder::with_capacity_in_location(
             &factories,
             run.key_count(),
@@ -280,14 +305,16 @@ mod tests {
     }
 
     /// A snapshot of the runs, each in a file or in memory as listed.
-    fn snapshot(runs: &[(Vec<Row>, bool)]) -> SpineSnapshot<MergedIndexBatch> {
+    pub(crate) fn snapshot<P: DBData>(
+        runs: &[(Vec<(Vec<u8>, P, ZWeight)>, bool)],
+    ) -> SpineSnapshot<MergedIndexBatch> {
         let factories =
-            OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, u8, ZWeight>();
+            OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, P, ZWeight>();
         let batches = runs
             .iter()
             .map(|(rows, in_file)| {
                 let run = memory_run(rows);
-                Arc::new(if *in_file { file_run(&run) } else { run })
+                Arc::new(if *in_file { file_run::<P>(&run) } else { run })
             })
             .collect();
         SpineSnapshot::with_batches(&factories, batches)
@@ -489,7 +516,7 @@ mod tests {
     }
 
     /// The reads that `f` makes on this thread.
-    fn reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
+    pub(crate) fn reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
         let before = RunReads::current();
         let result = f();
         (result, RunReads::current().since(before))
@@ -533,13 +560,31 @@ mod tests {
 
     #[test]
     fn an_empty_snapshot_has_no_key() {
-        let snapshot = snapshot(&[]);
+        let snapshot = snapshot::<u8>(&[]);
         let mut merge = RunMerge::new(&snapshot);
         assert_eq!(merge.key(), None);
         merge.step();
         assert!(!merge.seek(b"a"));
         assert!(!merge.seek_exact(b"a"));
         assert!(take_all(&mut merge).is_empty());
+    }
+
+    #[test]
+    fn exhaust_moves_past_every_key_and_reads_nothing() {
+        run_in_circuit_with_storage(|| {
+            let runs = vec![(vec![row(b"a", 1, 1), row(b"b", 1, 1)], true)];
+            let snapshot = snapshot(&runs);
+            let mut merge = RunMerge::new(&snapshot);
+            let (_, exhausted) = reads_of(|| merge.exhaust());
+            assert_eq!(exhausted, RunReads::default());
+            assert_eq!(merge.key(), None);
+            // Nothing moves an exhausted merge.
+            merge.step();
+            assert!(!merge.seek(b"a"));
+            assert!(!merge.seek_exact(b"a"));
+            assert_eq!(merge.key(), None);
+            assert!(take_all(&mut merge).is_empty());
+        });
     }
 
     #[test]

@@ -161,7 +161,7 @@ The facts were checked against the code on 2026-11-09.
 | snapshot input | Before each transaction the harness puts the snapshots in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush. | The same pattern, holding `(Old, Dlt)`. |
 | joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. | One operator whose callback evaluates both joins per group. Separate operators sharing the buffers would hold every touched group until `V` finishes. |
 | `Dlt` complete under (A2) | The base transaction runs first. `prepare` folds its net delta, and `ManualIndex::append` builds the run before the view transaction starts. For RF1/RF2 each line item finds its customer through its order's row in the same transaction. | The run is not published, and the view circuit reads the SQL net delta instead. Feed the view side from `Dlt`; no extra owner lookup is needed. |
-| counters | Buffer-cache hits and misses, and Bloom and range filter statistics. `RunReads` (`trace/cursor/run_reads.rs`) counts per-run seeks in both run cursors, and filter rejections and key, value, and weight decodes in the file cursor, as per-thread running totals split by read owner (`with_read_owner`). `DBSPHandle::run_reads` reports the workers' totals. | `SessionCounts` in the scan session (step 2). |
+| counters | Buffer-cache hits and misses, and Bloom and range filter statistics. `RunReads` (`trace/cursor/run_reads.rs`) counts per-run seeks in both run cursors, and filter rejections and key, value, and weight decodes in the file cursor, as per-thread running totals split by read owner (`with_read_owner`). `DBSPHandle::run_reads` reports the workers' totals. `SessionCounts` (`merged_index/session.rs`) counts the session's logical moves and payload decodes. | None. |
 
 ## No extra decoding
 
@@ -209,7 +209,7 @@ One scan session executes buffered execution. It is schema-independent, and it d
 - `Old`, one pinned snapshot, read through `RunMerge`.
 - `Dlt`, the transaction's sorted run, read once by one forward cursor.
 - The trie, for the root domain's width.
-- `decode(key, payload bytes) -> P`, supplied by the caller (COL's `decode_payload`).
+- `decode(key, payload bytes) -> P`, supplied by the caller (COL's `decode_payload`) to each `Maintain` call, since `P` is the caller's type.
 - Two knobs, below.
 
 The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
@@ -217,9 +217,9 @@ The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + r
 ### Operations
 
 ```text
-ScanSession(trie, Old: RunMerge, Dlt run, decode, pass: Seek|Step, start: PrefixSeek|ProbeThenRange)
+ScanSession(trie, Old: snapshot → RunMerge, Dlt run, pass: Seek|Step, start: PrefixSeek|ProbeThenRange)
 
-  Maintain(inputs: set of index ids, reject?, on_group: (group, buffers) -> ()):
+  Maintain(inputs: set of index ids, decode, reject?, on_group: (group, buffers) -> ()):
     for each group g in Dlt, in order:     g = first 1 + trie.root_width() bytes of a Dlt key
       PassTo(g)
       buffers ← Collect(g, inputs, reject), plus Dlt's entries under g (version Dlt)
@@ -233,15 +233,22 @@ ScanSession(trie, Old: RunMerge, Dlt run, decode, pass: Seek|Step, start: Prefix
   Collect(g, inputs, reject):
     while Old.key() starts with g:         Peek is the merged key, already read
       id ← last byte of the key
-      if id ∈ inputs: Old.take → decode each payload → buffer[id] (version Old)
-                      if reject(entry): Skip(key without its trailing [0, id])
-      Old.step()
+      if id ∉ inputs: Old.step()
+      else: Old.take → decode each payload → buffer[id] (version Old)
+            if reject(any entry of the key): Skip(key without its trailing [0, id])
+            else: Old.step()
 
   Skip(n):                                 n is the rejected entry's own node prefix
     if Old.key() does not start with n: return
     Seek: Old.seek(prefix_successor(n)), or exhaust Old on None
     Step: Old.step() while Old.key() starts with n
 ```
+
+The code differs from the write-up's pseudocode in three details:
+
+- `Skip` ends on the first key outside the node, so `Collect` steps only when no skip happened. A step after a `Seek` skip would pass an unread key.
+- A key's entries are judged together: `Skip` runs when any entry of the key is rejected. `reject` sees only old entries; `Dlt` is read whole.
+- `ProbeThenRange` probes the first placement at the root node (the lowest id), and only when some run is still below the probe key. A trie whose root node has no placement is never probed. The probe is a hint: a run its filter rules out stays behind, so the pass that follows aligns it.
 
 The traversal mirrors the write-up: `Maintain` is `alg:ivm-buffered`'s loop over touched groups, `Collect` is `alg:session`'s, and `Skip` is `alg:skip`'s. `Old.key()` is the merged key `RunMerge` has already read, which plays the role of `Peek`'s kept `next_entry`.
 
@@ -266,10 +273,14 @@ Two knobs choose between ways of doing the same work. Both are A/B tests with eq
 
 `SessionCounts` holds:
 
-- groups;
-- cursor opens, logical seeks, logical steps, and positions reached;
-- payload decodes from `Old` and from `Dlt`;
-- cancelled entries.
+- `groups`;
+- `cursor_opens` (two: one logical cursor over `Old`, one over `Dlt`);
+- `logical_seeks`: seeks over `Old` that moved some run. A seek that finds `Old` already at or past its target costs nothing and counts nothing, so a first group that `Old` starts on counts no seek;
+- `probes`: exact-key probes made while some run was below the probed key;
+- `logical_steps`;
+- `positions`: the first key of `Old`, and each key that a step, seek, or probe landed on. Each costs one key decode in a file run;
+- `payload_decodes_old` and `payload_decodes_dlt`: one per buffered entry;
+- `cancelled`: values whose weights cancelled across runs.
 
 DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes.
 
@@ -351,7 +362,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - *Exit:* unit tests for the empty prefix, carry, and all-`0xFF`; a property test that `k.starts_with(p)` holds exactly when `p <= k < succ(p)`; COL's widths are 8, 8, and 4.
    - **Lazy value positioning** in `FileIndexedWSetCursor` ([Remedies](#remedies)). *Done 2026-11-09.* The value cursor becomes a once-filled slot (`OnceCell`), and `count_value_decode` moves to where it is filled. A landing reads the key only; the first `val`, `val_valid`, `weight`, `map_times`, or value move fills the slot. A key move keeps the emptied cursor as the hint for the next first value. The `run_reads` tests pin the lazy counts; the COL baseline is unchanged (see the note under its table).
      - *Exit:* a landing alone decodes no value; the first `val()` counts one value decode and a second counts none; `step_val`, `seek_val`, and `weight` before `val` work; a clone works before and after the fill. The pinned counts of `todays_readers_run_reads_on_the_worked_transaction` are recomputed with each derivation in its comment, and the baseline table above is updated. The existing trace tests pass unchanged.
-   - **`RunMerge`** in `merged_index/run_merge.rs`. *Done 2026-11-09.* `key`, `step`, `seek`, `seek_exact`, and `take`. `step` and `seek` read no value or weight; `take` sums weights per value and counts cancelled values. `seek` moves only the runs below its target and reports whether any moved. `seek_exact` probes through `seek_key_exact`, so a run its filter rules out stays behind and a `seek` must follow to align the runs.
+   - **`RunMerge`** in `merged_index/run_merge.rs`. *Done 2026-11-09.* `key`, `step`, `seek`, `seek_exact`, and `take`. `step` and `seek` read no value or weight; `take` sums weights per value and counts cancelled values. `seek` moves only the runs below its target and reports whether any moved. `seek_exact` probes through `seek_key_exact`, so a run its filter rules out stays behind and a `seek` must follow to align the runs. `exhaust` moves past every key without a read, for a skipped prefix that has no successor.
      - *Exit:* a property test against a consolidated brute force over several runs, file runs among them, with cross-run cancellations and replaced payloads; a counter test that stepping past entries counts no value or weight decode.
    - **`ScanSession`** in `merged_index/session.rs`, with `Maintain`, `PassTo`, `Collect`, `Skip`, the two knobs, and `SessionCounts` ([The scan session](#the-scan-session)).
      - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over random small tries (with `0xFF…` values to force carry), multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and all four knob combinations. A counter test shows that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode.
