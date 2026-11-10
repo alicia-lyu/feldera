@@ -359,7 +359,7 @@ The user decided to use DBSP's default placement in both modes. Memory pressure,
 
 ### 2026-11-09: In-memory runs count their accesses
 
-In-memory runs count key, value, and weight accesses in fields of their own, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (names unconfirmed), apart from the file decodes. A memory access is never counted as a deserialization. This amends "2026-11-03: Counters live at two levels", which let memory runs count only seeks because they deserialize nothing.
+In-memory runs count key, value, and weight accesses in fields of their own, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads`, apart from the file decodes. A memory access is never counted as a deserialization. This amends "2026-11-03: Counters live at two levels", which let memory runs count only seeks because they deserialize nothing.
 
 Why: seeks alone hide the key, value, and weight accesses of native traces, of the index's memory runs, and of `Dlt`, so a comparison across layouts would favor whichever mode keeps more state in memory.
 
@@ -375,7 +375,7 @@ Why: a run whose filter admits the root key is sought onto it. A run whose filte
 
 ### 2026-11-09: A key trie has exactly one root domain
 
-Two root domains mean two key tries, each stored as its own merged index. Several streams may still reside at the root domain's node. `KeyTrie::validate` and the Java `MergedIndexValidator` reject a trie with no top-level node or with more than one. The write-up fix is queued in the thesis `BUFFER.md` (entry of 2026-11-09, commit `720412c` in `merged_index_vldb2026_slides`), following the rule of 2026-11-03.
+Two root domains mean two key tries, each stored as its own merged index. Several streams may still reside at the root domain's node. The Java `MergedIndexValidator` rejects a trie with no top-level node or with more than one. (Amended on 2026-11-10: the Rust `KeyTrie::validate` that rejected the same is gone; see "2026-11-10: The compiler's validator is the only trie check".) The write-up fix is queued in the thesis `BUFFER.md` (entry of 2026-11-09, commit `720412c` in `merged_index_vldb2026_slides`), following the rule of 2026-11-03.
 
 ### 2026-11-09: The session's step-2 choices
 
@@ -384,6 +384,26 @@ The user confirmed these choices of the scan session:
 - `reject` judges old entries only, and a key is rejected when any of its entries is. `Dlt` is read whole.
 - `logical_seeks` counts only seeks that move some run.
 - One session serves one transaction, and `Maintain` runs once per session, since it reads `Dlt` once.
+
+### 2026-11-10: The compiler's validator is the only trie check
+
+The Java `MergedIndexValidator` checks every rule of the key trie, and `MergedIndexValidatorTest` has a rejecting test for each. `KeyTrie::validate` in Rust predated it and checked the same rules for tries written by hand, which exist only as test fixtures. Two copies meant that every rule change was made twice. The Rust validator and its 17 rejection tests are removed (user decision of 2026-11-10). `KeyTrie::root_width`, `placements`, and `key_columns` panic on a hand-built trie that breaks a rule, and `ScanSession::new` panics through `root_width`; the user confirmed on 2026-11-10 that they panic rather than return an error. Every production trie is emitted by the compiler from a validated spec.
+
+### 2026-11-10: `decode_payload` keys on the stream id
+
+`MergedIndexDefinition::decode_payload(stream_id, bytes)` takes the stream id, which is the folded key's last byte (the placement id), not the unfolded key. The stream id selects the payload type, so decoding needs no `unfold` (user confirmation of 2026-11-10, of the choice in "2026-11-09: The session is bound to its index definition").
+
+### 2026-11-10: Choices of the memory-run counters and the native comparison
+
+The user confirmed on 2026-11-10:
+
+- The field names `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see "2026-11-09: In-memory runs count their accesses").
+- A memory run's value counts once per position, mirroring the file cursor's laziness: a `Cell<bool>` that every key move clears and every value move sets.
+- The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads, and checks that files exist.
+- `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB) is a public constant, so that the harness can report the resolved default (see "2026-11-09: DBSP's default placement in both modes").
+- The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
+
+Not a decision: the native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
 
 ## Superseded and withdrawn
 
