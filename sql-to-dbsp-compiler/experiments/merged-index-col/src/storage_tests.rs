@@ -23,7 +23,7 @@ use dbsp::{
     dynamic::{DowncastTrait, DynData, Erase},
     trace::merged_index::MergedIndexDefinition,
     trace::{
-        Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, OrdIndexedWSet,
+        Batch, BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSet,
         OrdIndexedWSetFactories, Spine, Trace, TraceRole, WithSnapshot,
     },
     DynZWeight, Runtime, ZWeight,

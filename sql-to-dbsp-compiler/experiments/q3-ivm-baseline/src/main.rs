@@ -3229,22 +3229,24 @@ mod net_delta_tests {
     }
 }
 
-/// The worked transaction of `docs/design/merged-index/shared-traversal.md` in native mode: the
-/// view worker's run reads, to compare with the scan session's on the same rows
-/// (`session_run_reads_on_the_native_layout_*` in `merged-index-col/src/q3/tests.rs`). It runs
-/// in the native build, since the view circuit of the `merged-index` build reads the index.
-#[cfg(all(test, not(feature = "merged-index")))]
-mod native_worked_transaction_tests {
+/// What the two worked-transaction tests share: the rows, and the two arms with one config and
+/// one memory-pressure mechanism for both sides of the comparison (user decision of
+/// 2026-11-10). `native_worked_transaction_tests` (native build) and
+/// `session_worked_transaction_tests` (`merged-index` build) both start from `start`, so their
+/// configs cannot drift apart.
+#[cfg(test)]
+mod worked_transaction {
     use super::*;
+    use feldera_types::memory_pressure::MemoryPressure;
 
-    fn customer(key: i64, segment: &str) -> Customer {
+    pub(super) fn customer(key: i64, segment: &str) -> Customer {
         Customer {
             key,
             segment: segment.to_owned(),
         }
     }
 
-    fn order(key: i64, customer_key: i64) -> Order {
+    pub(super) fn order(key: i64, customer_key: i64) -> Order {
         Order {
             key,
             customer_key,
@@ -3253,7 +3255,7 @@ mod native_worked_transaction_tests {
         }
     }
 
-    fn line(order_key: i64, number: i32) -> Line {
+    pub(super) fn line(order_key: i64, number: i32) -> Line {
         Line {
             order_key,
             number,
@@ -3263,8 +3265,89 @@ mod native_worked_transaction_tests {
         }
     }
 
+    /// The old state: c5 with orders o3 and o4 (lines l7 and l8 under o3, l9 under o4), and
+    /// customers c6 and c7.
+    pub(super) fn load_change() -> Change {
+        Change {
+            customers: vec![
+                (customer(5, "BUILDING"), true),
+                (customer(6, "BUILDING"), true),
+                (customer(7, "BUILDING"), true),
+            ],
+            orders: vec![(order(3, 5), true), (order(4, 5), true)],
+            lines: vec![(line(3, 7), true), (line(3, 8), true), (line(4, 9), true)],
+        }
+    }
+
+    /// The transaction: c5 replaced, and o5 added with l10 and l11.
+    pub(super) fn worked_change() -> Change {
+        Change {
+            customers: vec![
+                (customer(5, "BUILDING"), false),
+                (customer(5, "AUTOMOBILE"), true),
+            ],
+            orders: vec![(order(5, 5), true)],
+            lines: vec![(line(5, 10), true), (line(5, 11), true)],
+        }
+    }
+
+    /// The memory-pressure configuration of a run. Nothing relieves the pressure by hand, and
+    /// the runs land wherever the runtime puts them.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Arm {
+        /// No memory target: the pressure stays low.
+        Default,
+        /// A target far below the process's size, which keeps the runtime under pressure for
+        /// good (it is sampled, so the level is reported, not assumed).
+        Pressured,
+    }
+
+    impl Arm {
+        pub(super) fn name(self) -> &'static str {
+            match self {
+                Arm::Default => "default",
+                Arm::Pressured => "pressured",
+            }
+        }
+
+        /// The one config of both sides.
+        pub(super) fn config(self) -> Config {
+            Config {
+                workers: 1,
+                cache_bytes: Some(64 * 1024 * 1024),
+                memory_target_bytes: matches!(self, Arm::Pressured).then_some(1024 * 1024),
+                ..Config::default()
+            }
+        }
+    }
+
+    /// The pipeline of `arm` with storage in a fresh directory, which is returned. Under
+    /// `Pressured` it waits until the runtime reports high pressure or more.
+    pub(super) fn start(arm: Arm) -> Result<(Pipeline, PathBuf)> {
+        let storage = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/worked-transaction")
+            .join(format!(
+                "{}-{}-{}",
+                std::process::id(),
+                if cfg!(feature = "merged-index") {
+                    "reconstructed"
+                } else {
+                    "native"
+                },
+                arm.name()
+            ));
+        let pipeline = Pipeline::new(runtime_config(&arm.config(), Some(&storage))?)?;
+        if matches!(arm, Arm::Pressured) {
+            measurement::drain_until(Duration::from_secs(30), || {
+                Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
+            })
+            .context("the runtime did not come under memory pressure")?;
+        }
+        Ok((pipeline, storage))
+    }
+
     /// The files under `path`.
-    fn files_under(path: &Path) -> Result<usize> {
+    pub(super) fn files_under(path: &Path) -> Result<usize> {
         let mut files = 0;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
@@ -3277,104 +3360,244 @@ mod native_worked_transaction_tests {
         Ok(files)
     }
 
-    /// What one arm of the test observed.
-    struct Observed {
-        /// The view worker's run reads in the transaction, per read owner.
-        reads: [RunReads; 3],
-        /// The files in the storage directory when the pipeline is built, after the load, and
-        /// after the transaction. They show whether the runs are in files.
-        files_at_start: usize,
-        files_after_load: usize,
-        files_after_transaction: usize,
+    /// The memory pressure at the points of a run.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Pressures {
+        pub(super) at_start: MemoryPressure,
+        pub(super) after_load: MemoryPressure,
+        pub(super) after_transaction: MemoryPressure,
     }
 
-    /// Loads the old state, then runs the worked transaction, with the runtime under high memory
-    /// pressure (`pressured`) or not.
-    fn run_arm(name: &str, pressured: bool) -> Result<Observed> {
-        use feldera_types::memory_pressure::MemoryPressure;
+    /// The files in the storage directory at the points of a run. They show whether the runs
+    /// are in files.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct FileCounts {
+        pub(super) at_start: usize,
+        pub(super) after_load: usize,
+        pub(super) after_transaction: usize,
+    }
 
-        let storage = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/native-worked-transaction")
-            .join(format!("{}-{name}", std::process::id()));
-        let config = Config {
-            workers: 1,
-            cache_bytes: Some(64 * 1024 * 1024),
-            // A target far below the process's size keeps the runtime under pressure for good.
-            memory_target_bytes: pressured.then_some(1024 * 1024),
-            ..Config::default()
-        };
-        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
-        if pressured {
-            measurement::drain_until(Duration::from_secs(30), || {
-                Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
-            })
-            .context("the runtime did not come under memory pressure")?;
+    impl std::fmt::Display for Pressures {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{:?} at start, {:?} after the load, {:?} after the transaction",
+                self.at_start, self.after_load, self.after_transaction
+            )
         }
-        let files_at_start = files_under(&storage)?;
+    }
+
+    impl std::fmt::Display for FileCounts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} at start, {} after the load, {} after the transaction",
+                self.at_start, self.after_load, self.after_transaction
+            )
+        }
+    }
+
+    /// Loads the old state through `transact`, then runs `worked`, the worked transaction, and
+    /// returns what it returns with what the run observed around it. The two sides run the
+    /// transaction differently (see their modules), but share the config, the load, and the
+    /// observations.
+    pub(super) fn run_load_and_transaction<T>(
+        pipeline: &mut Pipeline,
+        storage: &Path,
+        worked: impl FnOnce(&mut Pipeline, &mut Reference) -> Result<T>,
+    ) -> Result<(T, Pressures, FileCounts)> {
+        let pressure = |pipeline: &Pipeline| pipeline.runtime().current_memory_pressure();
+        let at_start = (pressure(pipeline), files_under(storage)?);
         let mut state = Reference::default();
-
-        // The old state: c5 with orders o3 and o4 (lines l7 and l8 under o3, l9 under o4), and
-        // customers c6 and c7.
-        let mut loading = Measurements::default();
         transact(
-            &mut pipeline,
+            pipeline,
             &mut state,
-            Change {
-                customers: vec![
-                    (customer(5, "BUILDING"), true),
-                    (customer(6, "BUILDING"), true),
-                    (customer(7, "BUILDING"), true),
-                ],
-                orders: vec![(order(3, 5), true), (order(4, 5), true)],
-                lines: vec![(line(3, 7), true), (line(3, 8), true), (line(4, 9), true)],
-            },
+            load_change(),
             true,
-            &mut loading,
+            &mut Measurements::default(),
         )?;
-        let files_after_load = files_under(&storage)?;
+        let after_load = (pressure(pipeline), files_under(storage)?);
+        let result = worked(pipeline, &mut state)?;
+        let after_transaction = (pressure(pipeline), files_under(storage)?);
+        Ok((
+            result,
+            Pressures {
+                at_start: at_start.0,
+                after_load: after_load.0,
+                after_transaction: after_transaction.0,
+            },
+            FileCounts {
+                at_start: at_start.1,
+                after_load: after_load.1,
+                after_transaction: after_transaction.1,
+            },
+        ))
+    }
 
-        // The transaction: c5 replaced, and o5 added with l10 and l11.
-        let mut stats = Measurements::default();
-        transact(
-            &mut pipeline,
-            &mut state,
-            Change {
-                customers: vec![
-                    (customer(5, "BUILDING"), false),
-                    (customer(5, "AUTOMOBILE"), true),
-                ],
-                orders: vec![(order(5, 5), true)],
-                lines: vec![(line(5, 10), true), (line(5, 11), true)],
+    /// A read count's memory reads and decodes together: what the cursors read, wherever the
+    /// runs are.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Totals {
+        pub(super) probes: u64,
+        pub(super) keys: u64,
+        pub(super) values: u64,
+        pub(super) weights: u64,
+    }
+
+    impl Totals {
+        pub(super) fn of(reads: &RunReads) -> Self {
+            Self {
+                // A probe that a run's filter rejects is a probe all the same.
+                probes: reads.seeks + reads.filter_rejections,
+                keys: reads.memory_key_reads + reads.key_decodes,
+                values: reads.memory_value_reads + reads.value_decodes,
+                weights: reads.memory_weight_reads + reads.weight_decodes,
+            }
+        }
+    }
+}
+
+/// The worked transaction of `docs/design/merged-index/shared-traversal.md` in native mode: the
+/// view worker's run reads, to compare with the scan session's on the same rows
+/// (`session_worked_transaction_tests`). It runs in the native build, since the view circuit of
+/// the `merged-index` build reads the index.
+///
+/// Both arms of `worked_transaction::Arm` pin what the cursors read in all, wherever the runtime
+/// put the runs. Each test prints the pressure level, the files, and where the reads went
+/// (memory reads or decodes), so a run's layout can be read from the output (`--nocapture`).
+#[cfg(all(test, not(feature = "merged-index")))]
+mod native_worked_transaction_tests {
+    use super::worked_transaction::*;
+    use super::*;
+
+    /// What one operator of the view circuit reads, derived per operator by a scout with no code
+    /// run, and confirmed by the pins below. `probes` are seeks, or filter rejections when a
+    /// file run's filter answers the probe.
+    struct OperatorReads {
+        probes: u64,
+        keys: u64,
+        values: u64,
+        weights: u64,
+    }
+
+    /// The view circuit is two incremental joins, `J = C ⋈ O` (keyed by custkey) and
+    /// `V = L ⋈ J` (keyed by orderkey), each `Δa ⋈ b' + a ⋈ Δb` over the integrated traces. The
+    /// "after" trace of each pair is the old run plus the transaction's delta run (two runs); the
+    /// "before" trace is the old run alone. The transaction is `ΔC = {-c5 BUILDING, +c5
+    /// AUTOMOBILE}`, `ΔO = {o5}`, `ΔL = {l10, l11}`. Old J holds c5's orders o3 and o4, so `ΔJ`
+    /// has entries of o3 and o4 (the retracted and the inserted c5, which cancel) and of o5.
+    ///
+    /// Values and weights exceed keys for four reasons: each delta value makes a full pass over
+    /// the trace's values and then rewinds; `CursorList` reads a weight at each value landing,
+    /// for its zero-weight skip; a seek that stays on the same key counts that key's value
+    /// again; and J's `plus` reads every output row.
+    ///
+    /// Rows of the table, in the order of the circuit:
+    ///
+    /// | Operator | Probes | Key | Value | Weight |
+    /// | --- | --- | --- | --- | --- |
+    /// | `ΔO ⋈ C` after the insert | 2 | 3 | 8 | 6 |
+    /// | `ΔC ⋈ O` before the insert | 1 | 2 | 8 | 8 |
+    /// | J's `plus`, merging the two join outputs | 0 | 3 | 5 | 5 |
+    /// | `ΔL ⋈ J` after the insert | 2 | 4 | 7 | 6 |
+    /// | `ΔJ ⋈ L` before the insert (swapped: L drives and ΔJ is sought) | 2 | 4 | 13 | 13 |
+    ///
+    /// J's `plus`, and the sought `ΔJ`, compute the view change from the circuit's own
+    /// intermediate results; the rest read the old state and the transaction's delta.
+    const OPERATOR_TALLY: [OperatorReads; 5] = [
+        OperatorReads {
+            probes: 2,
+            keys: 3,
+            values: 8,
+            weights: 6,
+        },
+        OperatorReads {
+            probes: 1,
+            keys: 2,
+            values: 8,
+            weights: 8,
+        },
+        OperatorReads {
+            probes: 0,
+            keys: 3,
+            values: 5,
+            weights: 5,
+        },
+        OperatorReads {
+            probes: 2,
+            keys: 4,
+            values: 7,
+            weights: 6,
+        },
+        OperatorReads {
+            probes: 2,
+            keys: 4,
+            values: 13,
+            weights: 13,
+        },
+    ];
+
+    /// The tally's sums: what native reads in all.
+    fn tally_totals() -> Totals {
+        OPERATOR_TALLY.iter().fold(
+            Totals {
+                probes: 0,
+                keys: 0,
+                values: 0,
+                weights: 0,
             },
-            true,
-            &mut stats,
-        )?;
-        Ok(Observed {
-            reads: stats.view_reads,
-            files_at_start,
-            files_after_load,
-            files_after_transaction: files_under(&storage)?,
-        })
+            |sum, operator| Totals {
+                probes: sum.probes + operator.probes,
+                keys: sum.keys + operator.keys,
+                values: sum.values + operator.values,
+                weights: sum.weights + operator.weights,
+            },
+        )
+    }
+
+    /// Runs `arm`, checks that the cursors read the tally's totals, and prints what the run
+    /// observed. Returns the reads and the observations.
+    fn run_arm(arm: Arm) -> Result<(RunReads, Pressures, FileCounts)> {
+        let (mut pipeline, storage) = start(arm)?;
+        let (stats, pressures, files) =
+            run_load_and_transaction(&mut pipeline, &storage, |pipeline, state| {
+                let mut stats = Measurements::default();
+                transact(pipeline, state, worked_change(), true, &mut stats)?;
+                Ok(stats)
+            })?;
+        let [query, base_relation, merged_index] = stats.view_reads;
+        println!(
+            "native {}: pressure {pressures}; files {files}\n  reads {query:?}",
+            arm.name()
+        );
+        assert_eq!(Totals::of(&query), tally_totals());
+        assert_eq!(base_relation, RunReads::default());
+        assert_eq!(merged_index, RunReads::default());
+        Ok((query, pressures, files))
+    }
+
+    #[test]
+    fn the_tally_adds_up_to_the_pinned_totals() {
+        assert_eq!(
+            tally_totals(),
+            Totals {
+                probes: 7,
+                keys: 16,
+                values: 41,
+                weights: 38
+            }
+        );
     }
 
     /// Default placement at low memory pressure: every run is in memory, so the reads are
-    /// memory reads and nothing is decoded.
-    ///
-    /// Derivation. The view circuit is two incremental joins, `J = C ⋈ O` (keyed by custkey) and
-    /// `V = L ⋈ J` (keyed by orderkey). Each join probes the other side's trace once for each
-    /// key of each delta, so the seeks are: `ΔC` (key c5) into O, `ΔO` (c5) into C, `ΔJ` (keys
-    /// o3, o4, and o5, produced by the first join) into L, and `ΔL` (o5) into J. That is 1 + 1 +
-    /// 3 + 1 = 7 seeks, which is what the test measures, so each trace is one run. The key, value, and
-    /// weight reads are the totals the traces' cursors make; they are pinned as measured, and
-    /// they are the same numbers as the decodes of the file arm. Not derived per operation.
+    /// memory reads and nothing is decoded. The seven probes are seeks; the tally's sums are 7
+    /// seeks and 16 key, 41 value, and 38 weight reads.
     #[test]
-    fn worked_transaction_in_memory() -> Result<()> {
-        let observed = run_arm("memory", false)?;
-        assert_eq!(observed.files_after_load, observed.files_at_start);
-        assert_eq!(observed.files_after_transaction, observed.files_at_start);
-        let [query, base_relation, merged_index] = observed.reads;
+    fn worked_transaction_default_arm() -> Result<()> {
+        let (reads, _pressures, files) = run_arm(Arm::Default)?;
+        assert_eq!(files.after_transaction, files.at_start);
         assert_eq!(
-            query,
+            reads,
             RunReads {
                 seeks: 7,
                 memory_key_reads: 16,
@@ -3383,35 +3606,245 @@ mod native_worked_transaction_tests {
                 ..RunReads::default()
             }
         );
-        assert_eq!(base_relation, RunReads::default());
-        assert_eq!(merged_index, RunReads::default());
         Ok(())
     }
 
-    /// High memory pressure from before the load, so that the traces' runs are in files: the
-    /// same probes, and the same numbers as decodes. One of the seven probes is answered by a
-    /// run's filter, so it counts a filter rejection and no seek: 6 seeks and 1 rejection. The
-    /// probe is probably `ΔJ`'s of order o5 in L, which has no line item of o5 yet; the test
-    /// does not check which one it is.
+    /// A 1 MiB target, with the wait for high pressure. The totals are the tally's, as in the
+    /// default arm, because the cursors make the same probes and passes. What differs is where
+    /// the reads go, which the test prints and does not force: the runtime's pressure puts the
+    /// runs wherever it does. When every run is in a file, the reads are decodes, and one of the
+    /// seven probes is answered by a run's filter, which counts a filter rejection and no seek
+    /// (6 seeks and 1 rejection); the test pins that split only then. The rejected probe is
+    /// ΔL's o5 into J's old run, which has no entry of o5.
     #[test]
-    fn worked_transaction_in_files() -> Result<()> {
-        let observed = run_arm("files", true)?;
-        assert!(observed.files_after_load > observed.files_at_start);
-        assert!(observed.files_after_transaction > observed.files_after_load);
-        let [query, base_relation, merged_index] = observed.reads;
-        assert_eq!(
-            query,
-            RunReads {
-                seeks: 6,
-                filter_rejections: 1,
-                key_decodes: 16,
-                value_decodes: 41,
-                weight_decodes: 38,
+    fn worked_transaction_pressured_arm() -> Result<()> {
+        let (reads, pressures, _files) = run_arm(Arm::Pressured)?;
+        assert!(pressures.at_start >= feldera_types::memory_pressure::MemoryPressure::High);
+        // The runs landed in files in every run observed (Critical pressure throughout). Then
+        // the totals are all decodes, and the one rejected probe is not a seek. A mixed layout
+        // would split the reads differently, and is reported, not forced.
+        let memory_reads =
+            reads.memory_key_reads + reads.memory_value_reads + reads.memory_weight_reads;
+        if memory_reads == 0 {
+            assert_eq!(
+                reads,
+                RunReads {
+                    seeks: 6,
+                    filter_rejections: 1,
+                    key_decodes: 16,
+                    value_decodes: 41,
+                    weight_decodes: 38,
+                    ..RunReads::default()
+                }
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The scan session on the worked transaction of `docs/design/merged-index/shared-traversal.md`,
+/// under the same arms as `native_worked_transaction_tests`: the same rows, the same config
+/// (`worked_transaction::Arm::config`), the same memory-pressure mechanism, and the same load
+/// through `transact`. The worked transaction runs on the base circuit and the index only (see
+/// `run_arm`). The index's runs are placed by that mechanism too: `Old` is
+/// the index's snapshot before the transaction (`ManualIndex` keeps it in a `Spine`, whose
+/// inserts consult `min_insert_storage_bytes`), and `Dlt` is built by `build_batch` with no
+/// fixed location, so it follows `min_step_storage_bytes` like native's delta batches.
+///
+/// The session runs on the test thread, bound to the runtime's buffer cache, after the
+/// transaction. The tests print the pressure level, the files, and the layout of `Old` and
+/// `Dlt`, and do not assert a layout. They pin what the session does (its `SessionCounts`),
+/// what the cursors read in all, wherever the runs are, and the split of those reads between
+/// memory reads and decodes by the layout that the run observed.
+#[cfg(all(test, feature = "merged-index"))]
+mod session_worked_transaction_tests {
+    use super::worked_transaction::*;
+    use super::*;
+    use dbsp::trace::merged_index::{Pass, ScanSession, SessionCounts};
+    use dbsp::trace::{with_read_owner, BatchLocation, BatchReader};
+    use merged_index_col::{
+        CustomerOrdersLineitemDefinition, INDEX_ID_CUSTOMER_BY_CUSTKEY,
+        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER, INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+    };
+    use std::collections::BTreeSet;
+
+    /// The streams, in index-id order: customers, orders, line items.
+    const STREAMS: [u8; 3] = [
+        INDEX_ID_CUSTOMER_BY_CUSTKEY,
+        INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+    ];
+
+    /// A run's location and its number of entries.
+    type RunShape = (BatchLocation, usize);
+
+    struct Observed {
+        pressures: Pressures,
+        files: FileCounts,
+        /// The nonempty runs of `Old`.
+        old_runs: Vec<RunShape>,
+        dlt: RunShape,
+        counts: SessionCounts,
+        /// The `(old, dlt)` entries that each group buffered, per stream, for each group.
+        groups: Vec<[(usize, usize); 3]>,
+        /// The session's reads for the merged index, and for every other owner.
+        reads: RunReads,
+        other_reads: RunReads,
+    }
+
+    /// Runs the arm's transactions, then the session over the last transaction's `Old` and `Dlt`.
+    fn run_arm(arm: Arm) -> Result<Observed> {
+        let (mut pipeline, storage) = start(arm)?;
+        // The base circuit and the index take the transaction; the view circuit does not run
+        // it. Its reconstructed readers take placements from the Orders rows of the same
+        // delta, and this transaction replaces c5 without any order row, a change outside
+        // RF1/RF2 that the readers reject by design (CLAUDE.md, "Placements and supported
+        // changes"). The session needs only the index's `Old` and `Dlt`.
+        let (appended, pressures, files) =
+            run_load_and_transaction(&mut pipeline, &storage, |pipeline, state| {
+                let net_delta = run_base(pipeline, state, worked_change(), true)?;
+                let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
+                pipeline.index.append(index_rows)
+            })?;
+        let (old, dlt) = (appended.before, appended.dlt);
+        let old_runs: Vec<RunShape> = old
+            .batches()
+            .iter()
+            .filter(|run| !run.is_empty())
+            .map(|run| (run.location(), run.len()))
+            .collect();
+        let dlt_shape = (dlt.location(), dlt.len());
+
+        let (counts, groups, reads, other_reads) = pipeline.in_cache(|| {
+            let index_before = RunReads::current_for(WriteOwner::MergedIndex);
+            let total_before = RunReads::current();
+            let mut groups = Vec::new();
+            let counts = with_read_owner(WriteOwner::MergedIndex, || {
+                let mut session =
+                    ScanSession::<CustomerOrdersLineitemDefinition>::new(&old, &dlt, Pass::Seek);
+                session
+                    .maintain(&BTreeSet::from(STREAMS), None, |_group, buffers| {
+                        groups
+                            .push(STREAMS.map(|id| (buffers.old(id).len(), buffers.dlt(id).len())));
+                        Ok(())
+                    })
+                    .map_err(anyhow::Error::msg)?;
+                Ok::<_, anyhow::Error>(session.counts())
+            })?;
+            let reads = RunReads::current_for(WriteOwner::MergedIndex).since(index_before);
+            let other_reads = RunReads::current().since(total_before).since(reads);
+            Ok::<_, anyhow::Error>((counts, groups, reads, other_reads))
+        })?;
+
+        println!(
+            "session {}: pressure {pressures}; files {files}\n  Old runs {old_runs:?}, Dlt {dlt_shape:?}\n  reads {reads:?}\n  counts {counts:?}",
+            arm.name()
+        );
+        Ok(Observed {
+            pressures,
+            files,
+            old_runs,
+            dlt: dlt_shape,
+            counts,
+            groups,
+            reads,
+            other_reads,
+        })
+    }
+
+    /// `keys` key, `values` value, and `weights` weight reads of a run in `location`: decodes
+    /// for a file, memory reads for a run in memory.
+    fn run_reads(location: BatchLocation, keys: u64, values: u64, weights: u64) -> RunReads {
+        match location {
+            BatchLocation::Storage => RunReads {
+                key_decodes: keys,
+                value_decodes: values,
+                weight_decodes: weights,
                 ..RunReads::default()
+            },
+            BatchLocation::Memory => RunReads {
+                memory_key_reads: keys,
+                memory_value_reads: values,
+                memory_weight_reads: weights,
+                ..RunReads::default()
+            },
+        }
+    }
+
+    /// Checks the observation against the derivation below, whatever the layout.
+    ///
+    /// Derivation. `Old` is the load's one run of eight keys in index order: c5, o3, l7, l8,
+    /// o4, l9, c6, c7. `Dlt` is the transaction's net delta: c5 (-BUILDING, +AUTOMOBILE; one key,
+    /// two entries), o5, l10, and l11, four keys and five entries. The session finds one group,
+    /// c5, and buffers `(old, dlt)` entries (1, 2) of customers, (2, 1) of orders, and (3, 2) of
+    /// line items.
+    ///
+    /// - `Old` opens on c5, the smallest key, so the seek to c5's prefix moves nothing: no
+    ///   logical seek. Six steps reach o3, l7, l8, o4, l9, and c6, which ends the group, so
+    ///   there are 7 positions (c7 is never reached), 6 payload decodes of `Old`, and 5 of
+    ///   `Dlt`.
+    /// - `Old`'s run: 7 key reads (the positions), and 6 value and 6 weight reads (the six
+    ///   entries taken; c6 only ends the group). `Dlt`'s run is read whole: 4 key reads (the
+    ///   step past l11 lands on nothing), 5 value, and 5 weight reads. A run in a file counts
+    ///   them as decodes, and a run in memory as memory reads. In all: 11 key, 11 value, and 11
+    ///   weight reads.
+    /// - No seek reaches a run, so no seek or filter rejection is counted.
+    fn check(observed: &Observed) {
+        assert_eq!(observed.groups, [[(1, 2), (2, 1), (3, 2)]]);
+        assert_eq!(
+            observed.counts,
+            SessionCounts {
+                groups: 1,
+                cursor_opens: 2,
+                logical_seeks: 0,
+                logical_steps: 6,
+                positions: 7,
+                payload_decodes_old: 6,
+                payload_decodes_dlt: 5,
+                cancelled: 0,
             }
         );
-        assert_eq!(base_relation, RunReads::default());
-        assert_eq!(merged_index, RunReads::default());
+        assert_eq!(observed.other_reads, RunReads::default());
+        assert_eq!(observed.old_runs.len(), 1, "Old is not one run");
+        assert_eq!(observed.old_runs[0].1, 8);
+        assert_eq!(observed.dlt.1, 5);
+
+        let mut expected = run_reads(observed.old_runs[0].0, 7, 6, 6);
+        expected += run_reads(observed.dlt.0, 4, 5, 5);
+        assert_eq!(observed.reads, expected);
+        assert_eq!(
+            Totals::of(&observed.reads),
+            Totals {
+                probes: 0,
+                keys: 11,
+                values: 11,
+                weights: 11
+            }
+        );
+    }
+
+    /// Default placement at low memory pressure: the index's runs are all in memory, so the
+    /// reads are memory reads and nothing is decoded.
+    #[test]
+    fn session_worked_transaction_default_arm() -> Result<()> {
+        let observed = run_arm(Arm::Default)?;
+        check(&observed);
+        assert_eq!(observed.old_runs[0].0, BatchLocation::Memory);
+        assert_eq!(observed.dlt.0, BatchLocation::Memory);
+        assert_eq!(observed.files.after_transaction, observed.files.at_start);
+        Ok(())
+    }
+
+    /// A 1 MiB target, with the wait for high pressure, as the native test. The layout of `Old`
+    /// and `Dlt` is whatever that pressure produces; it is printed, and the reads are checked
+    /// against it, not against a layout chosen here.
+    #[test]
+    fn session_worked_transaction_pressured_arm() -> Result<()> {
+        let observed = run_arm(Arm::Pressured)?;
+        assert!(
+            observed.pressures.at_start >= feldera_types::memory_pressure::MemoryPressure::High
+        );
+        check(&observed);
         Ok(())
     }
 }
