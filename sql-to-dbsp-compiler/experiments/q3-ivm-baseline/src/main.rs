@@ -3200,3 +3200,190 @@ mod net_delta_tests {
         Ok(())
     }
 }
+
+/// The worked transaction of `docs/design/merged-index/shared-traversal.md` in native mode: the
+/// view worker's run reads, to compare with the scan session's on the same rows
+/// (`session_run_reads_on_the_native_layout_*` in `merged-index-col/src/q3/tests.rs`). It runs
+/// in the native build, since the view circuit of the `merged-index` build reads the index.
+#[cfg(all(test, not(feature = "merged-index")))]
+mod native_worked_transaction_tests {
+    use super::*;
+
+    fn customer(key: i64, segment: &str) -> Customer {
+        Customer {
+            key,
+            segment: segment.to_owned(),
+        }
+    }
+
+    fn order(key: i64, customer_key: i64) -> Order {
+        Order {
+            key,
+            customer_key,
+            date: "1996-01-02".to_owned(),
+            ship_priority: 0,
+        }
+    }
+
+    fn line(order_key: i64, number: i32) -> Line {
+        Line {
+            order_key,
+            number,
+            price_cents: 100,
+            discount_hundredths: 4,
+            ship_date: "1996-03-13".to_owned(),
+        }
+    }
+
+    /// The files under `path`.
+    fn files_under(path: &Path) -> Result<usize> {
+        let mut files = 0;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            files += if entry.file_type()?.is_dir() {
+                files_under(&entry.path())?
+            } else {
+                1
+            };
+        }
+        Ok(files)
+    }
+
+    /// What one arm of the test observed.
+    struct Observed {
+        /// The view worker's run reads in the transaction, per read owner.
+        reads: [RunReads; 3],
+        /// The files in the storage directory when the pipeline is built, after the load, and
+        /// after the transaction. They show whether the runs are in files.
+        files_at_start: usize,
+        files_after_load: usize,
+        files_after_transaction: usize,
+    }
+
+    /// Loads the old state, then runs the worked transaction, with the runtime under high memory
+    /// pressure (`pressured`) or not.
+    fn run_arm(name: &str, pressured: bool) -> Result<Observed> {
+        use feldera_types::memory_pressure::MemoryPressure;
+
+        let storage = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/native-worked-transaction")
+            .join(format!("{}-{name}", std::process::id()));
+        let config = Config {
+            workers: 1,
+            cache_bytes: Some(64 * 1024 * 1024),
+            // A target far below the process's size keeps the runtime under pressure for good.
+            memory_target_bytes: pressured.then_some(1024 * 1024),
+            ..Config::default()
+        };
+        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
+        if pressured {
+            measurement::drain_until(Duration::from_secs(30), || {
+                Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
+            })
+            .context("the runtime did not come under memory pressure")?;
+        }
+        let files_at_start = files_under(&storage)?;
+        let mut state = Reference::default();
+
+        // The old state: c5 with orders o3 and o4 (lines l7 and l8 under o3, l9 under o4), and
+        // customers c6 and c7.
+        let mut loading = Measurements::default();
+        transact(
+            &mut pipeline,
+            &mut state,
+            Change {
+                customers: vec![
+                    (customer(5, "BUILDING"), true),
+                    (customer(6, "BUILDING"), true),
+                    (customer(7, "BUILDING"), true),
+                ],
+                orders: vec![(order(3, 5), true), (order(4, 5), true)],
+                lines: vec![(line(3, 7), true), (line(3, 8), true), (line(4, 9), true)],
+            },
+            true,
+            &mut loading,
+        )?;
+        let files_after_load = files_under(&storage)?;
+
+        // The transaction: c5 replaced, and o5 added with l10 and l11.
+        let mut stats = Measurements::default();
+        transact(
+            &mut pipeline,
+            &mut state,
+            Change {
+                customers: vec![
+                    (customer(5, "BUILDING"), false),
+                    (customer(5, "AUTOMOBILE"), true),
+                ],
+                orders: vec![(order(5, 5), true)],
+                lines: vec![(line(5, 10), true), (line(5, 11), true)],
+            },
+            true,
+            &mut stats,
+        )?;
+        Ok(Observed {
+            reads: stats.view_reads,
+            files_at_start,
+            files_after_load,
+            files_after_transaction: files_under(&storage)?,
+        })
+    }
+
+    /// Default placement at low memory pressure: every run is in memory, so the reads are
+    /// memory reads and nothing is decoded.
+    ///
+    /// Derivation. The view circuit is two incremental joins, `J = C ⋈ O` (keyed by custkey) and
+    /// `V = L ⋈ J` (keyed by orderkey). Each join probes the other side's trace once for each
+    /// key of each delta, so the seeks are: `ΔC` (key c5) into O, `ΔO` (c5) into C, `ΔJ` (keys
+    /// o3, o4, and o5, produced by the first join) into L, and `ΔL` (o5) into J. That is 1 + 1 +
+    /// 3 + 1 = 7 seeks, which is what the test measures, so each trace is one run. The key, value, and
+    /// weight reads are the totals the traces' cursors make; they are pinned as measured, and
+    /// they are the same numbers as the decodes of the file arm. Not derived per operation.
+    #[test]
+    fn worked_transaction_in_memory() -> Result<()> {
+        let observed = run_arm("memory", false)?;
+        assert_eq!(observed.files_after_load, observed.files_at_start);
+        assert_eq!(observed.files_after_transaction, observed.files_at_start);
+        let [query, base_relation, merged_index] = observed.reads;
+        assert_eq!(
+            query,
+            RunReads {
+                seeks: 7,
+                memory_key_reads: 16,
+                memory_value_reads: 41,
+                memory_weight_reads: 38,
+                ..RunReads::default()
+            }
+        );
+        assert_eq!(base_relation, RunReads::default());
+        assert_eq!(merged_index, RunReads::default());
+        Ok(())
+    }
+
+    /// High memory pressure from before the load, so that the traces' runs are in files: the
+    /// same probes, and the same numbers as decodes. One of the seven probes is answered by a
+    /// run's filter, so it counts a filter rejection and no seek: 6 seeks and 1 rejection. The
+    /// probe is probably `ΔJ`'s of order o5 in L, which has no line item of o5 yet; the test
+    /// does not check which one it is.
+    #[test]
+    fn worked_transaction_in_files() -> Result<()> {
+        let observed = run_arm("files", true)?;
+        assert!(observed.files_after_load > observed.files_at_start);
+        assert!(observed.files_after_transaction > observed.files_after_load);
+        let [query, base_relation, merged_index] = observed.reads;
+        assert_eq!(
+            query,
+            RunReads {
+                seeks: 6,
+                filter_rejections: 1,
+                key_decodes: 16,
+                value_decodes: 41,
+                weight_decodes: 38,
+                ..RunReads::default()
+            }
+        );
+        assert_eq!(base_relation, RunReads::default());
+        assert_eq!(merged_index, RunReads::default());
+        Ok(())
+    }
+}

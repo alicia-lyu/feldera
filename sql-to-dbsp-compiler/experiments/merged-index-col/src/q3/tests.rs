@@ -888,6 +888,77 @@ fn session_run_reads_on_the_worked_transaction() {
     });
 }
 
+/// The session on the worked transaction over `Old` in native's layout: one run holding all
+/// eight old keys (c5, o3, l7, l8, o4, l9, c6, c7), in memory or in a file. The native view
+/// circuit's traces are one run each after the load (see
+/// `native_worked_transaction_tests` in the harness), so this is the layout that the native
+/// counts are read from. `Dlt` is the transaction's delta, in memory.
+fn assert_session_on_the_native_layout(old_in_file: bool, expected: RunReads) {
+    in_storage_runtime(move || {
+        let (_, _, dlt) = worked_runs();
+        let all_old = build_batch(vec![
+            customer(5, "old", 1),
+            order(5, 3, 10, 1),
+            line(5, 3, 7, 100, 1),
+            line(5, 3, 8, 100, 1),
+            order(5, 4, 10, 1),
+            line(5, 4, 9, 100, 1),
+            customer(6, "other", 1),
+            customer(7, "later", 1),
+        ])
+        .unwrap();
+        let all_old = if old_in_file {
+            file_run(&all_old)
+        } else {
+            all_old
+        };
+        assert_eq!(
+            all_old.location(),
+            if old_in_file {
+                BatchLocation::Storage
+            } else {
+                BatchLocation::Memory
+            }
+        );
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            StoredPayload,
+            i64,
+        >();
+        let old = SourceSnapshot::with_batches(&factories, vec![Arc::new(all_old)]);
+        let ((groups, counts), index, other) = maintain_col(&old, &dlt, Pass::Seek, false);
+
+        // One group, c5, with the buffers of the worked transaction, and the same positions
+        // as over the layout of the test above: c5 at open, six steps, c6 ends the group.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, prefix_custkey(5));
+        assert_eq!(buffered(&groups[0].1), [(1, 2), (2, 1), (3, 2)]);
+        assert_eq!((counts.logical_seeks, counts.logical_steps), (0, 6));
+        assert_eq!(counts.positions, 7);
+        assert_eq!(other, RunReads::default());
+        assert_eq!(index, expected);
+    });
+}
+
+/// `Old` in one memory run, as in native with default placement at low memory pressure.
+///
+/// Memory reads of `Old`'s run: its keys are the seven positions (c5 at open, then six steps;
+/// c7 is never reached), so 7 key reads; the six taken entries are 6 value and 6 weight reads.
+/// `Dlt` adds its 4 keys, 5 values, and 5 weights, as in the test above. In all: 11 keys, 11
+/// values, 11 weights, no seek, and nothing decoded.
+#[test]
+fn session_run_reads_on_the_native_layout_in_memory() {
+    assert_session_on_the_native_layout(false, with_memory(reads(0, 0, 0, 0, 0), 11, 11, 11));
+}
+
+/// `Old` in one file, as in native under high memory pressure. The file run decodes what the
+/// memory run read: 7 keys, 6 values, 6 weights. `Dlt` is still in memory: 4 keys, 5 values, and
+/// 5 weights.
+#[test]
+fn session_run_reads_on_the_native_layout_in_a_file() {
+    assert_session_on_the_native_layout(true, with_memory(reads(0, 0, 7, 6, 6), 4, 5, 5));
+}
+
 /// The A/B of the `Pass` knob on one transaction with untouched customers
 /// between the touched ones and a segment filter.
 ///

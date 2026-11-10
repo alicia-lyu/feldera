@@ -380,8 +380,29 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      | Value decodes | 6 | 22 |
      | Weight decodes | 6 | 19 |
      | Payload decodes from `Old` | 6 | |
+     | Memory key reads (`M`, `Dlt`) | 5 | 11 |
+     | Memory value reads | 5 | 8 |
+     | Memory weight reads | 5 | 8 |
      | Payload decodes from `Dlt` | 5 | |
      | Logical seeks, steps, positions | 0, 6, 7 | |
+
+     *Added 2026-11-10:* the memory reads. The session reads `M`'s key at the opening and `Dlt` whole (4 keys, 5 values, 5 weights).
+
+     **Pinned: native and the session on the same rows** (*added 2026-11-10*). The native side is the view worker's run reads in the worked transaction, in the harness's native build (`native_worked_transaction_tests` in `q3-ivm-baseline/src/main.rs`): the old state is loaded (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`, `c6`, `c7`) and the transaction replaces `c5` and adds `o5` with `l10` and `l11`. The session side is `Maintain` over an `Old` of one run holding the same eight keys, which is the layout of a native trace after one load transaction (`session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file` in `merged-index-col/src/q3/tests.rs`). Both arms use DBSP's default placement. The memory arm runs at low memory pressure, where every run is in memory (the storage directory gains no file). The file arm waits until the runtime reports high memory pressure before the load, as `append_one_file_run_to_the_index` does, so that the runs are files (the directory gains files in the load and in the transaction).
+
+     | Reading | Layout | Seeks | Filter rejections | Key | Value | Weight | Memory key | Memory value | Memory weight |
+     | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+     | Native, view worker | memory | 7 | 0 | 0 | 0 | 0 | 16 | 41 | 38 |
+     | Native, view worker | files | 6 | 1 | 16 | 41 | 38 | 0 | 0 | 0 |
+     | Session | memory | 0 | 0 | 0 | 0 | 0 | 11 | 11 | 11 |
+     | Session | `Old` in a file, `Dlt` in memory | 0 | 0 | 7 | 6 | 6 | 4 | 5 | 5 |
+
+     How to read the table:
+
+     - *Native counts the whole of `V`'s maintenance*: both joins, all four traces. Each join probes the other side's trace once for each key of each delta: `ΔC` (`c5`) into O, `ΔO` (`c5`) into C, `ΔJ` (`o3`, `o4`, `o5`) into L, and `ΔL` (`o5`) into J. That is 1 + 1 + 3 + 1 = 7 probes, and the measured seeks are 7 in memory. In files one probe is answered by a run's filter (it counts a rejection and no seek, so 6 + 1); it is probably `ΔJ`'s probe of `o5` in L, which has no line item of `o5` yet, but the test does not check which one. The key, value, and weight counts (16, 41, 38) are the totals that the traces' cursors make, pinned as measured. They are not derived per operation.
+     - *The session counts only the traversal*: the old entries of the one touched group (7 positions, 6 entries taken) and the delta. Evaluating the delta rules over the buffers reads nothing more.
+     - *Placement does not change the counts*, only their kind: native's file arm decodes exactly the numbers that its memory arm reads (16, 41, 38), and the session's `Old` decodes in a file (7, 6, 6) what it reads in memory (7, 6, 6, inside the 11, 11, 11). The delta stays in memory in both of the session's arms, and native's step batches are not counted, since they are not indexed Z-set runs of a trace.
+     - *Native reads 16 keys, 41 values, and 38 weights, against the session's 7, 6, and 6 old reads* (11 keys, 11 values, and 11 weights, with `Dlt`). The comparison is of the two designs on one transaction at this tiny scale, not a claim about a workload: a measurement needs a raw artifact (see CLAUDE.md).
 
      **Pinned: the A/B.** `Old` has 18 keys (17 in a file run, `c7` in a memory run) over customers `c3`, `c5`, `c6`, `c7`, `c8`, `c9`. `Dlt` touches `c5` (old entries `c5`, `o3`, `l7`, `l8`, `o4`, `l9`; delta entries `-c5`, `+c5'`, `o5`, `l10`, `l11`), `c8` (a delta line item; its old customer is rejected by the segment filter, so its order and line item are passed unread), and `c10` (past the end of `Old`). Both passes buffer the same entries, and decode seven old payloads, eight delta payloads, seven values, and seven weights:
 
