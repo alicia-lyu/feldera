@@ -1495,6 +1495,27 @@ fn cache_mib(cache_bytes: Option<usize>) -> Option<usize> {
     cache_bytes.map(|bytes| bytes / (1024 * 1024))
 }
 
+/// The storage options of the runtime. The harness leaves DBSP's run placement at its defaults
+/// (user decision of 2026-11-09): memory pressure, from the cgroup and RSS targets, decides what
+/// reaches disk, as in a pipeline. `min_storage_bytes` and `min_step_storage_bytes` stay unset.
+fn storage_options(config: &Config) -> StorageOptions {
+    StorageOptions {
+        cache_mib: cache_mib(config.cache_bytes),
+        compression: feldera_types::config::StorageCompression::None,
+        ..StorageOptions::default()
+    }
+}
+
+/// The `min_storage_bytes` that the runtime applies: the option if set, else DBSP's default.
+/// At low memory pressure a merge output below it stays in memory and inserted batches stay in
+/// memory; moderate pressure spills every merge output, and high pressure every inserted batch
+/// (`Runtime::min_merge_storage_bytes` and `Runtime::min_insert_storage_bytes`).
+fn resolved_min_storage_bytes(options: &StorageOptions) -> usize {
+    options
+        .min_storage_bytes
+        .unwrap_or(Runtime::DEFAULT_MIN_STORAGE_BYTES)
+}
+
 /// The configuration of the runtime that hosts both circuits: one storage directory, one buffer
 /// cache, and the memory-pressure target.
 fn runtime_config(config: &Config, storage_path: Option<&Path>) -> Result<CircuitConfig> {
@@ -1512,12 +1533,7 @@ fn runtime_config(config: &Config, storage_path: Option<&Path>) -> Result<Circui
                 path: path.to_string_lossy().into_owned(),
                 cache: StorageCacheConfig::FelderaCache,
             },
-            StorageOptions {
-                min_storage_bytes: Some(0),
-                cache_mib: cache_mib(config.cache_bytes),
-                compression: feldera_types::config::StorageCompression::None,
-                ..StorageOptions::default()
-            },
+            storage_options(config),
         )?));
     }
     Ok(circuit_config)
@@ -1817,7 +1833,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 6,
+        "measurement_version": 7,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -1830,8 +1846,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 "storage_path": storage_root, "cache_mib": cache_mib(config.cache_bytes),
                 "note": "One runtime hosts the base and the view circuit, with one storage directory and one buffer cache of cache_bytes. The phases are told apart by transaction boundaries (base commits before the view transaction starts), with the CPU profiler's per-circuit step CPU time as a cross-check.",
             },
-            "cache": "feldera_cache", "compression": "none", "min_storage_bytes": 0,
+            "cache": "feldera_cache", "compression": "none",
+            "min_storage_bytes": resolved_min_storage_bytes(&storage_options(config)),
+            "min_storage_bytes_source": "DBSP default; the harness sets no value",
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
+            "run_placement": "default: at low memory pressure a merge output below min_storage_bytes stays in memory and inserted batches stay in memory; moderate pressure spills every merge output, high pressure every inserted batch",
             "native_join_fetch": false, "compaction_timeout_secs": config.compaction_timeout_secs,
             "compaction_policy": if config.setup_full_compaction {
                 "setup full compaction after loading, before the refreshes; no compaction requested after any refresh; no final wait"
@@ -2703,7 +2722,9 @@ mod measurement_tests {
             runs: 1,
             batch: 2,
             cache_bytes: Some(8 * 1024 * 1024),
-            memory_target_bytes: Some(512 * 1024 * 1024),
+            // Far below the process's size: with default placement only memory pressure puts runs in
+            // files at this tiny scale, and a target this low keeps the runtime under pressure.
+            memory_target_bytes: Some(1024 * 1024),
             compaction_timeout_secs: 10.0,
             verify: true,
             r5: true,
@@ -2753,7 +2774,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 6);
+        assert_eq!(output["measurement_version"], 7);
         // Version 5 adds the merged index's run reads per reader, and where its runs were.
         const READERS: [&str; 4] = [
             "customers_after",
@@ -2846,8 +2867,9 @@ mod measurement_tests {
             .is_none());
         assert!(output["sequence"].get("settled_storage_bytes").is_none());
         assert!(output["sequence"].get("background_merge_wait_ms").is_none());
+        // The runtime is under memory pressure, so the loaded runs are in files.
         assert!(
-            output["load"]["catalog_storage"]["CUSTOMER"]["memory_batch_count"]
+            output["load"]["catalog_storage"]["CUSTOMER"]["storage_batch_count"]
                 .as_u64()
                 .unwrap()
                 > 0
@@ -2953,12 +2975,13 @@ mod measurement_tests {
         run(&config, 1)?;
         let single: Value = serde_json::from_reader(File::open(config.report.as_ref().unwrap())?)?;
         let lines = &single["sequence"]["catalog_storage"]["LINEITEM"];
+        // Default placement under memory pressure puts the runs in files. Whether a run that
+        // arrived before the first pressure sample stays in memory is a race, so the test pins
+        // only that files exist.
         assert!(lines["storage_batch_count"].as_u64().unwrap() > 0);
-        assert!(lines["memory_batch_count"].as_u64().unwrap() > 0);
-        assert_eq!(lines["file_backed"], false);
         #[cfg(feature = "merged-index")]
         assert!(
-            single["sequence"]["manual_index_storage"]["memory_batch_count"]
+            single["sequence"]["manual_index_storage"]["storage_batch_count"]
                 .as_u64()
                 .unwrap()
                 > 0

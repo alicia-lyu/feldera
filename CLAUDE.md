@@ -104,6 +104,7 @@ The COL library tests with `cargo +1.96.1 test --offline --locked` in its own di
 ### Contracts that the code enforces but the docs omit
 
 - **One worker.** Maintenance and initial loading both use one DBSP worker; this is the user's decision of 2026-10-12. Reconstructed mode and R5 runs reject any other count in `main.rs`.
+- **Default run placement.** Both modes use DBSP's default placement (user decision of 2026-11-09; measurement version 7): `storage_options` in `main.rs` sets no `min_storage_bytes` or `min_step_storage_bytes`, and memory pressure decides what reaches disk. At low pressure runs stay in memory below `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB), so a smoke-scale run has no file runs; a test that needs them forces memory pressure (`append_one_file_run_to_the_index`). The report gives the resolved value. `merged-index-col/src/storage_tests.rs` keeps `Some(0)` because it builds file runs on purpose.
 - **Transactions.** A DBSP transaction is `start_transaction`, any number of `step()` calls, then `commit_transaction`. It is not an OLTP commit: outputs appear at commit and the logical clock advances once.
   - A transaction runs on the base circuit, then on the view circuit. Wrap the view circuit's transaction in `Q3State::publish(before, after, placements)` and `finish()`.
   - The join readers run once, at the commit flush. Steps inside one transaction share one publish, but separate transactions cannot share one.

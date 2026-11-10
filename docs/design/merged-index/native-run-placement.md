@@ -143,9 +143,9 @@ obsolete memory runs.
 
 ### The harness's override
 
-The R5 harness's `runtime_config` (`sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs`) sets `min_storage_bytes: Some(0)`. It dates from commit `5ac3a8769` (2026-10-01) and was not recorded as a decision until 2026-11-09. It sets the merge threshold to 0, so every merge output goes to a file, however small, while inserted runs follow `min_insert_storage_bytes` and stay in memory at low pressure. Measurements through version 6 therefore ran with a placement that default DBSP never produces at low pressure.
+The R5 harness's `runtime_config` (`sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs`) set `min_storage_bytes: Some(0)` through measurement version 6. It dates from commit `5ac3a8769` (2026-10-01) and was not recorded as a decision until 2026-11-09. It set the merge threshold to 0, so every merge output went to a file, however small, while inserted runs followed `min_insert_storage_bytes` and stayed in memory at low pressure. Measurements through version 6 therefore ran with a placement that default DBSP never produces at low pressure.
 
-The user decided on 2026-11-09 to use the default placement in both modes; see [decisions.md](decisions.md). The harness will drop the override (planned, with measurement version 7), and memory pressure will decide what reaches disk. `merged-index-col/src/storage_tests.rs` keeps its own setting because it builds file runs on purpose.
+The user decided on 2026-11-09 to use the default placement in both modes; see [decisions.md](decisions.md). Measurement version 7 drops the override: `storage_options` in `main.rs` leaves `min_storage_bytes` and `min_step_storage_bytes` unset, and memory pressure decides what reaches disk. The report gives the resolved value, `configuration.min_storage_bytes` (`Runtime::DEFAULT_MIN_STORAGE_BYTES`, 10 MiB), with `min_storage_bytes_source` and `run_placement`. At the harness's smoke scale no merge output reaches 10 MiB, so a run under low memory pressure keeps every run in memory; the tests that need file runs force memory pressure. `merged-index-col/src/storage_tests.rs` keeps its own setting because it builds file runs on purpose.
 
 ## Memory pressure
 

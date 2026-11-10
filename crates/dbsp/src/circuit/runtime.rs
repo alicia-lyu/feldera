@@ -1298,6 +1298,12 @@ impl Runtime {
         self.inner().memory_pressure_notify.clone()
     }
 
+    /// The `min_storage_bytes` that applies when the storage options leave it
+    /// unset. At low memory pressure a merge output below it stays in memory;
+    /// at moderate pressure the foreground spills inserted batches at or above
+    /// it.
+    pub const DEFAULT_MIN_STORAGE_BYTES: usize = 10 * 1024 * 1024;
+
     /// Returns the minimum number of bytes in a batch produced by a merge operator to spill it to storage.
     ///
     /// The output is determined by the current memory pressure level and the user-configured `min_storage_bytes` option.
@@ -1318,11 +1324,14 @@ impl Runtime {
             if inner.memory_pressure() >= MemoryPressure::Moderate {
                 Some(0)
             } else {
-                Some(storage.options.min_storage_bytes.unwrap_or({
-                    // This reduces the files stored on disk to a reasonable number.
-
-                    10 * 1024 * 1024
-                }))
+                // The default reduces the files stored on disk to a reasonable
+                // number.
+                Some(
+                    storage
+                        .options
+                        .min_storage_bytes
+                        .unwrap_or(Self::DEFAULT_MIN_STORAGE_BYTES),
+                )
             }
         })
     }
@@ -1352,7 +1361,7 @@ impl Runtime {
                     storage
                         .options
                         .min_storage_bytes
-                        .unwrap_or(10 * 1024 * 1024),
+                        .unwrap_or(Self::DEFAULT_MIN_STORAGE_BYTES),
                 )
             } else {
                 // When there is no memory pressure, we leave it to the merger to write the batches to storage
