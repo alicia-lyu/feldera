@@ -399,7 +399,7 @@ The user confirmed on 2026-11-10:
 
 - The field names `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see "2026-11-09: In-memory runs count their accesses").
 - A memory run's value counts once per position, mirroring the file cursor's laziness: a `Cell<bool>` that every key move clears and every value move sets.
-- The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads, and checks that files exist.
+- The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads. *Amended on 2026-11-10 (see the entry below):* the arm is now the pressured arm of both sides, and no test asserts that files exist or where a run is; each reports its layout.
 - `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB) is a public constant, so that the harness can report the resolved default (see "2026-11-09: DBSP's default placement in both modes").
 - The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
 - The native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
@@ -411,7 +411,25 @@ The user confirmed on 2026-11-10:
 - The publication change shares measurement version 7 with the default run placement, since no run at version 7 had been measured.
 - `index_layout` keeps its `before` and `after` keys; `after` is the layout of `Old`'s runs plus `Dlt`, the view that the after reads take.
 - An empty `Dlt` adds no run to the after view.
-- The after reads take `Dlt` from memory, never from a file the spine spilled, so their counts can move from file decodes to `memory_*` reads.
+- The after reads take `Dlt` from memory, never from a file the spine spilled, so their counts can move from file decodes to `memory_*` reads. *Amended on 2026-11-10 (see the next entry):* `Dlt` follows step placement, so at Critical memory pressure it is a file.
+
+### 2026-11-10: One memory-pressure mechanism for both sides of the worked-transaction comparison
+
+The user decided on 2026-11-10:
+
+- The comparison is fair when both sides run under the same memory-pressure mechanism and configuration, wherever that mechanism puts their runs. Old state need not be in files, and deltas need not be in memory. The harness reports the layout each side got and does not assert one.
+- Pressure is not relieved by hand before the transaction, since that is not a realistic workload.
+- No further work imitates a typical placement (old state in files, delta in memory). The counters are read now, with their limits stated, until a full realistic workload runs.
+
+The user also confirmed on 2026-11-10:
+
+- `build_batch` (`crates/dbsp/src/trace/merged_index/batch.rs`) drops its fixed `BatchLocation::Memory`. A delta batch is placed as an operator's output is, by `BuildTo::for_capacity` (`min_step_storage_bytes`, zero at Critical memory pressure). This changes where today's reconstructed readers find `Dlt`, but only at Critical pressure. It amends "2026-11-10: The step-3 publication of `(Old, Dlt)`": the after reads take `Dlt` itself, which is in memory unless the runtime is at Critical pressure, where it is a file.
+- The two COL tests that hand-placed `Old` as one run in memory or in a file (`session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file`) are deleted. The harness's `session_worked_transaction_tests` replaces them. `session_run_reads_on_the_worked_transaction` and the COL counter tests of today's readers stay.
+
+Choices the user has not confirmed (see "Unconfirmed choices" in [shared-traversal.md](shared-traversal.md)):
+
+- The session's worked transaction runs on the base circuit and the index, not on the view circuit, because the reconstructed readers reject a change of `c5` without an order row.
+- The native layout is reported from the reads (memory reads or decodes) and the file counts, not from an inventory of the circuit's spines.
 
 ## Superseded and withdrawn
 

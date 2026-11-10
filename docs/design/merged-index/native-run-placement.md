@@ -56,6 +56,16 @@ unlimited, so operators build runs in memory. Only at Critical memory pressure
 does it drop to zero; nonempty runs are then written to a file from their
 first record.
 
+The merged index's delta follows the same threshold (user decision of
+2026-11-10). `build_batch` in `trace/merged_index/batch.rs` fixes no location,
+so the delta run of a transaction is placed by `BuildTo::for_capacity` like an
+operator's output: in memory unless the runtime is at Critical memory
+pressure. The index's `Spine` places the inserted run by
+`min_insert_storage_bytes`, as it places a native trace's. The worked-transaction
+tests (`native_worked_transaction_tests`, `session_worked_transaction_tests`)
+put both sides under the same pressure and report the layout each got; see
+[shared-traversal.md](shared-traversal.md).
+
 ## Levels
 
 A run's level depends only on its record count (`Spine::size_to_level` in

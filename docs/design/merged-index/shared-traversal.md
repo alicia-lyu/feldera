@@ -475,7 +475,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 3. **Publish `(Old, Dlt)`, and read the after state as the overlay.** *Done 2026-11-10.*
    - `ManualIndex::append` returns `(Old, Dlt)`: the snapshot before the append and the appended run, which the spine shares. `Q3State::publish(old, dlt, placements)` replaces the two snapshots.
    - The four readers are not rewritten, since step 5 replaces them. `Q3State` builds their after view as `Old`'s runs with `Dlt` as one more run (none when `Dlt` is empty), and the after readers read it through `CursorList`, which consolidates across runs. That gives the same Z-set as `Old ⊎ Dlt` (`prop:overlay`). The session reads the two apart.
-   - The COL baseline already modeled the after state as `Old` plus `Dlt`, so its counts are unchanged. In the harness, the after reads now take `Dlt` from memory, never from a file the spine spilled, so the after readers' counts can move from file decodes to `memory_*` reads (measurement version 7).
+   - The COL baseline already modeled the after state as `Old` plus `Dlt`, so its counts are unchanged. In the harness, the after reads now take `Dlt` itself, not a copy that the spine may have spilled, so the after readers' counts can move from file decodes to `memory_*` reads (measurement version 7). `Dlt` follows step placement (2026-11-10): it is in memory unless the runtime is at Critical memory pressure, where it is a file.
    - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone. `after_reads_overlay_dlt_on_old` (COL) pins the overlay and the accessors.
 4. **Hand-written view circuit.**
    - The view side reads its inputs from `Dlt` (still RF1/RF2), each row keyed by its full trie path.
@@ -517,3 +517,5 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
+- The worked-transaction session test runs the transaction on the base circuit and the index, not on the view circuit, since the reconstructed readers reject a change of `c5` without an order row.
+- The native layout is reported from the reads (memory reads or decodes) and the storage directory's file counts. A `spine_contents` inventory is not used: the diagnostics registry is process-global, so spines of tests that run in parallel would mix.
