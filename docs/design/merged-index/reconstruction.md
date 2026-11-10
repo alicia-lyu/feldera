@@ -38,18 +38,18 @@ The reconstructed joins call their readers once, at the commit flush. In `JoinTr
 Per transaction, the harness does the following in order (`q3-ivm-baseline/src/main.rs`):
 
 1. `prepare` the change: validate it (`BaseState::validate`, `workload.rs`) and build the index rows and the placement map (`reconstruction::prepare`).
-2. `ManualIndex::append` the rows. It yields the `before` and `after` snapshots.
-3. `Q3State::publish(before, after, placements)`.
+2. `ManualIndex::append` the rows. It yields `Old`, the snapshot before the append, and `Dlt`, the appended run.
+3. `Q3State::publish(old, dlt, placements)`. Before reads take `Old`; after reads take `Old ⊎ Dlt`, `Old`'s runs with `Dlt` as one more run (`prop:overlay`), so no after snapshot is taken (2026-11-10).
 4. Run the transaction.
 5. `Q3State::finish()`.
 
-`publish` returns an error if a previous publication has not been finished; `finish` returns an error if nothing was published (`merged-index-col/src/q3.rs`). Consequently several transactions cannot share one publication: each has its own before and after.
+`publish` returns an error if a previous publication has not been finished; `finish` returns an error if nothing was published (`merged-index-col/src/q3.rs`). Consequently several transactions cannot share one publication: each has its own `Old` and `Dlt`.
 
 The test `published_views_cover_multiple_transaction_steps` (`q3-ivm-baseline/src/main.rs`) covers one transaction with two steps under a single publish: Orders in the first step, Lineitems in the second.
 
 To batch more changes, use one larger transaction. Its full change set must be known before it starts, because the index is updated first.
 
-The merged index is owned by `ManualIndex` on an auxiliary thread of the runtime that hosts the base and view circuits (with that runtime's buffer cache and storage directory, which the index readers share), outside the Q3 graph. `append` builds the transaction's index rows, adds them to the index, and returns the immutable before and after snapshots, which `publish` hands to the readers together with the placement map. The index uses the native `Spine`. `ManualIndex::save` and `restore` can take a checkpoint UUID, but the harness no longer checkpoints: one runtime hosts both circuits, `init_circuits` rejects an initial checkpoint for several circuits, and the checkpoint test of the two-runtime pipeline was removed on 2026-11-05. Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
+The merged index is owned by `ManualIndex` on an auxiliary thread of the runtime that hosts the base and view circuits (with that runtime's buffer cache and storage directory, which the index readers share), outside the Q3 graph. `append` builds the transaction's index rows, adds them to the index, and returns `Old` and `Dlt`, which `publish` hands to the readers together with the placement map. The index uses the native `Spine`. `ManualIndex::save` and `restore` can take a checkpoint UUID, but the harness no longer checkpoints: one runtime hosts both circuits, `init_circuits` rejects an initial checkpoint for several circuits, and the checkpoint test of the two-runtime pipeline was removed on 2026-11-05. Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
 
 ## Placement map
 

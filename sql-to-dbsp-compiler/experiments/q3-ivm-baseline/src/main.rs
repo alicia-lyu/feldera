@@ -564,16 +564,17 @@ fn transact_inner(
         let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
         stats.preparation += preparation_started.elapsed();
         let index_started = Instant::now();
-        let appended = pipeline.index.append(index_rows)?;
+        let (old, dlt) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         let publish_started = Instant::now();
+        // The after reads take `Old`'s runs and `Dlt`, which is placed like an operator's output.
         stats.index_layout = Some(json!({
-            "before": reconstruction::snapshot_layout(&appended.before),
-            "after": reconstruction::snapshot_layout(&appended.after),
+            "before": reconstruction::runs_layout(old.batches()),
+            "after": reconstruction::runs_layout(old.batches().iter().chain([&dlt])),
         }));
         pipeline
             .q3_state
-            .publish(appended.before, appended.after, placements)
+            .publish(old, dlt, placements)
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
@@ -749,15 +750,15 @@ fn run_base(
     workload::net_delta(&pipeline.base.catalog)
 }
 
-/// Appends the net delta to the merged index and publishes the before and after snapshots,
-/// as `transact_inner` does before the view circuit runs.
+/// Appends the net delta to the merged index and publishes `Old` and `Dlt`, as
+/// `transact_inner` does before the view circuit runs.
 #[cfg(all(test, feature = "merged-index"))]
 fn publish_net_delta(pipeline: &Pipeline, net_delta: &Change) -> Result<()> {
     let (placements, index_rows) = reconstruction::prepare(net_delta)?;
-    let appended = pipeline.index.append(index_rows)?;
+    let (old, dlt) = pipeline.index.append(index_rows)?;
     pipeline
         .q3_state
-        .publish(appended.before, appended.after, placements)
+        .publish(old, dlt, placements)
         .map_err(anyhow::Error::msg)
 }
 
@@ -1380,7 +1381,7 @@ fn finish_loading(
         let snapshot = pipeline.index.snapshot()?;
         pipeline
             .q3_state
-            .publish(snapshot.clone(), snapshot, BTreeMap::new())
+            .publish(snapshot, reconstruction::empty_run()?, BTreeMap::new())
             .map_err(anyhow::Error::msg)?;
     }
     let base_transaction = pipeline.base.circuit.transaction();
@@ -2486,11 +2487,10 @@ mod reconstructed_tests {
         Ok(())
     }
 
-    /// An append returns the run it appended, beside the snapshots around it: the snapshot
-    /// before lacks the rows, the one after has them, and with no memory pressure the run is
-    /// built in memory.
+    /// An append returns `Old`, the snapshot before it, and `Dlt`, the run it appended. With no
+    /// memory pressure the run is built in memory.
     #[test]
-    fn append_returns_the_appended_run_as_dlt() -> Result<()> {
+    fn append_returns_old_and_the_appended_run() -> Result<()> {
         use dbsp::trace::{BatchLocation, BatchReader};
 
         let mut pipeline = Pipeline::with_workers(1)?;
@@ -2501,15 +2501,15 @@ mod reconstructed_tests {
         };
         let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
         let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
-        let appended = pipeline.index.append(index_rows)?;
+        let (old, dlt) = pipeline.index.append(index_rows)?;
         let rows = |snapshot: &reconstruction::Snapshot| -> usize {
             snapshot.batches().iter().map(|run| run.len()).sum()
         };
-        assert_eq!(rows(&appended.before), 0);
+        assert_eq!(rows(&old), 0);
         // One customer, one order, and two line items.
-        assert_eq!(appended.dlt.len(), 4);
-        assert_eq!(rows(&appended.after), 4);
-        assert_eq!(appended.dlt.location(), BatchLocation::Memory);
+        assert_eq!(dlt.len(), 4);
+        assert_eq!(rows(&pipeline.index.snapshot()?), 4);
+        assert_eq!(dlt.location(), BatchLocation::Memory);
         Ok(())
     }
 
@@ -2569,9 +2569,10 @@ mod reconstructed_tests {
         };
         let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
         let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
-        let appended = pipeline.index.append(index_rows)?;
-        let runs: Vec<_> = appended
-            .after
+        pipeline.index.append(index_rows)?;
+        let runs: Vec<_> = pipeline
+            .index
+            .snapshot()?
             .batches()
             .iter()
             .filter(|run| !run.is_empty())
@@ -3700,13 +3701,12 @@ mod session_worked_transaction_tests {
         // delta, and this transaction replaces c5 without any order row, a change outside
         // RF1/RF2 that the readers reject by design (CLAUDE.md, "Placements and supported
         // changes"). The session needs only the index's `Old` and `Dlt`.
-        let (appended, pressures, files) =
+        let ((old, dlt), pressures, files) =
             run_load_and_transaction(&mut pipeline, &storage, |pipeline, state| {
                 let net_delta = run_base(pipeline, state, worked_change(), true)?;
                 let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
                 pipeline.index.append(index_rows)
             })?;
-        let (old, dlt) = (appended.before, appended.dlt);
         let old_runs: Vec<RunShape> = old
             .batches()
             .iter()

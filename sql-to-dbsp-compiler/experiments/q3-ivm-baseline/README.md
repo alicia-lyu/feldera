@@ -72,7 +72,7 @@ In reconstructed mode the harness maintains the merged index in `ManualIndex`, o
 circuits, on an auxiliary thread of the runtime that hosts both circuits (booked as base maintenance since
 measurement version 4). Per
 transaction it converts the base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
-publishes the before and after snapshots to the view circuit, which keeps them until its
+publishes `Old` (the index before the append) and `Dlt` (the appended run) to the view circuit, which keeps them until its
 consumers finish. The placement map (order → customer) is built from the Orders rows of that net
 delta, so only RF1 and RF2 are supported. The index is fed from the net delta and not from the
 driver's logical change, so a workload with upserts would feed it correctly too. The contract and its limits are in

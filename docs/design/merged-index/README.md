@@ -14,7 +14,7 @@ The prototype compares two modes:
   customer, order, and line identifiers (11, 20, and 25 bytes). A harness-side owner,
   `ManualIndex`, appends to the index outside the circuit on an auxiliary thread of the runtime that
   hosts both circuits (measurement version 4 books this upkeep as base maintenance). Before each
-  transaction it publishes before and after snapshots of the index. The join that consumes them is
+  transaction it publishes the index's snapshot before the transaction (`Old`) and the transaction's run (`Dlt`); after reads take `Old ⊎ Dlt`. The join that consumes them is
   the supplied-snapshot join, `dyn_join_generic_with_snapshot_readers` in
   `crates/dbsp/src/operator/dynamic/join.rs`; it builds no integrate or delay traces.
   The compiler option `--q3-merged-index` selects this mode.

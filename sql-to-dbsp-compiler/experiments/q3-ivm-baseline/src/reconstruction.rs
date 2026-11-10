@@ -31,26 +31,16 @@ type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
 type SourceRow = (Key, Payload, ZWeight);
 
-/// What one append left the index: the snapshots around it, and the appended run itself.
-pub(crate) struct Appended {
-    pub(crate) before: Snapshot,
-    pub(crate) after: Snapshot,
-    /// The transaction's delta, `Dlt` of the scan session. It is not the newest run of `after`:
-    /// the insert may rebuild that run, and a merge may fold it into another.
-    pub(crate) dlt: IndexBatch,
-}
-
-/// The snapshot after an append, and the run appended.
-type AppendedRuns = (Snapshot, IndexBatch);
 type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
 
 enum Request {
     BackgroundIdle(mpsc::SyncSender<bool>),
     StorageEvidence(mpsc::SyncSender<serde_json::Value>),
     Snapshot(mpsc::SyncSender<Snapshot>),
+    /// Builds the rows' run, `Dlt`, inserts it into the spine, and replies with it.
     Append(
         Vec<SourceRow>,
-        mpsc::SyncSender<Result<AppendedRuns, String>>,
+        mpsc::SyncSender<Result<Arc<IndexBatch>, String>>,
     ),
     Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
     Restore(StoragePath, mpsc::SyncSender<Result<(), String>>),
@@ -164,9 +154,10 @@ impl ManualIndex {
                             }
                             Ok(Request::Append(rows, reply)) => {
                                 let result = build_batch(rows).map(|batch| {
-                                    let dlt = batch.clone();
-                                    feldera_storage::tokio::TOKIO.block_on(trace.insert(batch));
-                                    (trace.ro_snapshot(), dlt)
+                                    let dlt = Arc::new(batch);
+                                    feldera_storage::tokio::TOKIO
+                                        .block_on(trace.insert(dlt.clone()));
+                                    dlt
                                 });
                                 let _ = reply.send(result);
                             }
@@ -222,11 +213,12 @@ impl ManualIndex {
         self.request(Request::Snapshot)
     }
 
-    pub(crate) fn append(&self, rows: Vec<SourceRow>) -> Result<Appended> {
-        let before = self.snapshot()?;
-        let appended = self.request(|reply| Request::Append(rows, reply))?;
-        let (after, dlt) = appended.map_err(anyhow::Error::msg)?;
-        Ok(Appended { before, after, dlt })
+    /// Appends `rows` and returns `(Old, Dlt)`: the snapshot before the append, and the
+    /// appended run. The index after the append is `Old + Dlt`.
+    pub(crate) fn append(&self, rows: Vec<SourceRow>) -> Result<(Snapshot, Arc<IndexBatch>)> {
+        let old = self.snapshot()?;
+        let dlt = self.request(|reply| Request::Append(rows, reply))?;
+        Ok((old, dlt.map_err(anyhow::Error::msg)?))
     }
 
     pub(crate) fn is_background_merge_idle(&self) -> Result<bool> {
@@ -280,12 +272,21 @@ fn check_on_runtime_cache(runtime: &Runtime) -> Result<(), String> {
     }
 }
 
-/// Where a snapshot's nonempty runs are: how many, and their approximate
-/// bytes, in files and in memory. Only file runs count key, value, and weight
+/// A `Dlt` with no entries, for a view transaction that changes no base table.
+pub(crate) fn empty_run() -> Result<Arc<IndexBatch>> {
+    Ok(Arc::new(
+        build_batch(Vec::new()).map_err(anyhow::Error::msg)?,
+    ))
+}
+
+/// Where nonempty runs are: how many, and their approximate bytes, in files
+/// and in memory. File runs count decodes and in-memory runs count `memory_*`
 /// reads, so this qualifies every index read count.
-pub(crate) fn snapshot_layout(snapshot: &Snapshot) -> serde_json::Value {
+pub(crate) fn runs_layout<'a>(
+    runs: impl IntoIterator<Item = &'a Arc<IndexBatch>>,
+) -> serde_json::Value {
     let mut layout = BTreeMap::from([("file", (0_usize, 0_usize)), ("memory", (0, 0))]);
-    for batch in snapshot.batches().iter().filter(|batch| !batch.is_empty()) {
+    for batch in runs.into_iter().filter(|batch| !batch.is_empty()) {
         let location = match batch.location() {
             BatchLocation::Storage => "file",
             BatchLocation::Memory => "memory",
@@ -491,7 +492,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_layout_counts_nonempty_runs_by_location() {
+    fn runs_layout_counts_nonempty_runs_by_location() {
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
             Vec<u8>,
             merged_index_col::StoredPayload,
@@ -509,7 +510,7 @@ mod tests {
         );
         let empty = Arc::new(build_batch(Vec::new()).unwrap());
         let bytes = run.approximate_byte_size();
-        let layout = snapshot_layout(&Snapshot::with_batches(&factories, vec![run, empty]));
+        let layout = runs_layout(Snapshot::with_batches(&factories, vec![run, empty]).batches());
         assert_eq!(
             layout,
             serde_json::json!({

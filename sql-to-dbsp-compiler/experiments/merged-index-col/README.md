@@ -10,9 +10,9 @@ Commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). T
 
 The `q3` module reconstructs the four native accumulated reads from COL snapshots that the harness maintains outside the circuit. The harness-side `ManualIndex` (in [`q3-ivm-baseline`](../q3-ivm-baseline/README.md)) appends to the index; this library never does. `q3.rs` contains no insertion call.
 
-`Q3State::publish` supplies one transaction's before and after snapshots and its placement map (order to customer). The placement map comes only from the Orders rows of that transaction's delta. Call `Q3State::finish` after the transaction commits and before publishing another. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract and the supported workload: complete order-and-line groups under referential integrity. General replacements, key moves, orphan lines, and Customer updates are unsupported by design.
+`Q3State::publish` supplies one transaction's `Old` snapshot, its `Dlt` run, and its placement map (order to customer). The placement map comes only from the Orders rows of that transaction's delta. Call `Q3State::finish` after the transaction commits and before publishing another. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract and the supported workload: complete order-and-line groups under referential integrity. General replacements, key moves, orphan lines, and Customer updates are unsupported by design.
 
-Each reader receives a transaction delta, takes the requested keys from it, and scans the matching snapshot:
+Each reader receives a transaction delta, takes the requested keys from it, and scans the matching view: the before reads take `Old`, and the after reads take `Old ⊎ Dlt`, `Old`'s runs with `Dlt` as one more run:
 
 - `customers_after` seeks each requested customer in the after snapshot.
 - `orders_before` scans the customer prefix of each requested customer in the before snapshot, so it reads all of that customer's orders.

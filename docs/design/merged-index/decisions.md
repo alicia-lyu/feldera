@@ -404,6 +404,15 @@ The user confirmed on 2026-11-10:
 - The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
 - The native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
 
+### 2026-11-10: The step-3 publication of `(Old, Dlt)`
+
+The user confirmed on 2026-11-10:
+
+- The publication change shares measurement version 7 with the default run placement, since no run at version 7 had been measured.
+- `index_layout` keeps its `before` and `after` keys; `after` is the layout of `Old`'s runs plus `Dlt`, the view that the after reads take.
+- An empty `Dlt` adds no run to the after view.
+- The after reads take `Dlt` from memory, never from a file the spine spilled, so their counts can move from file decodes to `memory_*` reads.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
