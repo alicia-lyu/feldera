@@ -11,12 +11,14 @@ use crate::{
 pub mod batch;
 pub mod ordered;
 pub mod packed;
+pub mod run_merge;
 pub mod testing;
 pub mod trie;
 
 pub use batch::MergedIndexBatch;
 pub use ordered::OrderedKey;
 pub use packed::{PackedField, PayloadDecoder, PayloadEncoder};
+pub use run_merge::RunMerge;
 pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement, Via};
 
 /// Terminates the key fields of a folded key. No domain may use it as a tag.

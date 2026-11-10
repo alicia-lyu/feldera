@@ -14,7 +14,8 @@
 //!   key row and one for each key a predicate seek probes.
 //! * `value_decodes`: values a file run deserializes, one for each landing on a
 //!   new value row and one for each value a predicate seek probes. Landing on
-//!   a key also lands on its first value.
+//!   a key reads no value. The first read of a value, weight, or value move
+//!   after a landing positions on the key's first value, and counts it once.
 //! * `weight_decodes`: weights a file run deserializes, one for each weight
 //!   that `weight`, `map_times`, or `map_values` returns.
 //!

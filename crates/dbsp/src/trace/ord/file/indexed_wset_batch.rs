@@ -40,6 +40,7 @@ use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer}
 use size_of::SizeOf;
 use std::any::TypeId;
 use std::{
+    cell::OnceCell,
     fmt::{self, Debug},
     ops::{Neg, Range},
     sync::Arc,
@@ -301,7 +302,7 @@ where
         let mut cursor = self.cursor();
         while cursor.key_valid() {
             while cursor.val_valid() {
-                unsafe { cursor.val_cursor.aux(&mut cursor.diff) };
+                cursor.load_weight();
                 let diff = cursor.diff.neg_by_ref();
                 writer.write1((cursor.val(), diff.erase())).unwrap_storage();
                 cursor.step_val();
@@ -686,7 +687,18 @@ where
 
     key_cursor: KeyCursor<'s, K, V, R>,
 
-    val_cursor: ValCursor<'s, K, V, R>,
+    /// The cursor over the current key's values. It stays empty until the
+    /// first read of a value or weight, so landing on a key deserializes no
+    /// value; see [`Self::value_cursor`]. A `OnceCell` lets `val` and
+    /// `val_valid`, which take `&self`, fill it, like a C++ `mutable` member.
+    /// Moving the key cursor empties it.
+    #[size_of(skip)]
+    val_cursor: OnceCell<ValCursor<'s, K, V, R>>,
+
+    /// The value cursor that the last key move emptied. It tells the reader
+    /// where in the value column to look for the next key's first value.
+    #[size_of(skip)]
+    val_hint: Option<ValCursor<'s, K, V, R>>,
     diff: Box<R>,
 }
 
@@ -701,6 +713,7 @@ where
             wset: self.wset,
             key_cursor: self.key_cursor.clone(),
             val_cursor: self.val_cursor.clone(),
+            val_hint: self.val_hint.clone(),
             diff: self.weight_factory().default_box(),
         }
     }
@@ -714,32 +727,22 @@ where
 {
     pub fn new(wset: &'s FileIndexedWSet<K, V, R>) -> Self {
         let key_cursor = unsafe { wset.file.rows().first().unwrap_storage() };
-
-        let val_cursor = unsafe {
-            key_cursor
-                .next_column()
-                .unwrap_storage()
-                .first()
-                .unwrap_storage()
-        };
-        // Opening the cursor reads the first key and its first value.
+        // Opening the cursor reads the first key. Its first value waits for
+        // the first read of a value.
         if key_cursor.has_value() {
             count_key_decode();
-        }
-        if val_cursor.has_value() {
-            count_value_decode();
         }
         Self {
             wset,
             key_cursor,
-            val_cursor,
+            val_cursor: OnceCell::new(),
+            val_hint: None,
             diff: wset.factories.weight_factory().default_box(),
         }
     }
 
-    /// Moves the key cursor with `op`, then puts the value cursor on the new
-    /// key's first value. Counts the key read that `landing` says `op` makes,
-    /// and the read of the first value.
+    /// Moves the key cursor with `op`. Counts the key read that `landing` says
+    /// `op` makes. The new key's values are not positioned until they are read.
     fn move_key<F>(&mut self, landing: Landing, op: F)
     where
         F: Fn(&mut KeyCursor<'s, K, V, R>) -> Result<(), ReaderError>,
@@ -749,16 +752,38 @@ where
         if landing.reads(start, row(&self.key_cursor)) {
             count_key_decode();
         }
-        self.val_cursor = unsafe {
-            self.key_cursor
-                .next_column()
-                .unwrap_storage()
-                .first_with_hint(&self.val_cursor)
-                .unwrap_storage()
-        };
-        if self.val_cursor.has_value() {
-            count_value_decode();
+        // Keep the old value cursor as the hint for the next first value. If
+        // it was never filled, the hint from an earlier key stays.
+        if let Some(previous) = self.val_cursor.take() {
+            self.val_hint = Some(previous);
         }
+    }
+
+    /// The cursor over the current key's values. The first call after a key
+    /// move puts it on the key's first value and counts that value read.
+    fn value_cursor(&self) -> &ValCursor<'s, K, V, R> {
+        self.val_cursor.get_or_init(|| {
+            let values = self.key_cursor.next_column().unwrap_storage();
+            let first = unsafe {
+                match &self.val_hint {
+                    Some(hint) => values.first_with_hint(hint),
+                    None => values.first(),
+                }
+            }
+            .unwrap_storage();
+            if first.has_value() {
+                count_value_decode();
+            }
+            first
+        })
+    }
+
+    /// Like [`Self::value_cursor`], for the moves that change the value cursor.
+    fn value_cursor_mut(&mut self) -> &mut ValCursor<'s, K, V, R> {
+        self.value_cursor();
+        self.val_cursor
+            .get_mut()
+            .expect("value_cursor fills the cell")
     }
 
     /// Moves the value cursor with `op`, counting the value read that
@@ -767,17 +792,26 @@ where
     where
         F: Fn(&mut ValCursor<'s, K, V, R>) -> Result<(), ReaderError>,
     {
-        let start = row(&self.val_cursor);
-        op(&mut self.val_cursor).unwrap_storage();
-        if landing.reads(start, row(&self.val_cursor)) {
+        let val_cursor = self.value_cursor_mut();
+        let start = row(val_cursor);
+        op(val_cursor).unwrap_storage();
+        if landing.reads(start, row(val_cursor)) {
             count_value_decode();
         }
     }
 
-    /// Deserializes the current value's weight into `self.diff`.
+    /// Deserializes the current value's weight into `self.diff`, and counts it.
     fn read_weight(&mut self) {
         count_weight_decode();
-        unsafe { self.val_cursor.aux(&mut self.diff) };
+        self.load_weight();
+    }
+
+    /// Deserializes the current value's weight into `self.diff`, uncounted.
+    /// Batch construction uses this directly.
+    fn load_weight(&mut self) {
+        self.value_cursor();
+        let val_cursor = self.val_cursor.get().expect("value_cursor fills the cell");
+        unsafe { val_cursor.aux(&mut self.diff) };
     }
 }
 
@@ -825,7 +859,7 @@ where
 
     fn val(&self) -> &V {
         debug_assert!(self.val_valid());
-        self.val_cursor.key().unwrap()
+        self.value_cursor().key().unwrap()
     }
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&(), &R)) {
@@ -862,7 +896,7 @@ where
     }
 
     fn val_valid(&self) -> bool {
-        self.val_cursor.has_value()
+        self.value_cursor().has_value()
     }
 
     fn step_key(&mut self) {
