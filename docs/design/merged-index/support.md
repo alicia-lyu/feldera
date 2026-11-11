@@ -235,7 +235,7 @@ A snapshot is a read handle, not a rollback point. A DBSP transaction is `start_
 
 ## Acceptance criteria
 
-R3 and R4 implement a restricted single-worker RF1/RF2 prototype. The criteria below say what would establish the design more broadly. The status column covers only what the repository shows.
+R3 and R4 implement a single-worker prototype (general deltas since 2026-11-10). The criteria below say what would establish the design more broadly. The status column covers only what the repository shows.
 
 | Acceptance question | Required evidence | Status |
 | --- | --- | --- |

@@ -11,8 +11,8 @@ The designs and work items here are not implemented. None is a prerequisite for 
 
 The R3 implementation (see [reconstruction.md](reconstruction.md)) uses no single owner and no atomic append-and-publish step in the circuit. The harness-side `ManualIndex` appends to the Customer–Orders–Lineitem (COL) merged index on a DBSP auxiliary thread, outside the circuit. For each transaction it:
 
-1. appends the transaction delta, which yields a before and an after snapshot;
-2. publishes both, with the placement map, through `Q3State::publish`;
+1. appends the transaction delta, which yields `Old` and `Dlt`;
+2. publishes both through `Q3State::publish` and buffers the touched groups with `Q3State::collect`;
 3. runs the DBSP transaction, whose supplied-snapshot join calls its readers once, at the commit flush;
 4. calls `Q3State::finish`.
 

@@ -1,8 +1,8 @@
-# Reconstruction (R3) and RF1/RF2 verification (R4)
+# Reconstruction (R3) and verification (R4)
 
 R3 maintains `V = Customer ⋈ Orders ⋈ Lineitem` (TPC-H Q3 without predicates) without the four join integrator traces. Instead, the joins read requested key ranges from the Customer–Orders–Lineitem (COL) merged index. R4 checks the result against an independent evaluation.
 
-Scope: loading and the refresh functions RF1 (insert complete order groups) and RF2 (delete them), with [one DBSP worker](decisions.md). Commands are in [WORKFLOW.md](WORKFLOW.md); the index layout is in [col-storage.md](col-storage.md); out-of-scope changes are in [deferred.md](deferred.md).
+Scope: loading, the refresh functions RF1 (insert complete order groups) and RF2 (delete them), and general deltas of the base tables (since 2026-11-10), with [one DBSP worker](decisions.md). Commands are in [WORKFLOW.md](WORKFLOW.md); the index layout is in [col-storage.md](col-storage.md); out-of-scope changes are in [deferred.md](deferred.md).
 
 ## Access path
 
@@ -13,7 +13,7 @@ An integrator is logical accumulation; a retained keyed trace supplies its accum
 ΔV = ΔL ⋈ (B₀ + ΔB) + L₀ ⋈ ΔB
 ```
 
-The COL keys nest customer, order, and line prefixes, so the four reads (`C` after, `O` before, `B` after, `L` before) are range reads by customer or by customer and order. Base storage, the index, materialized `V`, and remaining state are accounted for separately. The four read bindings and their types are in [native-state-read-contracts.md](native-state-read-contracts.md).
+The COL keys nest customer, order, and line prefixes, so the four reads (`C` after, `O` before, `B` after, `L` before) are path or range reads of a touched customer's group. Base storage, the index, materialized `V`, and remaining state are accounted for separately. The four read bindings and their types are in [native-state-read-contracts.md](native-state-read-contracts.md).
 
 ## Trace omission
 
@@ -21,9 +21,9 @@ The COL keys nest customer, order, and line prefixes, so the four reads (`C` aft
 
 The reader contract is in the function's doc comment: the left reader returns right state after the current update; the right reader returns left state before it. The caller keeps the state behind each snapshot valid through the flush.
 
-The generated Q3 circuit uses two such joins, which together replace four traces (see [native-state-read-contracts.md](native-state-read-contracts.md)). The `--q3-merged-index` option emits them (`Q3MergedIndexBinding.java`, `ToRustVisitor.java`; run `generate.sh --q3-merged-index`).
+The reconstructed Q3 circuit uses two such joins, which together replace four traces (see [native-state-read-contracts.md](native-state-read-contracts.md)). Since 2026-11-10 the circuit is hand-written (`q3-ivm-baseline/q3-trie-view-circuit`): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, and `V` joins on `(custkey, orderkey)`, so each join's key is on the trie (A1). The compiler hook `--q3-merged-index` (`Q3MergedIndexBinding.java`, `ToRustVisitor.java`) that used to emit the circuit stays in Java, unused.
 
-Q3 inserts nothing into the index. The readers in `merged-index-col/src/q3.rs` only read snapshots, and the module comment says so. The sole writer is `ManualIndex::append` in the harness (`q3-ivm-baseline/src/reconstruction.rs`), outside the circuit.
+Q3 inserts nothing into the index. The readers in `merged-index-col/src/q3.rs` only read the buffers of the scan session, and the module comment says so. The sole writer is `ManualIndex::append` in the harness (`q3-ivm-baseline/src/reconstruction.rs`), outside the circuit.
 
 ## Transaction contract
 
@@ -33,15 +33,16 @@ A DBSP transaction is `start_transaction`, any number of `step()` calls, then `c
 - Outputs appear at commit.
 - The logical clock advances once per transaction.
 
-The reconstructed joins call their readers once, at the commit flush. In `JoinTrace` (`join.rs`), a step that is not a flush yields an empty output and returns before any reader runs.
+The reconstructed joins call their readers once, at the commit flush, and the readers read groups that the session buffered before the transaction. In `JoinTrace` (`join.rs`), a step that is not a flush yields an empty output and returns before any reader runs.
 
 Per transaction, the harness does the following in order (`q3-ivm-baseline/src/main.rs`):
 
-1. `prepare` the change: validate it (`BaseState::validate`, `workload.rs`) and build the index rows and the placement map (`reconstruction::prepare`).
-2. `ManualIndex::append` the rows. It yields `Old`, the snapshot before the append, and `Dlt`, the appended run.
-3. `Q3State::publish(old, dlt, placements)`. Before reads take `Old`; after reads take `Old ⊎ Dlt`, `Old`'s runs with `Dlt` as one more run (`prop:overlay`), so no after snapshot is taken (2026-11-10).
-4. Run the transaction.
-5. `Q3State::finish()`.
+1. Run the base transaction, then `prepare` its net delta into the complete rows of `Dlt` (`reconstruction::prepare`; see [General deltas](#general-deltas)). The CLI drivers' inputs are first checked by `BaseState::validate` (`workload.rs`).
+2. `ManualIndex::append` the rows. It yields `Old`, the snapshot before the append, and `Dlt`, the appended run. `prepare` and the append are timed as `index_ms`, inside `base_ms`.
+3. `Q3State::publish(old, dlt)`, then `Q3State::collect(pass)`: one scan session buffers the touched groups. Before reads take `Old`; after reads take `Old` then `Dlt`, unconsolidated (`prop:overlay`).
+4. `Q3State::push_driving_deltas` feeds the buffers' `Dlt` halves to the view circuit's input handles.
+5. Run the view transaction.
+6. `Q3State::finish()` releases the groups and returns the session's reads.
 
 `publish` returns an error if a previous publication has not been finished; `finish` returns an error if nothing was published (`merged-index-col/src/q3.rs`). Consequently several transactions cannot share one publication: each has its own `Old` and `Dlt`.
 
@@ -49,34 +50,36 @@ The test `published_views_cover_multiple_transaction_steps` (`q3-ivm-baseline/sr
 
 To batch more changes, use one larger transaction. Its full change set must be known before it starts, because the index is updated first.
 
-The merged index is owned by `ManualIndex` on an auxiliary thread of the runtime that hosts the base and view circuits (with that runtime's buffer cache and storage directory, which the index readers share), outside the Q3 graph. `append` builds the transaction's index rows, adds them to the index, and returns `Old` and `Dlt`, which `publish` hands to the readers together with the placement map. The index uses the native `Spine`. `ManualIndex::save` and `restore` can take a checkpoint UUID, but the harness no longer checkpoints: one runtime hosts both circuits, `init_circuits` rejects an initial checkpoint for several circuits, and the checkpoint test of the two-runtime pipeline was removed on 2026-11-05. Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
+The merged index is owned by `ManualIndex` on an auxiliary thread of the runtime that hosts the base and view circuits (with that runtime's buffer cache and storage directory, which the index readers share), outside the Q3 graph. `append` builds the transaction's index rows, adds them to the index, and returns `Old` and `Dlt`, which `publish` hands to the session. The index uses the native `Spine`. `ManualIndex::save` and `restore` can take a checkpoint UUID, but the harness no longer checkpoints: one runtime hosts both circuits, `init_circuits` rejects an initial checkpoint for several circuits, and the checkpoint test of the two-runtime pipeline was removed on 2026-11-05. Independently stacked circuits and their checkpoint protocol are not implemented (see [deferred.md](deferred.md)).
 
-## Placement map
+## General deltas
 
-The placement map (order → customer) tells the readers where to look in the index, whose keys begin with the customer. It is built by `reconstruction::prepare` from the Orders rows of the same transaction, and nothing else. It is held as `BTreeMap<i64, BTreeSet<i64>>`: each order maps to a set of candidate customers, and both temporal readers probe every candidate in their own snapshot. RF1/RF2 preparation supplies exactly one candidate per order. The sets exist for future workloads; the tests with several candidates are COL reader tests (below), not harness tests.
+Every delta row the view gets must carry its folded key (A2). A line item folds under its order's customer, so `reconstruction::prepare` gives every changed order a before owner `cb` and an after owner `ca`, each a customer or none. They come from the net delta's deletion and insertion of the order, or else from the base `Orders` state, which the transaction left unchanged (`BaseState` taken before the transaction in the driver, `Reference` in tests; the reads count under `BaseRelation`). The order's lines before are `L⁻`, read from `Old` at `(cb, order)` or, with no owner, from `OrphanLines`. The lines after are `L⁺ = L⁻ + ΔL`.
 
-A requested order with a missing or empty candidate set is an error.
+| Case | `Dlt` line rows | Side store |
+| --- | --- | --- |
+| same owner `c` | `ΔL` at `c` | unchanged |
+| the order moves | `−L⁻` at `cb`, `+L⁺` at `ca` | unchanged |
+| the order is deleted, lines kept | `−L⁻` at `cb` | order ↦ `L⁺` |
+| the order arrives for orphan lines | `+L⁺` at `ca` | remove the order |
+| orphan lines only | none | order ↦ `L⁺` |
 
-### Accepted limitation
+Customers and orders fold from the net delta alone: an order folds at its own `o_custkey`, so customers need no side store. `OrphanLines` is part of base maintenance and sits beside `ManualIndex` as `Pipeline.orphans`. Native accepts orphan lines and never joins them. `prepare` rejects only a net delta that contradicts the state.
 
-Changes outside RF1/RF2 are unsupported by design, for example a Lineitem added to an existing order, a Customer update, a replacement, or a key move. See [decisions.md](decisions.md).
-
-- `prepare` rejects a Lineitem whose Order is absent from the transaction, or whose direction differs from its Order's.
-- `BaseState::validate` rejects duplicate, replacement, and key-moving changes. This is also what makes folded keys unique.
-- A change that reached the circuit by another route would hit an `expect` in `merged-index-col/src/q3.rs` (for example "Q3 B+ reconstruction failed") and panic the worker.
+`BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs and is not where support is decided. A request outside the touched groups is a broken contract: the reader returns an error and the join's `expect` in `merged-index-col/src/q3.rs` panics the worker. Folded keys stay unique because of the base tables' primary keys.
 
 ## Cost of reconstruction
 
-The readers decode the requested key ranges and copy them into temporary native batches that the existing join consumes. This copying, decoding, and any sorting is charged to Q3 maintenance. A direct reconstructed cursor could avoid the temporary rows; it is not implemented. The choice of container for the placement map is likewise open. No cost figure is claimed here; see [measurement.md](measurement.md).
+The session decodes each touched group once. Two copies remain at the DBSP boundary (the driving deltas into the input handles, and each reader's partner vector into the snapshot-reader join); roadmap step 5 of [shared-traversal.md](shared-traversal.md) removes both. This copying and decoding is charged to Q3 maintenance. No cost figure is claimed here; see [measurement.md](measurement.md).
 
 ## Verification (R4)
 
-The test `verification::rf1_rf2_transcript` (`q3-ivm-baseline/src/verification.rs`) runs deterministic loading and RF1/RF2 transactions in both generated modes. Customers load first. The transactions cover several customers and orders, distinct lines with identical payloads, groups larger than the splitter boundary, repeated refresh cycles, empty transactions, and multi-step transactions. It checks that:
+The tests `verification::rf1_rf2_transcript` and `verification::general_transcript` (`q3-ivm-baseline/src/verification.rs`) run deterministic loading and transactions in both modes. The first covers RF1/RF2. The second covers general deltas: customer updates, line items added to existing orders, orders that change customer, deleted orders with kept lines, and orphans. The description below is of the first. Customers load first. The transactions cover several customers and orders, distinct lines with identical payloads, groups larger than the splitter boundary, repeated refresh cycles, empty transactions, and multi-step transactions. It checks that:
 
 - every committed delta and materialized `V` equals the difference of `Reference::evaluate` before and after, an independent full join over primary-key maps;
 - in reconstructed mode, the four reader outputs equal rows computed directly from the logical records, without index reads (`check_readers`).
 
-`verify.sh` regenerates both modes, runs both suites, and compares the two JSON transcripts byte for byte. It also runs the COL suite, formatting, and Clippy with warnings denied, then restores native generation. Its logs and transcripts are written to the git-ignored `target/r4-verification/` and are local-only.
+`verify.sh` runs both suites and compares the two pairs of JSON transcripts byte for byte (`rf1_rf2_transcript`; `general_transcript`, written to `$Q3_GENERAL_TRANSCRIPT`). It also runs the COL suite, formatting, and Clippy with warnings denied. Its logs and transcripts are written to the git-ignored `target/r4-verification/` and are local-only.
 
 Other tests that bear on reconstruction:
 
@@ -85,13 +88,15 @@ Other tests that bear on reconstruction:
 | `supplied_snapshot_join_matches_native_signed_updates` | `crates/dbsp/src/operator/dynamic/join.rs` | The supplied-snapshot join equals the native join on simultaneous and multi-step transactions |
 | `Q3MergedIndexBindingTest` | `sql-to-dbsp-compiler/SQL-compiler` | The hook accepts the supported circuit and rejects others |
 | `rf1_rf2_match_full_join` | `q3-ivm-baseline/src/main.rs` | RF1 and RF2 against the full join (reconstructed mode) |
-| `rejects_missing_placement_and_incomplete_rf2` | same | The limitation above |
+| `native_deltas_match_full_join_across_updates` | same (both builds) | Customer-only and line-only changes, an order that moves, and an orphan line, against the full join |
+| `random_general_changes_match_the_reference_join` | same | Random general changes against the reference join |
+| `lines_of_an_order_with_one_owner_fold_from_the_delta_alone`, `a_moved_order_takes_its_old_and_new_lines_with_it`, `a_deleted_order_leaves_its_kept_lines_in_the_side_store`, `an_arriving_order_takes_the_orphan_lines`, `a_net_delta_that_contradicts_the_state_is_rejected` | `q3-ivm-baseline/src/reconstruction.rs` | One for each row of the case table above, and the one rejection |
+| `deltas_beyond_rf1_rf2_match_the_brute_force_join` | `q3-trie-view-circuit/src/tests.rs` | The hand-written circuit against a brute-force join |
 | `grouped_load_keeps_oversized_order_and_lines_together` | same | Grouped loading |
-| `four_readers_preserve_weighted_before_after_relations` | `merged-index-col/src/q3.rs` | Reader outputs |
-| `candidate_locations_follow_each_snapshot_without_duplicating_rows` | same | Several candidate customers per order |
-| `requested_orders_require_nonempty_candidate_locations` | same | Missing or empty candidates |
-| `publication_and_batch_local_placement_are_required` | same | `publish`/`finish` lifecycle |
+| `four_readers_preserve_weighted_before_after_relations` | `merged-index-col/src/q3/tests.rs` | Reader outputs |
+| `virtual_buffer_reads_match_a_brute_force` | `merged-index-col/src/q3/tests.rs` | Reads of the session's buffers against a brute force (property test) |
+| `publication_collection_and_release_follow_one_order` | same | `publish`/`collect`/`finish` lifecycle |
 
 Test counts and pass results from the earlier plans are not repeated; rerun `verify.sh` for current results.
 
-Not covered: Customer updates, independent line changes, orphans, replacements, key moves, and general-update maintenance.
+Not covered: more than one worker, and checkpoints of a runtime with several circuits.

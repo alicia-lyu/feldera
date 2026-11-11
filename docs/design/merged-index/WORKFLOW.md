@@ -46,12 +46,13 @@ git-ignored, and Cargo would take `src/lib.rs` for a library target, so `verify.
 `native-format` with "failed to resolve mod `udf`". Move them to `TRASH/` and rerun.
 
 ```bash
-# Native circuit (the default)
+# Generate the native pair (base and view circuits); takes no option
 ./generate.sh
+
+# Native build (the default)
 cargo +1.96.1 test --offline --locked
 
-# Reconstructed circuit: the compiler option and the Cargo feature must be enabled together
-./generate.sh --q3-merged-index
+# Reconstructed build: the view circuit is hand-written (q3-trie-view-circuit), so only the Cargo feature is needed
 cargo +1.96.1 build --release --offline -j2 --features merged-index
 cargo +1.96.1 test --offline --locked --features merged-index
 ```
@@ -70,7 +71,7 @@ cargo +1.96.1 test --offline -p dbsp --lib merged_index::run_merge
 cargo +1.96.1 test --offline -p dbsp --lib merged_index::session
 ```
 
-The `run_reads` filter covers the run counters (`RunReads`). The COL suite includes their baseline on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`. The `run_merge` and `session` filters cover the merging cursor and the scan session. The session's counters on the COL data are `session_run_reads_on_the_worked_transaction` and `the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways` (filter `session_run_reads` and `the_passes`) in the COL suite. The same rows under one memory-pressure mechanism for both sides are the harness's `native_worked_transaction_tests` (`worked_transaction_default_arm` and `worked_transaction_pressured_arm`, with the native circuits generated, which is what `./generate.sh` without arguments does) and `session_worked_transaction_tests` (`session_worked_transaction_default_arm` and `session_worked_transaction_pressured_arm`, with `./generate.sh --q3-merged-index` and `--features merged-index`). Run each with `cargo +1.96.1 test --offline --locked worked_transaction` from `q3-ivm-baseline`, adding `-- --nocapture` to print each run's pressure level, file counts, layout, and reads. The pressure is sampled, so repeat the run when changing them.
+The `run_reads` filter covers the run counters (`RunReads`). The baseline of the four readers on the worked transaction, `todays_readers_run_reads_on_the_worked_transaction`, was retired in step 4. The `run_merge` and `session` filters cover the merging cursor and the scan session. The session's counters on the COL data are `session_run_reads_on_the_worked_transaction` and `the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways` (filter `session_run_reads` and `the_passes`) in the COL suite. The same rows under one memory-pressure mechanism for both sides are the harness's `native_worked_transaction_tests` (`worked_transaction_default_arm` and `worked_transaction_pressured_arm`, with the native build, which is what the default features give) and `session_worked_transaction_tests` (`session_worked_transaction_default_arm` and `session_worked_transaction_pressured_arm`, with `--features merged-index`). Run each with `cargo +1.96.1 test --offline --locked worked_transaction` from `q3-ivm-baseline`, adding `-- --nocapture` to print each run's pressure level, file counts, layout, and reads. The pressure is sampled, so repeat the run when changing them.
 
 The merged-index spec parser, validator, and emitter test in the SQL compiler, with Java 21 configured:
 

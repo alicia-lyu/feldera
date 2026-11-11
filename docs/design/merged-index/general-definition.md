@@ -73,7 +73,7 @@ Lineitem is placed below `custkey`, so every Lineitem key starts with a customer
 1. **Orders' primary key, `o_orderkey`, lies in a domain for which Lineitem has its own column:** `orderkey`, through `l_orderkey`. So each line refers to exactly one order.
 2. **Orders has a column in the requested domain:** `o_custkey` in `custkey`.
 
-The generated Lineitem key still has a `custkey` field, typed from `o_custkey`. The caller supplies its value when it folds a key, as COL's placement map does today (see [reconstruction.md](reconstruction.md)). The compiler emits no lookup.
+The generated Lineitem key still has a `custkey` field, typed from `o_custkey`. The caller supplies its value when it folds a key: `reconstruction::prepare` takes it from the line item's order, as [reconstruction.md](reconstruction.md#general-deltas) describes. The compiler emits no lookup.
 
 ## What the compiler derives
 

@@ -7,7 +7,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10); nothing later is. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, 2026-11-09, and 2026-11-10.
+> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10). Step 4, the hand-written view circuit, is implemented (2026-11-10) and carries step 7: the circuit admits general deltas. Step 5 and later are not. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, 2026-11-09, and 2026-11-10 (including the step-4 entries).
 
 This doc covers:
 
@@ -20,7 +20,7 @@ This doc covers:
 - design work the write-up leaves to the implementation;
 - the coding roadmap.
 
-The implementation follows both of the write-up's assumptions, (A1) and (A2).
+The reconstructed view circuit follows both of the write-up's assumptions, (A1) and (A2) (step 4).
 
 ## The algorithm
 
@@ -148,7 +148,7 @@ The facts were checked against the code on 2026-11-09.
 | Concept | Feldera today | Gap |
 | --- | --- | --- |
 | `Old` | `ManualIndex::append` takes `before` from `trace.ro_snapshot()`. A `SpineSnapshot` holds shared references to its runs, so a later compaction does not change it (`prop:overlay`(iii)). | None. |
-| `Dlt` | `ManualIndex`'s `Request::Append` handler builds the run with `build_batch`, inserts a shared reference into the spine, and returns the run; `Q3State::publish` takes it beside `Old`. | None. |
+| `Dlt` | `ManualIndex`'s `Request::Append` handler builds the run with `build_batch`, inserts a shared reference into the spine, and returns the run; `Q3State::publish(old, dlt)` takes it beside `Old`. `reconstruction::prepare` completes it for every change (see the `Dlt` row below). | None. |
 | a node's prefix; a child domain's prefix | `KeyEncoder::prefix` and `then_tag` in `crates/dbsp/src/trace/merged_index/mod.rs`. The folded key is `[tag enc(value)]* 0 id`. | None. |
 | `SkipPrefix`: seek past a prefix | Only `Cursor::seek_key`, which is forward-only. No prefix successor exists. | A byte-string successor, with carry and the all-`0xFF` case. |
 | the root prefix of a `Dlt` key | Value widths exist only as `OrderedKey::WIDTH` on Rust types. `Domain` has a name and columns only. | A width per domain in `KeyTrie` and `MergedIndexRustEmitter`. Only the root's is used: a group is the first `1 + root_width` bytes of a key. |
@@ -156,11 +156,11 @@ The facts were checked against the code on 2026-11-09.
 | seek to a group | `CursorList::seek_key` seeks every run, then re-merges. | The session's `PassTo`, which counts logical seeks; the run cursors count per-run seeks. |
 | `Collect`'s range test | `key().starts_with(prefix)` after a step, as in `scan` and the merged-index tests. | None. |
 | decode | `unfold` and `decode_payload` in the client crate. | Decode only buffered entries, from key bytes ([No extra decoding](#no-extra-decoding)). |
-| the four readers | The four functions in `merged-index-col/src/q3.rs`. Each opens its own cursor for every requested key; no two readers share a cursor. | Replaced by the session and the operator's callback (roadmap step 5). |
+| the four readers | The four functions in `merged-index-col/src/q3.rs` (`customers_after`, `orders_before`, `joined_orders_after`, `lineitems_before`). Since step 4 each is a description (before or after, path or range, and its streams) read through a `VirtualBuffer`, a borrowing view of the touched groups that `Q3State::collect` buffered: `Old` for a before read, `Old` then `Dlt` unconsolidated for an after read (`prop:overlay`). They open no cursor on the index. A request outside the touched groups returns an error, which the joins' `expect` turns into a panic of the worker. | Replaced by the operator's callback (roadmap step 5). |
 | session operator | `add_ternary_operator` and `add_quaternary_operator` (`circuit_builder.rs`). Existing users include `GroupTransform` (ternary) and `AsofJoin` (quaternary). Accumulators in front supply each whole delta at the flush. Output is chunked by `splitter_output_chunk_size`. | A new operator. |
-| snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`). The join's read functions take them from that slot at the flush, and `Q3State::old` and `dlt` return them. | None. |
-| joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. | One operator whose callback evaluates both joins per group. Separate operators sharing the buffers would hold every touched group until `V` finishes. |
-| `Dlt` complete under (A2) | The base transaction runs first. `prepare` folds its net delta, and `ManualIndex::append` builds the run before the view transaction starts. For RF1/RF2 each line item finds its customer through its order's row in the same transaction. | The run is published, but the view circuit still reads the SQL net delta. Feed the view side from `Dlt` (roadmap step 4); no extra owner lookup is needed. |
+| snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`), runs `Q3State::collect` once, and pushes the driving deltas into the view circuit's input handles (`push_driving_deltas`). The join's read functions read the collected groups at the flush. `Q3State::finish` releases the groups and returns the `SessionReads`. | The two copies at the DBSP boundary (step 4 below). |
+| joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. Step 4 keeps the two joins as separate operators, so `Q3State` holds every touched group from `collect` until `finish`. | One operator whose callback evaluates both joins per group and releases each group on return (step 5). |
+| `Dlt` complete under (A2) | The base transaction runs first. `reconstruction::prepare` folds its net delta into index rows, and `ManualIndex::append` builds the run before the view transaction starts. Each changed order gets a before owner and an after owner; a moved order takes its line items with it, read from `Old`; line items with no owner wait in `OrphanLines`. The owner of an order that is not in the delta comes from the base `Orders` state: the pre-transaction `BaseState` (driver) or `Reference` (tests), counted under `BaseRelation`. | None (step 4). The view circuit's inputs come from `Dlt`. |
 | counters | Buffer-cache hits and misses, and Bloom and range filter statistics. `RunReads` (`trace/cursor/run_reads.rs`) counts per-run seeks in both run cursors, and filter rejections and key, value, and weight decodes in the file cursor, as per-thread running totals split by read owner (`with_read_owner`). `DBSPHandle::run_reads` reports the workers' totals. `SessionCounts` (`merged_index/session.rs`) counts the session's logical moves and payload decodes. | None. |
 
 ## No extra decoding
@@ -299,20 +299,20 @@ This table refreshes `tab:prototype`.
 | Aspect | Prototype today | Write-up |
 | --- | --- | --- |
 | Reads | `C⁺`, `O⁻`, `J⁺`, `L⁻`, versions as in the table above | Same |
-| `V`'s key | `orderkey` alone, so (A1) fails | `(custkey, orderkey)` |
-| Delta delivery | Each reader receives its whole driving delta once, at the transaction's flush | Per touched group, from its buffers |
-| Base deltas | SQL net deltas, plus the order → customer placements from the same transaction's Orders rows; RF1/RF2 only | The complete changes of the stored entries, `Dlt`, from index maintenance (A2) |
-| Versions | `Old`, and `Old`'s runs with `Dlt` as one more run, which a merged cursor consolidates | `Old`, overlaid with `Dlt`, unconsolidated |
-| Owner-key change | Rejected, as are replacement Orders deltas; customers change only at the initial load, so no line item moves in the validated workloads | Both folded keys of each moved entry, in `Dlt` |
-| Cursors and seeks | A fresh cursor and seek per requested key; `O⁻` decodes the customer's whole subtree and discards all but Orders; `J⁺` reads the customer again for each pair of order and placement customer; `J⁺` and `L⁻` request by `orderkey`, which is not index order; a seek visits every run, and a file-backed run decodes the first value on every landing | One forward seek per touched group, each old entry read once; untouched groups not read |
+| `V`'s key | `(custkey, orderkey)`; `J` joins on `(custkey)` and keeps `(custkey, orderkey)` (step 4) | `(custkey, orderkey)` |
+| Delta delivery | Each join receives its whole driving delta once, at the transaction's flush; its partner reads come from the groups that one session buffered | Per touched group, from its buffers |
+| Base deltas | The driving deltas are the `Dlt` halves of the collected groups, pushed through typed input handles; `prepare` completes `Dlt` for general changes | The complete changes of the stored entries, `Dlt`, from index maintenance (A2) |
+| Versions | `Old` for before reads; `Old` then `Dlt`, unconsolidated, for after reads | Same |
+| Owner-key change | `prepare` emits both folded keys of each moved line item, reading its lines from `Old` | Same |
+| Cursors and seeks | One session per transaction: one forward cursor over `Old`, each buffered old entry read once, untouched groups passed. The readers read the buffers and open no cursor | Same |
 | Key order | Folded byte keys compared as bytes; signed integers in value order, tested | Folded order |
-| Counters | Run counters only (`RunReads`); no logical seeks or payload decodes | `SessionCounts` and the run counters, needed for every cost claim |
+| Counters | `SessionCounts` and the run counters (`index_session_counts`, `index_run_reads.session`; measurement version 8) | Same |
 
 ## Design work the write-up leaves to the implementation
 
 These are implementation questions, not algorithm questions:
 
-- **Feeding the view side from `Dlt`.** The run is published with `Old` (roadmap step 3); step 4 feeds the view side from it.
+- **Feeding the view side from `Dlt`.** Done in step 4: the driving deltas are the `Dlt` halves of the collected groups. Two copies remain at the DBSP boundary until step 5: the driving deltas into the input handles, and each reader's partner vector into the snapshot-reader join.
 - **The cost model.** A logical seek costs one seek per run of the snapshot. Decoding has four levels: key, value, weight, and payload. [No extra decoding](#no-extra-decoding) sets the rules and the counters that check them.
 - **The join-plan type.** The operator interprets it: the joins with their keys and delta terms, each term's version and kind (path or range), and any selections and projections between them. The callback evaluates it over a group's buffers.
 - **Output.** Emit chunks of the size DBSP expects, and leave consolidation to DBSP's batcher.
@@ -339,7 +339,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      *Rerun on 2026-11-05* in one runtime with one buffer cache ([measurement.md](measurement.md#one-runtime-version-6-2026-11-05)): every run-read count equals the exact-path run's, in both workloads and modes. Reconstructed backend reads fell from 169 to 72 (clustered) and from 192 to 83 (scattered); native read 7 and 11. At a 256 MiB cache (clustered only), both modes made no backend reads, so the remaining reads at 32 MiB depend on cache capacity, not on placement.
 
      Steps 2 and 5 address the per-scan cursors, the repeated customer reads, and the landings that take nothing. The per-run multiplier of a logical seek depends on compaction, which no step changes.
-   - *Exit:* DBSP unit tests (filter `run_reads`) pin the counts of single moves on an in-memory run and a file run, and one seek per run through `CursorList`. A COL test pins today's four readers on the worked transaction (without `v2` and `v8`, since COL has no invoices), over a file run plus an in-memory run.
+   - *Exit:* DBSP unit tests (filter `run_reads`) pin the counts of single moves on an in-memory run and a file run, and one seek per run through `CursorList`. A COL test pinned the four readers of step 1 on the worked transaction (without `v2` and `v8`, since COL has no invoices), over a file run plus an in-memory run. Step 4 retired it (`todays_readers_run_reads_on_the_worked_transaction`) with the readers it measured; the table below is history.
    - *Baseline.* `Old` is a file run holding `c5`, `o3`, `l7`, `l8`, `o4`, `l9`, and `c6`, plus an in-memory run holding `c7`; the after state adds `Dlt`. Each comment in `todays_readers_run_reads_on_the_worked_transaction` derives its count. The counts are the index's own. The driving deltas are in memory and read under the caller's owner, so the test pins their memory reads apart: one key, value, and weight for each key of a delta (`requested_keys` steps through them, and `CursorList` reads the first value and weight under each key).
 
      | Reader | Per-run seeks | Filter rejections | Key decodes | Value decodes | Weight decodes | Memory key reads | Memory value reads | Memory weight reads |
@@ -396,7 +396,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      Nothing relieves the pressure by hand, and the runs are wherever the runtime's mechanism puts them. The old state is loaded through `transact` (`c5`, `o3`, `l7`, `l8`, `o4`, `l9`, `c6`, `c7`), and the transaction replaces `c5` and adds `o5` with `l10` and `l11`.
 
      - The native side is the view worker's run reads (`native_worked_transaction_tests`, native build only, since the `merged-index` build's view circuit reads the index). The transaction goes through `transact`.
-     - The session side is `Maintain` over the index's `Old` and `Dlt` (`session_worked_transaction_tests`, `merged-index` build). `Old` is the index's snapshot before the transaction, which `ManualIndex`'s `Spine` placed. `Dlt` is built by `build_batch` with no fixed location, so it follows `min_step_storage_bytes` like a native operator's output. The transaction runs on the base circuit and the index only: the reconstructed readers take placements from the Orders rows of the same delta, and this transaction changes `c5` without any, a change outside RF1/RF2 that they reject by design.
+     - The session side is `Maintain` over the index's `Old` and `Dlt` (`session_worked_transaction_tests`, `merged-index` build). `Old` is the index's snapshot before the transaction, which `ManualIndex`'s `Spine` placed. `Dlt` is built by `build_batch` with no fixed location, so it follows `min_step_storage_bytes` like a native operator's output. The transaction runs on the base circuit and the index; the session then collects the groups, and the view circuit runs on the driving deltas it buffered. Since step 4 the view circuit admits the replacement of `c5`.
 
      The pressure and the layout each side got, in five repeats of each test (identical every time):
 
@@ -455,7 +455,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
      - Eight old rows and five delta rows: the counts show the mechanism, not a scale.
      - The placement is whatever each arm's pressure produced (Critical in every sample, in 5 of 5 repeats), not a typical workload's. At Critical pressure every run, the delta batches included, is in a file, so the old state is not in files with the delta in memory as a long-running pipeline would have it. The user decided on 2026-11-10 not to imitate that placement.
-     - The session does not compute the view change yet, and its transaction does not run the view circuit.
+     - The session does not compute the view change itself: the view circuit's joins do, over copies of the buffered partner vectors, until step 5.
      - Pressure is sampled. The tests print the level at three points and pin counts, never a level or a layout, except that a native run whose reads are all decodes pins the 6 + 1 split.
      - Real conclusions wait for a full realistic workload.
 
@@ -473,15 +473,27 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - *Before 2026-11-09* a second knob, `GroupStart::ProbeThenRange`, probed the root entry first. It replaced two prefix seeks by exact probes landing on the same keys, saved no key decode or run seek, and added one filter rejection (the probe of `c10`). It was removed.
 
 3. **Publish `(Old, Dlt)`, and read the after state as the overlay.** *Done 2026-11-10.*
-   - `ManualIndex::append` returns `(Old, Dlt)`: the snapshot before the append and the appended run, which the spine shares. `Q3State::publish(old, dlt, placements)` replaces the two snapshots.
-   - The four readers are not rewritten, since step 5 replaces them. `Q3State` builds their after view as `Old`'s runs with `Dlt` as one more run (none when `Dlt` is empty), and the after readers read it through `CursorList`, which consolidates across runs. That gives the same Z-set as `Old ⊎ Dlt` (`prop:overlay`). The session reads the two apart.
+   - `ManualIndex::append` returns `(Old, Dlt)`: the snapshot before the append and the appended run, which the spine shares. `Q3State::publish` replaces the two snapshots (it took a placement map until step 4 dropped it).
+   - *As of step 3:* the four readers were not rewritten. `Q3State` built their after view as `Old`'s runs with `Dlt` as one more run (none when `Dlt` is empty), and the after readers read it through `CursorList`, which consolidated across runs. That gives the same Z-set as `Old ⊎ Dlt` (`prop:overlay`). Step 4 replaced this: the readers read the session's buffers, which keep the two apart.
    - The COL baseline already modeled the after state as `Old` plus `Dlt`, so its counts are unchanged. In the harness, the after reads now take `Dlt` itself, not a copy that the spine may have spilled, so the after readers' counts can move from file decodes to `memory_*` reads (measurement version 7). `Dlt` follows step placement (2026-11-10): it is in memory unless the runtime is at Critical memory pressure, where it is a file.
    - *Exit:* `check_readers` and the transcript comparison pass, and the after snapshot is gone. `after_reads_overlay_dlt_on_old` (COL) pins the overlay and the accessors.
-4. **Hand-written view circuit.**
-   - The view side reads its inputs from `Dlt` (still RF1/RF2), each row keyed by its full trie path.
-   - The joins are keyed by `(custkey)` and `(custkey, orderkey)`, still on today's snapshot-reader joins.
-   - The placement map is dropped.
-   - *Exit:* the transcript comparison with native mode passes.
+4. **Hand-written view circuit.** *Done 2026-11-10* (commits `0dea7a708` to `0d77f3741`; decisions of 2026-11-10 in [decisions.md](decisions.md)). It replaces the generated reconstructed circuit and meets (A1) and (A2).
+   - `merged-index-col/src/q3.rs`:
+     - One `ScanSession` per transaction, `Q3State::collect(Pass)`. It buffers the touched groups of `{C, O, L}`, and `finish` releases them. `J` and `V` are separate operators, and `V` flushes only after `J` has passed every customer, so the groups stay until the view transaction commits.
+     - The four readers are descriptions read through a borrowing `VirtualBuffer` (`Old` for before reads; `Old` then `Dlt`, unconsolidated, for after reads). A request outside the touched groups errors, and the join's `expect` panics.
+     - The `*Batch` aliases are now `*Vector` (decision of 2026-11-10). `scan`, `scan_entry`, the after-overlay snapshot, the placements, and `IndexReads` are gone. The harness's interface is `publish(old, dlt)`, `collect`, `push_driving_deltas`, and `finish() -> SessionReads`.
+     - In `crates/dbsp`, `on_group` takes the group's buffers by value, so the caller decides when to release them. `SessionCounts` gained `Serialize` and `AddAssign`.
+   - `q3-ivm-baseline/q3-trie-view-circuit` (committed): `J` on `(custkey)` keeps `(custkey, orderkey)`; `V` on `(custkey, orderkey)`; the inputs are keyed by their full trie paths; there is no `ERROR_VIEW`; the harness gets the input handles through an `Arc<OnceLock<TrieInputs>>`.
+   - `reconstruction::prepare(change, old, orphans, base_owner)` completes `Dlt` for every change (the case table is in its doc comment): the owner table (`cb`, `ca`), moves, and `OrphanLines`, the side store by `orderkey` that sits beside `ManualIndex` as `Pipeline.orphans`. Both RF1/RF2 rejections and the placement map are gone. `prepare` and the append are timed as `index_ms` inside `base_ms`.
+   - Harness: the view phase collects the groups, pushes the driving deltas, then runs the transaction. `generate.sh` takes no option, the view circuit lost its `merged-index` feature, and `verify.sh` compares two transcript pairs (`rf1_rf2_transcript` and `general_transcript`, the latter written to `$Q3_GENERAL_TRANSCRIPT`).
+   - Measurement version 8: `index_run_reads` is `{session}`, with the new `index_session_counts` and `index_upkeep_run_reads` ([measurement.md](measurement.md#report-fields)).
+   - *Exit:* both transcript comparisons with native pass.
+   - *New tests:*
+     - `prepare`, one for each row of the case table: `lines_of_an_order_with_one_owner_fold_from_the_delta_alone`, `a_moved_order_takes_its_old_and_new_lines_with_it`, `a_deleted_order_leaves_its_kept_lines_in_the_side_store`, `an_arriving_order_takes_the_orphan_lines`, and `a_net_delta_that_contradicts_the_state_is_rejected`;
+     - COL: `virtual_buffer_reads_match_a_brute_force` (a property test), `joined_orders_are_read_at_the_customer_and_order_of_the_request`, `collect_reads_the_index_once_and_the_readers_not_at_all`, `driving_deltas_carry_trie_keys`, `publication_collection_and_release_follow_one_order`, and `cancelled_keys_have_no_values_and_untouched_groups_are_refused`;
+     - `q3-trie-view-circuit`: `deltas_beyond_rf1_rf2_match_the_brute_force_join` and `single_stream_transactions_and_empty_ones_match`;
+     - harness: `general_transcript`, `random_general_changes_match_the_reference_join`, and `native_deltas_match_full_join_across_updates`, which now runs in both builds (its orphan line included); `session_worked_transaction_tests` also runs the view circuit.
+   - *Retired tests:* `rejects_missing_placement_and_incomplete_rf2`, `publication_and_batch_local_placement_are_required`, `candidate_locations_follow_each_snapshot_without_duplicating_rows`, `requested_orders_require_nonempty_candidate_locations`, `cancelled_and_missing_keys_have_no_values`, and `todays_readers_run_reads_on_the_worked_transaction` (its table under step 1 stays as history).
 5. **Buffered-execution session.**
    - The join-plan type, plus one operator that drives the scan session. The operator supplies `Maintain`'s `on_group` callback, which evaluates `ΔJ` and `ΔV` over a group's buffers and emits rows; the session then releases the buffers. It replaces step 4's two joins, which now take turns per group inside the callback.
    - It is exact for any plan with path or range reads.
@@ -490,10 +502,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 6. **Measurement, new version.**
    - Add the counters to `measure.py`, and run the native and reconstructed (buffered) modes on Linux, with the session's `Pass` knob as an A/B.
    - *Exit:* raw artifacts under `target/`; [measurement.md](measurement.md) reports base and IVM side by side.
-7. **Beyond RF1/RF2 (optional).**
-   - Customer updates, line items added to existing orders, and orders that change customer.
-   - Each needs index maintenance to produce a complete `Dlt`. That is base-phase work; view maintenance is unchanged.
-   - *Exit:* new transcript fixtures pass in every mode.
+7. **Beyond RF1/RF2.** *Done 2026-11-10, as part of step 4.* `prepare` supports customer updates, line items added to existing orders, orders that change customer, and orphan line items. *Exit:* `general_transcript` passes in both modes.
 8. **Deferred:**
    - selective execution ([deferred.md](deferred.md#selective-execution));
    - plans derived from the spec;
@@ -504,8 +513,6 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
 - The session as one DBSP operator over the ternary streaming interface, or the quaternary one for wider plans.
 - `ΔJ` internal to the operator unless a plan exports it.
-- Step 4 as an intermediate milestone before the session.
-- Changes beyond RF1/RF2 kept out of scope until step 7.
 - `prefix_successor` returning `Option`, with `None` meaning the range runs to the end of the index, rather than a sentinel key.
 - `RunMerge` finding the minimum key by linear scan over its run cursors, not a heap. Snapshots hold few runs.
 - The once-filled value slot as the shape of lazy values in the file cursor (a `OnceCell`), with a hint field that keeps the last value cursor for `first_with_hint`.
@@ -517,3 +524,13 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
+
+Step 4 (2026-11-10):
+
+- `Arc<OnceLock<TrieInputs>>` as the hand-off of the input handles from the circuit builder to the harness, as `view_worker_cache` does for the cache.
+- No `ERROR_VIEW` in the hand-written circuit; the generated circuit's error view is absent from the reconstructed build.
+- **Open: the IVM window differs between the modes.** In reconstructed mode `q3_ms` and `ivm_ms` include the session's collection and the push of the driving deltas. In native mode the JSON feed to the view circuit stays outside the window (`forward_ms`). Whether to move either side is unconfirmed.
+- `on_group` takes the buffers by value, not by reference, so that `collect` can keep them until `finish`.
+- The reader shape: each reader is a `Version` and a `Node` description over a borrowing `VirtualBuffer`, as the seed of step 5's join-plan type.
+- The compiler hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused; removing it is a follow-up.
+- Owner lookup sources: for an order that is not in the delta, the driver passes the pre-transaction `BaseState` and tests pass `Reference`, both counted under `BaseRelation`.

@@ -17,11 +17,12 @@ The prototype compares two modes:
   transaction it publishes the index's snapshot before the transaction (`Old`) and the transaction's run (`Dlt`); after reads take `Old ⊎ Dlt`. The join that consumes them is
   the supplied-snapshot join, `dyn_join_generic_with_snapshot_readers` in
   `crates/dbsp/src/operator/dynamic/join.rs`; it builds no integrate or delay traces.
-  The compiler option `--q3-merged-index` selects this mode.
+  The view circuit of this mode is hand-written (`q3-trie-view-circuit`, since 2026-11-10); the `merged-index` Cargo feature selects it.
 
 The workload is one DBSP worker, with initial loading followed by RF1 (insert complete
-order and line groups) and RF2 (delete them). The placement map (order → customer) comes
-only from Orders rows in the same transaction, so other changes are unsupported by design.
+order and line groups) and RF2 (delete them). Reconstructed mode supports any delta of the base
+tables since 2026-11-10 (line items with no order wait in a side store); the CLI drivers still
+produce RF1 files and RF2 keys only.
 See [decisions.md](decisions.md) for the user's confirmed decisions, including the
 single-worker policy, secondary-storage scope, and why folded keys need no uniqueness validator.
 
@@ -35,8 +36,8 @@ git-ignored `target/` directories and are local only.
 | --- | --- | --- | --- |
 | R1 | Native baseline | Implemented. Correctness is checked against a full join; no measured result is recorded. | `q3-ivm-baseline` tests; [CIRCUIT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CIRCUIT.md) |
 | R2 | COL library and state-read bindings | Implemented. The library and the generated-read contracts are documented. | `merged-index-col` tests; `crates/dbsp/src/trace/merged_index/`; [native-state-read-contracts.md](native-state-read-contracts.md) |
-| R3 | Reconstruction | Implemented behind `--q3-merged-index` and the `merged-index` Cargo feature, for RF1/RF2 only. | [reconstruction.md](reconstruction.md); `Q3MergedIndexBinding.java`; `q3-ivm-baseline/src/reconstruction.rs` |
-| R4 | RF1/RF2 verification | Complete. `verify.sh` compares native and reconstructed transcripts byte for byte. Replacements, key moves, independent line updates, and customer updates are deferred. | [reconstruction.md](reconstruction.md); [WORKFLOW.md](WORKFLOW.md) |
+| R3 | Reconstruction | Implemented behind the `merged-index` Cargo feature, with a hand-written view circuit, for general deltas. | [reconstruction.md](reconstruction.md); `q3-trie-view-circuit`; `q3-ivm-baseline/src/reconstruction.rs` |
+| R4 | RF1/RF2 verification | Complete. `verify.sh` compares native and reconstructed transcripts byte for byte, for RF1/RF2 and for general deltas. | [reconstruction.md](reconstruction.md); [WORKFLOW.md](WORKFLOW.md) |
 | R5 | Maintenance measurement | Harness implemented (`measure.py`, `src/measurement.rs`). The qualifying Linux run is pending, so no comparison exists. | [measurement.md](measurement.md) |
 
 ## Open code follow-ups
@@ -56,7 +57,7 @@ These were found by the 2026-10-12 review and are tracked here, not yet schedule
 - [col-storage.md](col-storage.md): folded-key encoding and batch and file layout.
 - [general-definition.md](general-definition.md): the key-trie spec for declaring a merged index,
   and the roadmap for generating its definition.
-- [reconstruction.md](reconstruction.md): the transaction contract, the placement map, R3 and R4.
+- [reconstruction.md](reconstruction.md): the transaction contract, general deltas, R3 and R4.
 - [measurement.md](measurement.md): R5 definitions and the pending Linux campaign.
 - [native-state-read-contracts.md](native-state-read-contracts.md): the four generated reads.
 - [native-run-placement.md](native-run-placement.md): how native runs are built,

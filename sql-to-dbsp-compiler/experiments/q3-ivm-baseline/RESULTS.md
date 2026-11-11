@@ -6,6 +6,8 @@ The R1 native-baseline measurement table was removed on 2026-10-12: no raw artif
 
 ## R4 shared RF1/RF2 verification
 
+*Since 2026-11-10 `verification::general_transcript` adds a second shared transcript for general deltas; `verify.sh` compares both. The description below is of the RF1/RF2 one.*
+
 The shared tests in [src/verification.rs](src/verification.rs) verify both
 generated modes with the same initial loading of Customers followed by complete
 Order/Lineitem groups, and three RF1/RF2 cycles. They use one worker and a native
@@ -46,8 +48,8 @@ mode-specific fields. The verified cardinalities are:
 The test data includes three customers, four initially loaded orders, five RF1
 orders, 44 total inserted lines, and six RF2 orders with 38 deleted lines.
 Distinct line identities have identical payloads. Broader replacements, key
-moves, independent line updates, customer updates, and orders with several
-candidate customers are outside R4 (see
+moves, independent line updates, and customer updates were outside R4 when it was written; the
+general transcript covers them since 2026-11-10 (see
 [reconstruction.md](../../../docs/design/merged-index/reconstruction.md)).
 R4 transactions supply one candidate customer per order and do not establish
 broader maintenance support. Residual Q3 and performance measurements remain

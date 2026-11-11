@@ -347,7 +347,7 @@ unchanged identity and summing would yield zero, although its payload changes.
 
 On 2026-10-06, before R3 existed, the storage prototype differed from the native reads in key placement,
 identity widths, payload representation, cursor representation, Lineitem placement, and runtime integration.
-R3 closed the runtime-integration gap for RF1/RF2 (see [R3 RF1/RF2 binding](#r3-rf1rf2-binding) and
+R3 closed the runtime-integration gap (see [R3 binding](#r3-rf1rf2-binding) and
 [reconstruction.md](reconstruction.md)). The row-by-row table is in
 [history.md](history.md#2026-10-06-compatibility-gaps-before-r3); [col-storage.md](col-storage.md) is current.
 
@@ -360,7 +360,9 @@ maintenance measurements.
 
 ### R3 RF1/RF2 binding
 
-The opt-in compiler (`--q3-merged-index`) emits calls to the COL library's
+*Updated 2026-11-10: the hand-written view circuit replaced the compiler's emitter, the placement map is gone, and general deltas are supported (see [reconstruction.md](reconstruction.md)). The text below describes the original RF1/RF2 binding, which the readers' keys have since replaced: the readers take their customer from the delta key and read the groups that one scan session buffered.*
+
+The opt-in compiler (`--q3-merged-index`) emitted calls to the COL library's
 [Q3 readers](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/q3.rs).
 The manually maintained index has already received its physical updates when Q3
 starts. Its immutable before/after snapshots and a temporary order/customer map

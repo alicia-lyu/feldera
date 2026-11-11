@@ -43,7 +43,7 @@ An earlier slide plan banned the phrase. The ban is withdrawn and is not carried
 
 ### 2026-10-12: Placement limitation accepted
 
-The placement map (order → customer) comes only from Orders rows in the same transaction. Changes outside RF1 and RF2, such as a Lineitem added to an existing order, are therefore unsupported by design. This is an accepted limitation, not a defect. The harness's `prepare` rejects such changes.
+The placement map (order → customer) comes only from Orders rows in the same transaction. Changes outside RF1 and RF2, such as a Lineitem added to an existing order, are therefore unsupported by design. This is an accepted limitation, not a defect. The harness's `prepare` rejects such changes. *Amended on 2026-11-10: lifted (see [General deltas](#2026-11-10-general-deltas-with-an-orphan-side-store)).*
 
 ### 2026-10-12: Report only what was measured
 
@@ -232,7 +232,7 @@ The harness does not clear Feldera's buffer cache after loading and setup compac
 
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
 
-For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. (Amended on 2026-11-09: selective execution is deferred, so buffered execution applies.) The compiler hook stays for the existing reconstructed mode. (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
+For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. (Amended on 2026-11-09: selective execution is deferred, so buffered execution applies.) The compiler hook stays for the existing reconstructed mode. *Amended on 2026-11-10: the hand-written circuit replaces the generated reconstructed circuit (see [the entry](#2026-11-10-the-hand-written-view-circuit-replaces-the-generated-one)); the hook stays in Java, unused.* (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
 
 ### 2026-10-29: Merged-index deltas come from the base transaction
 
@@ -431,12 +431,40 @@ The user confirmed on 2026-11-10:
 - The native layout is reported from the reads (memory reads or decodes) and the file counts, not from an inventory of the circuit's spines. The inventory (`spine_contents`) is process-wide, and the test runner runs the arms in parallel.
 - The shared helper is named `run_load_and_transaction`.
 
-The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting it to the roadmap step 4 work (the hand-written view circuit). That work decides whether the view circuit admits other transactions, the worked transaction included. Until then, the session's worked transaction runs on the base circuit and the index only.
+The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting it to roadmap step 4. Step 4 lifted it (see [General deltas](#2026-11-10-general-deltas-with-an-orphan-side-store)), and the session's worked transaction now also runs the view circuit.
+
+### 2026-11-10: The hand-written view circuit replaces the generated one
+
+The user decided on 2026-11-10 (roadmap step 4):
+
+- The hand-written circuit (`q3-ivm-baseline/q3-trie-view-circuit`) replaces the generated reconstructed circuit in the `merged-index` build. This amends 2026-10-29's "the compiler hook stays": the hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused. Its removal is an unconfirmed follow-up.
+- Both modes now build the view circuit from different sources: native from `q3.sql`, reconstructed from the committed crate. `generate.sh` takes no option, and `verify.sh` no longer regenerates for the reconstructed run.
+- The circuit meets (A1) and (A2): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, `V` joins on `(custkey, orderkey)`, and the inputs are keyed by their full trie paths.
+
+### 2026-11-10: Inputs through typed handles fed from `Dlt`
+
+The hand-written circuit's inputs arrive through typed input handles (`ZSetHandle`). The harness collects the touched groups with `Q3State::collect`, then pushes the driving deltas (the buffers' `Dlt` halves) with `Q3State::push_driving_deltas`. The view side no longer reads the SQL net delta.
+
+### 2026-11-10: General deltas with an orphan side store
+
+The user called the RF1/RF2 limit self-imposed and decided on 2026-11-10 that step 4 admits general deltas. This amends the placement contract of 2026-10-12.
+
+- Every delta row the view gets carries its trie keys. That invariant, not the base phase's cost, is the point.
+- `reconstruction::prepare` gives every changed order a before owner and an after owner (a `custkey` or none), taken from the net delta or else from the base `Orders` state. A moved order takes its line items with it. The placement map and both RF1/RF2 rejections are gone.
+- Line items whose order has no owner (orphans, which native accepts and never joins) wait in a side store keyed by `orderkey` (`OrphanLines`, beside `ManualIndex`). It is part of base maintenance.
+- `BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs; `prepare` decides what reconstructed mode supports.
+- The exit check adds a second transcript comparison (`general_transcript`) beside `rf1_rf2_transcript`.
+
+### 2026-11-10: Pipelining types take the suffix `Vector`
+
+The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" is a transaction's delta in this project (see the notation), and these types are not that. A vector is the unit that a pipelined plan hands from one operator to the next, as in MonetDB/X100's vectorized execution, and step 5 builds on it.
 
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-10-12 | Placement map from the same transaction's Orders rows; changes outside RF1/RF2 are unsupported by design. | 2026-11-10: general deltas; `prepare` gives each order owners and orphan lines wait in a side store. |
+| 2026-10-29 | The compiler hook generates the reconstructed circuit. | 2026-11-10: the hand-written `q3-trie-view-circuit` replaces it. |
 | 2026-11-09 | `GroupStart::{PrefixSeek, ProbeThenRange}` A/B-tests the root probe; the 2026-11-04 root probe applies to buffered group reads. | 2026-11-09: group reads use no exact probe; path reads keep `seek_key_exact`. |
 | 2026-10-01 | `min_storage_bytes: Some(0)` in the harness's `runtime_config` (never recorded as a decision). | 2026-11-09: DBSP's default placement in both modes. |
 | 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |

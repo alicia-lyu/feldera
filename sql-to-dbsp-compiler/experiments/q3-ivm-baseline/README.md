@@ -18,7 +18,8 @@ runtime (user decision of 2026-10-23):
   relations, with complete rows for deletions.
 - **View circuit** ([q3.sql](q3.sql), crate `q3-view-circuit`). The same tables without keys (Z-set
   inputs) and `V`. The driver feeds it the net delta, so it maintains `V` and nothing else.
-  `--q3-merged-index` applies to this circuit only.
+  This is the native view circuit. The reconstructed build replaces it with the hand-written
+  `q3-trie-view-circuit`, whose inputs are keyed by their full trie paths and come from `Dlt`.
 
 [query.sql](query.sql) remains the logical definition: keyed tables plus `V`. The merged-index
 module is generated from its schema.
@@ -49,8 +50,9 @@ every run configuration.
 | Path | Role |
 | --- | --- |
 | `base.sql`, `q3.sql`, `query.sql` | The base circuit's SQL, the view circuit's SQL, and the logical definition (keyed tables plus `V`) from which the merged-index module is generated. |
-| `generate.sh` | Generates `q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and `plan.json` (the view circuit's plan), all git-ignored. `generate.sh --q3-merged-index` generates the reconstructed view circuit. It strips the generated allocator, which `src/main.rs` defines once. |
-| `q3-base-circuit/`, `q3-view-circuit/` | Library crates around the generated circuits. The view crate has the Cargo feature `merged-index`, which the driver's feature of the same name enables. |
+| `generate.sh` | Generates `q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and `plan.json` (the view circuit's plan), all git-ignored. `generate.sh` takes no option: the reconstructed view circuit is hand-written. It strips the generated allocator, which `src/main.rs` defines once. |
+| `q3-base-circuit/`, `q3-view-circuit/` | Library crates around the generated circuits. |
+| `q3-trie-view-circuit/` | The committed, hand-written reconstructed view circuit (the driver's `merged-index` feature builds it in place of `q3-view-circuit`). |
 | `src/main.rs`, `src/data.rs` | Handwritten driver (`Pipeline` holds both circuits) and `.tbl` parser. |
 | `src/workload.rs` | `BaseState`, the workload checks including `BaseState::validate`, and `net_delta`, which reads the base circuit's delta streams. |
 | `src/reconstruction.rs` | `ManualIndex` and the auxiliary-thread index maintenance (Cargo feature `merged-index`). |
@@ -64,7 +66,7 @@ every run configuration.
 ## Modes
 
 The native path is the default: `./generate.sh` and Cargo without the `merged-index` feature. The
-reconstructed path needs the compiler option `--q3-merged-index` and the Cargo feature together.
+reconstructed path needs the `merged-index` Cargo feature.
 The concrete COL codecs and storage tests live in the standalone
 [`merged-index-col`](../merged-index-col/README.md) library, which the native path does not use.
 
@@ -72,13 +74,14 @@ In reconstructed mode the harness maintains the merged index in `ManualIndex`, o
 circuits, on an auxiliary thread of the runtime that hosts both circuits (booked as base maintenance since
 measurement version 4). Per
 transaction it converts the base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
-publishes `Old` (the index before the append) and `Dlt` (the appended run) to the view circuit, which keeps them until its
-consumers finish. The placement map (order → customer) is built from the Orders rows of that net
-delta, so only RF1 and RF2 are supported. The index is fed from the net delta and not from the
+publishes `Old` (the index before the append) and `Dlt` (the appended run). One scan session buffers the touched groups, and
+the harness pushes the driving deltas into the view circuit's input handles; the groups are kept until the view transaction
+finishes. Any delta of the base tables is supported: `prepare` gives each changed order its owners, and line items with no order
+wait in `OrphanLines`. The index is fed from the net delta and not from the
 driver's logical change, so a workload with upserts would feed it correctly too. The contract and its limits are in
 [reconstruction.md](../../../docs/design/merged-index/reconstruction.md).
 
-Reconstruction decodes the requested key ranges and copies them into temporary native batches for
+Reconstruction copies the buffered rows into temporary native vectors for
 the existing joins. This copy is suboptimal; a direct reconstructed cursor is a future
 optimization. The prototype makes no performance-gain or hard-memory-cap claim.
 
@@ -88,9 +91,8 @@ optimization. The prototype makes no performance-gain or hard-memory-cap claim.
 independent Customer, Orders, and Lineitem maps and compares each transaction's emitted delta and
 materialized `V` with a full join; `--no-verify` allocates none of them. The shared tests in
 `src/verification.rs` run loading, then RF1 insertion and RF2 deletion, in both modes, and
-`verify.sh` compares the two modes' transcripts byte for byte. Details are in
-[reconstruction.md](../../../docs/design/merged-index/reconstruction.md). Replacements, key moves,
-orphan rows, independent Lineitem changes, and Customer updates are unsupported.
+`verify.sh` compares the two modes' transcripts byte for byte, for RF1/RF2 and for general deltas (`general_transcript`). Details are in
+[reconstruction.md](../../../docs/design/merged-index/reconstruction.md).
 
 ## Measurement
 

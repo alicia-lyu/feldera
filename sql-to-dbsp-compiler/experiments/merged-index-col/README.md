@@ -10,17 +10,17 @@ Commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). T
 
 The `q3` module reconstructs the four native accumulated reads from COL snapshots that the harness maintains outside the circuit. The harness-side `ManualIndex` (in [`q3-ivm-baseline`](../q3-ivm-baseline/README.md)) appends to the index; this library never does. `q3.rs` contains no insertion call.
 
-`Q3State::publish` supplies one transaction's `Old` snapshot, its `Dlt` run, and its placement map (order to customer). The placement map comes only from the Orders rows of that transaction's delta. Call `Q3State::finish` after the transaction commits and before publishing another. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract and the supported workload: complete order-and-line groups under referential integrity. General replacements, key moves, orphan lines, and Customer updates are unsupported by design.
+`Q3State::publish` supplies one transaction's `Old` snapshot and its `Dlt` run. `Q3State::collect` then runs one scan session and buffers the touched groups; the harness pushes the driving deltas with `push_driving_deltas`. Call `Q3State::finish` after the transaction commits and before publishing another; it releases the groups and returns the session's reads. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract. Every delta row must carry its trie keys, which the harness's `reconstruction::prepare` ensures for any change of the base tables.
 
-Each reader receives a transaction delta, takes the requested keys from it, and scans the matching view: the before reads take `Old`, and the after reads take `Old ⊎ Dlt`, `Old`'s runs with `Dlt` as one more run:
+Each reader receives a transaction delta, takes the requested keys from it, and reads the matching version of the buffered groups through a borrowing `VirtualBuffer`: the before reads take `Old`, and the after reads take `Old` then `Dlt`, unconsolidated. The result types are named `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`):
 
-- `customers_after` seeks each requested customer in the after snapshot.
-- `orders_before` scans the customer prefix of each requested customer in the before snapshot, so it reads all of that customer's orders.
-- `lineitems_before` scans the line prefix of each requested order, for each customer the placement map lists, in the before snapshot.
-- `joined_orders_after` reconstructs `B⁺` for the distinct order keys in `ΔL`. It seeks the Customer and the Order at each placement in the after snapshot, then multiplies their signed weights.
+- `customers_after` reads each requested customer's entry in the after version.
+- `orders_before` reads the Orders of each requested customer in the before version.
+- `lineitems_before` reads the line items of each requested `(customer, order)` in the before version.
+- `joined_orders_after` reconstructs `J⁺` for the `(customer, order)` pairs in `ΔL`. It reads the Customer and the Order on the path in the after version, then multiplies their signed weights.
 
-A scan seeks to the requested prefix and stops at the first key outside it (`scan` in `src/q3.rs`). Only the rows found are decoded and pushed into a transient native indexed batch, which the reader returns as a `SpineSnapshot`. The reader never builds an accumulated `B` relation. Decoding, copying, and sorting these rows are charged to Q3 maintenance. No hard memory bound is claimed.
+The readers open no cursor on the index: the session read each touched group once. Each reader copies its rows into a transient native indexed vector, which it returns as a `SpineSnapshot`. The reader never builds an accumulated `J` relation. Decoding, copying, and sorting these rows are charged to Q3 maintenance. No hard memory bound is claimed.
 
-The join readers (`join_orders_customers`, `join_lineitems_orders`) call `expect` on reader errors. A change that violates the placement-map contract therefore panics the worker; the harness's `prepare` rejects such changes first.
+The join readers (`join_orders_customers`, `join_lineitems_orders`) call `expect` on reader errors. A request outside the touched groups therefore panics the worker; `reconstruction::prepare` makes `Dlt` complete, so a harness-fed change never makes one.
 
 `verify.sh` in the Q3 experiment runs both generated circuit modes over the same loading and RF1/RF2 transactions and checks reader rows, emitted deltas, and materialized `V` against a full join recomputed from the logical records. It also compares the two modes' per-transaction JSON output byte for byte. The COL weighted-reader, storage, and compaction tests stay in this library's suite.
