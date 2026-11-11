@@ -459,6 +459,8 @@ The user called the RF1/RF2 limit self-imposed and decided on 2026-11-10 that st
 
 The user decided on 2026-11-11 that completing the base delta into trie-keyed `Dlt` rows (`reconstruction::prepare`, the orphan side store, and the reads of `Old` for a moved order's line items) stays outside the IVM window. It is booked in `index_ms`, a sub-phase of `base_ms`. Rationale: the merged index is closer to a base table than to this view's state. It can serve the maintenance of several views, and queries that store no intermediate or final results, so its upkeep is not work for this one view.
 
+The user also decided that the boundary copy of the driving deltas into the view circuit's input handles is outside the IVM window in both modes. Native's feed of the net delta was already in `forward_ms`; reconstructed mode's `push_driving_deltas` moves there from `q3_ms`. The scan session's collection, which does the partner reads, stays in `q3_ms`. This is measurement version 9.
+
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
 The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.

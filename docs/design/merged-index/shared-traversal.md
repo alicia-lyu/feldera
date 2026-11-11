@@ -529,7 +529,7 @@ Step 4 (2026-11-10):
 
 - `Arc<OnceLock<TrieInputs>>` as the hand-off of the input handles from the circuit builder to the harness, as `view_worker_cache` does for the cache.
 - No `ERROR_VIEW` in the hand-written circuit; the generated circuit's error view is absent from the reconstructed build.
-- **Open: the IVM window differs between the modes.** In reconstructed mode `q3_ms` and `ivm_ms` include the session's collection and the push of the driving deltas. In native mode the JSON feed to the view circuit stays outside the window (`forward_ms`). Whether to move either side is unconfirmed.
+- The IVM window (settled on 2026-11-11, measurement version 9): in reconstructed mode `q3_ms` and `ivm_ms` include the session's collection; the push of the driving deltas is booked in `forward_ms`, as native's feed is. Completing `Dlt` stays in `index_ms`.
 - `on_group` takes the buffers by value, not by reference, so that `collect` can keep them until `finish`.
 - The reader shape: each reader is a `Version` and a `Node` description over a borrowing `VirtualBuffer`, as the seed of step 5's join-plan type.
 - The compiler hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused; removing it is a follow-up.

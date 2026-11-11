@@ -722,22 +722,31 @@ fn transact_inner(
     let view_reads_before = pipeline.view.circuit.run_reads()?;
     let view_started = Instant::now();
     // The IVM window of the reconstructed build starts with the scan session, which reads the
-    // index once for the whole transaction, and the push of the driving deltas it buffered.
+    // index once for the whole transaction. Pushing the driving deltas it buffered into the
+    // input handles is a boundary copy, like the native feed, so it is booked in `forward_ms`
+    // and the window resumes with the transaction.
     #[cfg(feature = "merged-index")]
-    let collection_result = pipeline
-        .collect_groups()
-        .and_then(|()| pipeline.push_driving_deltas());
-    #[cfg(feature = "merged-index")]
-    let transaction_result = collection_result.and_then(|()| {
-        pipeline
-            .view
-            .circuit
-            .transaction()
-            .map_err(anyhow::Error::from)
-    });
+    let (transaction_result, latency) = {
+        let collection_result = pipeline.collect_groups();
+        let collection = view_started.elapsed();
+        let push_started = Instant::now();
+        let push_result = collection_result.and_then(|()| pipeline.push_driving_deltas());
+        stats.forward += push_started.elapsed();
+        let transaction_started = Instant::now();
+        let transaction_result = push_result.and_then(|()| {
+            pipeline
+                .view
+                .circuit
+                .transaction()
+                .map_err(anyhow::Error::from)
+        });
+        (transaction_result, collection + transaction_started.elapsed())
+    };
     #[cfg(not(feature = "merged-index"))]
-    let transaction_result = pipeline.view.circuit.transaction();
-    let latency = view_started.elapsed();
+    let (transaction_result, latency) = {
+        let transaction_result = pipeline.view.circuit.transaction();
+        (transaction_result, view_started.elapsed())
+    };
     let view_reads_after = pipeline.view.circuit.run_reads()?;
     if let (Some(before), Some(base_after)) = (cpu_before, base_cpu_after) {
         let view_after = profiled_cpu(&mut pipeline.view.circuit)?;
@@ -1600,9 +1609,11 @@ fn finish_loading(
 ///
 /// `base_ms` is base maintenance: the base circuit's transaction plus the merged index's
 /// upkeep. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `ivm_ms` is
-/// incremental view maintenance and equals `q3_ms`, the view circuit's transaction. The
-/// base circuit, `forward_ms`, the index append and `q3_ms` are disjoint intervals of the
-/// transaction; the base and IVM phases are always reported side by side.
+/// incremental view maintenance and equals `q3_ms`, the view circuit's transaction (in
+/// reconstructed mode, with the scan session's collection before it). `forward_ms` holds the
+/// boundary copy of the driving deltas into the view circuit's input handles in both modes
+/// (measurement version 9). The base circuit, `forward_ms`, the index append and `q3_ms` are
+/// disjoint intervals of the transaction; the base and IVM phases are always reported side by side.
 fn phase_json(stats: &Measurements) -> Value {
     json!({
         "rows": stats.rows,
@@ -1616,7 +1627,7 @@ fn phase_json(stats: &Measurements) -> Value {
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
         "ivm_ms": milliseconds(stats.ivm_phase()),
-        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it starts with the scan session's collection of the touched groups and the push of the driving deltas into the circuit's input handles. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and in native mode its feed to the view circuit), discovery, preparation and publication/cleanup are in neither.",
+        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it also includes the scan session's collection of the touched groups. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and the boundary copy of the driving deltas into the view circuit's input handles: native's feed of the net delta, reconstructed's push from the session's buffers), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
         "profiled_cpu_ms": stats.profiled_cpu.map(|cpu| json!({
             "base": milliseconds(cpu.base),
@@ -2040,7 +2051,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 8,
+        "measurement_version": 9,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -3125,7 +3136,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 8);
+        assert_eq!(output["measurement_version"], 9);
         // Version 8 reports the merged index's run reads of the view phase as the scan
         // session's (`index_run_reads.session`, with the session's moves in
         // `index_session_counts`), and the reads of base maintenance apart
