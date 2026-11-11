@@ -426,10 +426,12 @@ The user also confirmed on 2026-11-10:
 - `build_batch` (`crates/dbsp/src/trace/merged_index/batch.rs`) drops its fixed `BatchLocation::Memory`. A delta batch is placed as an operator's output is, by `BuildTo::for_capacity` (`min_step_storage_bytes`, zero at Critical memory pressure). This changes where today's reconstructed readers find `Dlt`, but only at Critical pressure. It amends "2026-11-10: The step-3 publication of `(Old, Dlt)`": the after reads take `Dlt` itself, which is in memory unless the runtime is at Critical pressure, where it is a file.
 - The two COL tests that hand-placed `Old` as one run in memory or in a file (`session_run_reads_on_the_native_layout_in_memory` and `..._in_a_file`) are deleted. The harness's `session_worked_transaction_tests` replaces them. `session_run_reads_on_the_worked_transaction` and the COL counter tests of today's readers stay.
 
-Choices the user has not confirmed (see "Unconfirmed choices" in [shared-traversal.md](shared-traversal.md)):
+The user confirmed on 2026-11-10:
 
-- The session's worked transaction runs on the base circuit and the index, not on the view circuit, because the reconstructed readers reject a change of `c5` without an order row.
-- The native layout is reported from the reads (memory reads or decodes) and the file counts, not from an inventory of the circuit's spines.
+- The native layout is reported from the reads (memory reads or decodes) and the file counts, not from an inventory of the circuit's spines. The inventory (`spine_contents`) is process-wide, and the test runner runs the arms in parallel.
+- The shared helper is named `run_load_and_transaction`.
+
+The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting it to the roadmap step 4 work (the hand-written view circuit). That work decides whether the view circuit admits other transactions, the worked transaction included. Until then, the session's worked transaction runs on the base circuit and the index only.
 
 ## Superseded and withdrawn
 

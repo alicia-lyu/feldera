@@ -517,5 +517,3 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
 - `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
-- The worked-transaction session test runs the transaction on the base circuit and the index, not on the view circuit, since the reconstructed readers reject a change of `c5` without an order row.
-- The native layout is reported from the reads (memory reads or decodes) and the storage directory's file counts. A `spine_contents` inventory is not used: the diagnostics registry is process-global, so spines of tests that run in parallel would mix.
