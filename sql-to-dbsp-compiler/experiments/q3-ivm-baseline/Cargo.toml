@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [features]
-merged-index = ["dep:merged-index-col", "dep:crossbeam", "q3-view-circuit/merged-index"]
+merged-index = ["dep:merged-index-col", "dep:crossbeam", "dep:q3-trie-view-circuit"]
 
 [dependencies]
 anyhow = "1"
@@ -27,6 +27,7 @@ feldera-types = { path = "../../../crates/feldera-types" }
 feldera-macros = { path = "../../../crates/feldera-macros" }
 paste = "1"
 q3-base-circuit = { path = "q3-base-circuit" }
+q3-trie-view-circuit = { path = "q3-trie-view-circuit", optional = true }
 q3-view-circuit = { path = "q3-view-circuit" }
 rkyv = { version = "0.7", default-features = false, features = ["std", "size_64"] }
 serde = { version = "1", features = ["derive"] }

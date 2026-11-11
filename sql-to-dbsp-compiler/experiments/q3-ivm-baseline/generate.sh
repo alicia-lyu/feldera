@@ -2,7 +2,8 @@
 # Generates the two chained circuits of the Q3 baseline:
 #   q3-base-circuit/src/lib.rs  from base.sql  (primary-key tables, no view)
 #   q3-view-circuit/src/lib.rs  from q3.sql    (keyless tables and V), plus plan.json
-# `--q3-merged-index` makes the view circuit read the merged index instead of its join traces.
+# This is the native pair. The reconstructed build's view circuit is written by hand
+# (q3-trie-view-circuit), so it needs no generation.
 set -euo pipefail
 
 experiment_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,11 +23,8 @@ if [[ -n "${JAVA_HOME:-}" ]]; then
   export PATH="${JAVA_HOME}/bin:${PATH}"
 fi
 
-view_args=()
-if [[ "${1:-}" == "--q3-merged-index" && "$#" -eq 1 ]]; then
-  view_args+=("--q3-merged-index")
-elif [[ "$#" -ne 0 ]]; then
-  echo "usage: $0 [--q3-merged-index]" >&2
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: $0" >&2
   exit 2
 fi
 
@@ -74,4 +72,4 @@ generate_circuit() {
 generate_circuit "${experiment_dir}/base.sql" "${experiment_dir}/q3-base-circuit" "" --alltables
 # plan.json is the relational plan of the view circuit.
 generate_circuit "${experiment_dir}/q3.sql" "${experiment_dir}/q3-view-circuit" \
-  "${experiment_dir}/plan.json" "${view_args[@]+"${view_args[@]}"}"
+  "${experiment_dir}/plan.json"

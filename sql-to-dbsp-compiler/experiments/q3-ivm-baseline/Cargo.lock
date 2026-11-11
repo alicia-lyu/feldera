@@ -6192,11 +6192,33 @@ dependencies = [
  "merged-index-col",
  "paste",
  "q3-base-circuit",
+ "q3-trie-view-circuit",
  "q3-view-circuit",
  "rkyv",
  "serde",
  "serde_json",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "q3-trie-view-circuit"
+version = "0.1.0"
+dependencies = [
+ "arcstr",
+ "compare",
+ "dbsp",
+ "dbsp_adapters",
+ "derive_more 1.0.0",
+ "erased-serde",
+ "feldera-macros",
+ "feldera-size-of",
+ "feldera-sqllib",
+ "feldera-types",
+ "merged-index-col",
+ "paste",
+ "rkyv",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6213,7 +6235,6 @@ dependencies = [
  "feldera-size-of",
  "feldera-sqllib",
  "feldera-types",
- "merged-index-col",
  "paste",
  "rkyv",
  "serde",
