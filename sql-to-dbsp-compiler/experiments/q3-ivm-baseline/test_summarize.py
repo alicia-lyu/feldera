@@ -22,8 +22,8 @@ def owners(query: int, base: int, index: int) -> dict[str, dict[str, int]]:
 
 
 def index_reads(seeks: int) -> dict[str, dict[str, int]]:
-    """Every reader with `seeks` seeks and twice as many key, value and weight decodes, and as
-    many memory reads."""
+    """The scan session with `seeks` seeks and twice as many key, value and weight decodes, and
+    as many memory reads."""
     return {reader: {"seeks": seeks, "filter_rejections": 0, "key_decodes": 2 * seeks,
                      "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks,
                      "memory_key_reads": seeks, "memory_value_reads": seeks,
@@ -31,14 +31,13 @@ def index_reads(seeks: int) -> dict[str, dict[str, int]]:
             for reader in summarize.INDEX_READERS}
 
 
-def view_reads(index: dict | None, query: int) -> dict[str, dict[str, int]]:
-    """The view worker's reads: `query` of every count under `query`, and the index readers'
-    sums under `merged_index` (zero without an index)."""
+def view_reads(query: int) -> dict[str, dict[str, int]]:
+    """The view worker's reads: `query` of every count under `query`. The scan session reads the
+    index on the driver's thread, so the worker reads nothing under `merged_index`."""
     return {
         "query": {field: query for field in summarize.RUN_READ_FIELDS},
         "base_relation": {field: 0 for field in summarize.RUN_READ_FIELDS},
-        "merged_index": {field: sum(reads[field] for reads in index.values()) if index else 0
-                         for field in summarize.RUN_READ_FIELDS},
+        "merged_index": {field: 0 for field in summarize.RUN_READ_FIELDS},
     }
 
 
@@ -59,15 +58,14 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                   "index_layout": None if native else LAYOUT}
                  for number in (1, 2)]
     for refresh in refreshes:
-        refresh["view_run_reads"] = view_reads(refresh["index_run_reads"],
-                                               10 * refresh["refresh"])
+        refresh["view_run_reads"] = view_reads(10 * refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 7, "os": "linux",
+        "measurement_version": 8, "os": "linux",
         "refreshes": refreshes,
         "sequence": {
             "index_run_reads": None if native else index_reads(int(3 * scale)),
-            "view_run_reads": view_reads(None if native else index_reads(int(3 * scale)), 30),
+            "view_run_reads": view_reads(30),
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
             "window_peak_rss_bytes": 7_000_000 + int(scale),
             "window_end_rss_bytes": 6_000_000 + int(scale), "cgroup": None,
@@ -137,21 +135,21 @@ class SummarizeTest(unittest.TestCase):
         self.assertIn("Runs per mode: native 3, merged-index 3.", markdown)
         self.assertIn("| `sequence_wall_ms` | 200 | 100 | 300 | 600 | 500 | 700 |", markdown)
         # The index's run reads exist for the merged-index mode alone. Its sequence makes
-        # 3 * scale seeks per reader over four readers, so 12 * scale.
+        # 3 * scale seeks for the one reader, the scan session.
         self.assertNotIn("index_run_reads", native)
         merged = summary["workloads"]["clustered"]["modes"]["merged-index"]
         seeks = merged["index_run_reads"]["index_seeks"]
-        self.assertEqual((seeks["median"], seeks["min"], seeks["max"]), (72, 60, 84))
-        self.assertEqual(merged["index_run_reads"]["index_value_decodes"]["median"], 144)
+        self.assertEqual((seeks["median"], seeks["min"], seeks["max"]), (18, 15, 21))
+        self.assertEqual(merged["index_run_reads"]["index_value_decodes"]["median"], 36)
         # The memory reads are separate metrics, one per seek, not added to the decodes.
-        self.assertEqual(merged["index_run_reads"]["index_memory_value_reads"]["median"], 72)
+        self.assertEqual(merged["index_run_reads"]["index_memory_value_reads"]["median"], 18)
         self.assertNotIn("index_seeks", merged["metrics"])
         self.assertIn("Merged-index run reads (merged-index)", markdown)
-        self.assertIn("| `index_seeks` | 72 | 60 | 84 |", markdown)
-        # Both modes report the view worker's reads, summed over the owners: 30 query seeks,
-        # plus the index's 12 * scale in the merged-index mode.
+        self.assertIn("| `index_seeks` | 18 | 15 | 21 |", markdown)
+        # Both modes report the view worker's reads, summed over the owners: 30 query seeks. The
+        # scan session reads the index on the driver's thread, so the worker adds none.
         self.assertEqual(native["metrics"]["view_seeks"]["median"], 30)
-        self.assertEqual(merged["metrics"]["view_seeks"]["median"], 30 + 72)
+        self.assertEqual(merged["metrics"]["view_seeks"]["median"], 30)
         self.assertTrue(markdown.endswith("|\n"))
         self.assertNotIn("  \n", markdown)
 
@@ -292,17 +290,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 7")
+        self.failing(content, "native run 1: measurement_version is 2, not 8")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 7")
+        self.failing(content, "native run 1: measurement_version is 3, not 8")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 7")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 8")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 7")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 8")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")
@@ -314,9 +312,9 @@ class SummarizeTest(unittest.TestCase):
 
     def test_inconsistent_index_run_reads_are_an_error(self) -> None:
         content = manifest({"native": [1.0], "merged-index": [1.0]})
-        content["runs"][1]["driver"]["sequence"]["index_run_reads"]["orders_before"]["seeks"] += 1
+        content["runs"][1]["driver"]["sequence"]["index_run_reads"]["session"]["seeks"] += 1
         self.failing(content, "inconsistent run reads")
-        # The view worker's index part must match the index readers'.
+        # The view worker reads nothing under `merged_index`.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         refresh = content["runs"][1]["driver"]["refreshes"][0]
         refresh["view_run_reads"]["merged_index"]["seeks"] += 1

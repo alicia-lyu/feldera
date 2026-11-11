@@ -20,9 +20,10 @@ from typing import Any
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
 WRITE_OWNERS = ("query", "base_relation", "merged_index")
-# The merged index's readers, and the run counts reported for each (measurement version 7). The
-# decodes are file runs'; the memory reads are in-memory runs', kept apart from them.
-INDEX_READERS = ("customers_after", "orders_before", "joined_orders_after", "lineitems_before")
+# The merged index's readers, and the run counts reported for each (measurement version 8). The
+# view phase reads the index only through its scan session, so there is one reader. The decodes
+# are file runs'; the memory reads are in-memory runs', kept apart from them.
+INDEX_READERS = ("session",)
 RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes",
                    "memory_key_reads", "memory_value_reads", "memory_weight_reads")
 
@@ -118,10 +119,10 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
 
     Each refresh and the sequence give `view_run_reads` for every owner in
     `WRITE_OWNERS`, with every `RUN_READ_FIELDS` a non-negative integer, and the
-    sequence's counts are the sums of the refreshes'. Only the index readers read
-    under `merged_index`: a native report has none, and a reconstructed report's
-    `merged_index` counts are its `index_run_reads` summed over the readers. A
-    report that names neither mode is not checked here.
+    sequence's counts are the sums of the refreshes'. Nothing the view worker runs
+    reads under `merged_index`: the scan session reads the index on the driver's
+    thread, and its reads are in `index_run_reads`, not here. A report that names
+    neither mode is not checked here.
     """
     mode = report.get("mode")
     if mode not in ("native", "reconstructed"):
@@ -149,14 +150,9 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
             total[key] = total.get(key, 0) + value
         for field in RUN_READ_FIELDS:
             index_part = found[("merged_index", field)]
-            if mode == "native":
-                expected = 0
-            else:
-                readers = item.get("index_run_reads") or {}
-                expected = sum(readers.get(reader, {}).get(field, 0) for reader in INDEX_READERS)
-            if index_part != expected:
+            if index_part != 0:
                 problems.append(f"{place}: view_run_reads.merged_index.{field} is {index_part}, "
-                                f"expected {expected}")
+                                "expected 0")
     summed = counts("sequence", report.get("sequence", {}).get("view_run_reads"))
     if summed is not None and not problems and summed != total:
         problems.append("sequence: view_run_reads are not the sums of the refreshes'")

@@ -1616,7 +1616,7 @@ fn phase_json(stats: &Measurements) -> Value {
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
         "ivm_ms": milliseconds(stats.ivm_phase()),
-        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction. Report base_ms and ivm_ms side by side. forward_ms (net delta read and feed), discovery, preparation and publication/cleanup are in neither.",
+        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it starts with the scan session's collection of the touched groups and the push of the driving deltas into the circuit's input handles. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and in native mode its feed to the view circuit), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
         "profiled_cpu_ms": stats.profiled_cpu.map(|cpu| json!({
             "base": milliseconds(cpu.base),
@@ -2537,6 +2537,114 @@ mod general_delta_tests {
         })?;
         step(Change::default())?;
         assert_eq!(stats.transactions, 10);
+        Ok(())
+    }
+
+    /// A small deterministic generator, so that a failing seed reproduces.
+    struct Generator(u64);
+
+    impl Generator {
+        /// A number below `bound`.
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// A random change of the primary-key tables, valid against `state`: at most one operation
+    /// per key. A key that exists is deleted or replaced (an order replaced may change its
+    /// customer, which moves its line items), and a key that does not exist is inserted. Line
+    /// items may have no order, and orders may have no customer.
+    fn random_change(generator: &mut Generator, state: &Reference) -> Change {
+        let mut change = Change::default();
+        for key in 1..=3 {
+            let old = state.customers.get(&key);
+            let segment = ["AUTOMOBILE", "BUILDING", "MACHINERY"][generator.below(3) as usize];
+            match (generator.below(4), old) {
+                (0, Some(old)) => change.customers.push((old.clone(), false)),
+                (0, None) => change.customers.push((customer(key, segment), true)),
+                (1, Some(old)) if old.segment != segment => {
+                    change.customers.push((old.clone(), false));
+                    change.customers.push((customer(key, segment), true));
+                }
+                _ => {}
+            }
+        }
+        for key in 1..=5 {
+            let old = state.orders.get(&key);
+            let mut new = order(key, 1 + generator.below(3) as i64);
+            new.ship_priority = generator.below(3) as i32;
+            match (generator.below(4), old) {
+                (0, Some(old)) => change.orders.push((old.clone(), false)),
+                (0, None) => change.orders.push((new, true)),
+                (1, Some(old)) if *old != new => {
+                    change.orders.push((old.clone(), false));
+                    change.orders.push((new, true));
+                }
+                _ => {}
+            }
+        }
+        for order_key in 1..=5 {
+            for number in 1..=3 {
+                let old = state.lines.get(&(order_key, number));
+                let mut new = line(order_key, number);
+                new.price_cents = 100 + 50 * generator.below(3) as i64;
+                match (generator.below(4), old) {
+                    (0, Some(old)) => change.lines.push((old.clone(), false)),
+                    (0, None) => change.lines.push((new, true)),
+                    (1, Some(old)) if *old != new => {
+                        change.lines.push((old.clone(), false));
+                        change.lines.push((new, true));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        change
+    }
+
+    /// Random changes of every kind, in sequence from several seeds: after each, `V` and its
+    /// delta equal the independent join of the reference (`transact` checks them), and, in the
+    /// reconstructed build, the index and the view circuit have taken the same change by way of
+    /// `prepare`'s complete `Dlt`.
+    #[test]
+    fn random_general_changes_match_the_reference_join() -> Result<()> {
+        // Orders that moved to another customer while they had line items, and line items
+        // inserted or kept with no order: the hard cases must occur.
+        let (mut moves_with_lines, mut orphan_lines_seen) = (0, 0);
+        for seed in 0..8 {
+            let mut generator = Generator(seed);
+            let mut pipeline = Pipeline::with_workers(1)?;
+            let mut state = Reference::default();
+            let mut stats = Measurements::default();
+            for _ in 0..30 {
+                let change = random_change(&mut generator, &state);
+                moves_with_lines += change
+                    .orders
+                    .iter()
+                    .filter(|(new, insert)| {
+                        *insert
+                            && state.orders.get(&new.key).is_some_and(|old| {
+                                old.customer_key != new.customer_key
+                                    && state.lines.keys().any(|(order, _)| *order == new.key)
+                            })
+                    })
+                    .count();
+                transact(&mut pipeline, &mut state, change, true, &mut stats)
+                    .with_context(|| format!("seed {seed}, transaction {}", stats.transactions))?;
+                orphan_lines_seen += state
+                    .lines
+                    .keys()
+                    .filter(|(order, _)| !state.orders.contains_key(order))
+                    .count();
+            }
+            assert_eq!(stats.transactions, 30);
+        }
+        assert!(moves_with_lines > 0, "no order moved with its line items");
+        assert!(orphan_lines_seen > 0, "no line item was ever an orphan");
         Ok(())
     }
 }

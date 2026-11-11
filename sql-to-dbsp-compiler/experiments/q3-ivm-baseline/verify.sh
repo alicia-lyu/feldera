@@ -24,37 +24,42 @@ run_check() {
   fi
 }
 
-restore_native() {
+report_artifacts() {
   local status="$?"
   trap - EXIT
-  if ! run_check restore-native "${experiment_dir}/generate.sh"; then
-    echo "Default native generation could not be restored; see ${artifacts}/restore-native.log" >&2
-    status=1
-  fi
   echo "Verification artifacts: ${artifacts}"
   exit "${status}"
 }
-trap restore_native EXIT
+trap report_artifacts EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 run_check native-generation "${experiment_dir}/generate.sh"
 run_check native-format cargo +1.96.1 fmt --manifest-path "${manifest}" --all -- --check
 run_check native-tests env Q3_VERIFICATION_TRANSCRIPT="${artifacts}/native.json" \
+  Q3_GENERAL_TRANSCRIPT="${artifacts}/native-general.json" \
   cargo +1.96.1 test --manifest-path "${manifest}" --offline --locked -j2
 run_check native-clippy cargo +1.96.1 clippy --manifest-path "${manifest}" \
   --offline --locked --all-targets --workspace -j2 -- -D warnings
 
-run_check reconstructed-generation "${experiment_dir}/generate.sh" --q3-merged-index
+# The reconstructed build needs no generation: its view circuit is written by hand.
 run_check reconstructed-format cargo +1.96.1 fmt --manifest-path "${manifest}" --all -- --check
 run_check reconstructed-tests env Q3_VERIFICATION_TRANSCRIPT="${artifacts}/reconstructed.json" \
+  Q3_GENERAL_TRANSCRIPT="${artifacts}/reconstructed-general.json" \
   cargo +1.96.1 test --manifest-path "${manifest}" --offline --locked -j2 --features merged-index
 run_check reconstructed-clippy cargo +1.96.1 clippy --manifest-path "${manifest}" \
   --offline --locked --all-targets --workspace -j2 --features merged-index -- -D warnings
 
+run_check trie-circuit-tests cargo +1.96.1 test --manifest-path "${manifest}" --offline --locked -j2 \
+  -p q3-trie-view-circuit
+
 test -s "${artifacts}/native.json"
 test -s "${artifacts}/reconstructed.json"
+test -s "${artifacts}/native-general.json"
+test -s "${artifacts}/reconstructed-general.json"
 run_check transcript-comparison cmp "${artifacts}/native.json" "${artifacts}/reconstructed.json"
+run_check general-transcript-comparison cmp "${artifacts}/native-general.json" \
+  "${artifacts}/reconstructed-general.json"
 
 # The committed generated module must match what col.mi and the compiler produce now.
 run_check col-generation "${col_dir}/generate.sh" "${artifacts}/generated.rs"
@@ -71,4 +76,4 @@ for script in "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh" "${c
   run_check "shell-syntax-$(basename "$(dirname "${script}")")-$(basename "${script}" .sh)" bash -n "${script}"
 done
 run_check whitespace git -C "${experiment_dir}" diff --check -- . ../merged-index-col
-echo "RF1/RF2 suites, reader projections, and exact transaction transcripts agree."
+echo "RF1/RF2 and general suites, reader projections, and exact transaction transcripts agree."
