@@ -1,129 +1,197 @@
-//! Query-specific accumulated-state reads for the RF1/RF2 Q3 prototype.
+//! Query-specific partner reads for the Q3 view circuit.
 //!
-//! The caller maintains the secondary index before publishing a transaction's
-//! immutable views. Order placement comes exclusively from that transaction's
-//! complete Orders delta. These readers never insert into a historical trace.
+//! The view is `V = L ⋈ (O ⋈ C)`. The caller maintains the secondary index,
+//! publishes the transaction's `Old` (the snapshot before it) and `Dlt` (its
+//! signed index changes), and [`Q3State::collect`] runs one scan session over
+//! them. The session buffers each touched customer's group once; the groups
+//! stay in [`Q3State`] until [`Q3State::finish`].
 //!
-//! Requested rows are decoded (each stored payload with its key) and copied
-//! into temporary native batches so the existing join can consume them. This is suboptimal: a future reconstructed
-//! cursor could avoid this materialization and its possible sorting costs.
+//! The four partner reads of the delta rules are logical: each is a
+//! description (before or after the transaction, a path or a range, and its
+//! streams) that reads through a [`VirtualBuffer`], a borrowing view of one
+//! group's buffers at one node. A before read sees `Old`; an after read sees
+//! `Old` followed by `Dlt`, unconsolidated (`prop:overlay`). The readers never
+//! touch the index, and a request outside the touched groups breaks the
+//! contract that every driving-delta key lies in a group that `Dlt` touches.
+//!
+//! The values that cross the DBSP boundary are copied twice: the driving
+//! deltas (the buffers' `Dlt` halves) into the circuit's input handles, and
+//! each reader's partner vector into the join. The scan session of roadmap
+//! step 5 removes both copies.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::AddAssign,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use dbsp::{
     circuit::{splitter_output_chunk_size, RootCircuit},
-    dynamic::{DowncastTrait, DynData, Erase},
+    dynamic::DowncastTrait,
     storage::write_attribution::WriteOwner,
     trace::{
-        current_read_owner, merged_index::MergedIndexBatch, with_read_owner,
-        BatchReader as DynamicBatchReader, Cursor, RunReads, SpineSnapshot as DynamicSnapshot,
+        merged_index::{
+            Entry, GroupBuffers, MergedIndexBatch, MergedIndexDefinition, Pass, ScanSession,
+            SessionCounts,
+        },
+        with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
+        SpineSnapshot as DynamicSnapshot,
     },
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
-    utils::{Tup1, Tup2, Tup3, Tup4},
-    DBData, DynZWeight, OrdIndexedZSet, OrdZSet, Stream,
+    utils::{Tup1, Tup2, Tup3, Tup4, Tup6},
+    DBData, OrdIndexedZSet, OrdZSet, Stream, ZSetHandle,
 };
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
-use dbsp::trace::merged_index::MergedIndexDefinition;
-
 use super::{
-    decode_payload, prefix_custkey, prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey,
+    prefix_custkey, prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey,
     CustomerOrdersLineitemDefinition, Key, LineitemByCustkeyOrderkeyLinenumberKey,
-    OrdersByCustkeyOrderkeyKey, Payload, StoredPayload,
+    OrdersByCustkeyOrderkeyKey, Payload, INDEX_ID_CUSTOMER_BY_CUSTKEY,
+    INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER, INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
 };
 
-pub type CustomerBatch = OrdIndexedZSet<Tup1<i64>, Tup1<SqlString>>;
-pub type OrdersBatch = OrdIndexedZSet<Tup1<i64>, Tup3<i64, Date, i32>>;
-pub type JoinedOrdersBatch = OrdIndexedZSet<Tup1<i64>, Tup4<i64, SqlString, Date, i32>>;
-pub type LineitemBatch =
-    OrdIndexedZSet<Tup1<i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>;
+// A *vector* is DBSP's unit of pipelining: a weighted, key-sorted set of rows
+// that flows between operators. It is the counterpart of an X100 vector, not
+// of a Volcano row.
+
+/// The customers, indexed by `custkey`.
+pub type CustomerByCustkeyVector = OrdIndexedZSet<Tup1<i64>, Tup1<SqlString>>;
+/// The orders, indexed by their customer: `(orderkey, orderdate, shippriority)`.
+pub type OrdersByCustkeyVector = OrdIndexedZSet<Tup1<i64>, Tup3<i64, Date, i32>>;
+/// The joined orders `J`, indexed by `(custkey, orderkey)`, the node at which
+/// `V` reads them: `(mktsegment, orderdate, shippriority)`.
+pub type JoinedByCustkeyOrderkeyVector = OrdIndexedZSet<Tup2<i64, i64>, Tup3<SqlString, Date, i32>>;
+/// The line items, indexed by `(custkey, orderkey)`.
+pub type LineitemByCustkeyOrderkeyVector =
+    OrdIndexedZSet<Tup2<i64, i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>;
+
+/// A row of the view circuit's customer input: `(custkey, mktsegment)`.
+pub type CustomerRow = Tup2<i64, SqlString>;
+/// A row of the view circuit's order input: `(custkey, orderkey, orderdate, shippriority)`.
+pub type OrderRow = Tup4<i64, i64, Date, i32>;
+/// A row of the view circuit's line-item input: `(custkey, orderkey, linenumber, extendedprice,
+/// discount, shipdate)`.
+pub type LineitemRow = Tup6<i64, i64, i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
+
 pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
+
+/// The streams the session collects: all three.
+const STREAMS: [u8; 3] = [
+    INDEX_ID_CUSTOMER_BY_CUSTKEY,
+    INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+    INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+];
+
+/// What one transaction's view maintenance read from the index: the scan
+/// session's moves, and the run reads they cost (all under the merged index's
+/// read owner, on the thread that collected).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionReads {
+    pub counts: SessionCounts,
+    pub run_reads: RunReads,
+}
+
+impl AddAssign for SessionReads {
+    fn add_assign(&mut self, other: Self) {
+        self.counts += other.counts;
+        self.run_reads += other.run_reads;
+    }
+}
+
+/// The touched groups of one transaction, by group prefix (the root domain's
+/// tag and value), and what collecting them read.
+struct CollectedGroups {
+    groups: BTreeMap<Vec<u8>, GroupBuffers<Payload>>,
+    reads: SessionReads,
+}
+
+impl CollectedGroups {
+    /// The buffers of customer `custkey`'s group.
+    fn group(&self, custkey: i64) -> Result<&GroupBuffers<Payload>, String> {
+        self.groups.get(&prefix_custkey(custkey)).ok_or_else(|| {
+            format!("customer {custkey} is outside the touched groups: Dlt has no entry for it")
+        })
+    }
+}
 
 struct ReadViews {
     old: SourceSnapshot,
     dlt: Arc<MergedIndexBatch>,
-    /// `Old ⊎ Dlt`: `Old`'s runs with `Dlt` as one more run. A cursor over
-    /// it sums each entry's weights across runs, which gives the after state.
-    after: SourceSnapshot,
-    order_customers: BTreeMap<i64, BTreeSet<i64>>,
-    reads: Mutex<IndexReads>,
+    /// Set once by [`Q3State::collect`].
+    collected: OnceLock<CollectedGroups>,
 }
 
-/// The index's run reads in one transaction, per reader. Each reader's calls
-/// accumulate in its field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IndexReads {
-    pub customers_after: RunReads,
-    pub orders_before: RunReads,
-    pub joined_orders_after: RunReads,
-    pub lineitems_before: RunReads,
-}
-
-impl AddAssign for IndexReads {
-    fn add_assign(&mut self, other: Self) {
-        self.customers_after += other.customers_after;
-        self.orders_before += other.orders_before;
-        self.joined_orders_after += other.joined_orders_after;
-        self.lineitems_before += other.lineitems_before;
-    }
-}
-
-/// One externally prepared transaction's read views, shared by the generated joins.
+/// One externally prepared transaction's index views and groups, shared by the
+/// view circuit's joins.
 ///
 /// Publish `Old`, the index snapshot before the transaction, and `Dlt`, the
 /// run of the transaction's signed index changes, after index maintenance and
-/// before starting Q3. Before reads take `Old`; after reads take `Old ⊎ Dlt`
-/// (`prop:overlay`), so no after snapshot is published. Keep the
-/// publication unchanged until `DBSPHandle::transaction` or the equivalent
-/// multi-step commit has completed, then call [`Self::finish`]. The caller must
-/// restore the index, base state, and Q3 at the same completed transaction.
-/// Customer sets contain candidate physical locations for each requested order;
-/// both temporal readers probe the same locations in their respective snapshots.
-/// They deduplicate addresses without storing payloads or signed weights.
+/// before the view transaction. [`Self::collect`] then buffers the touched
+/// groups; the joins' readers and [`Self::push_driving_deltas`] use them. Keep
+/// the publication unchanged until `DBSPHandle::transaction` or the equivalent
+/// multi-step commit has completed, then call [`Self::finish`]: the groups are
+/// held until then, since `J` and `V` are separate operators and `V` flushes
+/// only after `J` has passed every customer. The caller must restore the
+/// index, base state, and the view circuit at the same completed transaction.
 #[derive(Clone, Default)]
 pub struct Q3State {
     views: Arc<Mutex<Option<Arc<ReadViews>>>>,
 }
 
 impl Q3State {
-    pub fn publish(
-        &self,
-        old: SourceSnapshot,
-        dlt: Arc<MergedIndexBatch>,
-        order_customers: BTreeMap<i64, BTreeSet<i64>>,
-    ) -> Result<(), String> {
+    pub fn publish(&self, old: SourceSnapshot, dlt: Arc<MergedIndexBatch>) -> Result<(), String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
         if views.is_some() {
             return Err("finish the previous Q3 transaction before publishing another".into());
         }
-        let mut after = old.clone();
-        // An empty run would add a cursor that reads nothing but may still seek.
-        if !dlt.is_empty() {
-            after.extend_with_batches([dlt.clone()]);
-        }
         *views = Some(Arc::new(ReadViews {
             old,
             dlt,
-            after,
-            order_customers,
-            reads: Mutex::default(),
+            collected: OnceLock::new(),
         }));
         Ok(())
     }
 
-    /// Release published handles after all transaction consumers finish, and
-    /// return the index's run reads in the transaction.
-    pub fn finish(&self) -> Result<IndexReads, String> {
+    /// Runs the scan session over the published `Old` and `Dlt` and keeps the
+    /// touched groups until [`Self::finish`]. The index is read here, on the
+    /// calling thread under the merged index's read owner, and nowhere else;
+    /// the caller binds the runtime's buffer cache to this thread.
+    pub fn collect(&self, pass: Pass) -> Result<(), String> {
+        let views = self.views()?;
+        let before = RunReads::current_for(WriteOwner::MergedIndex);
+        let mut groups = BTreeMap::new();
+        let counts = with_read_owner(WriteOwner::MergedIndex, || {
+            let mut session =
+                ScanSession::<CustomerOrdersLineitemDefinition>::new(&views.old, &views.dlt, pass);
+            session.maintain(&BTreeSet::from(STREAMS), None, |group, buffers| {
+                groups.insert(group.to_vec(), buffers);
+                Ok(())
+            })?;
+            Ok::<_, String>(session.counts())
+        })?;
+        let run_reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
+        let collected = CollectedGroups {
+            groups,
+            reads: SessionReads { counts, run_reads },
+        };
+        views
+            .collected
+            .set(collected)
+            .map_err(|_| "the published views were already collected".to_owned())
+    }
+
+    /// Release the groups and published handles after all transaction
+    /// consumers finish, and return what collecting them read from the index
+    /// (nothing, if the transaction never collected).
+    pub fn finish(&self) -> Result<SessionReads, String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
         let views = views
             .take()
             .ok_or("no Q3 transaction views were published")?;
-        let reads = *views.reads.lock().map_err(|_| "Q3 reads lock poisoned")?;
-        Ok(reads)
+        Ok(views
+            .collected
+            .get()
+            .map_or_else(SessionReads::default, |collected| collected.reads))
     }
 
     /// The published `Old` snapshot.
@@ -144,295 +212,317 @@ impl Q3State {
             .ok_or_else(|| "publish merged-index views before Q3 maintenance".into())
     }
 
+    /// Pushes the buffers' `Dlt` halves into the view circuit's input handles:
+    /// the driving deltas. Every row carries its trie keys. This is the first
+    /// of the two copies at the DBSP boundary.
+    pub fn push_driving_deltas(
+        &self,
+        customers: &ZSetHandle<CustomerRow>,
+        orders: &ZSetHandle<OrderRow>,
+        lines: &ZSetHandle<LineitemRow>,
+    ) -> Result<(), String> {
+        let views = self.views()?;
+        let collected = views.collected_groups()?;
+        for buffers in collected.groups.values() {
+            for entry in buffers.dlt(INDEX_ID_CUSTOMER_BY_CUSTKEY) {
+                let key = customer_key(entry)?;
+                let segment = customer_segment(entry)?;
+                customers.push(Tup2(key.custkey, segment.clone()), entry.weight);
+            }
+            for entry in buffers.dlt(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY) {
+                let key = order_key(entry)?;
+                let (date, priority) = order_payload(entry)?;
+                orders.push(
+                    Tup4(key.custkey, key.orderkey, date, priority),
+                    entry.weight,
+                );
+            }
+            for entry in buffers.dlt(INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER) {
+                let key = line_key(entry)?;
+                let (price, discount, ship_date) = line_payload(entry)?;
+                lines.push(
+                    Tup6(
+                        key.custkey,
+                        key.orderkey,
+                        key.linenumber,
+                        price,
+                        discount,
+                        ship_date,
+                    ),
+                    entry.weight,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `C⁺`: the customers of the requested customers after the transaction.
+    /// A path read of the Customer stream, driven by `ΔO`.
     pub fn customers_after(
         &self,
-        delta: &SpineSnapshot<OrdersBatch>,
-    ) -> Result<SpineSnapshot<CustomerBatch>, String> {
+        delta: &SpineSnapshot<OrdersByCustkeyVector>,
+    ) -> Result<SpineSnapshot<CustomerByCustkeyVector>, String> {
         let views = self.views()?;
-        count_index_reads(
-            &views,
-            |reads| &mut reads.customers_after,
-            || {
-                let mut output = RequestedRows::new();
-                for customer in requested_keys(delta) {
-                    let key = CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(
-                        CustomerByCustkeyKey { custkey: customer },
-                    ));
-                    scan_entry(&views.after, key.as_bytes(), |key, payload, weight| {
-                        if let (
-                            Key::CustomerByCustkey(CustomerByCustkeyKey { custkey }),
-                            Payload::CustomerByCustkey(payload),
-                        ) = (key, payload)
-                        {
-                            output.push(Tup1(custkey), Tup1(payload.c_mktsegment), weight);
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(output.finish())
-            },
-        )
+        let collected = views.collected_groups()?;
+        let mut output = RequestedRows::new();
+        for Tup1(customer) in requested_keys(delta) {
+            let buffer = VirtualBuffer::new(collected.group(customer)?, Version::After);
+            let node = fold_customer(customer);
+            for entry in buffer.entries(INDEX_ID_CUSTOMER_BY_CUSTKEY, Node::Path(&node)) {
+                output.push(
+                    Tup1(customer),
+                    Tup1(customer_segment(entry)?.clone()),
+                    entry.weight,
+                );
+            }
+        }
+        Ok(output.finish())
     }
 
+    /// `O⁻`: the orders of the requested customers before the transaction. A
+    /// range read of the Orders stream below the customer, driven by `ΔC`.
     pub fn orders_before(
         &self,
-        delta: &SpineSnapshot<CustomerBatch>,
-    ) -> Result<SpineSnapshot<OrdersBatch>, String> {
+        delta: &SpineSnapshot<CustomerByCustkeyVector>,
+    ) -> Result<SpineSnapshot<OrdersByCustkeyVector>, String> {
         let views = self.views()?;
-        count_index_reads(
-            &views,
-            |reads| &mut reads.orders_before,
-            || {
-                let mut output = RequestedRows::new();
-                for customer in requested_keys(delta) {
-                    scan(
-                        &views.old,
-                        &prefix_custkey(customer),
-                        |key, payload, weight| {
-                            if let (
-                                Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
-                                    custkey,
-                                    orderkey,
-                                }),
-                                Payload::OrdersByCustkeyOrderkey(payload),
-                            ) = (key, payload)
-                            {
-                                output.push(
-                                    Tup1(custkey),
-                                    Tup3(orderkey, payload.o_orderdate, payload.o_shippriority),
-                                    weight,
-                                );
-                            }
-                            Ok(())
-                        },
-                    )?;
-                }
-                Ok(output.finish())
-            },
-        )
+        let collected = views.collected_groups()?;
+        let mut output = RequestedRows::new();
+        for Tup1(customer) in requested_keys(delta) {
+            let buffer = VirtualBuffer::new(collected.group(customer)?, Version::Before);
+            let below_customer = prefix_custkey(customer);
+            for entry in buffer.entries(
+                INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+                Node::Range(&below_customer),
+            ) {
+                let key = order_key(entry)?;
+                let (date, priority) = order_payload(entry)?;
+                output.push(
+                    Tup1(customer),
+                    Tup3(key.orderkey, date, priority),
+                    entry.weight,
+                );
+            }
+        }
+        Ok(output.finish())
     }
 
+    /// `J⁺`: the joined orders at the requested `(custkey, orderkey)` nodes
+    /// after the transaction. A path read of the Customer and Orders streams,
+    /// driven by `ΔL`. A joined row's weight is the product of its two
+    /// entries' weights.
     pub fn joined_orders_after(
         &self,
-        delta: &SpineSnapshot<LineitemBatch>,
-    ) -> Result<SpineSnapshot<JoinedOrdersBatch>, String> {
+        delta: &SpineSnapshot<LineitemByCustkeyOrderkeyVector>,
+    ) -> Result<SpineSnapshot<JoinedByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
-        count_index_reads(
-            &views,
-            |reads| &mut reads.joined_orders_after,
-            || {
-                let mut output = RequestedRows::new();
-                for order in requested_keys(delta) {
-                    for &customer in placements(&views, order)? {
-                        let mut customers = Vec::new();
-                        let customer_key = CustomerOrdersLineitemDefinition::fold(
-                            &Key::CustomerByCustkey(CustomerByCustkeyKey { custkey: customer }),
-                        );
-                        scan_entry(
-                            &views.after,
-                            customer_key.as_bytes(),
-                            |key, payload, weight| {
-                                if let (
-                                    Key::CustomerByCustkey(_),
-                                    Payload::CustomerByCustkey(payload),
-                                ) = (key, payload)
-                                {
-                                    customers.push((payload.c_mktsegment, weight));
-                                }
-                                Ok(())
-                            },
-                        )?;
-                        let order_key = CustomerOrdersLineitemDefinition::fold(
-                            &Key::OrdersByCustkeyOrderkey(OrdersByCustkeyOrderkeyKey {
-                                custkey: customer,
-                                orderkey: order,
-                            }),
-                        );
-                        scan_entry(
-                            &views.after,
-                            order_key.as_bytes(),
-                            |key, payload, order_weight| {
-                                if let (
-                                    Key::OrdersByCustkeyOrderkey(_),
-                                    Payload::OrdersByCustkeyOrderkey(payload),
-                                ) = (key, payload)
-                                {
-                                    for (segment, customer_weight) in &customers {
-                                        let weight = order_weight
-                                            .checked_mul(*customer_weight)
-                                            .ok_or("Q3 reconstructed join weight overflow")?;
-                                        output.push(
-                                            Tup1(order),
-                                            Tup4(
-                                                customer,
-                                                segment.clone(),
-                                                payload.o_orderdate,
-                                                payload.o_shippriority,
-                                            ),
-                                            weight,
-                                        );
-                                    }
-                                }
-                                Ok(())
-                            },
-                        )?;
-                    }
+        let collected = views.collected_groups()?;
+        let mut output = RequestedRows::new();
+        for Tup2(customer, order) in requested_keys(delta) {
+            let buffer = VirtualBuffer::new(collected.group(customer)?, Version::After);
+            let customer_node = fold_customer(customer);
+            let order_node = fold_order(customer, order);
+            for customer_entry in
+                buffer.entries(INDEX_ID_CUSTOMER_BY_CUSTKEY, Node::Path(&customer_node))
+            {
+                let segment = customer_segment(customer_entry)?;
+                for order_entry in
+                    buffer.entries(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY, Node::Path(&order_node))
+                {
+                    let (date, priority) = order_payload(order_entry)?;
+                    let weight = order_entry
+                        .weight
+                        .checked_mul(customer_entry.weight)
+                        .ok_or("Q3 reconstructed join weight overflow")?;
+                    output.push(
+                        Tup2(customer, order),
+                        Tup3(segment.clone(), date, priority),
+                        weight,
+                    );
                 }
-                Ok(output.finish())
-            },
-        )
+            }
+        }
+        Ok(output.finish())
     }
 
+    /// `L⁻`: the line items of the requested `(custkey, orderkey)` nodes
+    /// before the transaction. A range read of the Lineitem stream below the
+    /// order, driven by `ΔJ`.
     pub fn lineitems_before(
         &self,
-        delta: &SpineSnapshot<JoinedOrdersBatch>,
-    ) -> Result<SpineSnapshot<LineitemBatch>, String> {
+        delta: &SpineSnapshot<JoinedByCustkeyOrderkeyVector>,
+    ) -> Result<SpineSnapshot<LineitemByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
-        count_index_reads(
-            &views,
-            |reads| &mut reads.lineitems_before,
-            || {
-                let mut output = RequestedRows::new();
-                for order in requested_keys(delta) {
-                    for &customer in placements(&views, order)? {
-                        scan(
-                            &views.old,
-                            &prefix_custkey_orderkey_then_linenumber(customer, order),
-                            |key, payload, weight| {
-                                if let (
-                                    Key::LineitemByCustkeyOrderkeyLinenumber(
-                                        LineitemByCustkeyOrderkeyLinenumberKey {
-                                            orderkey,
-                                            linenumber,
-                                            ..
-                                        },
-                                    ),
-                                    Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
-                                ) = (key, payload)
-                                {
-                                    output.push(
-                                        Tup1(orderkey),
-                                        Tup4(
-                                            linenumber,
-                                            payload.l_extendedprice,
-                                            payload.l_discount,
-                                            payload.l_shipdate,
-                                        ),
-                                        weight,
-                                    );
-                                }
-                                Ok(())
-                            },
-                        )?;
-                    }
-                }
-                Ok(output.finish())
-            },
-        )
+        let collected = views.collected_groups()?;
+        let mut output = RequestedRows::new();
+        for Tup2(customer, order) in requested_keys(delta) {
+            let buffer = VirtualBuffer::new(collected.group(customer)?, Version::Before);
+            let below_order = prefix_custkey_orderkey_then_linenumber(customer, order);
+            for entry in buffer.entries(
+                INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+                Node::Range(&below_order),
+            ) {
+                let key = line_key(entry)?;
+                let (price, discount, ship_date) = line_payload(entry)?;
+                output.push(
+                    Tup2(customer, order),
+                    Tup4(key.linenumber, price, discount, ship_date),
+                    entry.weight,
+                );
+            }
+        }
+        Ok(output.finish())
     }
 }
 
-/// Runs `read` and adds the index's run reads that it makes on this thread to
-/// the field of `views.reads` that `field` selects.
-fn count_index_reads<T>(
-    views: &ReadViews,
-    field: impl FnOnce(&mut IndexReads) -> &mut RunReads,
-    read: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    let before = RunReads::current_for(WriteOwner::MergedIndex);
-    let result = read();
-    let made = RunReads::current_for(WriteOwner::MergedIndex).since(before);
-    *field(&mut *views.reads.lock().map_err(|_| "Q3 reads lock poisoned")?) += made;
-    result
+impl ReadViews {
+    fn collected_groups(&self) -> Result<&CollectedGroups, String> {
+        self.collected
+            .get()
+            .ok_or_else(|| "collect the touched groups before reading them".to_owned())
+    }
 }
 
-fn placements(views: &ReadViews, order: i64) -> Result<&BTreeSet<i64>, String> {
-    views
-        .order_customers
-        .get(&order)
-        .filter(|customers| !customers.is_empty())
-        .ok_or_else(|| format!("order {order} is missing from the current Orders delta"))
+/// Which state of the index a read sees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Version {
+    /// `Old`, the index before the transaction.
+    Before,
+    /// `Old ⊎ Dlt`, the index after it, unconsolidated.
+    After,
 }
 
-fn requested_keys<V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<Tup1<i64>, V>>) -> Vec<i64> {
+/// The entries of a stream that a read takes at a node of the trie.
+#[derive(Clone, Copy, Debug)]
+enum Node<'k> {
+    /// The entries whose folded key is exactly this one.
+    Path(&'k [u8]),
+    /// The entries whose folded key starts with this prefix: the subtree.
+    Range(&'k [u8]),
+}
+
+impl Node<'_> {
+    /// The sub-slice of `entries`, which are in key order, that this node takes.
+    fn select<P>(self, entries: &[Entry<P>]) -> &[Entry<P>] {
+        let (Node::Path(bytes) | Node::Range(bytes)) = self;
+        let start = entries.partition_point(|entry| entry.key.as_slice() < bytes);
+        let taken = entries[start..]
+            .iter()
+            .take_while(|entry| match self {
+                Node::Path(key) => entry.key == key,
+                Node::Range(prefix) => entry.key.starts_with(prefix),
+            })
+            .count();
+        &entries[start..start + taken]
+    }
+}
+
+/// A borrowing view of one group's buffers: what a read of a given version
+/// sees. Nothing is copied and nothing is consolidated; a join is bilinear,
+/// so it can take `Old`'s entries and `Dlt`'s as they are (`prop:overlay`).
+struct VirtualBuffer<'g> {
+    group: &'g GroupBuffers<Payload>,
+    version: Version,
+}
+
+impl<'g> VirtualBuffer<'g> {
+    fn new(group: &'g GroupBuffers<Payload>, version: Version) -> Self {
+        Self { group, version }
+    }
+
+    /// The entries of `stream` at `node`: `Old`'s, then, for an after read,
+    /// `Dlt`'s.
+    fn entries(&self, stream: u8, node: Node<'_>) -> impl Iterator<Item = &'g Entry<Payload>> + 'g {
+        let old = node.select(self.group.old(stream));
+        let dlt = match self.version {
+            Version::Before => &[][..],
+            Version::After => node.select(self.group.dlt(stream)),
+        };
+        old.iter().chain(dlt)
+    }
+}
+
+fn fold_customer(custkey: i64) -> Vec<u8> {
+    CustomerOrdersLineitemDefinition::fold(&Key::CustomerByCustkey(CustomerByCustkeyKey {
+        custkey,
+    }))
+    .as_bytes()
+    .to_vec()
+}
+
+fn fold_order(custkey: i64, orderkey: i64) -> Vec<u8> {
+    CustomerOrdersLineitemDefinition::fold(&Key::OrdersByCustkeyOrderkey(
+        OrdersByCustkeyOrderkeyKey { custkey, orderkey },
+    ))
+    .as_bytes()
+    .to_vec()
+}
+
+fn customer_key(entry: &Entry<Payload>) -> Result<CustomerByCustkeyKey, String> {
+    match CustomerOrdersLineitemDefinition::unfold(&entry.key)? {
+        Key::CustomerByCustkey(key) => Ok(key),
+        other => Err(format!("expected a Customer key, found {other:?}")),
+    }
+}
+
+fn order_key(entry: &Entry<Payload>) -> Result<OrdersByCustkeyOrderkeyKey, String> {
+    match CustomerOrdersLineitemDefinition::unfold(&entry.key)? {
+        Key::OrdersByCustkeyOrderkey(key) => Ok(key),
+        other => Err(format!("expected an Orders key, found {other:?}")),
+    }
+}
+
+fn line_key(entry: &Entry<Payload>) -> Result<LineitemByCustkeyOrderkeyLinenumberKey, String> {
+    match CustomerOrdersLineitemDefinition::unfold(&entry.key)? {
+        Key::LineitemByCustkeyOrderkeyLinenumber(key) => Ok(key),
+        other => Err(format!("expected a Lineitem key, found {other:?}")),
+    }
+}
+
+fn customer_segment(entry: &Entry<Payload>) -> Result<&SqlString, String> {
+    match &entry.payload {
+        Payload::CustomerByCustkey(payload) => Ok(&payload.c_mktsegment),
+        other => Err(format!("expected a Customer payload, found {other:?}")),
+    }
+}
+
+fn order_payload(entry: &Entry<Payload>) -> Result<(Date, i32), String> {
+    match &entry.payload {
+        Payload::OrdersByCustkeyOrderkey(payload) => {
+            Ok((payload.o_orderdate, payload.o_shippriority))
+        }
+        other => Err(format!("expected an Orders payload, found {other:?}")),
+    }
+}
+
+fn line_payload(
+    entry: &Entry<Payload>,
+) -> Result<(SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date), String> {
+    match &entry.payload {
+        Payload::LineitemByCustkeyOrderkeyLinenumber(payload) => Ok((
+            payload.l_extendedprice,
+            payload.l_discount,
+            payload.l_shipdate,
+        )),
+        other => Err(format!("expected a Lineitem payload, found {other:?}")),
+    }
+}
+
+/// The keys of a driving delta, in order.
+fn requested_keys<K: DBData, V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<K, V>>) -> Vec<K> {
     let mut cursor = delta.inner().cursor();
     let mut keys = Vec::new();
     while cursor.key_valid() {
-        keys.push(cursor.key().downcast_checked::<Tup1<i64>>().0);
+        keys.push(cursor.key().downcast_checked::<K>().clone());
         cursor.step_key();
     }
     keys
 }
 
-/// Visits the index entries under `prefix` in `snapshot`: a range read. The
-/// snapshot's run reads count for the merged index; `visit` runs under the
-/// caller's owner.
-fn scan(
-    snapshot: &SourceSnapshot,
-    prefix: &[u8],
-    mut visit: impl FnMut(Key, Payload, i64) -> Result<(), String>,
-) -> Result<(), String> {
-    let caller = current_read_owner();
-    with_read_owner(WriteOwner::MergedIndex, || {
-        let mut cursor = snapshot.cursor();
-        let seek = prefix.to_vec();
-        cursor.seek_key(seek.erase());
-        while cursor.key_valid() {
-            if !cursor
-                .key()
-                .downcast_checked::<Vec<u8>>()
-                .starts_with(prefix)
-            {
-                break;
-            }
-            visit_values(&mut cursor, caller, &mut visit)?;
-            cursor.step_key();
-        }
-        Ok(())
-    })
-}
-
-/// Visits the one index entry whose folded key is `key`: a path read. Each
-/// run's filters answer first, so a run that cannot hold `key` is neither
-/// sought nor decoded, as in a native join's probe.
-fn scan_entry(
-    snapshot: &SourceSnapshot,
-    key: &[u8],
-    mut visit: impl FnMut(Key, Payload, i64) -> Result<(), String>,
-) -> Result<(), String> {
-    let caller = current_read_owner();
-    with_read_owner(WriteOwner::MergedIndex, || {
-        let mut cursor = snapshot.cursor();
-        let probe = key.to_vec();
-        if cursor.seek_key_exact(probe.erase(), None) {
-            visit_values(&mut cursor, caller, &mut visit)?;
-        }
-        Ok(())
-    })
-}
-
-/// Decodes the values of the cursor's current key and visits each under
-/// `caller`'s read owner.
-fn visit_values(
-    cursor: &mut impl Cursor<DynData, DynData, (), DynZWeight>,
-    caller: WriteOwner,
-    visit: &mut impl FnMut(Key, Payload, i64) -> Result<(), String>,
-) -> Result<(), String> {
-    let key = CustomerOrdersLineitemDefinition::unfold(cursor.key().downcast_checked::<Vec<u8>>())?;
-    while cursor.val_valid() {
-        let weight = **cursor.weight();
-        // The stored bytes carry no tag: the key names the fields.
-        let stored = cursor.val().downcast_checked::<StoredPayload>();
-        let payload = decode_payload(&key, stored)
-            .map_err(|error| format!("stored payload of key {key:?}: {error}"))?;
-        with_read_owner(caller, || visit(key.clone(), payload, weight))?;
-        cursor.step_val();
-    }
-    Ok(())
-}
-
 /// Bounded sort chunks, combined through the native consolidated snapshot cursor.
 /// The snapshot still owns all result chunks; this is not a hard memory bound.
+/// This is the second of the two copies at the DBSP boundary: the reader's
+/// partner vector.
 struct RequestedRows<K: DBData, V: DBData> {
     pending: Vec<Tup2<Tup2<K, V>, i64>>,
     snapshot: SpineSnapshot<OrdIndexedZSet<K, V>>,
@@ -470,16 +560,18 @@ impl<K: DBData, V: DBData> RequestedRows<K, V> {
     }
 }
 
-/// The generated Orders/Customer join, with both historical operands reconstructed.
+/// `J = O ⋈ C` on `custkey`, with both historical operands read from the
+/// collected groups. `J`'s rows are indexed by `(custkey, orderkey)`, the node
+/// at which `V` reads them.
 pub fn join_orders_customers<F, It>(
-    orders: &Stream<RootCircuit, OrdersBatch>,
-    customers: &Stream<RootCircuit, CustomerBatch>,
+    orders: &Stream<RootCircuit, OrdersByCustkeyVector>,
+    customers: &Stream<RootCircuit, CustomerByCustkeyVector>,
     state: Q3State,
     join: F,
-) -> Stream<RootCircuit, JoinedOrdersBatch>
+) -> Stream<RootCircuit, JoinedByCustkeyOrderkeyVector>
 where
     F: Fn(&Tup1<i64>, &Tup3<i64, Date, i32>, &Tup1<SqlString>) -> It + Clone + 'static,
-    It: IntoIterator<Item = (Tup1<i64>, Tup4<i64, SqlString, Date, i32>)> + 'static,
+    It: IntoIterator<Item = (Tup2<i64, i64>, Tup3<SqlString, Date, i32>)> + 'static,
 {
     let before = state.clone();
     orders.join_index_with_snapshot_readers(
@@ -498,19 +590,19 @@ where
     )
 }
 
-/// The generated Lineitem/joined-orders join, preserving the native delta formula.
+/// `V = L ⋈ J` on `(custkey, orderkey)`, preserving the native delta formula.
 pub fn join_lineitems_orders<F, OV>(
-    lines: &Stream<RootCircuit, LineitemBatch>,
-    orders: &Stream<RootCircuit, JoinedOrdersBatch>,
+    lines: &Stream<RootCircuit, LineitemByCustkeyOrderkeyVector>,
+    orders: &Stream<RootCircuit, JoinedByCustkeyOrderkeyVector>,
     state: Q3State,
     join: F,
 ) -> Stream<RootCircuit, OrdZSet<OV>>
 where
     OV: DBData,
     F: Fn(
-            &Tup1<i64>,
+            &Tup2<i64, i64>,
             &Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>,
-            &Tup4<i64, SqlString, Date, i32>,
+            &Tup3<SqlString, Date, i32>,
         ) -> OV
         + Clone
         + 'static,
@@ -521,7 +613,7 @@ where
         move |delta| {
             state
                 .joined_orders_after(delta)
-                .expect("Q3 B+ reconstruction failed")
+                .expect("Q3 J+ reconstruction failed")
         },
         move |delta| {
             before

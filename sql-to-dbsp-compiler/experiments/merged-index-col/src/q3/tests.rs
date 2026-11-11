@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     build_batch, prefix_custkey, CustomerByCustkeyPayload,
-    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyPayload,
+    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyPayload, StoredPayload,
     INDEX_ID_CUSTOMER_BY_CUSTKEY, INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
     INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
 };
@@ -17,6 +17,7 @@ use dbsp::{
     DynZWeight, Runtime,
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
+use proptest::prelude::*;
 
 type SourceRow = (Key, Payload, i64);
 
@@ -106,6 +107,29 @@ fn tuples<K: DBData, V: DBData>(
     rows
 }
 
+fn money(hundredths: i128) -> SqlDecimal<15, 2> {
+    SqlDecimal::new(hundredths, 2).unwrap()
+}
+
+fn discount() -> SqlDecimal<4, 2> {
+    SqlDecimal::new(4, 2).unwrap()
+}
+
+fn line_value(
+    linenumber: i32,
+    price: i128,
+) -> Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date> {
+    Tup4(linenumber, money(price), discount(), Date::from_days(30))
+}
+
+/// Publishes `old` and `dlt` and collects their groups with the `Seek` pass.
+fn published(old: Vec<Vec<SourceRow>>, dlt: Vec<SourceRow>) -> Q3State {
+    let state = Q3State::default();
+    state.publish(source(old), run(dlt)).unwrap();
+    state.collect(Pass::Seek).unwrap();
+    state
+}
+
 #[test]
 fn four_readers_preserve_weighted_before_after_relations() {
     let initial = vec![
@@ -125,29 +149,13 @@ fn four_readers_preserve_weighted_before_after_relations() {
         line(2, 20, 1, 100, -4),
         line(2, 20, 1, 200, 1),
     ];
-    let state = Q3State::default();
-    state
-        .publish(
-            source(vec![initial]),
-            run(changes),
-            BTreeMap::from([(20, BTreeSet::from([2]))]),
-        )
-        .unwrap();
+    let state = published(vec![initial], changes);
     let orders_delta = delta(vec![(Tup1(2), Tup3(20, Date::from_days(11), 7), 1)]);
     let customers_delta = delta(vec![(Tup1(2), Tup1(SqlString::from("new")), 1)]);
-    let lines_delta = delta(vec![(
-        Tup1(20),
-        Tup4(
-            1,
-            SqlDecimal::new(200, 2).unwrap(),
-            SqlDecimal::new(4, 2).unwrap(),
-            Date::from_days(30),
-        ),
-        1,
-    )]);
+    let lines_delta = delta(vec![(Tup2(2, 20), line_value(1, 200), 1)]);
     let joined_delta = delta(vec![(
-        Tup1(20),
-        Tup4(2, SqlString::from("new"), Date::from_days(11), 7),
+        Tup2(2, 20),
+        Tup3(SqlString::from("new"), Date::from_days(11), 7),
         1,
     )]);
 
@@ -162,253 +170,196 @@ fn four_readers_preserve_weighted_before_after_relations() {
     assert_eq!(
         tuples(&state.joined_orders_after(&lines_delta).unwrap()),
         vec![(
-            Tup1(20),
-            Tup4(2, SqlString::from("new"), Date::from_days(11), 7),
+            Tup2(2, 20),
+            Tup3(SqlString::from("new"), Date::from_days(11), 7),
             1
         )]
     );
     assert_eq!(
         tuples(&state.lineitems_before(&joined_delta).unwrap()),
         vec![
-            (
-                Tup1(20),
-                Tup4(
-                    1,
-                    SqlDecimal::new(100, 2).unwrap(),
-                    SqlDecimal::new(4, 2).unwrap(),
-                    Date::from_days(30)
-                ),
-                4
-            ),
-            (
-                Tup1(20),
-                Tup4(
-                    2,
-                    SqlDecimal::new(100, 2).unwrap(),
-                    SqlDecimal::new(4, 2).unwrap(),
-                    Date::from_days(30)
-                ),
-                4
-            )
+            (Tup2(2, 20), line_value(1, 100), 4),
+            (Tup2(2, 20), line_value(2, 100), 4),
         ]
     );
     state.finish().unwrap();
 }
 
+/// A line item reaches `V` through the order it joins at its own customer:
+/// the same order key at another customer is another node.
 #[test]
-fn candidate_locations_follow_each_snapshot_without_duplicating_rows() {
-    let initial = vec![
-        customer(2, "old", 2),
-        customer(3, "new", 3),
-        order(2, 20, 10, 4),
-        line(2, 20, 1, 100, 5),
-        line(2, 20, 2, 100, 5),
-    ];
-    let changes = vec![
-        order(2, 20, 10, -4),
-        order(3, 20, 11, 7),
-        line(2, 20, 1, 100, -5),
-        line(2, 20, 2, 100, -5),
-        line(3, 20, 1, 100, 5),
-        line(3, 20, 2, 100, 5),
-    ];
-    let state = Q3State::default();
-    state
-        .publish(
-            source(vec![initial]),
-            run(changes),
-            BTreeMap::from([
-                (20, BTreeSet::from([2, 3, 2, 9, 3])),
-                (99, BTreeSet::from([2, 3])),
-            ]),
-        )
-        .unwrap();
-    let line_value = Tup4(
-        1,
-        SqlDecimal::new(100, 2).unwrap(),
-        SqlDecimal::new(4, 2).unwrap(),
-        Date::from_days(30),
+fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
+    let state = published(
+        vec![vec![customer(2, "old", 1), customer(3, "new", 1)]],
+        vec![
+            order(2, 20, 10, -1),
+            order(3, 20, 11, 1),
+            order(3, 21, 12, 1),
+        ],
     );
-    let line_request = delta(vec![(Tup1(20), line_value, -1), (Tup1(99), line_value, 1)]);
+    let request = delta(vec![
+        (Tup2(2, 20), line_value(1, 100), 1),
+        (Tup2(3, 20), line_value(1, 100), 1),
+        (Tup2(3, 21), line_value(1, 100), 1),
+    ]);
     assert_eq!(
-        tuples(&state.joined_orders_after(&line_request).unwrap()),
-        vec![(
-            Tup1(20),
-            Tup4(3, SqlString::from("new"), Date::from_days(11), 7),
-            21,
-        )]
+        tuples(&state.joined_orders_after(&request).unwrap()),
+        vec![
+            (
+                Tup2(2, 20),
+                Tup3(SqlString::from("old"), Date::from_days(10), 7),
+                -1
+            ),
+            (
+                Tup2(3, 20),
+                Tup3(SqlString::from("new"), Date::from_days(11), 7),
+                1
+            ),
+            (
+                Tup2(3, 21),
+                Tup3(SqlString::from("new"), Date::from_days(12), 7),
+                1
+            ),
+        ]
     );
-    let joined_request = delta(vec![
+    // The line items before the transaction are those of the node asked for.
+    let state_with_lines = published(
+        vec![vec![line(2, 20, 1, 100, 1), line(3, 20, 5, 100, 1)]],
+        vec![customer(2, "x", 1), customer(3, "y", 1)],
+    );
+    let joined = delta(vec![
         (
-            Tup1(20),
-            Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
-            -1,
-        ),
-        (
-            Tup1(20),
-            Tup4(3, SqlString::from("new"), Date::from_days(11), 7),
+            Tup2(3, 20),
+            Tup3(SqlString::from("y"), Date::from_days(0), 0),
             1,
         ),
         (
-            Tup1(99),
-            Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
+            Tup2(2, 21),
+            Tup3(SqlString::from("x"), Date::from_days(0), 0),
             1,
         ),
     ]);
-    let mut second_line = line_value;
-    second_line.0 = 2;
     assert_eq!(
-        tuples(&state.lineitems_before(&joined_request).unwrap()),
-        vec![(Tup1(20), line_value, 5), (Tup1(20), second_line, 5)]
+        tuples(&state_with_lines.lineitems_before(&joined).unwrap()),
+        vec![(Tup2(3, 20), line_value(5, 100), 1)]
     );
-}
-
-#[test]
-fn requested_orders_require_nonempty_candidate_locations() {
-    let line_request = delta(vec![(
-        Tup1(20),
-        Tup4(
-            1,
-            SqlDecimal::new(100, 2).unwrap(),
-            SqlDecimal::new(4, 2).unwrap(),
-            Date::from_days(30),
-        ),
-        1,
-    )]);
-    let joined_request = delta(vec![(
-        Tup1(20),
-        Tup4(2, SqlString::from("old"), Date::from_days(10), 7),
-        -1,
-    )]);
-    for locations in [BTreeMap::new(), BTreeMap::from([(20, BTreeSet::new())])] {
-        let state = Q3State::default();
-        state
-            .publish(source(vec![]), run(vec![]), locations)
-            .unwrap();
-        assert!(state
-            .joined_orders_after(&line_request)
-            .unwrap_err()
-            .contains("current Orders delta"));
-        assert!(state
-            .lineitems_before(&joined_request)
-            .unwrap_err()
-            .contains("current Orders delta"));
-    }
 }
 
 #[test]
 fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() {
-    let state = Q3State::default();
-    state
-        .publish(
-            source(vec![]),
-            run(vec![
-                customer(2, "A", -2),
-                order(2, 20, 10, 3),
-                order(2, 21, 10, 7),
-                customer(9, "unused", 100),
-                order(9, 90, 10, 100),
-            ]),
-            BTreeMap::from([(20, BTreeSet::from([2]))]),
-        )
-        .unwrap();
-    let request = delta(vec![(
-        Tup1(20),
-        Tup4(
-            1,
-            SqlDecimal::new(100, 2).unwrap(),
-            SqlDecimal::new(4, 2).unwrap(),
-            Date::from_days(30),
-        ),
-        1,
-    )]);
+    let state = published(
+        vec![],
+        vec![
+            customer(2, "A", -2),
+            order(2, 20, 10, 3),
+            order(2, 21, 10, 7),
+            customer(9, "unused", 100),
+            order(9, 90, 10, 100),
+        ],
+    );
+    let request = delta(vec![(Tup2(2, 20), line_value(1, 100), 1)]);
     assert_eq!(
         tuples(&state.joined_orders_after(&request).unwrap()),
         vec![(
-            Tup1(20),
-            Tup4(2, SqlString::from("A"), Date::from_days(10), 7),
+            Tup2(2, 20),
+            Tup3(SqlString::from("A"), Date::from_days(10), 7),
             -6
         )]
     );
 }
 
 #[test]
-fn cancelled_and_missing_keys_have_no_values() {
-    let state = Q3State::default();
-    state
-        .publish(
-            source(vec![vec![customer(2, "A", 1)]]),
-            run(vec![customer(2, "A", -1)]),
-            BTreeMap::new(),
-        )
-        .unwrap();
-    let request = delta(vec![
-        (Tup1(2), Tup3(20, Date::from_days(0), 0), 1),
-        (Tup1(3), Tup3(30, Date::from_days(0), 0), 1),
-    ]);
-    assert!(tuples(&state.customers_after(&request).unwrap()).is_empty());
+fn cancelled_keys_have_no_values_and_untouched_groups_are_refused() {
+    let state = published(
+        vec![vec![customer(2, "A", 1), customer(3, "B", 1)]],
+        vec![customer(2, "A", -1)],
+    );
+    let touched = delta(vec![(Tup1(2), Tup3(20, Date::from_days(0), 0), 1)]);
+    assert!(tuples(&state.customers_after(&touched).unwrap()).is_empty());
     assert!(tuples(
         &state
             .orders_before(&delta(vec![(Tup1(2), Tup1(SqlString::from("A")), 1)]))
             .unwrap()
     )
     .is_empty());
+
+    // Customer 3 exists in `Old` but `Dlt` does not touch it: no driving delta
+    // can name it, so a request for it breaks the contract.
+    let untouched = delta(vec![(Tup1(3), Tup3(30, Date::from_days(0), 0), 1)]);
+    assert!(state
+        .customers_after(&untouched)
+        .unwrap_err()
+        .contains("outside the touched groups"));
+    let missing = delta(vec![(Tup2(4, 40), line_value(1, 100), 1)]);
+    assert!(state
+        .joined_orders_after(&missing)
+        .unwrap_err()
+        .contains("outside the touched groups"));
 }
 
-/// The after reads take `Old ⊎ Dlt`: `Old`'s runs with `Dlt` as one more
-/// run, unless `Dlt` is empty. The published runs are the caller's own.
+/// The after reads take `Old` and then `Dlt`, unconsolidated; the before reads
+/// take `Old` alone. The published runs are the caller's own.
 #[test]
 fn after_reads_overlay_dlt_on_old() {
     let state = Q3State::default();
     assert!(state.old().unwrap_err().contains("publish"));
     let old = source(vec![vec![customer(2, "old", 1)]]);
     let dlt = run(vec![customer(2, "old", -1), customer(2, "new", 1)]);
-    state
-        .publish(old.clone(), dlt.clone(), BTreeMap::new())
-        .unwrap();
+    state.publish(old.clone(), dlt.clone()).unwrap();
     assert!(Arc::ptr_eq(&state.dlt().unwrap(), &dlt));
     assert!(Arc::ptr_eq(
         &state.old().unwrap().batches()[0],
         &old.batches()[0]
     ));
-    let request = delta(vec![(Tup1(2), Tup3(20, Date::from_days(0), 0), 1)]);
+    state.collect(Pass::Seek).unwrap();
+    let after = delta(vec![(Tup1(2), Tup3(20, Date::from_days(0), 0), 1)]);
     assert_eq!(
-        tuples(&state.customers_after(&request).unwrap()),
+        tuples(&state.customers_after(&after).unwrap()),
         vec![(Tup1(2), Tup1(SqlString::from("new")), 1)]
     );
     state.finish().unwrap();
 
-    // An empty `Dlt` adds no run: the after state is `Old`.
-    state.publish(old, run(vec![]), BTreeMap::new()).unwrap();
-    assert_eq!(state.views().unwrap().after.batches().len(), 1);
-    assert_eq!(
-        tuples(&state.customers_after(&request).unwrap()),
-        vec![(Tup1(2), Tup1(SqlString::from("old")), 1)]
-    );
+    // An empty `Dlt` touches no group, so no read can be asked of it.
+    state.publish(old, run(vec![])).unwrap();
+    state.collect(Pass::Seek).unwrap();
+    assert!(state
+        .customers_after(&after)
+        .unwrap_err()
+        .contains("outside the touched groups"));
+    assert_eq!(state.finish().unwrap().counts.groups, 0);
 }
 
 #[test]
-fn publication_and_batch_local_placement_are_required() {
+fn publication_collection_and_release_follow_one_order() {
     let state = Q3State::default();
-    let request = delta(vec![(
-        Tup1(20),
-        Tup4(2, SqlString::from("A"), Date::from_days(0), 0),
+    let request = delta(vec![(Tup2(2, 20), line_value(1, 100), 1)]);
+    let joined = delta(vec![(
+        Tup2(2, 20),
+        Tup3(SqlString::from("A"), Date::from_days(0), 0),
         1,
     )]);
     assert!(state
-        .lineitems_before(&request)
+        .lineitems_before(&joined)
         .unwrap_err()
         .contains("publish"));
+    assert!(state.collect(Pass::Seek).unwrap_err().contains("publish"));
     state
-        .publish(source(vec![]), run(vec![]), BTreeMap::new())
+        .publish(source(vec![]), run(vec![order(2, 20, 10, 1)]))
         .unwrap();
     assert!(state
-        .publish(source(vec![]), run(vec![]), BTreeMap::new())
-        .is_err());
-    assert!(state
-        .lineitems_before(&request)
+        .publish(source(vec![]), run(vec![]))
         .unwrap_err()
-        .contains("current Orders delta"));
+        .contains("finish the previous"));
+    // Reading before collecting is an error, not an empty answer.
+    assert!(state
+        .joined_orders_after(&request)
+        .unwrap_err()
+        .contains("collect"));
+    state.collect(Pass::Seek).unwrap();
+    assert!(state
+        .collect(Pass::Seek)
+        .unwrap_err()
+        .contains("already collected"));
     assert!(tuples(&state.lineitems_before(&delta(Vec::new())).unwrap()).is_empty());
     state.finish().unwrap();
     assert!(state.finish().is_err());
@@ -428,6 +379,277 @@ fn reconstruction_chunks_use_native_ordering_and_consolidation() {
     assert_eq!(actual.first(), Some(&(Tup1(1), Tup1(9), 1)));
     assert_eq!(actual.last(), Some(&(Tup1((count - 1) as i64), Tup1(9), 1)));
     assert!(actual.windows(2).all(|rows| rows[0].0 < rows[1].0));
+}
+
+/// The `Dlt` halves of the buffers reach the circuit's input handles as
+/// complete rows: each row carries its trie keys, and a moved line item
+/// appears under both customers.
+#[test]
+fn driving_deltas_carry_trie_keys() {
+    let state = published(
+        vec![vec![
+            customer(2, "old", 1),
+            order(2, 20, 10, 1),
+            line(2, 20, 1, 100, 1),
+        ]],
+        vec![
+            customer(2, "old", -1),
+            customer(2, "new", 1),
+            order(3, 21, 11, 1),
+            line(2, 20, 1, 100, -1),
+            line(3, 20, 1, 100, 1),
+        ],
+    );
+    let (mut circuit, (handles, outputs)) =
+        Runtime::init_circuit(CircuitConfig::with_workers(1), |circuit| {
+            let (customers, customer_handle) = circuit.add_input_zset::<CustomerRow>();
+            let (orders, order_handle) = circuit.add_input_zset::<OrderRow>();
+            let (lines, line_handle) = circuit.add_input_zset::<LineitemRow>();
+            Ok((
+                (customer_handle, order_handle, line_handle),
+                (customers.output(), orders.output(), lines.output()),
+            ))
+        })
+        .unwrap();
+    state
+        .push_driving_deltas(&handles.0, &handles.1, &handles.2)
+        .unwrap();
+    circuit.transaction().unwrap();
+    state.finish().unwrap();
+
+    assert_eq!(
+        zset_rows(&outputs.0.consolidate()),
+        vec![
+            (Tup2(2, SqlString::from("new")), 1),
+            (Tup2(2, SqlString::from("old")), -1),
+        ]
+    );
+    assert_eq!(
+        zset_rows(&outputs.1.consolidate()),
+        vec![(Tup4(3, 21, Date::from_days(11), 7), 1)]
+    );
+    assert_eq!(
+        zset_rows(&outputs.2.consolidate()),
+        vec![
+            (
+                Tup6(2, 20, 1, money(100), discount(), Date::from_days(30)),
+                -1
+            ),
+            (
+                Tup6(3, 20, 1, money(100), discount(), Date::from_days(30)),
+                1
+            ),
+        ]
+    );
+}
+
+fn zset_rows<T: DBData>(zset: &OrdZSet<T>) -> Vec<(T, i64)> {
+    let mut cursor = zset.inner().cursor();
+    let mut rows = Vec::new();
+    while cursor.key_valid() {
+        rows.push((
+            cursor.key().downcast_checked::<T>().clone(),
+            **cursor.weight(),
+        ));
+        cursor.step_key();
+    }
+    rows
+}
+
+// ---- The virtual buffers against a brute force ----
+
+/// The summed weight of each `(key, payload)` over `runs`, zero sums dropped:
+/// the consolidated rows of an index state.
+fn consolidated(runs: &[&Vec<SourceRow>]) -> BTreeMap<(Key, Payload), i64> {
+    let mut sums = BTreeMap::new();
+    for rows in runs {
+        for (key, payload, weight) in rows.iter() {
+            *sums.entry((key.clone(), payload.clone())).or_insert(0) += weight;
+        }
+    }
+    sums.retain(|_, weight| *weight != 0);
+    sums
+}
+
+fn wanted<K: Ord, V: Ord>(rows: Vec<(K, V, i64)>) -> Vec<(K, V, i64)> {
+    let mut sums = BTreeMap::new();
+    for (key, value, weight) in rows {
+        *sums.entry((key, value)).or_insert(0) += weight;
+    }
+    sums.into_iter()
+        .filter(|(_, weight)| *weight != 0)
+        .map(|((key, value), weight)| (key, value, weight))
+        .collect()
+}
+
+/// A random row of a small trie: customers 1 to 3, orders 1 to 3, and line
+/// numbers 1 to 2, with two payloads each and a nonzero weight.
+fn source_rows() -> impl Strategy<Value = Vec<SourceRow>> {
+    let weight = prop_oneof![Just(-2_i64), Just(-1), Just(1), Just(2)];
+    let row = (1_i64..=3, 1_i64..=3, 1_i32..=2, 0_u8..3, 0_i32..2, weight).prop_map(
+        |(custkey, orderkey, linenumber, stream, variant, weight)| match stream {
+            0 => customer(custkey, ["A", "B"][variant as usize], weight),
+            1 => order(custkey, orderkey, variant, weight),
+            _ => line(
+                custkey,
+                orderkey,
+                linenumber,
+                100 + i128::from(variant),
+                weight,
+            ),
+        },
+    );
+    proptest::collection::vec(row, 0..14)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Every reader, asked about every node of every touched customer, equals
+    /// a brute force over the consolidated `Old` and `Old + Dlt`, whatever the
+    /// split of `Old` into runs and the pass.
+    #[test]
+    fn virtual_buffer_reads_match_a_brute_force(
+        first_run in source_rows(),
+        second_run in source_rows(),
+        dlt_rows in source_rows(),
+        step_pass in any::<bool>(),
+    ) {
+        let state = Q3State::default();
+        state
+            .publish(
+                source(vec![first_run.clone(), second_run.clone()]),
+                run(dlt_rows.clone()),
+            )
+            .unwrap();
+        state
+            .collect(if step_pass { Pass::Step } else { Pass::Seek })
+            .unwrap();
+
+        let before = consolidated(&[&first_run, &second_run]);
+        let dlt = consolidated(&[&dlt_rows]);
+        let after = consolidated(&[&first_run, &second_run, &dlt_rows]);
+        let touched: BTreeSet<i64> = dlt
+            .keys()
+            .map(|(key, _)| match key {
+                Key::CustomerByCustkey(k) => k.custkey,
+                Key::OrdersByCustkeyOrderkey(k) => k.custkey,
+                Key::LineitemByCustkeyOrderkeyLinenumber(k) => k.custkey,
+            })
+            .collect();
+        let nodes: Vec<(i64, i64)> = touched
+            .iter()
+            .flat_map(|&c| (1..=3).map(move |o| (c, o)))
+            .collect();
+        let dummy_order = Tup3(0, Date::from_days(0), 0);
+        let dummy_segment = Tup1(SqlString::from("request"));
+        let dummy_joined = Tup3(SqlString::from("request"), Date::from_days(0), 0);
+
+        let customers: Vec<_> = after
+            .iter()
+            .filter_map(|((key, payload), weight)| match (key, payload) {
+                (Key::CustomerByCustkey(k), Payload::CustomerByCustkey(p))
+                    if touched.contains(&k.custkey) =>
+                {
+                    Some((Tup1(k.custkey), Tup1(p.c_mktsegment.clone()), *weight))
+                }
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(
+            tuples(
+                &state
+                    .customers_after(&delta(
+                        touched.iter().map(|&c| (Tup1(c), dummy_order, 1)).collect()
+                    ))
+                    .unwrap()
+            ),
+            wanted(customers)
+        );
+
+        let orders: Vec<_> = before
+            .iter()
+            .filter_map(|((key, payload), weight)| match (key, payload) {
+                (Key::OrdersByCustkeyOrderkey(k), Payload::OrdersByCustkeyOrderkey(p))
+                    if touched.contains(&k.custkey) =>
+                {
+                    Some((
+                        Tup1(k.custkey),
+                        Tup3(k.orderkey, p.o_orderdate, p.o_shippriority),
+                        *weight,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(
+            tuples(
+                &state
+                    .orders_before(&delta(
+                        touched.iter().map(|&c| (Tup1(c), dummy_segment.clone(), 1)).collect()
+                    ))
+                    .unwrap()
+            ),
+            wanted(orders)
+        );
+
+        let mut joined = Vec::new();
+        for ((customer_key, customer_payload), customer_weight) in &after {
+            for ((order_key, order_payload), order_weight) in &after {
+                if let (
+                    Key::CustomerByCustkey(c),
+                    Payload::CustomerByCustkey(cp),
+                    Key::OrdersByCustkeyOrderkey(o),
+                    Payload::OrdersByCustkeyOrderkey(op),
+                ) = (customer_key, customer_payload, order_key, order_payload)
+                {
+                    if c.custkey == o.custkey && touched.contains(&c.custkey) {
+                        joined.push((
+                            Tup2(o.custkey, o.orderkey),
+                            Tup3(cp.c_mktsegment.clone(), op.o_orderdate, op.o_shippriority),
+                            customer_weight * order_weight,
+                        ));
+                    }
+                }
+            }
+        }
+        prop_assert_eq!(
+            tuples(
+                &state
+                    .joined_orders_after(&delta(
+                        nodes.iter().map(|&(c, o)| (Tup2(c, o), line_value(0, 0), 1)).collect()
+                    ))
+                    .unwrap()
+            ),
+            wanted(joined)
+        );
+
+        let lines: Vec<_> = before
+            .iter()
+            .filter_map(|((key, payload), weight)| match (key, payload) {
+                (
+                    Key::LineitemByCustkeyOrderkeyLinenumber(k),
+                    Payload::LineitemByCustkeyOrderkeyLinenumber(p),
+                ) if touched.contains(&k.custkey) => Some((
+                    Tup2(k.custkey, k.orderkey),
+                    Tup4(k.linenumber, p.l_extendedprice, p.l_discount, p.l_shipdate),
+                    *weight,
+                )),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(
+            tuples(
+                &state
+                    .lineitems_before(&delta(
+                        nodes.iter().map(|&(c, o)| (Tup2(c, o), dummy_joined.clone(), 1)).collect()
+                    ))
+                    .unwrap()
+            ),
+            wanted(lines)
+        );
+        state.finish().unwrap();
+    }
 }
 
 /// Copies `run` into a batch in a file.
@@ -523,11 +745,12 @@ fn worked_runs() -> (MergedIndexBatch, MergedIndexBatch, MergedIndexBatch) {
     (old_file, old_memory, dlt)
 }
 
-/// The storage-level baseline of today's four readers on the worked
-/// transaction of `docs/design/merged-index/shared-traversal.md`, without
-/// its invoices, since COL has none.
+/// `collect` is the scan session of the worked transaction (see
+/// `session_run_reads_on_the_worked_transaction`), and `finish` reports what it
+/// read. The four readers then read the index not at all: they read the
+/// buffers.
 #[test]
-fn todays_readers_run_reads_on_the_worked_transaction() {
+fn collect_reads_the_index_once_and_the_readers_not_at_all() {
     in_storage_runtime(|| {
         let (old_file, old_memory, dlt) = worked_runs();
         let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
@@ -535,18 +758,16 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
             StoredPayload,
             i64,
         >();
-        let (old_file, old_memory, dlt) = (Arc::new(old_file), Arc::new(old_memory), Arc::new(dlt));
-        let old = SourceSnapshot::with_batches(&factories, vec![old_file, old_memory]);
-        // Today's harness takes placements from the Orders delta alone and
-        // would reject this `ΔC`; the readers accept any placements.
+        let old = SourceSnapshot::with_batches(
+            &factories,
+            vec![Arc::new(old_file), Arc::new(old_memory)],
+        );
         let state = Q3State::default();
-        state
-            .publish(
-                old,
-                dlt,
-                BTreeMap::from([3, 4, 5].map(|order| (order, BTreeSet::from([5])))),
-            )
-            .unwrap();
+        state.publish(old, Arc::new(dlt)).unwrap();
+
+        let (collected, collecting, collecting_other) = run_reads_of(|| state.collect(Pass::Seek));
+        collected.unwrap();
+        assert_eq!(collecting_other, RunReads::default());
 
         let orders_delta = delta(vec![(Tup1(5), Tup3(5, Date::from_days(11), 7), 1)]);
         let customers_delta = delta(vec![
@@ -555,220 +776,112 @@ fn todays_readers_run_reads_on_the_worked_transaction() {
         ]);
         let lines_delta = delta(
             [10, 11]
-                .map(|linenumber| {
-                    (
-                        Tup1(5),
-                        Tup4(
-                            linenumber,
-                            SqlDecimal::new(200, 2).unwrap(),
-                            SqlDecimal::new(4, 2).unwrap(),
-                            Date::from_days(30),
-                        ),
-                        1,
-                    )
-                })
+                .map(|linenumber| (Tup2(5, 5), line_value(linenumber, 200), 1))
                 .to_vec(),
         );
         let joined_delta = delta(
             [3, 4, 5]
                 .map(|order| {
                     (
-                        Tup1(order),
-                        Tup4(5, SqlString::from("new"), Date::from_days(10), 7),
+                        Tup2(5, order),
+                        Tup3(SqlString::from("new"), Date::from_days(10), 7),
                         1,
                     )
                 })
                 .to_vec(),
         );
-
-        let (customers, c_reads, c_other) =
-            run_reads_of(|| state.customers_after(&orders_delta).unwrap());
-        let (orders, o_reads, o_other) =
-            run_reads_of(|| state.orders_before(&customers_delta).unwrap());
-        let (joined, j_reads, j_other) =
-            run_reads_of(|| state.joined_orders_after(&lines_delta).unwrap());
-        let (lines, l_reads, l_other) =
-            run_reads_of(|| state.lineitems_before(&joined_delta).unwrap());
-        let tally = state.finish().unwrap();
+        let (customers, c_reads, _) = run_reads_of(|| state.customers_after(&orders_delta));
+        let (orders, o_reads, _) = run_reads_of(|| state.orders_before(&customers_delta));
+        let (joined, j_reads, _) = run_reads_of(|| state.joined_orders_after(&lines_delta));
+        let (lines, l_reads, _) = run_reads_of(|| state.lineitems_before(&joined_delta));
+        for reads in [c_reads, o_reads, j_reads, l_reads] {
+            assert_eq!(reads, RunReads::default());
+        }
 
         assert_eq!(
-            tuples(&customers),
+            tuples(&customers.unwrap()),
             vec![(Tup1(5), Tup1(SqlString::from("new")), 1)]
         );
         assert_eq!(
-            tuples(&orders),
+            tuples(&orders.unwrap()),
             vec![
                 (Tup1(5), Tup3(3, Date::from_days(10), 7), 1),
                 (Tup1(5), Tup3(4, Date::from_days(10), 7), 1),
             ]
         );
         assert_eq!(
-            tuples(&joined),
+            tuples(&joined.unwrap()),
             vec![(
-                Tup1(5),
-                Tup4(5, SqlString::from("new"), Date::from_days(11), 7),
+                Tup2(5, 5),
+                Tup3(SqlString::from("new"), Date::from_days(11), 7),
                 1
             )]
         );
         assert_eq!(
-            tuples(&lines)
+            tuples(&lines.unwrap())
                 .into_iter()
-                .map(|(order, Tup4(linenumber, ..), weight)| (order.0, linenumber, weight))
+                .map(|(Tup2(_, order), Tup4(linenumber, ..), weight)| (order, linenumber, weight))
                 .collect::<Vec<_>>(),
             vec![(3, 7, 1), (3, 8, 1), (4, 9, 1)]
         );
 
-        // The index reads. The file run's keys, in folded-key order, are c5,
-        // o3, l7, l8, o4, l9, and c6, each with one value. Every scan opens a
-        // cursor over all runs, which lands the file run on c5 (one key
-        // decode).
-        //
-        // The file cursor decodes a value only when asked (lazy values), and
-        // `CursorList` asks for the first value of every run at its smallest
-        // key. The file run is at the smallest key at every landing
-        // here: the memory run holds only c7, past every file key, and `Dlt`
-        // holds c5 and the keys under it. So each landing of the file run
-        // costs one key decode and one value decode, as it did before lazy
-        // values, and lazy values change none of the counts below. A seek that
-        // leaves the file run on its current key still decodes that key's
-        // first value, since the seek empties the cursor's value and
-        // `CursorList` asks again. `CursorList` decodes a file weight
-        // whenever the file run holds the smallest value, to skip zero
-        // weights. `RunMerge` (roadmap step 2) avoids these reads.
-        //
-        // The path reads, C⁺ and J⁺, probe one exact key (`scan_entry`): a run
-        // whose filter excludes the key is neither sought nor decoded, and
-        // nothing past the entry is read. The range reads, O⁻ and L⁻, seek a
-        // prefix and step through it (`scan`), with no filter.
-        //
-        // The in-memory runs are the memory run M (c7 alone) and, for the
-        // reads of the new state, `Dlt`. Their accesses count apart from the
-        // file decodes (`memory_*`), by the same rules: opening reads a
-        // run's first key; a seek reads a key only if it moves the run; a
-        // value counts once per position, and `CursorList` reads the first
-        // value of every run at its smallest key, plus that value's weight
-        // to skip zero weights.
-        let reads =
-            |seeks, filter_rejections, key_decodes, value_decodes, weight_decodes| RunReads {
-                seeks,
-                filter_rejections,
-                key_decodes,
-                value_decodes,
-                weight_decodes,
-                ..RunReads::default()
-            };
-        // C⁺: one probe of c5's own key over three runs. Opening decodes c5's
-        // key and value; the file filter admits c5, and its seek stays on c5,
-        // which decodes the value again. `Dlt`'s "new" comes first, then
-        // "old" cancels across `Dlt` and the file run (one weight decode).
-        //
-        // Memory: opening reads M's key (c7) and `Dlt`'s (c5): 2 keys. `Dlt`
-        // holds c5's values "new" and "old", in that order. At the opening,
-        // `Dlt` is at the smallest value, "new": a value and its weight (the
-        // file run's value "old" is larger, so only its value is decoded).
-        // The seeks stay (M is past c5; `Dlt` and the file run are on it),
-        // and empty the values, so `Dlt` reads "new" and its weight again.
-        // Stepping to "old" reads that value (the third), and the sum over
-        // `Dlt` and the file run reads its weight (the third); the step past
-        // it lands on nothing. M is never at the smallest key, so none of
-        // its values is read.
-        assert_eq!(c_reads, with_memory(reads(3, 0, 1, 2, 1), 2, 3, 3));
-        // O⁻: one scan of c5's range over two runs. Opening and the seek stay
-        // on c5 (a weight decode each); then six key steps, c5 through c6,
-        // each decode a key, a value, and a weight.
-        //
-        // Memory: only M's key (c7), read at the opening. The scan neither
-        // moves M (it is past the range) nor reads its value.
-        assert_eq!(o_reads, with_memory(reads(2, 0, 7, 8, 8), 1, 0, 0));
-        // J⁺: c5's key as in C⁺, then a probe of (c5, o5)'s key. Its opening
-        // decodes c5 again (one key, one value); the file filter rejects o5,
-        // which only `Dlt` holds, so the file run is not sought, and the two
-        // in-memory runs are sought once each.
-        //
-        // Memory: C⁺'s 2 keys, 3 values, and 3 weights. The second probe
-        // opens M and `Dlt` again (2 keys) and reads `Dlt`'s "new" and its
-        // weight, as the opening of C⁺ does (1 value, 1 weight). The seek
-        // to (c5, o5) moves `Dlt` from c5 to o5 (1 key); M stays on c7. Only
-        // `Dlt` holds o5, so `CursorList` reads its first value and weight
-        // there (1 and 1). In all: keys 2 + 2 + 1, values 3 + 1 + 1, weights
-        // 3 + 1 + 1.
-        assert_eq!(j_reads, with_memory(reads(5, 1, 2, 3, 1), 5, 5, 5));
-        // L⁻: the line items of o3, o4, and o5, one scan each over two runs.
-        // Each scan opens on c5 and seeks to its order's first line item: o3
-        // decodes l7, l8, and o4 (4 of each); o4 decodes l9 and c6 (3 of
-        // each); o5 has no line items and lands on c6 (2 of each).
-        //
-        // Memory: each of the three scans opens M, and reads its one key
-        // (c7). M is past every range, and so never at the smallest key.
-        assert_eq!(l_reads, with_memory(reads(6, 0, 9, 9, 9), 3, 0, 0));
-
-        // The driving deltas are in memory and read by `requested_keys`,
-        // which steps through their keys: `CursorList` reads each landed key,
-        // and the first value and weight under it, to skip zero weights.
-        // That is one key, one value, and one weight for each key of a delta:
-        // one each for the Orders delta (key 5), the Customer delta (key 5,
-        // two values), and the Lineitem delta (key 5, two values), and three
-        // for the joined delta (keys 3, 4, and 5). Nothing is decoded.
-        assert_eq!(c_other, memory_only(1));
-        assert_eq!(o_other, memory_only(1));
-        assert_eq!(j_other, memory_only(1));
-        assert_eq!(l_other, memory_only(3));
-
-        // `finish` returns the same counts, as the harness reports them.
+        // `finish` returns the session's counts and the reads that collecting
+        // made, as the harness reports them: the pinned reads of the session
+        // test.
+        let report = state.finish().unwrap();
+        assert_eq!(report.run_reads, collecting);
+        assert_eq!(collecting, with_memory(reads(0, 0, 7, 6, 6), 5, 5, 5));
         assert_eq!(
-            tally,
-            IndexReads {
-                customers_after: c_reads,
-                orders_before: o_reads,
-                joined_orders_after: j_reads,
-                lineitems_before: l_reads,
+            report.counts,
+            SessionCounts {
+                groups: 1,
+                cursor_opens: 2,
+                logical_seeks: 0,
+                logical_steps: 6,
+                positions: 7,
+                payload_decodes_old: 6,
+                payload_decodes_dlt: 5,
+                cancelled: 0,
             }
         );
     });
 }
 
+/// The reads of a transaction that never collected are nothing, and the next
+/// transaction starts from zero.
 #[test]
-fn finish_returns_each_transactions_index_reads() {
+fn finish_returns_each_transactions_session_reads() {
     let state = Q3State::default();
-    let orders_delta = delta(vec![(Tup1(5), Tup3(5, Date::from_days(11), 7), 1)]);
     let one_run = || source(vec![vec![customer(5, "only", 1)]]);
 
-    // Two calls in one transaction accumulate. Each scan of the one in-memory
-    // run seeks it once (the seek stays on c5), reads its key at the opening
-    // (1), and reads c5's first value and weight twice: at the opening, and
-    // again after the seek empties the value (2 and 2). So the two calls make
-    // 2 seeks, 2 key reads, 4 value reads, and 4 weight reads, and no decode.
-    state
-        .publish(one_run(), run(vec![]), BTreeMap::new())
-        .unwrap();
-    state.customers_after(&orders_delta).unwrap();
-    state.customers_after(&orders_delta).unwrap();
-    let tally = state.finish().unwrap();
-    assert_eq!(
-        tally.customers_after,
-        with_memory(
-            RunReads {
-                seeks: 2,
-                ..RunReads::default()
-            },
-            2,
-            4,
-            4
-        )
-    );
-    assert_eq!(
-        IndexReads {
-            customers_after: RunReads::default(),
-            ..tally
-        },
-        IndexReads::default()
-    );
+    state.publish(one_run(), run(vec![])).unwrap();
+    assert_eq!(state.finish().unwrap(), SessionReads::default());
 
-    // The next transaction starts from zero.
+    // One touched group: the session opens a cursor over `Old` and `Dlt`,
+    // reads the old customer once, and the delta's two entries.
     state
-        .publish(one_run(), run(vec![]), BTreeMap::new())
+        .publish(
+            one_run(),
+            run(vec![customer(5, "only", -1), customer(5, "new", 1)]),
+        )
         .unwrap();
-    assert_eq!(state.finish().unwrap(), IndexReads::default());
+    state.collect(Pass::Seek).unwrap();
+    let first = state.finish().unwrap();
+    assert_eq!(first.counts.groups, 1);
+    assert_eq!(first.counts.payload_decodes_old, 1);
+    assert_eq!(first.counts.payload_decodes_dlt, 2);
+
+    state.publish(one_run(), run(vec![])).unwrap();
+    state.collect(Pass::Seek).unwrap();
+    assert_eq!(state.finish().unwrap().counts.groups, 0);
+
+    let mut total = first;
+    total += first;
+    assert_eq!(total.counts.groups, 2);
+    assert_eq!(
+        total.run_reads.memory_key_reads,
+        2 * first.run_reads.memory_key_reads
+    );
 }
 
 /// A synthetic segment filter: rejects an old customer outside `BUILDING`.
@@ -805,7 +918,7 @@ fn maintain_col(
                     ]),
                     reject.then_some(&mut reject_entry as &mut dyn FnMut(&Entry<Payload>) -> bool),
                     |group, buffers| {
-                        groups.push((group.to_vec(), buffers.clone()));
+                        groups.push((group.to_vec(), buffers));
                         Ok(())
                     },
                 )
@@ -824,12 +937,6 @@ fn buffered(buffers: &GroupBuffers<Payload>) -> [(usize, usize); 3] {
         INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
     ]
     .map(|id| (buffers.old(id).len(), buffers.dlt(id).len()))
-}
-
-/// The reads of in-memory runs that land on `keys` keys and read the first
-/// value and weight of each.
-fn memory_only(keys: u64) -> RunReads {
-    with_memory(RunReads::default(), keys, keys, keys)
 }
 
 /// `reads` with the accesses of the in-memory runs.
@@ -860,8 +967,8 @@ fn reads(
 }
 
 /// The scan session on the worked transaction, under `Seek`: one group, and the storage reads of the same index state as
-/// `todays_readers_run_reads_on_the_worked_transaction` (22 value decodes
-/// there, against 6 here).
+/// the step 1 baseline of today's four readers, which
+/// the doc keeps as history (22 value decodes there, against 6 here).
 #[test]
 fn session_run_reads_on_the_worked_transaction() {
     in_storage_runtime(|| {

@@ -25,8 +25,8 @@
 //! # What the session buffers
 //!
 //! For each group, [`ScanSession::maintain`] collects the entries of the
-//! requested streams (index ids) into a [`GroupBuffers`], calls the caller's
-//! `on_group` with them, and releases them. `Old` and `Dlt` entries stay
+//! requested streams (index ids) into a [`GroupBuffers`] and hands them to the
+//! caller's `on_group` by value. `Old` and `Dlt` entries stay
 //! apart and unconsolidated, since a join is bilinear (`prop:overlay`).
 //! A position of `Old` whose stream is not requested costs a key decode and
 //! nothing else, as does the position that ends a group.
@@ -42,7 +42,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
+    ops::AddAssign,
 };
+
+use serde::Serialize;
 
 use crate::{
     ZWeight,
@@ -140,7 +143,7 @@ impl<P> GroupBuffers<P> {
 
 /// What the session did. The storage costs of these moves are in
 /// [`RunReads`](crate::trace::RunReads), which the cursors keep.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SessionCounts {
     /// Groups handed to `on_group`.
     pub groups: u64,
@@ -164,6 +167,20 @@ pub struct SessionCounts {
     /// Values of `Old` whose weights cancelled across runs. They cost a
     /// value and a weight decode each and are not buffered.
     pub cancelled: u64,
+}
+
+impl AddAssign for SessionCounts {
+    /// Adds the counts of another session, for the totals of several transactions.
+    fn add_assign(&mut self, other: Self) {
+        self.groups += other.groups;
+        self.cursor_opens += other.cursor_opens;
+        self.logical_seeks += other.logical_seeks;
+        self.logical_steps += other.logical_steps;
+        self.positions += other.positions;
+        self.payload_decodes_old += other.payload_decodes_old;
+        self.payload_decodes_dlt += other.payload_decodes_dlt;
+        self.cancelled += other.cancelled;
+    }
 }
 
 /// A forward pass over `Old` and `Dlt` of the index that `D` defines; see the
@@ -229,13 +246,15 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
     ///   session passes the rest of the key's node and everything below it in
     ///   `Old` (`Skip`), because no consumer needs them. `Dlt` entries are
     ///   never rejected: the delta is read whole.
-    /// * `on_group(group prefix, buffers)` runs once per group. The buffers
-    ///   are released when it returns.
+    /// * `on_group(group prefix, buffers)` runs once per group and takes the
+    ///   buffers by value, so the caller decides when to release them: it can
+    ///   drop them on return, or keep a transaction's groups until its
+    ///   consumers finish.
     pub fn maintain(
         &mut self,
         inputs: &BTreeSet<u8>,
         mut reject: Option<&mut dyn FnMut(&Entry<D::Payload>) -> bool>,
-        mut on_group: impl FnMut(&[u8], &GroupBuffers<D::Payload>) -> Result<(), String>,
+        mut on_group: impl FnMut(&[u8], GroupBuffers<D::Payload>) -> Result<(), String>,
     ) -> Result<(), String> {
         while self.dlt.key_valid() {
             let group = self.next_group()?;
@@ -245,7 +264,7 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
             let mut buffers = GroupBuffers::default();
             self.collect_old(&group, inputs, &mut reject, &mut buffers)?;
             self.collect_delta(&group, inputs, &mut buffers)?;
-            on_group(&group, &buffers)?;
+            on_group(&group, buffers)?;
         }
         Ok(())
     }

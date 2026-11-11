@@ -255,7 +255,7 @@ fn run_session<D: MergedIndexDefinition<Payload = u8>>(
             .as_mut()
             .map(|reject| reject as &mut dyn FnMut(&Entry<u8>) -> bool),
         |group, buffers| {
-            groups.push((group.to_vec(), buffers.clone()));
+            groups.push((group.to_vec(), buffers));
             Ok(())
         },
     )?;
