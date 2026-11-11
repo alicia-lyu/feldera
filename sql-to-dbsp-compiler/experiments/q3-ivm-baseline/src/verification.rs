@@ -1,9 +1,10 @@
 //! Shared, deterministic verification of both Q3 builds: the RF1/RF2 transcript, and the
 //! general one for changes beyond RF1/RF2.
 
-use std::collections::BTreeSet;
-
 use super::*;
+
+#[cfg(feature = "merged-index")]
+use std::collections::BTreeSet;
 
 #[cfg(feature = "merged-index")]
 use dbsp::{
