@@ -455,6 +455,10 @@ The user called the RF1/RF2 limit self-imposed and decided on 2026-11-10 that st
 - `BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs; `prepare` decides what reconstructed mode supports.
 - The exit check adds a second transcript comparison (`general_transcript`) beside `rf1_rf2_transcript`.
 
+### 2026-11-11: Completing `Dlt` is base maintenance
+
+The user decided on 2026-11-11 that completing the base delta into trie-keyed `Dlt` rows (`reconstruction::prepare`, the orphan side store, and the reads of `Old` for a moved order's line items) stays outside the IVM window. It is booked in `index_ms`, a sub-phase of `base_ms`. Rationale: the merged index is closer to a base table than to this view's state. It can serve the maintenance of several views, and queries that store no intermediate or final results, so its upkeep is not work for this one view.
+
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
 The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
