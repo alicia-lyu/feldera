@@ -221,14 +221,30 @@ impl Q3State {
         orders: &ZSetHandle<OrderRow>,
         lines: &ZSetHandle<LineitemRow>,
     ) -> Result<(), String> {
+        self.push_customer_deltas(customers)?;
+        self.push_order_deltas(orders)?;
+        self.push_line_deltas(lines)
+    }
+
+    /// Pushes the `Dlt` entries of the Customer stream; see
+    /// [`Self::push_driving_deltas`].
+    pub fn push_customer_deltas(&self, customers: &ZSetHandle<CustomerRow>) -> Result<(), String> {
         let views = self.views()?;
-        let collected = views.collected_groups()?;
-        for buffers in collected.groups.values() {
+        for buffers in views.collected_groups()?.groups.values() {
             for entry in buffers.dlt(INDEX_ID_CUSTOMER_BY_CUSTKEY) {
                 let key = customer_key(entry)?;
                 let segment = customer_segment(entry)?;
                 customers.push(Tup2(key.custkey, segment.clone()), entry.weight);
             }
+        }
+        Ok(())
+    }
+
+    /// Pushes the `Dlt` entries of the Orders stream; see
+    /// [`Self::push_driving_deltas`].
+    pub fn push_order_deltas(&self, orders: &ZSetHandle<OrderRow>) -> Result<(), String> {
+        let views = self.views()?;
+        for buffers in views.collected_groups()?.groups.values() {
             for entry in buffers.dlt(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY) {
                 let key = order_key(entry)?;
                 let (date, priority) = order_payload(entry)?;
@@ -237,6 +253,15 @@ impl Q3State {
                     entry.weight,
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Pushes the `Dlt` entries of the Lineitem stream; see
+    /// [`Self::push_driving_deltas`].
+    pub fn push_line_deltas(&self, lines: &ZSetHandle<LineitemRow>) -> Result<(), String> {
+        let views = self.views()?;
+        for buffers in views.collected_groups()?.groups.values() {
             for entry in buffers.dlt(INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER) {
                 let key = line_key(entry)?;
                 let (price, discount, ship_date) = line_payload(entry)?;

@@ -1,11 +1,14 @@
-//! Shared, deterministic RF1/RF2 verification for both generated Q3 circuits.
+//! Shared, deterministic verification of both Q3 builds: the RF1/RF2 transcript, and the
+//! general one for changes beyond RF1/RF2.
+
+use std::collections::BTreeSet;
 
 use super::*;
 
 #[cfg(feature = "merged-index")]
 use dbsp::{
     dynamic::DowncastTrait,
-    trace::{BatchReader as DynamicBatchReader, Cursor, WithSnapshot},
+    trace::{merged_index::Pass, BatchReader as DynamicBatchReader, Cursor, WithSnapshot},
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
     DBData, OrdIndexedZSet,
@@ -130,6 +133,10 @@ fn discount(value: i64) -> Result<SqlDecimal<4, 2>> {
     SqlDecimal::new(i128::from(value), 2).context("invalid line discount")
 }
 
+/// Checks the four partner reads against brute force over the references, for every touched
+/// customer. The readers read one scan session's buffers, so the check collects them in a
+/// state of its own, from the published `Old` and `Dlt`, and leaves the pipeline's for the
+/// view circuit.
 #[cfg(feature = "merged-index")]
 fn check_readers(
     q3: &Q3State,
@@ -137,56 +144,70 @@ fn check_readers(
     after: &Reference,
     change: &Change,
 ) -> Result<()> {
-    // Requests come from logical deltas. In particular B is projected from
-    // Customer and Orders maps, independently of the reconstructed readers.
-    let customer_requests: HashSet<_> = change.customers.iter().map(|(c, _)| c.key).collect();
-    let order_requests: HashSet<_> = change.orders.iter().map(|(o, _)| o.customer_key).collect();
-    let line_requests: HashSet<_> = change.lines.iter().map(|(l, _)| l.order_key).collect();
-    let joined_before: BTreeMap<_, _> = before
+    let readers = Q3State::default();
+    readers
+        .publish(
+            q3.old().map_err(anyhow::Error::msg)?,
+            q3.dlt().map_err(anyhow::Error::msg)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+    readers.collect(Pass::Seek).map_err(anyhow::Error::msg)?;
+    check_collected_readers(&readers, before, after, change)?;
+    readers.finish().map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+#[cfg(feature = "merged-index")]
+fn check_collected_readers(
+    q3: &Q3State,
+    before: &Reference,
+    after: &Reference,
+    change: &Change,
+) -> Result<()> {
+    // The touched customers: those the logical change names, and the owners of every order it
+    // changes, before and after (a moved order touches both).
+    let changed_orders: HashSet<i64> = change
         .orders
-        .values()
-        .filter_map(|o| {
-            before
-                .customers
-                .get(&o.customer_key)
-                .map(|c| (o.key, (c, o)))
-        })
+        .iter()
+        .map(|(o, _)| o.key)
+        .chain(change.lines.iter().map(|(l, _)| l.order_key))
         .collect();
-    let joined_after: BTreeMap<_, _> = after
-        .orders
-        .values()
-        .filter_map(|o| {
-            after
-                .customers
-                .get(&o.customer_key)
-                .map(|c| (o.key, (c, o)))
-        })
-        .collect();
-    let joined_requests: HashSet<_> = joined_before
-        .keys()
-        .chain(joined_after.keys())
-        .filter(|key| joined_before.get(key) != joined_after.get(key))
-        .copied()
+    let mut touched: BTreeSet<i64> = change.customers.iter().map(|(c, _)| c.key).collect();
+    touched.extend(change.orders.iter().map(|(o, _)| o.customer_key));
+    for reference in [before, after] {
+        touched.extend(
+            changed_orders
+                .iter()
+                .filter_map(|key| reference.orders.get(key))
+                .map(|o| o.customer_key),
+        );
+    }
+    // Every `(custkey, orderkey)` node below a touched customer, before or after.
+    let nodes: BTreeSet<(i64, i64)> = [before, after]
+        .into_iter()
+        .flat_map(|reference| reference.orders.values())
+        .filter(|o| touched.contains(&o.customer_key))
+        .map(|o| (o.customer_key, o.key))
         .collect();
 
     let orders_delta = snapshot(
-        order_requests
+        touched
             .iter()
             .map(|c| (Tup1(*c), Tup3(0, Date::from_days(0), 0), 1))
             .collect(),
     );
     let customers_delta = snapshot(
-        customer_requests
+        touched
             .iter()
             .map(|c| (Tup1(*c), Tup1(SqlString::from("request")), 1))
             .collect(),
     );
     let lines_delta = snapshot(
-        line_requests
+        nodes
             .iter()
-            .map(|o| {
+            .map(|(c, o)| {
                 (
-                    Tup1(*o),
+                    Tup2(*c, *o),
                     Tup4(
                         0,
                         decimal(0).unwrap(),
@@ -199,20 +220,21 @@ fn check_readers(
             .collect(),
     );
     let joined_delta = snapshot(
-        joined_requests
+        nodes
             .iter()
-            .map(|o| {
+            .map(|(c, o)| {
                 (
-                    Tup1(*o),
-                    Tup4(0, SqlString::from("request"), Date::from_days(0), 0),
+                    Tup2(*c, *o),
+                    Tup3(SqlString::from("request"), Date::from_days(0), 0),
                     1,
                 )
             })
             .collect(),
     );
 
+    // C⁺: the touched customers after the change.
     let mut expected_customers = Vec::new();
-    for c in &order_requests {
+    for c in &touched {
         if let Some(row) = after.customers.get(c) {
             expected_customers.push((Tup1(*c), Tup1(SqlString::from(row.segment.as_str())), 1));
         }
@@ -226,11 +248,12 @@ fn check_readers(
         expected_customers
     );
 
+    // O⁻: the orders of the touched customers before the change.
     let mut expected_orders = Vec::new();
     for row in before
         .orders
         .values()
-        .filter(|o| customer_requests.contains(&o.customer_key))
+        .filter(|o| touched.contains(&o.customer_key))
     {
         expected_orders.push((
             Tup1(row.customer_key),
@@ -247,19 +270,21 @@ fn check_readers(
         expected_orders
     );
 
+    // J⁺: the joined orders after the change, at their `(custkey, orderkey)` nodes.
     let mut expected_joined = Vec::new();
-    for key in &line_requests {
-        if let Some((c, o)) = joined_after.get(key) {
-            expected_joined.push((
-                Tup1(*key),
-                Tup4(
-                    c.key,
-                    SqlString::from(c.segment.as_str()),
-                    date(&o.date)?,
-                    o.ship_priority,
-                ),
-                1,
-            ));
+    for (c, o) in &nodes {
+        if let (Some(customer), Some(order)) = (after.customers.get(c), after.orders.get(o)) {
+            if order.customer_key == *c {
+                expected_joined.push((
+                    Tup2(*c, *o),
+                    Tup3(
+                        SqlString::from(customer.segment.as_str()),
+                        date(&order.date)?,
+                        order.ship_priority,
+                    ),
+                    1,
+                ));
+            }
         }
     }
     expected_joined.sort();
@@ -271,22 +296,25 @@ fn check_readers(
         expected_joined
     );
 
+    // L⁻: the lines before the change of each order, at the order's customer then. An orphan
+    // line is in no group.
     let mut expected_lines = Vec::new();
-    for row in before
-        .lines
-        .values()
-        .filter(|l| joined_requests.contains(&l.order_key))
-    {
-        expected_lines.push((
-            Tup1(row.order_key),
-            Tup4(
-                row.number,
-                decimal(row.price_cents)?,
-                discount(row.discount_hundredths)?,
-                date(&row.ship_date)?,
-            ),
-            1,
-        ));
+    for (c, o) in &nodes {
+        if before.orders.get(o).map(|order| order.customer_key) != Some(*c) {
+            continue;
+        }
+        for row in before.lines.values().filter(|l| l.order_key == *o) {
+            expected_lines.push((
+                Tup2(*c, *o),
+                Tup4(
+                    row.number,
+                    decimal(row.price_cents)?,
+                    discount(row.discount_hundredths)?,
+                    date(&row.ship_date)?,
+                ),
+                1,
+            ));
+        }
     }
     expected_lines.sort();
     assert_eq!(
@@ -328,13 +356,74 @@ fn verify_output(
 /// before and after the change.
 #[cfg(feature = "merged-index")]
 fn publish(
-    pipeline: &Pipeline,
+    pipeline: &mut Pipeline,
     net_delta: &Change,
     before: &Reference,
     after: &Reference,
 ) -> Result<()> {
-    publish_net_delta(pipeline, net_delta)?;
+    publish_net_delta(pipeline, net_delta, after)?;
     check_readers(&pipeline.q3_state, before, after, net_delta)
+}
+
+/// One fixture of a transcript: its name, its change, and whether the circuits run it as one
+/// transaction of several steps.
+type Fixture = (&'static str, Change, bool);
+
+/// Runs the fixtures in order through a fresh pipeline, checking each against the references
+/// and the base relations, and returns the V transcript: each fixture's delta and view.
+fn replay(fixtures: Vec<Fixture>) -> Result<Vec<Value>> {
+    let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
+    let mut pipeline = Pipeline::new(config())?;
+    let mut state = Reference::default();
+    let mut transcript = Vec::new();
+
+    for (name, change, multi_step) in fixtures {
+        let before = state.clone();
+        let before_view = before.evaluate();
+        let mut expected_after = before.clone();
+        apply_reference(&mut expected_after, &change);
+        let after_view = expected_after.evaluate();
+
+        let net_delta = run_base(&mut pipeline, &mut state, change.clone(), multi_step)?;
+        assert_eq!(
+            (
+                net_delta.customers.len(),
+                net_delta.orders.len(),
+                net_delta.lines.len()
+            ),
+            (
+                change.customers.len(),
+                change.orders.len(),
+                change.lines.len()
+            ),
+            "{name}: the net delta has one entry per changed row"
+        );
+        assert!(
+            workload::BaseState::new(&pipeline.base.catalog)?.matches(&state)?,
+            "{name}: base relations"
+        );
+        #[cfg(feature = "merged-index")]
+        publish(&mut pipeline, &net_delta, &before, &expected_after)?;
+        run_view(&mut pipeline, net_delta, multi_step)?;
+
+        assert_eq!(state.evaluate(), after_view, "{name}: fixture state");
+        transcript.push(verify_output(
+            &pipeline.view.catalog,
+            &before_view,
+            &after_view,
+            name,
+        )?);
+    }
+    Ok(transcript)
+}
+
+/// Writes a transcript to the file that `variable` names, if it is set. The transcript of the
+/// native build and the reconstructed build's must be byte-identical.
+fn write_transcript(variable: &str, transcript: &[Value]) -> Result<()> {
+    if let Some(path) = std::env::var_os(variable) {
+        std::fs::write(path, serde_json::to_vec_pretty(transcript)?)?;
+    }
+    Ok(())
 }
 
 /// The V transcript of the two-circuit pipeline must stay byte-identical to the transcript
@@ -342,11 +431,6 @@ fn publish(
 /// also checked against the base relations, which the base circuit maintains.
 #[test]
 fn rf1_rf2_transcript() -> Result<()> {
-    let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
-    let mut pipeline = Pipeline::new(config())?;
-    let mut state = Reference::default();
-    let mut transcript = Vec::new();
-
     let fixtures = vec![
         (
             "customers",
@@ -401,46 +485,166 @@ fn rf1_rf2_transcript() -> Result<()> {
         ),
         ("empty-final", Change::default(), false),
     ];
-    for (name, change, multi_step) in fixtures {
-        let before = state.clone();
-        let before_view = before.evaluate();
-        let mut expected_after = before.clone();
-        apply_reference(&mut expected_after, &change);
-        let after_view = expected_after.evaluate();
-
-        let net_delta = run_base(&mut pipeline, &mut state, change.clone(), multi_step)?;
-        assert_eq!(
-            (
-                net_delta.customers.len(),
-                net_delta.orders.len(),
-                net_delta.lines.len()
-            ),
-            (
-                change.customers.len(),
-                change.orders.len(),
-                change.lines.len()
-            ),
-            "{name}: the net delta has one entry per changed row"
-        );
-        assert!(
-            workload::BaseState::new(&pipeline.base.catalog)?.matches(&state)?,
-            "{name}: base relations"
-        );
-        #[cfg(feature = "merged-index")]
-        publish(&pipeline, &net_delta, &before, &expected_after)?;
-        run_view(&mut pipeline, net_delta, multi_step)?;
-
-        assert_eq!(state.evaluate(), after_view, "{name}: fixture state");
-        transcript.push(verify_output(
-            &pipeline.view.catalog,
-            &before_view,
-            &after_view,
-            name,
-        )?);
-    }
+    let transcript = replay(fixtures)?;
     assert_eq!(transcript.len(), 13);
-    if let Some(path) = std::env::var_os("Q3_VERIFICATION_TRANSCRIPT") {
-        std::fs::write(path, serde_json::to_vec_pretty(&transcript)?)?;
+    write_transcript("Q3_VERIFICATION_TRANSCRIPT", &transcript)
+}
+
+/// A line item with a payload other than `line`'s, for an update.
+fn repriced(order_key: i64, number: i32, price_cents: i64) -> Line {
+    Line {
+        price_cents,
+        ..line(order_key, number)
     }
-    Ok(())
+}
+
+/// The same comparison for changes beyond RF1/RF2 (roadmap step 7): orphan line items, an
+/// order that arrives for them, line items added to and updated in an existing order, a
+/// customer replaced and deleted, an order that moves to another customer with and without
+/// line changes, an order deleted while its lines stay, and several of these in one
+/// transaction. The reconstructed build's `Dlt` must be complete for every one of them.
+#[test]
+fn general_transcript() -> Result<()> {
+    let fixtures = vec![
+        (
+            "customers",
+            Change {
+                customers: vec![
+                    (customer(2, "BUILDING"), true),
+                    (customer(3, "AUTOMOBILE"), true),
+                    (customer(4, "HOUSEHOLD"), true),
+                ],
+                ..Change::default()
+            },
+            false,
+        ),
+        // Lines with no order: they join nothing, and the index folds them nowhere.
+        (
+            "orphan-lines",
+            Change {
+                lines: vec![
+                    (line(20, 1), true),
+                    (line(20, 2), true),
+                    (line(99, 1), true),
+                ],
+                ..Change::default()
+            },
+            false,
+        ),
+        // The order arrives for its orphan lines, with one more line item.
+        (
+            "order-arrives",
+            Change {
+                orders: vec![(order(20, 2), true)],
+                lines: vec![(line(20, 3), true)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // A line item added to an existing order, and one updated in place.
+        (
+            "line-added-and-updated",
+            Change {
+                lines: vec![
+                    (line(20, 4), true),
+                    (line(20, 1), false),
+                    (repriced(20, 1, 250), true),
+                ],
+                ..Change::default()
+            },
+            true,
+        ),
+        (
+            "customer-replaced",
+            Change {
+                customers: vec![
+                    (customer(2, "BUILDING"), false),
+                    (customer(2, "MACHINERY"), true),
+                ],
+                ..Change::default()
+            },
+            false,
+        ),
+        // The order changes customer with no change to its line items: all of them move.
+        (
+            "order-moves",
+            Change {
+                orders: vec![(order(20, 2), false), (order(20, 3), true)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // It moves again while one line is deleted and another added.
+        (
+            "order-moves-with-line-changes",
+            Change {
+                orders: vec![(order(20, 3), false), (order(20, 4), true)],
+                lines: vec![(line(20, 2), false), (line(20, 5), true)],
+                ..Change::default()
+            },
+            true,
+        ),
+        // The order is deleted and its lines stay as orphans.
+        (
+            "order-deleted-lines-kept",
+            Change {
+                orders: vec![(order(20, 4), false)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // A line item of an orphan order changes while it is still an orphan.
+        (
+            "orphan-line-updated",
+            Change {
+                lines: vec![(line(99, 1), false), (repriced(99, 1, 300), true)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // The order returns, at another customer, and takes its orphan lines with it.
+        (
+            "order-returns",
+            Change {
+                orders: vec![(order(20, 3), true)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // A customer is deleted while its orders stay.
+        (
+            "customer-deleted",
+            Change {
+                customers: vec![(customer(3, "AUTOMOBILE"), false)],
+                ..Change::default()
+            },
+            false,
+        ),
+        // Several kinds in one transaction: a customer replaced, two new orders with lines, and
+        // an order deleted while one of its lines is deleted and the rest stay as orphans.
+        (
+            "mixed",
+            Change {
+                customers: vec![
+                    (customer(4, "HOUSEHOLD"), false),
+                    (customer(4, "FURNITURE"), true),
+                ],
+                orders: vec![
+                    (order(20, 3), false),
+                    (order(30, 4), true),
+                    (order(31, 2), true),
+                ],
+                lines: vec![
+                    (repriced(20, 1, 250), false),
+                    (line(30, 1), true),
+                    (line(31, 1), true),
+                ],
+            },
+            true,
+        ),
+        ("empty", Change::default(), false),
+    ];
+    let transcript = replay(fixtures)?;
+    assert_eq!(transcript.len(), 13);
+    write_transcript("Q3_GENERAL_TRANSCRIPT", &transcript)
 }

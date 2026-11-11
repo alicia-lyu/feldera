@@ -89,10 +89,8 @@ impl Model {
                 continue;
             };
             for ((order_key, order_payload), order_weight) in &self.0 {
-                let (
-                    Key::OrdersByCustkeyOrderkey(o),
-                    Payload::OrdersByCustkeyOrderkey(op),
-                ) = (order_key, order_payload)
+                let (Key::OrdersByCustkeyOrderkey(o), Payload::OrdersByCustkeyOrderkey(op)) =
+                    (order_key, order_payload)
                 else {
                     continue;
                 };
@@ -241,6 +239,10 @@ fn single_stream_transactions_and_empty_ones_match() {
         vec![],
         vec![line(1, 10, 2, 200, 1)],
         vec![customer(1, "A", -1), customer(1, "B", 1)],
-        vec![order(1, 10, 5, -1), line(1, 10, 1, 100, -1), line(1, 10, 2, 200, -1)],
+        vec![
+            order(1, 10, 5, -1),
+            line(1, 10, 1, 100, -1),
+            line(1, 10, 2, 200, -1),
+        ],
     ]);
 }

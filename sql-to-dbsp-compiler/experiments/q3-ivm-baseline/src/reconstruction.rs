@@ -1,9 +1,10 @@
-//! Manual merged-index maintenance for the restricted RF1/RF2 experiment.
+//! Manual merged-index maintenance: the index's owner thread, and the conversion of a
+//! transaction's net delta into the complete `Dlt` that the view circuit's inputs need.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{mpsc, Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::dynamic::{DowncastTrait, DynData, Erase};
 #[cfg(test)]
@@ -29,9 +30,8 @@ use crate::Change;
 
 type IndexBatch = dbsp::trace::merged_index::MergedIndexBatch;
 pub(crate) type Snapshot = SpineSnapshot<IndexBatch>;
-type SourceRow = (Key, Payload, ZWeight);
-
-type OrderLocations = BTreeMap<i64, BTreeSet<i64>>;
+/// One row of `Dlt`: a key, its payload, and a signed weight.
+pub(crate) type SourceRow = (Key, Payload, ZWeight);
 
 enum Request {
     BackgroundIdle(mpsc::SyncSender<bool>),
@@ -359,45 +359,191 @@ fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
     ))
 }
 
-/// Convert the base tables' net delta (`workload::net_delta`); physical folding/encoding stays
-/// in batch construction. Every Lineitem needs its Orders row in the same delta, for the
-/// customer that places it, and deletions carry complete rows.
-pub(crate) fn prepare(change: &Change) -> Result<(OrderLocations, Vec<SourceRow>)> {
-    let mut placements = OrderLocations::new();
-    let orders: BTreeMap<_, _> = change
-        .orders
-        .iter()
-        .map(|(row, insert)| (row.key, (row, insert)))
-        .collect();
+/// Line items whose order is absent, by order key and then line number: the side store of
+/// orphan lines, beside the index. The index folds a line item under its order's customer, so
+/// a line item with no order has no folded key; it waits here until its order arrives, and
+/// native Feldera accepts it too (it never joins). The store is part of base maintenance.
+#[derive(Debug, Default)]
+pub(crate) struct OrphanLines(BTreeMap<i64, BTreeMap<i32, Line>>);
+
+impl OrphanLines {
+    /// Removes and returns the orphan lines of `order_key`.
+    fn take(&mut self, order_key: i64) -> BTreeMap<i32, Line> {
+        self.0.remove(&order_key).unwrap_or_default()
+    }
+
+    /// Stores the orphan lines of `order_key`, replacing any; no lines clear the entry.
+    fn put(&mut self, order_key: i64, lines: BTreeMap<i32, Line>) {
+        if lines.is_empty() {
+            self.0.remove(&order_key);
+        } else {
+            self.0.insert(order_key, lines);
+        }
+    }
+
+    /// The orphan lines of `order_key`, by line number.
+    #[cfg(test)]
+    pub(crate) fn lines(&self, order_key: i64) -> Vec<&Line> {
+        self.0
+            .get(&order_key)
+            .map_or_else(Vec::new, |lines| lines.values().collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Converts the base tables' net delta (`workload::net_delta`) into the rows of `Dlt`, the
+/// transaction's complete change of the index; physical folding and encoding stay in batch
+/// construction. Deletions carry complete rows.
+///
+/// A line item folds under its order's customer, so every changed order `o` has a *before
+/// owner* and an *after owner*, each a customer or none. They come from the net delta's
+/// deletion and insertion of `o`, or else, when the delta does not mention `o`, from
+/// `base_owner`, the base `Orders` state, which the transaction left unchanged. The order's
+/// lines before are `L⁻`, and the lines after `L⁺ = L⁻ + ΔL(o)`:
+///
+/// | Case | `Dlt` line rows | Side store |
+/// | --- | --- | --- |
+/// | same owner `c` | `ΔL(o)` at `c` | unchanged |
+/// | the order moves | `−L⁻` at the old owner, `+L⁺` at the new | unchanged |
+/// | the order is deleted, lines kept | `−L⁻` at the old owner | `o ↦ L⁺` |
+/// | the order arrives for orphan lines | `+L⁺` at the new owner | remove `o` |
+/// | orphan lines only | none | `o ↦ L⁺` |
+///
+/// `L⁻` is read from `old` at `(owner, o)`, or, for an order with no owner before, from
+/// `orphans`. Customers and orders fold from the net delta alone; an order folds at its own
+/// `o_custkey`, so customers need no side store.
+pub(crate) fn prepare(
+    change: &Change,
+    old: &Snapshot,
+    orphans: &mut OrphanLines,
+    base_owner: &mut dyn FnMut(i64) -> Result<Option<i64>>,
+) -> Result<Vec<SourceRow>> {
     let mut rows = Vec::with_capacity(change.len());
     for (customer, insert) in &change.customers {
         rows.push(customer_row(customer, *insert));
     }
+
+    // What the delta says about each order: its deletion and its insertion.
+    let mut order_changes: BTreeMap<i64, (Option<&Order>, Option<&Order>)> = BTreeMap::new();
     for (order, insert) in &change.orders {
-        placements
-            .entry(order.key)
-            .or_default()
-            .insert(order.customer_key);
         rows.push(order_row(order, *insert)?);
+        let (deleted, inserted) = order_changes.entry(order.key).or_default();
+        let slot = if *insert { inserted } else { deleted };
+        ensure!(
+            slot.replace(order).is_none(),
+            "duplicate Orders {} of order {} in the net delta",
+            if *insert { "insertion" } else { "deletion" },
+            order.key
+        );
     }
+
+    // ΔL(o) for each order that has any.
+    let mut line_changes: BTreeMap<i64, Vec<(&Line, bool)>> = BTreeMap::new();
     for (line, insert) in &change.lines {
-        let (order, direction) = orders.get(&line.order_key).with_context(|| {
-            format!(
-                "Lineitem ({}, {}) has no Orders record in this transaction",
-                line.order_key, line.number
-            )
-        })?;
-        if insert != *direction {
-            bail!("Lineitem direction differs from Orders delta");
-        }
-        rows.push(line_row(line, order.customer_key, *insert)?);
+        line_changes
+            .entry(line.order_key)
+            .or_default()
+            .push((line, *insert));
     }
-    Ok((placements, rows))
+
+    let changed_orders: BTreeSet<i64> = order_changes
+        .keys()
+        .chain(line_changes.keys())
+        .copied()
+        .collect();
+    for order_key in changed_orders {
+        let (before_owner, after_owner) = match order_changes.get(&order_key) {
+            Some((deleted, inserted)) => (
+                deleted.map(|order| order.customer_key),
+                inserted.map(|order| order.customer_key),
+            ),
+            None => {
+                let owner = base_owner(order_key)?;
+                (owner, owner)
+            }
+        };
+        let order_lines = line_changes.get(&order_key).map_or(&[][..], Vec::as_slice);
+        match (before_owner, after_owner) {
+            // The lines stay where they are: only ΔL(o) changes the index.
+            (Some(before), Some(after)) if before == after => {
+                for (line, insert) in order_lines {
+                    rows.push(line_row(line, after, *insert)?);
+                }
+            }
+            _ => move_lines(
+                &mut rows,
+                old,
+                orphans,
+                order_key,
+                (before_owner, after_owner),
+                order_lines,
+            )?,
+        }
+    }
+    Ok(rows)
 }
 
-/// Seek one current complete Lineitem range, decoding only matching rows.
+/// The `Dlt` rows of an order whose lines change owner (a customer, or none): `−L⁻` at the
+/// before owner and `+L⁺` at the after owner, with the side store holding the lines of an
+/// order that has no owner. See [`prepare`].
+fn move_lines(
+    rows: &mut Vec<SourceRow>,
+    old: &Snapshot,
+    orphans: &mut OrphanLines,
+    order_key: i64,
+    (before_owner, after_owner): (Option<i64>, Option<i64>),
+    delta: &[(&Line, bool)],
+) -> Result<()> {
+    let lines_before: BTreeMap<i32, Line> = match before_owner {
+        Some(customer) => lines_below(old, customer, order_key)?
+            .into_iter()
+            .map(|line| (line.number, line))
+            .collect(),
+        None => orphans.take(order_key),
+    };
+
+    // Deletions first, so that an upsert's insertion of a line replaces its deletion.
+    let mut lines_after = lines_before.clone();
+    for (line, _) in delta.iter().filter(|(_, insert)| !insert) {
+        ensure!(
+            lines_after.remove(&line.number).is_some(),
+            "net delta deletes Lineitem ({}, {}), which the order does not hold",
+            order_key,
+            line.number
+        );
+    }
+    for (line, _) in delta.iter().filter(|(_, insert)| *insert) {
+        lines_after.insert(line.number, (*line).clone());
+    }
+
+    if let Some(customer) = before_owner {
+        for line in lines_before.values() {
+            rows.push(line_row(line, customer, false)?);
+        }
+    }
+    match after_owner {
+        Some(customer) => {
+            for line in lines_after.values() {
+                rows.push(line_row(line, customer, true)?);
+            }
+        }
+        None => orphans.put(order_key, lines_after),
+    }
+    Ok(())
+}
+
+/// The current lines of `order`, read from `snapshot`. The scan decodes only matching rows.
 pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
-    let prefix = prefix_custkey_orderkey_then_linenumber(order.customer_key, order.key);
+    lines_below(snapshot, order.customer_key, order.key)
+}
+
+/// Seeks the range below `(customer_key, order_key)` and decodes the line items in it.
+fn lines_below(snapshot: &Snapshot, customer_key: i64, order_key: i64) -> Result<Vec<Line>> {
+    let prefix = prefix_custkey_orderkey_then_linenumber(customer_key, order_key);
     let mut cursor = snapshot.cursor();
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
@@ -410,13 +556,13 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
             CustomerOrdersLineitemDefinition::unfold(&key).map_err(anyhow::Error::msg)?;
         let Key::LineitemByCustkeyOrderkeyLinenumber(LineitemByCustkeyOrderkeyLinenumberKey {
             custkey: customer,
-            orderkey: order_key,
+            orderkey: found_order,
             linenumber: number,
         }) = line_key
         else {
             bail!("non-Lineitem row inside Lineitem range");
         };
-        if customer != order.customer_key || order_key != order.key {
+        if customer != customer_key || found_order != order_key {
             bail!("Lineitem range has unexpected identity");
         }
         while cursor.val_valid() {
@@ -518,5 +664,207 @@ mod tests {
                 "memory": {"runs": 1, "bytes": bytes},
             })
         );
+    }
+
+    // ---- `prepare`: one test for each row of its table ----
+
+    fn customer(key: i64) -> Customer {
+        Customer {
+            key,
+            segment: "BUILDING".into(),
+        }
+    }
+
+    fn order(key: i64, customer_key: i64) -> Order {
+        Order {
+            key,
+            customer_key,
+            date: "1996-01-02".into(),
+            ship_priority: 0,
+        }
+    }
+
+    fn line(order_key: i64, number: i32) -> Line {
+        Line {
+            order_key,
+            number,
+            price_cents: 100,
+            discount_hundredths: 4,
+            ship_date: "1996-03-13".into(),
+        }
+    }
+
+    /// `Old`: one run holding `rows`.
+    fn old_index(rows: Vec<SourceRow>) -> Snapshot {
+        let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+            Vec<u8>,
+            merged_index_col::StoredPayload,
+            ZWeight,
+        >();
+        Snapshot::with_batches(&factories, vec![Arc::new(build_batch(rows).unwrap())])
+    }
+
+    /// The lines of the given orders, at their customers, as `Old` holds them.
+    fn old_lines(lines: &[(Line, i64)]) -> Snapshot {
+        old_index(
+            lines
+                .iter()
+                .map(|(line, customer)| line_row(line, *customer, true).unwrap())
+                .collect(),
+        )
+    }
+
+    /// The sorted rows of `prepare`, with the base state naming `owners` (order, customer).
+    fn prepared(
+        change: &Change,
+        old: &Snapshot,
+        orphans: &mut OrphanLines,
+        owners: &[(i64, i64)],
+    ) -> Result<Vec<SourceRow>> {
+        let mut base_owner = |order: i64| {
+            Ok(owners
+                .iter()
+                .find(|(key, _)| *key == order)
+                .map(|(_, c)| *c))
+        };
+        let mut rows = prepare(change, old, orphans, &mut base_owner)?;
+        rows.sort();
+        Ok(rows)
+    }
+
+    fn sorted(mut rows: Vec<SourceRow>) -> Vec<SourceRow> {
+        rows.sort();
+        rows
+    }
+
+    /// Same owner: the delta of the lines folds at the owner, whether the base state or the
+    /// order's replacement names it, and `Old` is not read.
+    #[test]
+    fn lines_of_an_order_with_one_owner_fold_from_the_delta_alone() {
+        let unread = old_index(Vec::new());
+        let change = Change {
+            lines: vec![(line(20, 2), true), (line(20, 1), false)],
+            ..Change::default()
+        };
+        assert_eq!(
+            prepared(&change, &unread, &mut OrphanLines::default(), &[(20, 3)]).unwrap(),
+            sorted(vec![
+                line_row(&line(20, 2), 3, true).unwrap(),
+                line_row(&line(20, 1), 3, false).unwrap(),
+            ])
+        );
+
+        let replaced = Change {
+            customers: vec![(customer(2), true)],
+            orders: vec![(order(20, 2), false), (order(20, 2), true)],
+            lines: vec![(line(20, 3), true)],
+        };
+        assert_eq!(
+            prepared(&replaced, &unread, &mut OrphanLines::default(), &[]).unwrap(),
+            sorted(vec![
+                customer_row(&customer(2), true),
+                order_row(&order(20, 2), false).unwrap(),
+                order_row(&order(20, 2), true).unwrap(),
+                line_row(&line(20, 3), 2, true).unwrap(),
+            ])
+        );
+    }
+
+    /// The order moves: every line leaves the old customer and arrives at the new one, those
+    /// of `Old` and those the delta adds, and a deleted line does not arrive.
+    #[test]
+    fn a_moved_order_takes_its_old_and_new_lines_with_it() {
+        let old = old_lines(&[(line(20, 1), 2), (line(20, 2), 2), (line(21, 1), 2)]);
+        let change = Change {
+            orders: vec![(order(20, 2), false), (order(20, 3), true)],
+            lines: vec![(line(20, 2), false), (line(20, 3), true)],
+            ..Change::default()
+        };
+        let mut orphans = OrphanLines::default();
+        assert_eq!(
+            prepared(&change, &old, &mut orphans, &[]).unwrap(),
+            sorted(vec![
+                order_row(&order(20, 2), false).unwrap(),
+                order_row(&order(20, 3), true).unwrap(),
+                line_row(&line(20, 1), 2, false).unwrap(),
+                line_row(&line(20, 2), 2, false).unwrap(),
+                line_row(&line(20, 1), 3, true).unwrap(),
+                line_row(&line(20, 3), 3, true).unwrap(),
+            ])
+        );
+        assert!(orphans.is_empty());
+    }
+
+    /// The order is deleted and its lines are kept: they leave the customer and wait in the
+    /// side store.
+    #[test]
+    fn a_deleted_order_leaves_its_kept_lines_in_the_side_store() {
+        let old = old_lines(&[(line(20, 1), 2), (line(20, 2), 2)]);
+        let change = Change {
+            orders: vec![(order(20, 2), false)],
+            lines: vec![(line(20, 2), false)],
+            ..Change::default()
+        };
+        let mut orphans = OrphanLines::default();
+        assert_eq!(
+            prepared(&change, &old, &mut orphans, &[]).unwrap(),
+            sorted(vec![
+                order_row(&order(20, 2), false).unwrap(),
+                line_row(&line(20, 1), 2, false).unwrap(),
+                line_row(&line(20, 2), 2, false).unwrap(),
+            ])
+        );
+        assert_eq!(orphans.lines(20), vec![&line(20, 1)]);
+    }
+
+    /// Orphan lines only: nothing reaches the index. The order then arrives, and the side
+    /// store's lines and the delta's fold at its customer.
+    #[test]
+    fn an_arriving_order_takes_the_orphan_lines() {
+        let old = old_index(Vec::new());
+        let mut orphans = OrphanLines::default();
+        let orphan_lines = Change {
+            lines: vec![(line(20, 1), true), (line(20, 2), true)],
+            ..Change::default()
+        };
+        assert_eq!(
+            prepared(&orphan_lines, &old, &mut orphans, &[]).unwrap(),
+            Vec::new()
+        );
+        assert_eq!(orphans.lines(20), vec![&line(20, 1), &line(20, 2)]);
+
+        let arrival = Change {
+            orders: vec![(order(20, 2), true)],
+            lines: vec![(line(20, 3), true), (line(20, 1), false)],
+            ..Change::default()
+        };
+        assert_eq!(
+            prepared(&arrival, &old, &mut orphans, &[]).unwrap(),
+            sorted(vec![
+                order_row(&order(20, 2), true).unwrap(),
+                line_row(&line(20, 2), 2, true).unwrap(),
+                line_row(&line(20, 3), 2, true).unwrap(),
+            ])
+        );
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn a_net_delta_that_contradicts_the_state_is_rejected() {
+        let old = old_lines(&[(line(20, 1), 2)]);
+        let twice = Change {
+            orders: vec![(order(20, 2), false), (order(20, 2), false)],
+            ..Change::default()
+        };
+        let error = prepared(&twice, &old, &mut OrphanLines::default(), &[]).unwrap_err();
+        assert!(error.to_string().contains("duplicate Orders deletion"));
+
+        let missing = Change {
+            orders: vec![(order(20, 2), false), (order(20, 3), true)],
+            lines: vec![(line(20, 9), false)],
+            ..Change::default()
+        };
+        let error = prepared(&missing, &old, &mut OrphanLines::default(), &[]).unwrap_err();
+        assert!(error.to_string().contains("does not hold"));
     }
 }

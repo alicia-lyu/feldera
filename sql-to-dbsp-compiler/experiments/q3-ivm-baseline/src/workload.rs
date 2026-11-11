@@ -506,7 +506,7 @@ mod tests {
     ) -> Result<()> {
         let net_delta = run_base(pipeline, reference, change, false)?;
         #[cfg(feature = "merged-index")]
-        crate::publish_net_delta(pipeline, &net_delta)?;
+        crate::publish_net_delta(pipeline, &net_delta, reference)?;
         run_view(pipeline, net_delta, false)
     }
     use std::fs;

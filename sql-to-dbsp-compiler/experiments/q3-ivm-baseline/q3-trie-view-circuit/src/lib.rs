@@ -38,17 +38,8 @@ use merged_index_col::q3::{
 
 /// A row of `V`: `(c_custkey, c_mktsegment, o_orderkey, o_orderdate,
 /// o_shippriority, l_linenumber, l_extendedprice, l_discount, l_shipdate)`.
-pub type ViewTuple = Tup9<
-    i64,
-    SqlString,
-    i64,
-    Date,
-    i32,
-    i32,
-    SqlDecimal<15, 2>,
-    SqlDecimal<4, 2>,
-    Date,
->;
+pub type ViewTuple =
+    Tup9<i64, SqlString, i64, Date, i32, i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
 
 /// The circuit's three input handles. The harness pushes the transaction's driving deltas
 /// into them.
@@ -69,23 +60,20 @@ pub fn view(
     let (lines, line_handle) = circuit.add_input_zset::<LineitemRow>();
 
     // Index each input by its join key, a prefix of its trie path.
-    let customers_by_custkey: Stream<RootCircuit, CustomerByCustkeyVector> =
-        customers.map_index(|Tup2(custkey, segment)| {
-            (Tup1::new(*custkey), Tup1::new(segment.clone()))
-        });
+    let customers_by_custkey: Stream<RootCircuit, CustomerByCustkeyVector> = customers
+        .map_index(|Tup2(custkey, segment)| (Tup1::new(*custkey), Tup1::new(segment.clone())));
     let orders_by_custkey: Stream<RootCircuit, OrdersByCustkeyVector> =
         orders.map_index(|Tup4(custkey, orderkey, date, priority)| {
             (Tup1::new(*custkey), Tup3::new(*orderkey, *date, *priority))
         });
-    let lines_by_order: Stream<RootCircuit, LineitemByCustkeyOrderkeyVector> =
-        lines.map_index(
-            |Tup6(custkey, orderkey, linenumber, price, discount, ship_date)| {
-                (
-                    Tup2::new(*custkey, *orderkey),
-                    Tup4::new(*linenumber, *price, *discount, *ship_date),
-                )
-            },
-        );
+    let lines_by_order: Stream<RootCircuit, LineitemByCustkeyOrderkeyVector> = lines.map_index(
+        |Tup6(custkey, orderkey, linenumber, price, discount, ship_date)| {
+            (
+                Tup2::new(*custkey, *orderkey),
+                Tup4::new(*linenumber, *price, *discount, *ship_date),
+            )
+        },
+    );
 
     // `J` keeps `(custkey, orderkey)`: the node at which `V` reads it.
     let joined = join_orders_customers(

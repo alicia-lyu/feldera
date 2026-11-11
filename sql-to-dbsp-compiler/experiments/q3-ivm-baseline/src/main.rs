@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
-#[cfg(all(test, feature = "merged-index"))]
+#[cfg(feature = "merged-index")]
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -31,14 +31,18 @@ use dbsp::storage::file::writer::{
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
 use dbsp::storage::write_attribution::WriteOwner;
+#[cfg(feature = "merged-index")]
+use dbsp::trace::merged_index::Pass;
+#[cfg(feature = "merged-index")]
+use dbsp::trace::with_read_owner;
 use dbsp::trace::RunReads;
 use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
-use merged_index_col::q3::{IndexReads, Q3State};
+use merged_index_col::q3::{Q3State, SessionReads};
 #[cfg(feature = "merged-index")]
-use reconstruction::ManualIndex;
+use reconstruction::{ManualIndex, OrphanLines};
 use serde_json::{json, Value};
 use size_of::SizeOf;
 
@@ -280,11 +284,13 @@ impl Inputs {
     }
 }
 
-/// One circuit with its catalog and the input streams of its tables.
+/// One circuit with its catalog and, if it has them, the JSON input streams of its tables. The
+/// view circuit of the reconstructed build has none: its inputs are typed handles, fed from the
+/// transaction's `Dlt`.
 struct Stage {
     circuit: dbsp::DBSPHandle,
     catalog: Catalog,
-    inputs: Inputs,
+    inputs: Option<Inputs>,
 }
 
 impl Stage {
@@ -293,8 +299,25 @@ impl Stage {
         Ok(Self {
             circuit,
             catalog,
-            inputs,
+            inputs: Some(inputs),
         })
+    }
+
+    /// A circuit whose inputs are not reached through its catalog.
+    #[cfg(feature = "merged-index")]
+    fn without_json_inputs((circuit, catalog): (dbsp::DBSPHandle, Catalog)) -> Self {
+        Self {
+            circuit,
+            catalog,
+            inputs: None,
+        }
+    }
+
+    /// The JSON input streams of the circuit's tables.
+    fn inputs(&mut self) -> &mut Inputs {
+        self.inputs
+            .as_mut()
+            .expect("this circuit's inputs are not reached through JSON streams")
     }
 }
 
@@ -304,9 +327,11 @@ impl Stage {
 /// separation between them is the transaction: a transaction runs first on `base`, which holds
 /// the base relations in primary-key input maps, and commits. The net change of those relations
 /// is then forwarded to `view`, which maintains `V`. In reconstructed mode the same net change
-/// also feeds the merged index, which stands in for the view circuit's join traces; the view
-/// circuit reads it through published snapshots. The index is base storage, written through the
-/// runtime's buffer cache, which the view circuit's readers use too.
+/// also feeds the merged index, which stands in for the view circuit's join traces: base
+/// maintenance turns the net delta into the index's `Dlt`, and the view circuit, a hand-written
+/// one (`q3-trie-view-circuit`), takes its inputs from `Dlt` and reads the index's touched
+/// groups through the transaction's scan session. The index is base storage, written through
+/// the runtime's buffer cache, which the session's reads use too.
 struct Pipeline {
     base: Stage,
     view: Stage,
@@ -314,8 +339,14 @@ struct Pipeline {
     profile_cpu: bool,
     #[cfg(feature = "merged-index")]
     index: ManualIndex,
+    /// Line items whose order is absent, beside the index (base maintenance).
+    #[cfg(feature = "merged-index")]
+    orphans: OrphanLines,
     #[cfg(feature = "merged-index")]
     q3_state: Q3State,
+    /// The view circuit's typed input handles, which the transaction's driving deltas fill.
+    #[cfg(feature = "merged-index")]
+    view_inputs: q3_trie_view_circuit::TrieInputs,
     /// The buffer cache that the view circuit's worker saw when it built the circuit, for the
     /// test that the index's thread shares it.
     #[cfg(all(test, feature = "merged-index"))]
@@ -336,15 +367,24 @@ impl Pipeline {
         let view_worker_cache = Arc::new(OnceLock::new());
         #[cfg(all(test, feature = "merged-index"))]
         let probe = view_worker_cache.clone();
+        // The constructor runs on the view circuit's worker, which hands its input handles to
+        // the driver. The reconstructed build runs one worker, so the circuit is built once.
+        #[cfg(feature = "merged-index")]
+        let view_input_slot = Arc::new(OnceLock::new());
+        #[cfg(feature = "merged-index")]
+        let view_input_probe = view_input_slot.clone();
         #[cfg(feature = "merged-index")]
         let view_constructor = CircuitConstructor::new(move |circuit: &mut RootCircuit| {
-            // The constructor runs on the view circuit's worker.
             #[cfg(test)]
             probe
                 .set(Runtime::buffer_cache().expect("the worker has a buffer cache"))
                 .expect("the view circuit is built once");
-            q3_view_circuit::circuit::SqlCircuit::build(circuit, view_state.clone())
-                .map_err(anyhow::Error::from)
+            let (catalog, inputs) = q3_trie_view_circuit::build(circuit, view_state.clone())
+                .map_err(anyhow::Error::from)?;
+            view_input_probe
+                .set(inputs)
+                .map_err(|_| anyhow::anyhow!("the view circuit is built once"))?;
+            Ok(catalog)
         });
         #[cfg(not(feature = "merged-index"))]
         let view_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
@@ -356,6 +396,9 @@ impl Pipeline {
         let base_circuit = circuits.pop().context("missing base circuit")?;
         let mut base = Stage::new(base_circuit, DeleteStyle::ByKey)?;
         workload::enable_net_delta(&base.catalog)?;
+        #[cfg(feature = "merged-index")]
+        let mut view = Stage::without_json_inputs(view_circuit);
+        #[cfg(not(feature = "merged-index"))]
         let mut view = Stage::new(view_circuit, DeleteStyle::WholeRow)?;
         base.circuit.enable_cpu_profiler()?;
         view.circuit.enable_cpu_profiler()?;
@@ -364,6 +407,11 @@ impl Pipeline {
         // the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
         let index = ManualIndex::new(base.circuit.runtime())?;
+        #[cfg(feature = "merged-index")]
+        let view_inputs = view_input_slot
+            .get()
+            .context("the view circuit did not hand over its input handles")?
+            .clone();
         Ok(Self {
             base,
             view,
@@ -371,7 +419,11 @@ impl Pipeline {
             #[cfg(feature = "merged-index")]
             index,
             #[cfg(feature = "merged-index")]
+            orphans: OrphanLines::default(),
+            #[cfg(feature = "merged-index")]
             q3_state,
+            #[cfg(feature = "merged-index")]
+            view_inputs,
             #[cfg(all(test, feature = "merged-index"))]
             view_worker_cache,
         })
@@ -393,6 +445,74 @@ impl Pipeline {
     fn with_workers(workers: usize) -> Result<Self> {
         Self::new(CircuitConfig::with_workers(workers))
     }
+}
+
+/// The view maintenance of the reconstructed build, which the driver runs on its own thread
+/// with the runtime's buffer cache bound.
+#[cfg(feature = "merged-index")]
+impl Pipeline {
+    /// Runs the transaction's scan session over the published `Old` and `Dlt`, which buffers the
+    /// touched groups until the publication is finished. This is the transaction's only read of
+    /// the index in the view phase.
+    fn collect_groups(&self) -> Result<()> {
+        self.in_cache(|| self.q3_state.collect(Pass::Seek))
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Pushes the buffered `Dlt` of all three streams into the view circuit's input handles.
+    fn push_driving_deltas(&self) -> Result<()> {
+        self.push_customer_and_order_deltas()?;
+        self.push_line_deltas()
+    }
+
+    fn push_customer_and_order_deltas(&self) -> Result<()> {
+        self.q3_state
+            .push_customer_deltas(&self.view_inputs.customers)
+            .and_then(|()| self.q3_state.push_order_deltas(&self.view_inputs.orders))
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn push_line_deltas(&self) -> Result<()> {
+        self.q3_state
+            .push_line_deltas(&self.view_inputs.lines)
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+/// Completes the net delta into the rows of the index's `Dlt` (see `reconstruction::prepare`).
+/// The reads of `Old` are base maintenance, counted under the merged index's read owner; the
+/// base state's reads of an order's customer are counted under the base relations'. `base`
+/// names the customer of an order that the delta mentions only through its lines, or else
+/// `reference` does; one of them must be given then. Returns the rows and the run reads of the
+/// index.
+#[cfg(feature = "merged-index")]
+fn complete_net_delta(
+    pipeline: &mut Pipeline,
+    net_delta: &Change,
+    base: Option<&workload::BaseState>,
+    reference: Option<&Reference>,
+) -> Result<(Vec<reconstruction::SourceRow>, RunReads)> {
+    let runtime = pipeline.runtime().clone();
+    runtime.with_buffer_cache(0, || {
+        let reads_before = RunReads::current_for(WriteOwner::MergedIndex);
+        let old = pipeline.index.snapshot()?;
+        let mut base_owner = |order: i64| -> Result<Option<i64>> {
+            if let Some(base) = base {
+                let found = with_read_owner(WriteOwner::BaseRelation, || base.order(order))?;
+                return Ok(found.map(|order| order.customer_key));
+            }
+            let reference = reference.context(
+                "a net delta that names an order only through its lines needs the base state \
+                 or a reference to say whose order it is",
+            )?;
+            Ok(reference.orders.get(&order).map(|order| order.customer_key))
+        };
+        let rows = with_read_owner(WriteOwner::MergedIndex, || {
+            reconstruction::prepare(net_delta, &old, &mut pipeline.orphans, &mut base_owner)
+        })?;
+        let reads = RunReads::current_for(WriteOwner::MergedIndex).since(reads_before);
+        Ok((rows, reads))
+    })
 }
 
 /// A circuit's cumulative CPU time inside steps, from the CPU profiler. The profile is read
@@ -451,10 +571,13 @@ struct Measurements {
     base_circuit: Duration,
     /// Reading the base tables' net delta and feeding it to the view circuit's inputs.
     forward: Duration,
-    /// Appending the net delta to the merged index and acquiring its snapshots (reconstructed
-    /// mode). The index is base storage, so this is a part of `base_ms`.
+    /// Completing the net delta into the index's `Dlt` (reading `Old` for moved lines), appending
+    /// it, and acquiring the snapshots (reconstructed mode). The index is base storage, so this
+    /// is a part of `base_ms`.
     index: Duration,
-    /// The view circuit's transaction: delta accumulation, joins and `V`.
+    /// The view circuit's transaction: delta accumulation, joins and `V`. In reconstructed mode
+    /// it starts with the scan session's collection of the touched groups and the push of the
+    /// driving deltas into the circuit's input handles.
     view_circuit: Duration,
     discovery: Duration,
     publication_cleanup: Duration,
@@ -466,10 +589,14 @@ struct Measurements {
     delta_positive: Option<i64>,
     delta_negative: Option<i64>,
     view_rows: Option<i64>,
-    /// The merged index's run reads in the view transactions, per reader, counted on the view
-    /// worker (reconstructed mode).
+    /// What the scan session read from the merged index in the view transactions: its moves and
+    /// the run reads they cost, counted on the driver thread (reconstructed mode).
     #[cfg(feature = "merged-index")]
-    index_reads: IndexReads,
+    session_reads: SessionReads,
+    /// The run reads of base maintenance on the merged index: `prepare` reading `Old` for the
+    /// lines of an order whose owner changes (reconstructed mode).
+    #[cfg(feature = "merged-index")]
+    upkeep_reads: RunReads,
     /// Where the last transaction's published index snapshots kept their runs (reconstructed
     /// mode).
     index_layout: Option<Value>,
@@ -531,7 +658,7 @@ fn transact_inner(
             base.validate(&change)?;
         }
     }
-    change.apply_optional(None, &mut pipeline.base.inputs)?;
+    change.apply_optional(None, pipeline.base.inputs())?;
     stats.preparation += preparation_started.elapsed();
 
     // The profiler's cumulative CPU time before the transactions; both circuits are idle.
@@ -556,35 +683,59 @@ fn transact_inner(
     let net_delta = workload::net_delta(&pipeline.base.catalog)?;
     stats.forward += forward_started.elapsed();
 
-    // The index and the view circuit's joins see the same net delta. The index append is base
-    // maintenance (`index`, a part of `base_ms`); the row conversion stays in preparation.
+    // The index sees the net delta, completed into `Dlt`. Base maintenance does that and the
+    // append (`index`, a part of `base_ms`), including its reads of `Old` for the lines of an
+    // order that changes owner; the view circuit then takes its inputs from `Dlt`.
     #[cfg(feature = "merged-index")]
     {
-        let preparation_started = Instant::now();
-        let (placements, index_rows) = reconstruction::prepare(&net_delta)?;
-        stats.preparation += preparation_started.elapsed();
         let index_started = Instant::now();
+        let (index_rows, upkeep_reads) = complete_net_delta(
+            pipeline,
+            &net_delta,
+            check.map(|(base, _)| base),
+            state.as_deref(),
+        )?;
         let (old, dlt) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
+        stats.upkeep_reads += upkeep_reads;
         let publish_started = Instant::now();
-        // The after reads take `Old`'s runs and `Dlt`, which is placed like an operator's output.
+        // The after reads see `Old`'s runs and `Dlt`, which is placed like an operator's output.
         stats.index_layout = Some(json!({
             "before": reconstruction::runs_layout(old.batches()),
             "after": reconstruction::runs_layout(old.batches().iter().chain([&dlt])),
         }));
         pipeline
             .q3_state
-            .publish(old, dlt, placements)
+            .publish(old, dlt)
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
-    let feed_started = Instant::now();
-    net_delta.apply_optional(None, &mut pipeline.view.inputs)?;
-    stats.forward += feed_started.elapsed();
+    // The native view circuit takes the net delta as JSON rows, which is not view maintenance.
+    #[cfg(not(feature = "merged-index"))]
+    {
+        let feed_started = Instant::now();
+        net_delta.apply_optional(None, pipeline.view.inputs())?;
+        stats.forward += feed_started.elapsed();
+    }
 
     // The view worker counts its own run reads; they are read outside the transaction's timer.
     let view_reads_before = pipeline.view.circuit.run_reads()?;
     let view_started = Instant::now();
+    // The IVM window of the reconstructed build starts with the scan session, which reads the
+    // index once for the whole transaction, and the push of the driving deltas it buffered.
+    #[cfg(feature = "merged-index")]
+    let collection_result = pipeline
+        .collect_groups()
+        .and_then(|()| pipeline.push_driving_deltas());
+    #[cfg(feature = "merged-index")]
+    let transaction_result = collection_result.and_then(|()| {
+        pipeline
+            .view
+            .circuit
+            .transaction()
+            .map_err(anyhow::Error::from)
+    });
+    #[cfg(not(feature = "merged-index"))]
     let transaction_result = pipeline.view.circuit.transaction();
     let latency = view_started.elapsed();
     let view_reads_after = pipeline.view.circuit.run_reads()?;
@@ -612,7 +763,7 @@ fn transact_inner(
     transaction_result?;
     #[cfg(feature = "merged-index")]
     {
-        stats.index_reads += finish_result?;
+        stats.session_reads += finish_result?;
     }
     stats.view_circuit += latency;
     stats.latencies.push(latency);
@@ -739,47 +890,71 @@ fn run_base(
     if stepped {
         pipeline.base.circuit.start_transaction()?;
         for step in steps_of(&change) {
-            step.apply_optional(Some(state), &mut pipeline.base.inputs)?;
+            step.apply_optional(Some(state), pipeline.base.inputs())?;
             assert!(!pipeline.base.circuit.step()?);
         }
         pipeline.base.circuit.commit_transaction()?;
     } else {
-        change.apply_optional(Some(state), &mut pipeline.base.inputs)?;
+        change.apply_optional(Some(state), pipeline.base.inputs())?;
         pipeline.base.circuit.transaction()?;
     }
     workload::net_delta(&pipeline.base.catalog)
 }
 
-/// Appends the net delta to the merged index and publishes `Old` and `Dlt`, as
-/// `transact_inner` does before the view circuit runs.
+/// Completes the net delta into the index's `Dlt`, appends it, and publishes `Old` and `Dlt`,
+/// as `transact_inner` does before the view circuit runs. `reference` names the customer of an
+/// order that the net delta mentions only through its lines.
 #[cfg(all(test, feature = "merged-index"))]
-fn publish_net_delta(pipeline: &Pipeline, net_delta: &Change) -> Result<()> {
-    let (placements, index_rows) = reconstruction::prepare(net_delta)?;
+fn publish_net_delta(
+    pipeline: &mut Pipeline,
+    net_delta: &Change,
+    reference: &Reference,
+) -> Result<()> {
+    let (index_rows, _) = complete_net_delta(pipeline, net_delta, None, Some(reference))?;
     let (old, dlt) = pipeline.index.append(index_rows)?;
     pipeline
         .q3_state
-        .publish(old, dlt, placements)
+        .publish(old, dlt)
         .map_err(anyhow::Error::msg)
 }
 
-/// Runs the net delta on the view circuit, as one transaction of three steps when `stepped`.
-/// In reconstructed mode the caller has published the delta, and the publication is finished
-/// here.
+/// Runs the view circuit's transaction, as one of three steps when `stepped`. In reconstructed
+/// mode the caller has published `Old` and `Dlt`: the session collects the touched groups, the
+/// driving deltas reach the input handles, and the publication is finished here. The three
+/// steps take the customers and orders, the line items, and nothing; the joins' readers run
+/// once, at the commit, so the steps share the one collection.
 #[cfg(test)]
 fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result<()> {
+    #[cfg(feature = "merged-index")]
+    {
+        drop(net_delta);
+        pipeline.collect_groups()?;
+        if stepped {
+            pipeline.view.circuit.start_transaction()?;
+            pipeline.push_customer_and_order_deltas()?;
+            assert!(!pipeline.view.circuit.step()?);
+            pipeline.push_line_deltas()?;
+            assert!(!pipeline.view.circuit.step()?);
+            assert!(!pipeline.view.circuit.step()?);
+            pipeline.view.circuit.commit_transaction()?;
+        } else {
+            pipeline.push_driving_deltas()?;
+            pipeline.view.circuit.transaction()?;
+        }
+        pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
+    }
+    #[cfg(not(feature = "merged-index"))]
     if stepped {
         pipeline.view.circuit.start_transaction()?;
         for step in steps_of(&net_delta) {
-            step.apply_optional(None, &mut pipeline.view.inputs)?;
+            step.apply_optional(None, pipeline.view.inputs())?;
             assert!(!pipeline.view.circuit.step()?);
         }
         pipeline.view.circuit.commit_transaction()?;
     } else {
-        net_delta.apply_optional(None, &mut pipeline.view.inputs)?;
+        net_delta.apply_optional(None, pipeline.view.inputs())?;
         pipeline.view.circuit.transaction()?;
     }
-    #[cfg(feature = "merged-index")]
-    pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -789,7 +964,7 @@ fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result
 #[cfg(all(test, feature = "merged-index"))]
 fn transact_in_steps(pipeline: &mut Pipeline, state: &mut Reference, change: Change) -> Result<()> {
     let net_delta = run_base(pipeline, state, change, true)?;
-    publish_net_delta(pipeline, &net_delta)?;
+    publish_net_delta(pipeline, &net_delta, state)?;
     run_view(pipeline, net_delta, true)
 }
 
@@ -1381,8 +1556,10 @@ fn finish_loading(
         let snapshot = pipeline.index.snapshot()?;
         pipeline
             .q3_state
-            .publish(snapshot, reconstruction::empty_run()?, BTreeMap::new())
+            .publish(snapshot, reconstruction::empty_run()?)
             .map_err(anyhow::Error::msg)?;
+        // The joins' readers run even on empty deltas, and need the (empty) collection.
+        pipeline.collect_groups()?;
     }
     let base_transaction = pipeline.base.circuit.transaction();
     let view_transaction = pipeline.view.circuit.transaction();
@@ -1401,10 +1578,13 @@ fn finish_loading(
         (&pipeline.view, ["V", "ERROR_VIEW"].as_slice()),
     ] {
         for name in names {
-            let output = stage
-                .catalog
-                .output_handles(&SqlIdentifier::from(*name))
-                .context("missing output")?;
+            // The reconstructed build's view circuit has no `ERROR_VIEW`.
+            let Some(output) = stage.catalog.output_handles(&SqlIdentifier::from(*name)) else {
+                if *name == "ERROR_VIEW" {
+                    continue;
+                }
+                bail!("missing output {name}");
+            };
             drop(output.delta_handle.concat());
         }
     }
@@ -1462,16 +1642,28 @@ fn view_reads_json(reads: &[RunReads; 3]) -> Result<Value> {
         .map(Value::Object)
 }
 
-/// The merged index's run reads per reader. File runs count key, value and weight decodes and
-/// in-memory runs count `memory_*` reads, apart; `index_layout` says where the runs were.
+/// The merged index's run reads in the view phase (measurement version 8): the scan session's,
+/// which are the only reads of the index there, under the key `session`. File runs count key,
+/// value and weight decodes and in-memory runs count `memory_*` reads, apart; `index_layout`
+/// says where the runs were. The session's moves are in [`session_counts_json`].
 #[cfg(feature = "merged-index")]
-fn index_reads_json(reads: &IndexReads) -> Result<Value> {
-    Ok(json!({
-        "customers_after": serde_json::to_value(reads.customers_after)?,
-        "orders_before": serde_json::to_value(reads.orders_before)?,
-        "joined_orders_after": serde_json::to_value(reads.joined_orders_after)?,
-        "lineitems_before": serde_json::to_value(reads.lineitems_before)?,
-    }))
+fn index_reads_json(reads: &SessionReads) -> Result<Value> {
+    Ok(json!({"session": serde_json::to_value(reads.run_reads)?}))
+}
+
+/// What the scan session did, summed over the view transactions: groups handed out, logical
+/// seeks and steps over `Old`, positions reached, and payloads decoded from `Old` and `Dlt`.
+#[cfg(feature = "merged-index")]
+fn session_counts_json(reads: &SessionReads) -> Result<Value> {
+    Ok(serde_json::to_value(reads.counts)?)
+}
+
+/// The merged index's run reads in base maintenance: `prepare`'s reads of `Old` for the lines of
+/// an order whose owner changes. They belong to the base phase, so they stay apart from
+/// `index_run_reads`, which is the view phase's.
+#[cfg(feature = "merged-index")]
+fn upkeep_reads_json(reads: &RunReads) -> Result<Value> {
+    Ok(serde_json::to_value(reads)?)
 }
 
 /// Inspects the actual batches behind the catalogs' snapshots, without scanning rows: the base
@@ -1670,7 +1862,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut verification_time = Duration::ZERO;
     let mut foreground_total = Duration::ZERO;
     #[cfg(feature = "merged-index")]
-    let mut sequence_index_reads = IndexReads::default();
+    let mut sequence_session_reads = SessionReads::default();
+    #[cfg(feature = "merged-index")]
+    let mut sequence_upkeep_reads = RunReads::default();
     let mut sequence_view_reads = [RunReads::default(); 3];
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
@@ -1761,15 +1955,22 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         } else {
             resource_delta
         };
-        // Run reads are counted on the view worker, so validation on the driver adds none.
+        // The view worker counts its own run reads, and the driver counts the index's (the scan
+        // session's in the view phase, and `prepare`'s in the base phase); validation on the
+        // driver adds none of them.
         #[cfg(feature = "merged-index")]
         {
-            sequence_index_reads += measurement.index_reads;
-            report["index_run_reads"] = index_reads_json(&measurement.index_reads)?;
+            sequence_session_reads += measurement.session_reads;
+            sequence_upkeep_reads += measurement.upkeep_reads;
+            report["index_run_reads"] = index_reads_json(&measurement.session_reads)?;
+            report["index_session_counts"] = session_counts_json(&measurement.session_reads)?;
+            report["index_upkeep_run_reads"] = upkeep_reads_json(&measurement.upkeep_reads)?;
         }
         #[cfg(not(feature = "merged-index"))]
         {
             report["index_run_reads"] = Value::Null;
+            report["index_session_counts"] = Value::Null;
+            report["index_upkeep_run_reads"] = Value::Null;
         }
         report["index_layout"] = json!(measurement.index_layout);
         for (total, reads) in sequence_view_reads.iter_mut().zip(measurement.view_reads) {
@@ -1786,9 +1987,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     // The window ends with the last refresh; read its memory figures before anything else runs.
     let window_memory_fields = window_evidence.finish();
     #[cfg(feature = "merged-index")]
-    let sequence_index_run_reads = index_reads_json(&sequence_index_reads)?;
+    let sequence_index_run_reads = index_reads_json(&sequence_session_reads)?;
+    #[cfg(feature = "merged-index")]
+    let sequence_index_session_counts = session_counts_json(&sequence_session_reads)?;
+    #[cfg(feature = "merged-index")]
+    let sequence_index_upkeep_run_reads = upkeep_reads_json(&sequence_upkeep_reads)?;
     #[cfg(not(feature = "merged-index"))]
-    let sequence_index_run_reads = Value::Null;
+    let (sequence_index_run_reads, sequence_index_session_counts, sequence_index_upkeep_run_reads) =
+        (Value::Null, Value::Null, Value::Null);
     let sequence_elapsed = sequence_finished
         .duration_since(sequence_started)
         .saturating_sub(verification_time);
@@ -1834,7 +2040,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 7,
+        "measurement_version": 8,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -1897,6 +2103,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "resources": if config.verify { json!({"unavailable": "independent validation enabled; counters omitted to exclude validation"}) } else { sequence_resources.delta(&resources_after) },
             "manual_index_file_backed": manual_file_backed,
             "index_run_reads": sequence_index_run_reads,
+            "index_session_counts": sequence_index_session_counts,
+            "index_upkeep_run_reads": sequence_index_upkeep_run_reads,
             "view_run_reads": view_reads_json(&sequence_view_reads)?,
             "manual_index_storage": manual_storage,
             "completion_boundary": "last_refresh_complete",
@@ -2017,80 +2225,6 @@ mod tests {
             discount_hundredths: 4,
             ship_date: "1996-03-13".to_owned(),
         }
-    }
-
-    #[test]
-    fn native_deltas_match_full_join_across_updates() -> Result<()> {
-        let mut pipeline = Pipeline::with_workers(1)?;
-        let mut state = Reference::default();
-        let mut stats = Measurements::default();
-        let mut step = |change| transact(&mut pipeline, &mut state, change, true, &mut stats);
-
-        // Orphan lines and unmatched orders produce no joined row.
-        step(Change {
-            orders: vec![(order(20, 2), true)],
-            lines: vec![(line(20, 1), true), (line(99, 1), true)],
-            ..Change::default()
-        })?;
-        step(Change {
-            customers: vec![(customer(2, "BUILDING"), true)],
-            ..Change::default()
-        })?;
-        // Distinct line identities retain multiplicity when payloads are identical.
-        step(Change {
-            lines: vec![(line(20, 2), true)],
-            ..Change::default()
-        })?;
-        // Replacement and key move, with the associated order and line changes together.
-        step(Change {
-            customers: vec![
-                (customer(2, "BUILDING"), false),
-                (customer(2, "AUTOMOBILE"), true),
-            ],
-            ..Change::default()
-        })?;
-        let mut changed_line = line(20, 1);
-        changed_line.price_cents = 250;
-        changed_line.discount_hundredths = 7;
-        changed_line.ship_date = "1996-04-01".to_owned();
-        step(Change {
-            lines: vec![(line(20, 1), false), (changed_line.clone(), true)],
-            ..Change::default()
-        })?;
-        // A stable order identity can move to another customer without line updates.
-        step(Change {
-            customers: vec![(customer(3, "HOUSEHOLD"), true)],
-            orders: vec![(order(20, 2), false), (order(20, 3), true)],
-            ..Change::default()
-        })?;
-        step(Change {
-            orders: vec![(order(20, 3), false), (order(21, 3), true)],
-            lines: vec![
-                (changed_line, false),
-                (line(20, 2), false),
-                (line(21, 1), true),
-                (line(21, 2), true),
-            ],
-            ..Change::default()
-        })?;
-        // Simultaneous deletion and insertion, then RF2 style removal.
-        step(Change {
-            orders: vec![(order(21, 3), false), (order(30, 2), true)],
-            lines: vec![
-                (line(21, 1), false),
-                (line(21, 2), false),
-                (line(30, 1), true),
-            ],
-            ..Change::default()
-        })?;
-        step(Change {
-            orders: vec![(order(30, 2), false)],
-            lines: vec![(line(30, 1), false)],
-            ..Change::default()
-        })?;
-        step(Change::default())?;
-        assert_eq!(stats.transactions, 10);
-        Ok(())
     }
 
     #[test]
@@ -2299,6 +2433,114 @@ mod tests {
     }
 }
 
+/// Deltas beyond RF1/RF2, in both builds: a pipeline's `V` must equal the independent join after
+/// every change, whatever the build. In the reconstructed build this exercises the index's
+/// complete `Dlt` (owner changes, orphan lines) through the hand-written view circuit.
+#[cfg(test)]
+mod general_delta_tests {
+    use super::*;
+
+    fn customer(key: i64, segment: &str) -> Customer {
+        Customer {
+            key,
+            segment: segment.to_owned(),
+        }
+    }
+
+    fn order(key: i64, customer_key: i64) -> Order {
+        Order {
+            key,
+            customer_key,
+            date: "1996-01-02".to_owned(),
+            ship_priority: 0,
+        }
+    }
+
+    fn line(order_key: i64, number: i32) -> Line {
+        Line {
+            order_key,
+            number,
+            price_cents: 100,
+            discount_hundredths: 4,
+            ship_date: "1996-03-13".to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_deltas_match_full_join_across_updates() -> Result<()> {
+        let mut pipeline = Pipeline::with_workers(1)?;
+        let mut state = Reference::default();
+        let mut stats = Measurements::default();
+        let mut step = |change| transact(&mut pipeline, &mut state, change, true, &mut stats);
+
+        // Orphan lines and unmatched orders produce no joined row.
+        step(Change {
+            orders: vec![(order(20, 2), true)],
+            lines: vec![(line(20, 1), true), (line(99, 1), true)],
+            ..Change::default()
+        })?;
+        step(Change {
+            customers: vec![(customer(2, "BUILDING"), true)],
+            ..Change::default()
+        })?;
+        // Distinct line identities retain multiplicity when payloads are identical.
+        step(Change {
+            lines: vec![(line(20, 2), true)],
+            ..Change::default()
+        })?;
+        // Replacement and key move, with the associated order and line changes together.
+        step(Change {
+            customers: vec![
+                (customer(2, "BUILDING"), false),
+                (customer(2, "AUTOMOBILE"), true),
+            ],
+            ..Change::default()
+        })?;
+        let mut changed_line = line(20, 1);
+        changed_line.price_cents = 250;
+        changed_line.discount_hundredths = 7;
+        changed_line.ship_date = "1996-04-01".to_owned();
+        step(Change {
+            lines: vec![(line(20, 1), false), (changed_line.clone(), true)],
+            ..Change::default()
+        })?;
+        // A stable order identity can move to another customer without line updates.
+        step(Change {
+            customers: vec![(customer(3, "HOUSEHOLD"), true)],
+            orders: vec![(order(20, 2), false), (order(20, 3), true)],
+            ..Change::default()
+        })?;
+        step(Change {
+            orders: vec![(order(20, 3), false), (order(21, 3), true)],
+            lines: vec![
+                (changed_line, false),
+                (line(20, 2), false),
+                (line(21, 1), true),
+                (line(21, 2), true),
+            ],
+            ..Change::default()
+        })?;
+        // Simultaneous deletion and insertion, then RF2 style removal.
+        step(Change {
+            orders: vec![(order(21, 3), false), (order(30, 2), true)],
+            lines: vec![
+                (line(21, 1), false),
+                (line(21, 2), false),
+                (line(30, 1), true),
+            ],
+            ..Change::default()
+        })?;
+        step(Change {
+            orders: vec![(order(30, 2), false)],
+            lines: vec![(line(30, 1), false)],
+            ..Change::default()
+        })?;
+        step(Change::default())?;
+        assert_eq!(stats.transactions, 10);
+        Ok(())
+    }
+}
+
 #[cfg(all(test, feature = "merged-index"))]
 mod reconstructed_tests {
     use super::*;
@@ -2388,38 +2630,6 @@ mod reconstructed_tests {
     }
 
     #[test]
-    fn rejects_missing_placement_and_incomplete_rf2() -> Result<()> {
-        let mut pipeline = Pipeline::with_workers(1)?;
-        let mut reference = Reference::default();
-        let no_order = Change {
-            lines: vec![(line(20, 1), true)],
-            ..Change::default()
-        };
-        assert!(workload::BaseState::new(&pipeline.base.catalog)?
-            .validate(&no_order)
-            .is_err());
-        transact(
-            &mut pipeline,
-            &mut reference,
-            Change {
-                customers: vec![(customer(2), true)],
-                orders: vec![(order(20, 2), true)],
-                lines: vec![(line(20, 1), true)],
-            },
-            true,
-            &mut Measurements::default(),
-        )?;
-        let missing_line = Change {
-            orders: vec![(order(20, 2), false)],
-            ..Change::default()
-        };
-        assert!(workload::BaseState::new(&pipeline.base.catalog)?
-            .validate(&missing_line)
-            .is_err());
-        Ok(())
-    }
-
-    #[test]
     fn grouped_load_keeps_oversized_order_and_lines_together() -> Result<()> {
         let batches = reconstruction::grouped_load(
             Change {
@@ -2499,8 +2709,10 @@ mod reconstructed_tests {
             orders: vec![(order(20, 2), true)],
             lines: vec![(line(20, 1), true), (line(20, 2), true)],
         };
-        let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
-        let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
+        let mut reference = Reference::default();
+        let net_delta = run_base(&mut pipeline, &mut reference, refresh, false)?;
+        let (index_rows, _) =
+            complete_net_delta(&mut pipeline, &net_delta, None, Some(&reference))?;
         let (old, dlt) = pipeline.index.append(index_rows)?;
         let rows = |snapshot: &reconstruction::Snapshot| -> usize {
             snapshot.batches().iter().map(|run| run.len()).sum()
@@ -2567,8 +2779,10 @@ mod reconstructed_tests {
                 (line(30, 1), true),
             ],
         };
-        let net_delta = run_base(&mut pipeline, &mut Reference::default(), refresh, false)?;
-        let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
+        let mut reference = Reference::default();
+        let net_delta = run_base(&mut pipeline, &mut reference, refresh, false)?;
+        let (index_rows, _) =
+            complete_net_delta(&mut pipeline, &net_delta, None, Some(&reference))?;
         pipeline.index.append(index_rows)?;
         let runs: Vec<_> = pipeline
             .index
@@ -2803,18 +3017,15 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 7);
-        // Version 5 adds the merged index's run reads per reader, and where its runs were.
-        const READERS: [&str; 4] = [
-            "customers_after",
-            "orders_before",
-            "joined_orders_after",
-            "lineitems_before",
-        ];
-        let seeks = |reads: &Value| -> u64 {
-            READERS
+        assert_eq!(output["measurement_version"], 8);
+        // Version 8 reports the merged index's run reads of the view phase as the scan
+        // session's (`index_run_reads.session`, with the session's moves in
+        // `index_session_counts`), and the reads of base maintenance apart
+        // (`index_upkeep_run_reads`), and where the index's runs were.
+        let key_reads = |reads: &Value| -> u64 {
+            ["key_decodes", "memory_key_reads"]
                 .iter()
-                .map(|reader| reads[reader]["seeks"].as_u64().unwrap())
+                .map(|field| reads[field].as_u64().unwrap())
                 .sum()
         };
         if cfg!(feature = "merged-index") {
@@ -2826,23 +3037,40 @@ mod measurement_tests {
                         assert!(layout[snapshot][location]["bytes"].is_u64(), "{refresh}");
                     }
                 }
+                assert!(
+                    refresh["index_upkeep_run_reads"]["seeks"].is_u64(),
+                    "{refresh}"
+                );
             }
-            let per_refresh: u64 = refreshes
-                .iter()
-                .map(|refresh| seeks(&refresh["index_run_reads"]))
-                .sum();
-            assert!(per_refresh > 0);
-            assert_eq!(seeks(&output["sequence"]["index_run_reads"]), per_refresh);
+            let per_refresh =
+                |field: &dyn Fn(&Value) -> u64| -> u64 { refreshes.iter().map(field).sum() };
+            let session_key_reads =
+                per_refresh(&|refresh| key_reads(&refresh["index_run_reads"]["session"]));
+            let groups =
+                per_refresh(&|refresh| refresh["index_session_counts"]["groups"].as_u64().unwrap());
+            // The refreshes that change the base touch groups, and the session reads keys.
+            assert!(groups > 0);
+            assert!(session_key_reads > 0);
+            let sequence = &output["sequence"];
+            assert_eq!(
+                key_reads(&sequence["index_run_reads"]["session"]),
+                session_key_reads
+            );
+            assert_eq!(
+                sequence["index_session_counts"]["groups"].as_u64().unwrap(),
+                groups
+            );
         } else {
             for refresh in refreshes {
                 assert!(refresh["index_run_reads"].is_null(), "{refresh}");
+                assert!(refresh["index_session_counts"].is_null(), "{refresh}");
+                assert!(refresh["index_upkeep_run_reads"].is_null(), "{refresh}");
                 assert!(refresh["index_layout"].is_null(), "{refresh}");
             }
             assert!(output["sequence"]["index_run_reads"].is_null());
         }
-        // The view worker's reads, per owner, in both modes. The index readers are the only
-        // reads under `merged_index`, so in reconstructed mode that owner's counts are the sums
-        // of `index_run_reads` over the readers.
+        // The view worker's reads, per owner, in both modes. Nothing the worker runs reads under
+        // `merged_index`: the scan session reads the index on the driver's thread.
         for refresh in refreshes {
             let view = &refresh["view_run_reads"];
             for owner in ["query", "base_relation", "merged_index"] {
@@ -2858,16 +3086,11 @@ mod measurement_tests {
                 "memory_value_reads",
                 "memory_weight_reads",
             ] {
-                let index_part = view["merged_index"][field].as_u64().unwrap();
-                if cfg!(feature = "merged-index") {
-                    let by_reader: u64 = READERS
-                        .iter()
-                        .map(|reader| refresh["index_run_reads"][reader][field].as_u64().unwrap())
-                        .sum();
-                    assert_eq!(index_part, by_reader, "{refresh}");
-                } else {
-                    assert_eq!(index_part, 0, "{refresh}");
-                }
+                assert_eq!(
+                    view["merged_index"][field].as_u64().unwrap(),
+                    0,
+                    "{refresh}"
+                );
             }
         }
         let view_seeks: u64 = refreshes
@@ -3148,7 +3371,7 @@ mod net_delta_tests {
 
     /// Applies `change` to the base circuit alone and returns its net delta.
     fn base_delta(pipeline: &mut Pipeline, change: Change) -> Result<Change> {
-        change.apply_optional(None, &mut pipeline.base.inputs)?;
+        change.apply_optional(None, pipeline.base.inputs())?;
         pipeline.base.circuit.transaction()?;
         workload::net_delta(&pipeline.base.catalog)
     }
@@ -3220,12 +3443,17 @@ mod net_delta_tests {
 
     #[test]
     fn view_inputs_delete_by_whole_row_and_base_inputs_by_key() -> Result<()> {
-        let pipeline = Pipeline::with_workers(1)?;
-        assert_eq!(pipeline.base.inputs.deletes, DeleteStyle::ByKey);
-        assert_eq!(pipeline.view.inputs.deletes, DeleteStyle::WholeRow);
-        assert!(!pipeline.base.inputs.whole_row(false));
-        assert!(pipeline.base.inputs.whole_row(true));
-        assert!(pipeline.view.inputs.whole_row(false));
+        let mut pipeline = Pipeline::with_workers(1)?;
+        assert_eq!(pipeline.base.inputs().deletes, DeleteStyle::ByKey);
+        assert!(!pipeline.base.inputs().whole_row(false));
+        assert!(pipeline.base.inputs().whole_row(true));
+        // The reconstructed build's view circuit takes whole rows from `Dlt`, not JSON.
+        if cfg!(feature = "merged-index") {
+            assert!(pipeline.view.inputs.is_none());
+        } else {
+            assert_eq!(pipeline.view.inputs().deletes, DeleteStyle::WholeRow);
+            assert!(pipeline.view.inputs().whole_row(false));
+        }
         Ok(())
     }
 }
@@ -3646,35 +3874,25 @@ mod native_worked_transaction_tests {
 /// The scan session on the worked transaction of `docs/design/merged-index/shared-traversal.md`,
 /// under the same arms as `native_worked_transaction_tests`: the same rows, the same config
 /// (`worked_transaction::Arm::config`), the same memory-pressure mechanism, and the same load
-/// through `transact`. The worked transaction runs on the base circuit and the index only (see
-/// `run_arm`). The index's runs are placed by that mechanism too: `Old` is
+/// through `transact`. The index's runs are placed by that mechanism too: `Old` is
 /// the index's snapshot before the transaction (`ManualIndex` keeps it in a `Spine`, whose
 /// inserts consult `min_insert_storage_bytes`), and `Dlt` is built by `build_batch` with no
 /// fixed location, so it follows `min_step_storage_bytes` like native's delta batches.
 ///
-/// The session runs on the test thread, bound to the runtime's buffer cache, after the
-/// transaction. The tests print the pressure level, the files, and the layout of `Old` and
-/// `Dlt`, and do not assert a layout. They pin what the session does (its `SessionCounts`),
-/// what the cursors read in all, wherever the runs are, and the split of those reads between
-/// memory reads and decodes by the layout that the run observed.
+/// The transaction runs on the base circuit, the index, and now the view circuit too (`run_arm`):
+/// the c5 replacement is a change outside RF1/RF2, which the hand-written circuit takes from
+/// `Dlt` like any other. The session runs on the test thread, bound to the runtime's buffer
+/// cache, as the driver runs it. The tests print the pressure level, the files, and the layout
+/// of `Old` and `Dlt`, and do not assert a layout. They pin what the session does (its
+/// `SessionCounts`), what the cursors read in all, wherever the runs are, and the split of those
+/// reads between memory reads and decodes by the layout that the run observed. They also check
+/// `V` against the independent join.
 #[cfg(all(test, feature = "merged-index"))]
 mod session_worked_transaction_tests {
     use super::worked_transaction::*;
     use super::*;
-    use dbsp::trace::merged_index::{Pass, ScanSession, SessionCounts};
-    use dbsp::trace::{with_read_owner, BatchLocation, BatchReader};
-    use merged_index_col::{
-        CustomerOrdersLineitemDefinition, INDEX_ID_CUSTOMER_BY_CUSTKEY,
-        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER, INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
-    };
-    use std::collections::BTreeSet;
-
-    /// The streams, in index-id order: customers, orders, line items.
-    const STREAMS: [u8; 3] = [
-        INDEX_ID_CUSTOMER_BY_CUSTKEY,
-        INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
-        INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
-    ];
+    use dbsp::trace::merged_index::SessionCounts;
+    use dbsp::trace::{BatchLocation, BatchReader};
 
     /// A run's location and its number of entries.
     type RunShape = (BatchLocation, usize);
@@ -3686,67 +3904,66 @@ mod session_worked_transaction_tests {
         old_runs: Vec<RunShape>,
         dlt: RunShape,
         counts: SessionCounts,
-        /// The `(old, dlt)` entries that each group buffered, per stream, for each group.
-        groups: Vec<[(usize, usize); 3]>,
         /// The session's reads for the merged index, and for every other owner.
         reads: RunReads,
         other_reads: RunReads,
     }
 
-    /// Runs the arm's transactions, then the session over the last transaction's `Old` and `Dlt`.
+    /// Runs the arm's transactions, then the session over the last transaction's `Old` and
+    /// `Dlt`, and the view circuit on the driving deltas it buffered.
     fn run_arm(arm: Arm) -> Result<Observed> {
         let (mut pipeline, storage) = start(arm)?;
-        // The base circuit and the index take the transaction; the view circuit does not run
-        // it. Its reconstructed readers take placements from the Orders rows of the same
-        // delta, and this transaction replaces c5 without any order row, a change outside
-        // RF1/RF2 that the readers reject by design (CLAUDE.md, "Placements and supported
-        // changes"). The session needs only the index's `Old` and `Dlt`.
-        let ((old, dlt), pressures, files) =
+        let ((old_runs, dlt_shape, session, reads, other_reads), pressures, files) =
             run_load_and_transaction(&mut pipeline, &storage, |pipeline, state| {
+                let before = state.evaluate();
                 let net_delta = run_base(pipeline, state, worked_change(), true)?;
-                let (_placements, index_rows) = reconstruction::prepare(&net_delta)?;
-                pipeline.index.append(index_rows)
-            })?;
-        let old_runs: Vec<RunShape> = old
-            .batches()
-            .iter()
-            .filter(|run| !run.is_empty())
-            .map(|run| (run.location(), run.len()))
-            .collect();
-        let dlt_shape = (dlt.location(), dlt.len());
+                publish_net_delta(pipeline, &net_delta, state)?;
+                let old = pipeline.q3_state.old().map_err(anyhow::Error::msg)?;
+                let dlt = pipeline.q3_state.dlt().map_err(anyhow::Error::msg)?;
+                let old_runs: Vec<RunShape> = old
+                    .batches()
+                    .iter()
+                    .filter(|run| !run.is_empty())
+                    .map(|run| (run.location(), run.len()))
+                    .collect();
+                let dlt_shape = (dlt.location(), dlt.len());
 
-        let (counts, groups, reads, other_reads) = pipeline.in_cache(|| {
-            let index_before = RunReads::current_for(WriteOwner::MergedIndex);
-            let total_before = RunReads::current();
-            let mut groups = Vec::new();
-            let counts = with_read_owner(WriteOwner::MergedIndex, || {
-                let mut session =
-                    ScanSession::<CustomerOrdersLineitemDefinition>::new(&old, &dlt, Pass::Seek);
-                session
-                    .maintain(&BTreeSet::from(STREAMS), None, |_group, buffers| {
-                        groups
-                            .push(STREAMS.map(|id| (buffers.old(id).len(), buffers.dlt(id).len())));
-                        Ok(())
-                    })
-                    .map_err(anyhow::Error::msg)?;
-                Ok::<_, anyhow::Error>(session.counts())
+                let index_before = RunReads::current_for(WriteOwner::MergedIndex);
+                let total_before = RunReads::current();
+                pipeline.collect_groups()?;
+                let reads = RunReads::current_for(WriteOwner::MergedIndex).since(index_before);
+                let other_reads = RunReads::current().since(total_before).since(reads);
+
+                // The view circuit takes the same buffers' driving deltas, and `V` must be the
+                // independent join of the new state.
+                pipeline.push_driving_deltas()?;
+                pipeline.view.circuit.transaction()?;
+                let session = pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
+                let output = pipeline
+                    .view
+                    .catalog
+                    .output_handles(&SqlIdentifier::from("V"))
+                    .context("missing V output")?;
+                let after = state.evaluate();
+                assert_eq!(
+                    pipeline.in_cache(|| read_output(&*output.delta_handle))?,
+                    difference(&before, &after)
+                );
+                Ok((old_runs, dlt_shape, session, reads, other_reads))
             })?;
-            let reads = RunReads::current_for(WriteOwner::MergedIndex).since(index_before);
-            let other_reads = RunReads::current().since(total_before).since(reads);
-            Ok::<_, anyhow::Error>((counts, groups, reads, other_reads))
-        })?;
+        assert_eq!(session.run_reads, reads);
 
         println!(
-            "session {}: pressure {pressures}; files {files}\n  Old runs {old_runs:?}, Dlt {dlt_shape:?}\n  reads {reads:?}\n  counts {counts:?}",
-            arm.name()
+            "session {}: pressure {pressures}; files {files}\n  Old runs {old_runs:?}, Dlt {dlt_shape:?}\n  reads {reads:?}\n  counts {:?}",
+            arm.name(),
+            session.counts
         );
         Ok(Observed {
             pressures,
             files,
             old_runs,
             dlt: dlt_shape,
-            counts,
-            groups,
+            counts: session.counts,
             reads,
             other_reads,
         })
@@ -3790,7 +4007,6 @@ mod session_worked_transaction_tests {
     ///   weight reads.
     /// - No seek reaches a run, so no seek or filter rejection is counted.
     fn check(observed: &Observed) {
-        assert_eq!(observed.groups, [[(1, 2), (2, 1), (3, 2)]]);
         assert_eq!(
             observed.counts,
             SessionCounts {
