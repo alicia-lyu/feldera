@@ -457,7 +457,7 @@ The user called the RF1/RF2 limit self-imposed and decided on 2026-11-10 that st
 
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
-The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" is a transaction's delta in this project (see the notation), and these types are not that. A vector is the unit that a pipelined plan hands from one operator to the next, as in MonetDB/X100's vectorized execution, and step 5 builds on it.
+The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
 
 ## Superseded and withdrawn
 
