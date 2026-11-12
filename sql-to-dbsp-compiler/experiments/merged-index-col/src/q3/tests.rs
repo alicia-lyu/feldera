@@ -129,9 +129,17 @@ fn line_value(
     Tup4(linenumber, money(price), discount(), Date::from_days(30))
 }
 
+/// A state whose partner reads check their contract, as the tests and the validation runs do;
+/// the measured driver's state does not.
+fn checked_state() -> Q3State {
+    let state = Q3State::default();
+    state.enable_contract_check();
+    state
+}
+
 /// Publishes `old` and `dlt` and collects their groups with the `Seek` pass.
 fn published(old: Vec<Vec<SourceRow>>, dlt: Vec<SourceRow>) -> Q3State {
-    let state = Q3State::default();
+    let state = checked_state();
     state.publish(source(old), run(dlt)).unwrap();
     state.collect(Pass::Seek).unwrap();
     state
@@ -500,7 +508,7 @@ fn cancelled_keys_have_no_values_and_unrequested_keys_are_refused() {
 /// whole with it.
 #[test]
 fn the_after_read_is_the_requested_slice_of_old_and_dlt() {
-    let state = Q3State::default();
+    let state = checked_state();
     assert!(state.old().unwrap_err().contains("publish"));
     let old = source(vec![vec![customer(2, "old", 1), customer(4, "four", 1)]]);
     let dlt = run(vec![
@@ -548,7 +556,7 @@ fn the_after_read_is_the_requested_slice_of_old_and_dlt() {
 
 #[test]
 fn publication_collection_and_release_follow_one_order() {
-    let state = Q3State::default();
+    let state = checked_state();
     let request = delta(vec![(Tup2(2, 20), line_value(1, 100), 1)]);
     let joined = delta(vec![(
         Tup2(2, 20),
@@ -726,7 +734,7 @@ fn check_readers(
     dlt_rows: Vec<SourceRow>,
     pass: Pass,
 ) -> Result<(), TestCaseError> {
-    let state = Q3State::default();
+    let state = checked_state();
     state
         .publish(source(old_runs.clone()), run(dlt_rows.clone()))
         .unwrap();
@@ -848,28 +856,70 @@ fn check_readers(
         prop_assert_eq!(tuples(&readers.lines.partner().unwrap()), wanted(lines));
         Ok(())
     })?;
-    state.finish().unwrap();
+    // Whatever the delta, the collecting thread reads under no owner but the index's and the
+    // requested slice's.
+    let reads = state.finish().unwrap();
+    for silent in [
+        WriteOwner::Query,
+        WriteOwner::BaseRelation,
+        WriteOwner::PartnerTrace,
+    ] {
+        prop_assert_eq!(reads.driver_reads[silent as usize], RunReads::default());
+    }
     Ok(())
 }
 
-/// A random row of a small trie: customers 1 to 3, orders 1 to 3, and line
-/// numbers 1 to 2, with two payloads each and a nonzero weight.
-fn source_rows() -> impl Strategy<Value = Vec<SourceRow>> {
-    let weight = prop_oneof![Just(-2_i64), Just(-1), Just(1), Just(2)];
-    let row = (1_i64..=3, 1_i64..=3, 1_i32..=2, 0_u8..3, 0_i32..2, weight).prop_map(
-        |(custkey, orderkey, linenumber, stream, variant, weight)| match stream {
-            0 => customer(custkey, ["A", "B"][variant as usize], weight),
-            1 => order(custkey, orderkey, variant, weight),
-            _ => line(
-                custkey,
-                orderkey,
-                linenumber,
-                100 + i128::from(variant),
-                weight,
-            ),
-        },
-    );
-    proptest::collection::vec(row, 0..14)
+/// A key of a small trie: customers 1 to 3, orders 1 to 3, and line numbers 1 to 2.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SmallKey {
+    Customer(i64),
+    Order(i64, i64),
+    Line(i64, i64, i32),
+}
+
+fn small_key() -> impl Strategy<Value = SmallKey> {
+    prop_oneof![
+        (1_i64..=3).prop_map(SmallKey::Customer),
+        (1_i64..=3, 1_i64..=3).prop_map(|(c, o)| SmallKey::Order(c, o)),
+        (1_i64..=3, 1_i64..=3, 1_i32..=2).prop_map(|(c, o, l)| SmallKey::Line(c, o, l)),
+    ]
+}
+
+/// The row of `key` with one of three payloads (`variant`) and `weight`. The segments are ordered
+/// against their packed form (`AAA` < `BB` < `C`, but the packed length comes first), so a
+/// replaced segment arrives in `Dlt` against the typed order.
+fn small_row(key: &SmallKey, variant: u8, weight: i64) -> SourceRow {
+    match *key {
+        SmallKey::Customer(c) => customer(c, ["AAA", "BB", "C"][usize::from(variant)], weight),
+        SmallKey::Order(c, o) => order(c, o, i32::from(variant), weight),
+        SmallKey::Line(c, o, l) => line(c, o, l, 100 + i128::from(variant), weight),
+    }
+}
+
+/// A logical `Old` (each key holds one payload with weight 1 or 2, as the primary keys make it),
+/// split at random into two runs, and a `Dlt` that replaces, deletes, or inserts some keys: for
+/// each changed key, `-old` if it has one and `+new` if it gets one. A folded key then yields at
+/// most three rows, its `Old` row and `Dlt`'s pair.
+fn old_runs_and_dlt() -> impl Strategy<Value = (Vec<Vec<SourceRow>>, Vec<SourceRow>)> {
+    let old =
+        proptest::collection::btree_map(small_key(), (0_u8..3, 1_i64..=2, any::<bool>()), 0..10);
+    let changes = proptest::collection::btree_map(small_key(), proptest::option::of(0_u8..3), 0..8);
+    (old, changes).prop_map(|(old, changes)| {
+        let mut runs = vec![Vec::new(), Vec::new()];
+        for (key, (variant, weight, second)) in &old {
+            runs[usize::from(*second)].push(small_row(key, *variant, *weight));
+        }
+        let mut dlt = Vec::new();
+        for (key, new) in changes {
+            if let Some((variant, weight, _)) = old.get(&key) {
+                dlt.push(small_row(&key, *variant, -*weight));
+            }
+            if let Some(variant) = new {
+                dlt.push(small_row(&key, variant, 1));
+            }
+        }
+        (runs, dlt)
+    })
 }
 
 proptest! {
@@ -881,17 +931,45 @@ proptest! {
     /// where `ΔJ` has a row.
     #[test]
     fn readers_match_a_brute_force(
-        first_run in source_rows(),
-        second_run in source_rows(),
-        dlt_rows in source_rows(),
+        (old_runs, dlt_rows) in old_runs_and_dlt(),
         step_pass in any::<bool>(),
     ) {
         check_readers(
-            vec![first_run, second_run],
+            old_runs,
             dlt_rows,
             if step_pass { Pass::Step } else { Pass::Seek },
         )?;
     }
+}
+
+/// A segment that changes to one that is smaller as a string but longer when packed (length
+/// first), so that `Dlt`'s `-old` and `+new` of the customer arrive against the typed order, and
+/// the driving delta and the `C⁺` slice are built in typed order all the same.
+#[test]
+fn a_replaced_segment_is_built_in_typed_order_though_it_arrives_in_packed_order() {
+    let state = published(
+        vec![vec![customer(5, "C", 1), order(5, 50, 10, 1)]],
+        vec![
+            customer(5, "C", -1),
+            customer(5, "AAA", 1),
+            order(5, 51, 10, 1),
+        ],
+    );
+    let DrivingDeltas {
+        customers, orders, ..
+    } = state.take_driving_deltas().unwrap();
+    assert_eq!(
+        tuples(&customers),
+        vec![
+            (Tup1(5), Tup1(SqlString::from("AAA")), 1),
+            (Tup1(5), Tup1(SqlString::from("C")), -1),
+        ]
+    );
+    // `C⁺`: `Old`'s `C` and `ΔC`'s pair, three rows of one entry, consolidate to `AAA`.
+    assert_eq!(
+        tuples(&state.customers_after(&snap(orders)).unwrap()),
+        vec![(Tup1(5), Tup1(SqlString::from("AAA")), 1)]
+    );
 }
 
 /// `ΔJ` on the general deltas that `reconstruction::prepare` produces: a
@@ -968,6 +1046,33 @@ fn delta_joined_requests_follow_customer_changes_and_moved_orders() {
         assert!(requests_of(&readers.customers).is_empty());
         assert!(requests_of(&readers.joined).is_empty());
     });
+}
+
+/// The contract check is off by default, as in the measured driver: a read of a key outside the
+/// requests then returns the batch, and the partner read walks nothing of the circuit's delta.
+#[test]
+fn the_contract_check_is_off_unless_enabled() {
+    let state = Q3State::default();
+    state
+        .publish(source(vec![]), run(vec![order(2, 20, 10, 1)]))
+        .unwrap();
+    state.collect(Pass::Seek).unwrap();
+    let outside = delta(vec![(Tup1(9), Tup3(90, Date::from_days(0), 0), 1)]);
+    let (result, _, other) = run_reads_of(|| state.customers_after(&outside));
+    assert!(tuples(&result.unwrap()).is_empty());
+    // Nothing of the delta was read under any owner.
+    assert_eq!(other, RunReads::default());
+    state.finish().unwrap();
+
+    let checked = checked_state();
+    checked
+        .publish(source(vec![]), run(vec![order(2, 20, 10, 1)]))
+        .unwrap();
+    checked.collect(Pass::Seek).unwrap();
+    assert!(checked
+        .customers_after(&outside)
+        .unwrap_err()
+        .contains("outside the requests"));
 }
 
 /// `ΔJ` has no row where its two terms cancel: a customer arrives while its
@@ -1047,18 +1152,17 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
             &factories,
             vec![Arc::new(old_file), Arc::new(old_memory)],
         );
-        let state = Q3State::default();
+        let state = checked_state();
         state.publish(old, Arc::new(dlt)).unwrap();
 
         let (collecting, collecting_other) = collect_reads_of(&state, Pass::Seek);
-        // The routing's own reads of the readers' in-memory driving deltas are
-        // not the index's: two lookups (`ΔC` and `ΔO` at customer 5), each a
-        // seek, with the key, the two values and weights of `ΔC`'s, and the
-        // value and weight of `ΔO`'s.
+        // The routing's reads of the driving deltas `ΔC` and `ΔO`, which it merges forward
+        // alongside the scan, are the requested-slice owner's: each cursor lands on its first
+        // key (2 key reads), and customer 5's rows are read (`ΔC`'s two and `ΔO`'s one, 3 value
+        // and 3 weight reads). No seek, and nothing is left to the default owner.
         assert_eq!(
             collecting_other,
             RunReads {
-                seeks: 2,
                 memory_key_reads: 2,
                 memory_value_reads: 3,
                 memory_weight_reads: 3,
@@ -1134,6 +1238,18 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
         // values, and five weights, read by the capture.
         let report = state.finish().unwrap();
         assert_eq!(report.run_reads, collecting);
+        // The collecting thread's reads, per owner: the index's, the routing's under the
+        // requested slice, and none under `query` (nor any other owner).
+        let owner = |owner: WriteOwner| report.driver_reads[owner as usize];
+        assert_eq!(owner(WriteOwner::MergedIndex), collecting);
+        assert_eq!(owner(WriteOwner::RequestedSlice), collecting_other);
+        for silent in [
+            WriteOwner::Query,
+            WriteOwner::BaseRelation,
+            WriteOwner::PartnerTrace,
+        ] {
+            assert_eq!(owner(silent), RunReads::default(), "{silent:?}");
+        }
         assert_eq!(collecting, with_memory(reads(0, 0, 7, 6, 6), 5, 5, 5));
         assert_eq!(
             report.counts,
@@ -1155,7 +1271,7 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
 /// transaction starts from zero.
 #[test]
 fn finish_returns_each_transactions_session_reads() {
-    let state = Q3State::default();
+    let state = checked_state();
     let one_run = || source(vec![vec![customer(5, "only", 1)]]);
 
     state.publish(one_run(), run(vec![])).unwrap();
@@ -1188,6 +1304,40 @@ fn finish_returns_each_transactions_session_reads() {
         total.run_reads.memory_key_reads,
         2 * first.run_reads.memory_key_reads
     );
+}
+
+/// Collecting leaves no read to the default owner on the collecting thread: the capture of
+/// `Dlt` is the index's, and the routing's merge of the driving deltas is the requested slice's.
+#[test]
+fn collect_leaves_zero_query_reads_on_the_collecting_thread() {
+    let state = published(
+        vec![vec![
+            customer(2, "A", 1),
+            customer(3, "B", 1),
+            order(2, 20, 10, 1),
+            order(3, 30, 10, 1),
+            line(2, 20, 1, 100, 1),
+            line(3, 30, 1, 100, 1),
+        ]],
+        vec![
+            customer(2, "A", -1),
+            customer(2, "C", 1),
+            order(3, 31, 11, 1),
+            order(4, 40, 11, 1),
+            line(3, 30, 2, 100, 1),
+            line(4, 40, 1, 100, 1),
+        ],
+    );
+    let reads = state.finish().unwrap();
+    assert_eq!(
+        reads.driver_reads[WriteOwner::Query as usize],
+        RunReads::default()
+    );
+    assert!(reads.driver_reads[WriteOwner::MergedIndex as usize].memory_key_reads > 0);
+    // The routing merged `ΔC` and `ΔO` forward: reads, and no seek.
+    let slice = reads.driver_reads[WriteOwner::RequestedSlice as usize];
+    assert!(slice.memory_key_reads > 0);
+    assert_eq!(slice.seeks, 0);
 }
 
 /// What a scan of the touched groups saw: per group, the positions and the

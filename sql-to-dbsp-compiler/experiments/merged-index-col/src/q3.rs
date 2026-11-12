@@ -42,7 +42,10 @@
 
 use std::{
     ops::AddAssign,
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+    },
 };
 
 use dbsp::{
@@ -51,9 +54,9 @@ use dbsp::{
     storage::write_attribution::WriteOwner,
     trace::{
         merged_index::{
-            capture, route, Capture, Delta, DeltaReader, DrivingDelta, MergedIndexBatch,
-            OrderedKey, Pass, Position, Reader, ReaderDefinition, ScanSession, SessionCounts,
-            StoredReader,
+            capture, route, Capture, Delta, DeltaCursor, DeltaReader, DrivingDelta,
+            MergedIndexBatch, OrderedKey, Pass, Position, Reader, ReaderDefinition, ScanSession,
+            SessionCounts, StoredReader,
         },
         with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
         SpineSnapshot as DynamicSnapshot,
@@ -91,19 +94,30 @@ pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 
 type Definition = CustomerOrdersLineitemDefinition;
 
+/// Run reads per read owner, indexed like [`WriteOwner::ALL`].
+pub type OwnerReads = [RunReads; WriteOwner::ALL.len()];
+
 /// What one transaction's view maintenance read from the index: the scan
-/// session's moves, and the run reads they cost (all under the merged index's
-/// read owner, on the thread that collected).
+/// session's moves, and the run reads they cost on the thread that collected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionReads {
     pub counts: SessionCounts,
+    /// The reads of the index, under the merged index's read owner (`Dlt`'s, the capture's,
+    /// included).
     pub run_reads: RunReads,
+    /// Every read the collecting thread made, per owner. Besides the index's, they are the
+    /// routing's reads of the driving deltas it merges alongside the scan, under the
+    /// requested-slice owner. No other owner reads here.
+    pub driver_reads: OwnerReads,
 }
 
 impl AddAssign for SessionReads {
     fn add_assign(&mut self, other: Self) {
         self.counts += other.counts;
         self.run_reads += other.run_reads;
+        for (total, reads) in self.driver_reads.iter_mut().zip(other.driver_reads) {
+            *total += reads;
+        }
     }
 }
 
@@ -343,8 +357,8 @@ struct Group {
 /// computes `J⁺` and `ΔJ`. The deltas are borrowed: the caller of `capture` owns them.
 struct Routing<'r> {
     /// `ΔC`, which `O⁻` requests, and `ΔO`, which `C⁺` requests.
-    delta_customers: &'r Delta<OrdersBefore>,
-    delta_orders: &'r Delta<CustomersAfter>,
+    delta_customers: DeltaCursor<'r, OrdersBefore>,
+    delta_orders: DeltaCursor<'r, CustomersAfter>,
     customers: &'r mut Reader<CustomersAfter>,
     orders: &'r mut Reader<OrdersBefore>,
     joined: &'r mut Reader<JoinedAfter>,
@@ -375,12 +389,12 @@ impl Routing<'_> {
         let custkey = custkey_of_group(prefix)?;
         // `ΔC` and `ΔO` have rows in this group only if `C⁺` and `O⁻` request it.
         let delta_customers = if self.orders.requests_mut().has(prefix) {
-            self.delta_customers.rows_at(&Tup1(custkey))?
+            self.delta_customers.rows_at(&Tup1(custkey))
         } else {
             Vec::new()
         };
         let delta_orders = if self.customers.requests_mut().has(prefix) {
-            self.delta_orders.rows_at(&Tup1(custkey))?
+            self.delta_orders.rows_at(&Tup1(custkey))
         } else {
             Vec::new()
         };
@@ -455,6 +469,7 @@ impl Routing<'_> {
         }
 
         let mut rows: Weighted<SqlString> = Vec::new();
+        let has_old = old.is_some();
         if let Some(position) = old {
             for (payload, weight) in position.decoded()? {
                 rows.push((segment_of(payload)?, *weight));
@@ -463,10 +478,16 @@ impl Routing<'_> {
         for (Tup1(segment), weight) in &group.delta_customers {
             rows.push((segment.clone(), *weight));
             if delta_orders_here {
-                // `C⁺`'s slice is `Old`'s row, which `route` pushes, and `ΔC`'s.
+                // `C⁺`'s slice is `Old`'s row, which `route` pushes, and `ΔC`'s rows: the three rows
+                // of one entry at most.
                 self.customers
                     .push_row(Tup1(group.custkey), Tup1(segment.clone()), *weight)?;
             }
+        }
+        if delta_orders_here && !has_old {
+            // `Old` has no entry of this customer for `route` to add to the open entry and
+            // close, so the entry of `ΔC`'s rows ends here.
+            self.customers.end_entry()?;
         }
         group.customer_after = consolidate(rows)?;
         Ok(())
@@ -523,7 +544,7 @@ impl Routing<'_> {
             )?;
             for (segment, customer_weight) in &group.customer_after {
                 for (Tup2(date, priority), order_weight) in &order_after {
-                    self.joined.push_row(
+                    self.joined.push_ordered_row(
                         Tup2(group.custkey, order),
                         Tup3(segment.clone(), *date, *priority),
                         multiply(*customer_weight, *order_weight)?,
@@ -635,12 +656,44 @@ struct ReadViews {
 /// `V` flushes only after `J` has passed every customer. The caller must
 /// restore the index, base state, and the view circuit at the same completed
 /// transaction.
+///
+/// The partner reads can check the contract that every key of the circuit's delta is one of
+/// their reader's requests ([`Self::enable_contract_check`]). The check walks the circuit's
+/// delta, so it is off by default and the measured driver never enables it; tests and the
+/// harness's validation runs do.
 #[derive(Clone, Default)]
 pub struct Q3State {
     views: Arc<Mutex<Option<Arc<ReadViews>>>>,
+    check_contract: Arc<AtomicBool>,
 }
 
 impl Q3State {
+    /// Makes every partner read check its contract (all clones of this state share the
+    /// setting): each key of the circuit's delta must be one of its reader's requests, or the
+    /// read errors. The check reads the circuit's delta once more, so a measured run must not
+    /// enable it.
+    pub fn enable_contract_check(&self) {
+        self.check_contract.store(true, Ordering::Relaxed);
+    }
+
+    /// Checks `keys` (the keys of a circuit delta, read only if the check is on) against `reader`.
+    fn check_requested<R: ReaderDefinition, K: DBData, V: DBData>(
+        &self,
+        reader: &Reader<R>,
+        delta: &SpineSnapshot<OrdIndexedZSet<K, V>>,
+        prefix: impl Fn(&K) -> (Vec<u8>, String),
+        reader_name: &str,
+    ) -> Result<(), String> {
+        if !self.check_contract.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        for key in requested_keys(delta) {
+            let (prefix, what) = prefix(&key);
+            require_requested(reader, &prefix, &what, reader_name)?;
+        }
+        Ok(())
+    }
+
     pub fn publish(&self, old: SourceSnapshot, dlt: Arc<MergedIndexBatch>) -> Result<(), String> {
         let mut views = self.views.lock().map_err(|_| "Q3 state lock poisoned")?;
         if views.is_some() {
@@ -660,7 +713,7 @@ impl Q3State {
     /// the runtime's buffer cache to this thread.
     pub fn collect(&self, pass: Pass) -> Result<(), String> {
         let views = self.views()?;
-        let before = RunReads::current_for(WriteOwner::MergedIndex);
+        let before = WriteOwner::ALL.map(RunReads::current_for);
         let (collected, driving, counts) = with_read_owner(WriteOwner::MergedIndex, || {
             let mut customers = Reader::<CustomersAfter>::new()?;
             let mut orders = Reader::<OrdersBefore>::new()?;
@@ -681,8 +734,8 @@ impl Q3State {
 
             let mut session = ScanSession::<Definition>::new(&views.old, &captured.touched, pass);
             Routing {
-                delta_customers: &delta_customers,
-                delta_orders: &delta_orders,
+                delta_customers: delta_customers.cursor()?,
+                delta_orders: delta_orders.cursor()?,
                 customers: &mut customers,
                 orders: &mut orders,
                 joined: &mut joined,
@@ -711,7 +764,9 @@ impl Q3State {
             };
             Ok::<_, String>(((customers, orders, joined, lines), driving, counts))
         })?;
-        let run_reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
+        let after = WriteOwner::ALL.map(RunReads::current_for);
+        let driver_reads: OwnerReads = std::array::from_fn(|i| after[i].since(before[i]));
+        let run_reads = driver_reads[WriteOwner::MergedIndex as usize];
 
         let (customers, orders, joined, lines) = collected;
         views
@@ -721,7 +776,11 @@ impl Q3State {
                 orders,
                 joined,
                 lines,
-                reads: SessionReads { counts, run_reads },
+                reads: SessionReads {
+                    counts,
+                    run_reads,
+                    driver_reads,
+                },
                 driving: Some(driving),
             }))
             .map_err(|_| "the published views were already collected".to_owned())
@@ -781,14 +840,12 @@ impl Q3State {
     ) -> Result<SpineSnapshot<CustomerByCustkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        for Tup1(customer) in requested_keys(delta) {
-            require_requested(
-                &collected.customers,
-                &prefix_custkey(customer),
-                &format!("customer {customer}"),
-                "C⁺",
-            )?;
-        }
+        self.check_requested(
+            &collected.customers,
+            delta,
+            |Tup1(customer)| (prefix_custkey(*customer), format!("customer {customer}")),
+            "C⁺",
+        )?;
         collected.customers.partner()
     }
 
@@ -800,14 +857,12 @@ impl Q3State {
     ) -> Result<SpineSnapshot<OrdersByCustkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        for Tup1(customer) in requested_keys(delta) {
-            require_requested(
-                &collected.orders,
-                &prefix_custkey(customer),
-                &format!("customer {customer}"),
-                "O⁻",
-            )?;
-        }
+        self.check_requested(
+            &collected.orders,
+            delta,
+            |Tup1(customer)| (prefix_custkey(*customer), format!("customer {customer}")),
+            "O⁻",
+        )?;
         collected.orders.partner()
     }
 
@@ -820,14 +875,17 @@ impl Q3State {
     ) -> Result<SpineSnapshot<JoinedByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        for Tup2(customer, order) in requested_keys(delta) {
-            require_requested(
-                &collected.joined,
-                &prefix_custkey_orderkey(customer, order),
-                &format!("order ({customer}, {order})"),
-                "J⁺",
-            )?;
-        }
+        self.check_requested(
+            &collected.joined,
+            delta,
+            |Tup2(customer, order)| {
+                (
+                    prefix_custkey_orderkey(*customer, *order),
+                    format!("order ({customer}, {order})"),
+                )
+            },
+            "J⁺",
+        )?;
         collected.joined.partner()
     }
 
@@ -839,14 +897,17 @@ impl Q3State {
     ) -> Result<SpineSnapshot<LineitemByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        for Tup2(customer, order) in requested_keys(delta) {
-            require_requested(
-                &collected.lines,
-                &prefix_custkey_orderkey(customer, order),
-                &format!("order ({customer}, {order})"),
-                "L⁻",
-            )?;
-        }
+        self.check_requested(
+            &collected.lines,
+            delta,
+            |Tup2(customer, order)| {
+                (
+                    prefix_custkey_orderkey(*customer, *order),
+                    format!("order ({customer}, {order})"),
+                )
+            },
+            "L⁻",
+        )?;
         collected.lines.partner()
     }
 }
@@ -861,15 +922,19 @@ impl ReadViews {
     }
 }
 
-/// The keys of a driving delta, in order.
+/// The keys of a driving delta, in order. This is a walk of the circuit's delta, like the join's
+/// own delta side, so its reads are the operators' (`query`), not the requested slice's, though
+/// the join runs the reader callback under that owner.
 fn requested_keys<K: DBData, V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<K, V>>) -> Vec<K> {
-    let mut cursor = delta.inner().cursor();
-    let mut keys = Vec::new();
-    while cursor.key_valid() {
-        keys.push(cursor.key().downcast_checked::<K>().clone());
-        cursor.step_key();
-    }
-    keys
+    with_read_owner(WriteOwner::Query, || {
+        let mut cursor = delta.inner().cursor();
+        let mut keys = Vec::new();
+        while cursor.key_valid() {
+            keys.push(cursor.key().downcast_checked::<K>().clone());
+            cursor.step_key();
+        }
+        keys
+    })
 }
 
 /// `J = O ⋈ C` on `custkey`, with both historical operands read from the
