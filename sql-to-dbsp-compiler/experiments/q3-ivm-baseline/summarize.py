@@ -12,6 +12,9 @@ reports, over the repetitions:
   sub-phase of `base_ms` that is never added to it again), `forward_ms` (reading the base net
   delta and feeding the view circuit), `q3_ms` (the view circuit alone) and `ivm_ms` (equal to
   `q3_ms`, the IVM figure). Base and IVM are always reported side by side;
+- the sums over the refreshes of the CPU profiler's step CPU time per circuit,
+  `refresh_profiled_cpu_base_ms` and `refresh_profiled_cpu_q3_ms` (`profiled_cpu_ms.base` and
+  `.q3`): a cross-check of `base_ms` and `q3_ms`, not a phase;
 - `sequence.resources.backend_write_by_owner`: write operations and bytes of
   `query`, `base_relation` and `merged_index`, plus the totals
   `backend_write_operations` and `backend_write_bytes`;
@@ -30,10 +33,13 @@ reports, over the repetitions:
   `view_weight_decodes`, `view_memory_key_reads`, `view_memory_value_reads`,
   `view_memory_weight_reads`), in both modes: the join traces' partner reads in native mode, the index
   readers' and the rest of the view circuit's in reconstructed mode;
-- for the merged-index mode only, `sequence.index_run_reads` summed over the readers
-  (`index_seeks`, `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
+- for the merged-index mode only, under the mode's `index_run_reads`: the scan session's run
+  reads of the index in the view phase (`sequence.index_run_reads.session`: `index_seeks`,
+  `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
   `index_weight_decodes`, `index_memory_key_reads`, `index_memory_value_reads`,
-  `index_memory_weight_reads`), under the mode's `index_run_reads`. File runs count decodes and
+  `index_memory_weight_reads`), the session's moves (`sequence.index_session_counts`, as
+  `index_session_<field>`), and base maintenance's reads of the index
+  (`sequence.index_upkeep_run_reads`, as `index_upkeep_<field>`). File runs count decodes and
   in-memory runs count memory reads; the two are never added.
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
@@ -52,8 +58,9 @@ import statistics
 import sys
 from typing import Any
 
-from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, WRITE_OWNERS, index_read_problems,
-                     owner_write_problems, view_read_problems)
+from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS, WRITE_OWNERS,
+                     counter_problems, index_read_problems, owner_write_problems,
+                     profiled_cpu_problems, view_read_problems)
 
 MEASUREMENT_VERSION = 10
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
@@ -105,12 +112,19 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     refreshes = driver.get("refreshes")
     if not isinstance(refreshes, list) or not refreshes:
         raise SummaryError(f"{where}: no refreshes in the driver report")
-    problems = index_read_problems(driver) + view_read_problems(driver)
+    problems = (index_read_problems(driver) + view_read_problems(driver)
+                + counter_problems(driver, "index_session_counts", SESSION_COUNT_FIELDS)
+                + counter_problems(driver, "index_upkeep_run_reads", RUN_READ_FIELDS)
+                + profiled_cpu_problems(driver))
     if problems:
-        raise SummaryError(f"{where}: inconsistent run reads: " + "; ".join(problems))
+        raise SummaryError(f"{where}: inconsistent counters: " + "; ".join(problems))
     for field in REFRESH_SUMS:
         metrics[f"refresh_{field}"] = sum(
             number(refresh, (field,), f"{where} refresh {index}")
+            for index, refresh in enumerate(refreshes, start=1))
+    for circuit in ("base", "q3"):
+        metrics[f"refresh_profiled_cpu_{circuit}_ms"] = sum(
+            number(refresh, ("profiled_cpu_ms", circuit), f"{where} refresh {index}")
             for index, refresh in enumerate(refreshes, start=1))
     resources = ("sequence", "resources")
     for owner in WRITE_OWNERS:
@@ -133,13 +147,20 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
 
 
 def index_read_metrics(driver: dict[str, Any]) -> dict[str, float]:
-    """The sequence's merged-index run reads, summed over the readers, or nothing in native
-    mode. `index_read_problems` has already checked the fields."""
-    reads = driver["sequence"]["index_run_reads"]
+    """The sequence's merged-index counters, or nothing in native mode: the scan session's
+    run reads, its moves, and base maintenance's reads of the index. `run_metrics` has
+    already checked the fields."""
+    sequence = driver["sequence"]
+    reads = sequence["index_run_reads"]
     if reads is None:
         return {}
-    return {f"index_{field}": sum(reads[reader][field] for reader in INDEX_READERS)
-            for field in RUN_READ_FIELDS}
+    metrics = {f"index_{field}": sum(reads[reader][field] for reader in INDEX_READERS)
+               for field in RUN_READ_FIELDS}
+    metrics.update({f"index_session_{field}": sequence["index_session_counts"][field]
+                    for field in SESSION_COUNT_FIELDS})
+    metrics.update({f"index_upkeep_{field}": sequence["index_upkeep_run_reads"][field]
+                    for field in RUN_READ_FIELDS})
+    return metrics
 
 
 def window_memory_metrics(driver: dict[str, Any], where: str) -> dict[str, float]:
@@ -271,9 +292,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
              "Times are milliseconds; sizes are bytes.", ""]
     for label, workload in summary["workloads"].items():
         runs = {mode: workload["modes"][mode]["runs"] for mode in MODES}
+        # A manifest from before `--session-pass` names no pass; its runs used `seek`.
+        session_pass = (workload.get("configuration") or {}).get("session_pass", "seek")
         lines += [f"## {label}", "",
                   f"Source: `{workload['source']}`. Runs per mode: "
-                  + ", ".join(f"{mode} {count}" for mode, count in runs.items()) + ".", ""]
+                  + ", ".join(f"{mode} {count}" for mode, count in runs.items())
+                  + f". Session pass: `{session_pass}`.", ""]
         lines.append("| Metric | " + " | ".join(f"{mode} {stat}" for mode in MODES
                                                  for stat in STATISTICS) + " |")
         lines.append("| --- | " + " | ".join("---:" for _ in MODES for _ in STATISTICS) + " |")
@@ -286,9 +310,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
             reads = workload["modes"][mode].get("index_run_reads")
             if not reads:
                 continue
-            lines += [f"Merged-index run reads ({mode}), summed over the readers. Only file "
-                      "runs count decodes; each refresh's `index_layout` "
-                      "in the driver report says where the runs were.", "",
+            lines += [f"Merged-index counters ({mode}): the scan session's run reads "
+                      "(`index_*`), its moves (`index_session_*`), and base maintenance's reads "
+                      "of the index (`index_upkeep_*`). Only file runs count decodes; each "
+                      "refresh's `index_layout` in the driver report says where the runs were.",
+                      "",
                       "| Metric | " + " | ".join(STATISTICS) + " |",
                       "| --- | " + " | ".join("---:" for _ in STATISTICS) + " |"]
             for name, values in reads.items():

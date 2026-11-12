@@ -41,6 +41,17 @@ def view_reads(query: int) -> dict[str, dict[str, int]]:
     }
 
 
+def session_counts(groups: int) -> dict[str, int]:
+    """The scan session's moves: `groups` groups, and twice as many of every other count."""
+    return {field: groups if field == "groups" else 2 * groups
+            for field in summarize.SESSION_COUNT_FIELDS}
+
+
+def upkeep_reads(seeks: int) -> dict[str, int]:
+    """Base maintenance's reads of the index: `seeks` of every count."""
+    return {field: seeks for field in summarize.RUN_READ_FIELDS}
+
+
 LAYOUT = {snapshot: {"file": {"runs": 1, "bytes": 10}, "memory": {"runs": 1, "bytes": 5}}
           for snapshot in ("before", "after")}
 
@@ -55,7 +66,11 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                   "index_ms": 1.0 * scale * number, "q3_ms": 2.0 * scale * number,
                   "ivm_ms": 2.0 * scale * number,
                   "index_run_reads": None if native else index_reads(int(number * scale)),
-                  "index_layout": None if native else LAYOUT}
+                  "index_layout": None if native else LAYOUT,
+                  "index_session_counts": None if native else session_counts(number),
+                  "index_upkeep_run_reads": None if native else upkeep_reads(number),
+                  "profiled_cpu_ms": {"base": 3.0 * scale * number,
+                                      "q3": 1.5 * scale * number}}
                  for number in (1, 2)]
     for refresh in refreshes:
         refresh["view_run_reads"] = view_reads(10 * refresh["refresh"])
@@ -65,6 +80,8 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
         "refreshes": refreshes,
         "sequence": {
             "index_run_reads": None if native else index_reads(int(3 * scale)),
+            "index_session_counts": None if native else session_counts(3),
+            "index_upkeep_run_reads": None if native else upkeep_reads(3),
             "view_run_reads": view_reads(30),
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
             "window_peak_rss_bytes": 7_000_000 + int(scale),
@@ -122,6 +139,9 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(native["metrics"]["refresh_index_ms"]["median"], 6.0)
         self.assertEqual(native["metrics"]["refresh_base_ms"]["median"], 24.0)
         self.assertEqual(native["metrics"]["refresh_forward_ms"]["median"], 3.0)
+        # The CPU profiler's times are summed per circuit in both modes: 3 and 1.5 * scale * 3.
+        self.assertEqual(native["metrics"]["refresh_profiled_cpu_base_ms"]["median"], 18.0)
+        self.assertEqual(native["metrics"]["refresh_profiled_cpu_q3_ms"]["max"], 13.5)
         self.assertEqual(native["metrics"]["write_operations_base_relation"]["median"], 2)
         self.assertEqual(native["metrics"]["write_bytes_total"]["median"], 300)
         self.assertEqual(native["metrics"]["observed_storage_bytes"]["max"], 1003)
@@ -132,7 +152,7 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(set(summary["workloads"]), {"clustered", "scattered"})
         markdown = (out / "summary.md").read_text()
         self.assertIn("## clustered", markdown)
-        self.assertIn("Runs per mode: native 3, merged-index 3.", markdown)
+        self.assertIn("Runs per mode: native 3, merged-index 3. Session pass: `seek`.", markdown)
         self.assertIn("| `sequence_wall_ms` | 200 | 100 | 300 | 600 | 500 | 700 |", markdown)
         # The index's run reads exist for the merged-index mode alone. Its sequence makes
         # 3 * scale seeks for the one reader, the scan session.
@@ -144,7 +164,11 @@ class SummarizeTest(unittest.TestCase):
         # The memory reads are separate metrics, one per seek, not added to the decodes.
         self.assertEqual(merged["index_run_reads"]["index_memory_value_reads"]["median"], 18)
         self.assertNotIn("index_seeks", merged["metrics"])
-        self.assertIn("Merged-index run reads (merged-index)", markdown)
+        # The session's moves and base maintenance's reads of the index sit beside them.
+        self.assertEqual(merged["index_run_reads"]["index_session_groups"]["median"], 3)
+        self.assertEqual(merged["index_run_reads"]["index_session_positions"]["median"], 6)
+        self.assertEqual(merged["index_run_reads"]["index_upkeep_seeks"]["median"], 3)
+        self.assertIn("Merged-index counters (merged-index)", markdown)
         self.assertIn("| `index_seeks` | 18 | 15 | 21 |", markdown)
         # Both modes report the view worker's reads, summed over the owners: 30 query seeks. The
         # scan session reads the index on the driver's thread, so the worker adds none.
@@ -313,7 +337,13 @@ class SummarizeTest(unittest.TestCase):
     def test_inconsistent_index_run_reads_are_an_error(self) -> None:
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["sequence"]["index_run_reads"]["session"]["seeks"] += 1
-        self.failing(content, "inconsistent run reads")
+        self.failing(content, "inconsistent counters")
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][1]["driver"]["sequence"]["index_session_counts"]["groups"] += 1
+        self.failing(content, "index_session_counts are not the sums")
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        del content["runs"][0]["driver"]["refreshes"][1]["profiled_cpu_ms"]
+        self.failing(content, "profiled_cpu_ms.base is None")
         # The view worker reads nothing under `merged_index`.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         refresh = content["runs"][1]["driver"]["refreshes"][0]
