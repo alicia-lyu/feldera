@@ -56,15 +56,19 @@ pub enum WriteOwner {
     /// partner rows. A read owner only: nothing is written under it, so its
     /// write counts stay zero.
     RequestedSlice,
+    /// The joins' reads of their partner traces in native mode, the counterpart
+    /// of [`WriteOwner::RequestedSlice`]. A read owner only.
+    PartnerTrace,
 }
 
 impl WriteOwner {
     /// Every owner, in the order of [`WriteSnapshot::by_owner`].
-    pub const ALL: [WriteOwner; 4] = [
+    pub const ALL: [WriteOwner; 5] = [
         WriteOwner::Query,
         WriteOwner::BaseRelation,
         WriteOwner::MergedIndex,
         WriteOwner::RequestedSlice,
+        WriteOwner::PartnerTrace,
     ];
 
     /// A stable lower-case name, used as a key in reports.
@@ -74,6 +78,7 @@ impl WriteOwner {
             WriteOwner::BaseRelation => "base_relation",
             WriteOwner::MergedIndex => "merged_index",
             WriteOwner::RequestedSlice => "requested_slice",
+            WriteOwner::PartnerTrace => "partner_trace",
         }
     }
 

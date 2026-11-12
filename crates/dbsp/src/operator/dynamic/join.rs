@@ -1602,13 +1602,16 @@ where
 ///
 /// Sampling is skipped when the smaller input is below [`MIN_KEYS_TO_SAMPLE`]:
 /// at that size neither side is expensive to drive.
-fn estimate_input_key_counts<D, T>(delta: &D, trace: &T) -> (usize, usize)
+///
+/// The partner's key count and sample are read under `trace_owner`, so that all partner-side
+/// reads are attributed to it ([`ReadOwnerCursor`]); the delta's stay under the current owner.
+fn estimate_input_key_counts<D, T>(delta: &D, trace: &T, trace_owner: WriteOwner) -> (usize, usize)
 where
     D: BatchReader,
     T: BatchReader,
 {
     let delta_key_count = delta.key_count();
-    let trace_key_count = trace.key_count();
+    let trace_key_count = with_read_owner(trace_owner, || trace.key_count());
 
     if min(delta_key_count, trace_key_count) < MIN_KEYS_TO_SAMPLE {
         return (delta_key_count, trace_key_count);
@@ -1616,7 +1619,7 @@ where
 
     (
         sampled_key_count(delta, delta_key_count),
-        sampled_key_count(trace, trace_key_count),
+        with_read_owner(trace_owner, || sampled_key_count(trace, trace_key_count)),
     )
 }
 
@@ -1768,6 +1771,15 @@ where
             // to the delta's keys, and a saturating join synthesizes values for
             // trace keys the delta does not hold, so both force the delta to
             // drive and neither needs the estimate.
+            // The partner side's reads are attributed to one read owner: the requested
+            // slice when a snapshot reader supplies the partner, else the partner trace.
+            // The delta's stay with the current owner (`query`).
+            let trace_owner = if self.snapshot_reader.is_some() {
+                WriteOwner::RequestedSlice
+            } else {
+                WriteOwner::PartnerTrace
+            };
+
             // A partner supplied by a snapshot reader holds only the rows that
             // the delta requests, so the delta drives, and the partner is not
             // sampled: its reads are not the operator's.
@@ -1775,7 +1787,7 @@ where
                 false
             } else {
                 let (delta_key_count, trace_key_count) =
-                    estimate_input_key_counts(&delta, &trace);
+                    estimate_input_key_counts(&delta, &trace, trace_owner);
                 delta_key_count > trace_key_count
             };
 
@@ -1787,13 +1799,12 @@ where
                 Box::new(trace.cursor())
             };
 
-            // The partner's calls interleave with the delta cursor's, so each
-            // is charged to the requested-slice owner on its own.
-            let trace_cursor: Box<dyn Cursor<_, _, _, _> + '_> = if self.snapshot_reader.is_some() {
-                Box::new(ReadOwnerCursor::new(WriteOwner::RequestedSlice, trace_cursor))
-            } else {
-                trace_cursor
-            };
+            // The partner's calls interleave with the delta cursor's, so each is charged to
+            // `trace_owner` on its own. The adapter runs on every DBSP join: each delegated
+            // call costs one thread-local swap and one restore (in a drop guard, so a panic
+            // restores the owner), and allocates nothing beyond the one box per evaluation.
+            let trace_cursor: Box<dyn Cursor<_, _, _, _> + '_> =
+                Box::new(ReadOwnerCursor::new(trace_owner, trace_cursor));
 
             let trace_cursor = SaturatingCursor::new(
                 self.saturate,
@@ -1997,6 +2008,7 @@ mod key_count_estimate_test {
     use crate::{
         ZWeight,
         dynamic::DynData,
+        storage::write_attribution::WriteOwner,
         trace::{BatchReader, BatchReaderFactories, SpineSnapshot},
         typed_batch::{DynOrdIndexedZSet, OrdIndexedZSet},
         utils::Tup2,
@@ -2053,7 +2065,7 @@ mod key_count_estimate_test {
 
         assert_eq!(delta.key_count(), 2 * N as usize);
 
-        let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+        let (delta_keys, _) = estimate_input_key_counts(&delta, &trace, WriteOwner::PartnerTrace);
         assert_eq!(delta_keys, 0);
     }
 
@@ -2076,7 +2088,7 @@ mod key_count_estimate_test {
 
         const DRAWS: usize = 50;
         let mean = (0..DRAWS)
-            .map(|_| estimate_input_key_counts(&delta, &trace).0)
+            .map(|_| estimate_input_key_counts(&delta, &trace, WriteOwner::PartnerTrace).0)
             .sum::<usize>()
             / DRAWS;
 
@@ -2102,7 +2114,8 @@ mod key_count_estimate_test {
 
             assert_eq!(delta.key_count(), N as usize);
 
-            let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+            let (delta_keys, _) =
+                estimate_input_key_counts(&delta, &trace, WriteOwner::PartnerTrace);
             assert_eq!(delta_keys, N as usize, "batch_count={batch_count}");
         }
     }
@@ -2125,7 +2138,8 @@ mod key_count_estimate_test {
             let key_count = delta.key_count();
             assert_eq!(key_count, batch_count * (N / 2) as usize);
 
-            let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+            let (delta_keys, _) =
+                estimate_input_key_counts(&delta, &trace, WriteOwner::PartnerTrace);
             assert_within(delta_keys, key_count, 5);
         }
     }
@@ -2139,7 +2153,8 @@ mod key_count_estimate_test {
         let delta = snapshot(vec![rows(0..N, 1)]);
         let trace = snapshot(vec![rows(0..N, 1)]);
 
-        let (delta_keys, trace_keys) = estimate_input_key_counts(&delta, &trace);
+        let (delta_keys, trace_keys) =
+            estimate_input_key_counts(&delta, &trace, WriteOwner::PartnerTrace);
         assert_eq!(delta_keys, N as usize);
         assert_eq!(trace_keys, N as usize);
     }
@@ -2289,6 +2304,54 @@ pub(crate) mod test {
         // The query's reads are the delta's alone: the same whatever the partner.
         assert_eq!(small[query], large[query]);
         assert!(small[query].memory_key_reads > 0);
+        // The native owner reads nothing here.
+        assert_eq!(small[WriteOwner::PartnerTrace.index()], Default::default());
+    }
+
+    /// In native mode the join's reads of its trace are the `partner_trace` owner's, and its
+    /// delta's stay with `query`: doubling the trace's rows changes the former and not the latter.
+    #[cfg(feature = "backend-mode")]
+    #[test]
+    fn native_join_charges_trace_reads_to_the_partner_trace() {
+        use crate::storage::write_attribution::WriteOwner;
+
+        fn reads(partner_rows: &[(u64, u64)]) -> [crate::trace::RunReads; WriteOwner::ALL.len()] {
+            let (mut circuit, (left_input, right_input)) =
+                Runtime::init_circuit(CircuitConfig::from(1), move |circuit| {
+                    let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                    let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                    left.join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                        .accumulate_output();
+                    Ok((left_input, right_input))
+                })
+                .unwrap();
+            right_input.append(
+                &mut partner_rows
+                    .iter()
+                    .map(|&(key, value)| Tup2(key, Tup2(value, 1)))
+                    .collect(),
+            );
+            circuit.transaction().unwrap();
+            let before = circuit.run_reads().unwrap();
+            left_input.append(&mut vec![Tup2(1, Tup2(2, 1))]);
+            circuit.transaction().unwrap();
+            let after = circuit.run_reads().unwrap();
+            circuit.kill().unwrap();
+            std::array::from_fn(|i| after[i].since(before[i]))
+        }
+
+        let small = reads(&[(1, 3)]);
+        let large = reads(&[(1, 3), (1, 4), (1, 5), (1, 6)]);
+        let (trace, query) = (WriteOwner::PartnerTrace.index(), WriteOwner::Query.index());
+        assert!(small[trace].memory_weight_reads > 0);
+        assert!(large[trace].memory_weight_reads > small[trace].memory_weight_reads);
+        // The delta's reads are the same whatever the trace holds.
+        assert!(small[query].memory_key_reads > 0);
+        assert_eq!(small[query], large[query]);
+        assert_eq!(
+            small[WriteOwner::RequestedSlice.index()],
+            Default::default()
+        );
     }
 
     fn do_join_test(workers: usize, transaction: bool, balanced: bool) {

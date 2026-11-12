@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn reads_count_for_the_query_by_default() {
-        let (total, [query, base, index, _]) = reads_by_owner(count_seek);
+        let (total, [query, base, index, ..]) = reads_by_owner(count_seek);
         assert_eq!(total, ONE_SEEK);
         assert_eq!(query, ONE_SEEK);
         assert_eq!(base, RunReads::default());
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_read_scope_attributes_its_reads() {
-        let (total, [query, _, index, _]) = reads_by_owner(|| {
+        let (total, [query, _, index, ..]) = reads_by_owner(|| {
             with_read_owner(WriteOwner::MergedIndex, count_seek);
             count_seek();
         });
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn nested_scopes_restore_the_outer_owner() {
-        let (_, [query, base, index, _]) = reads_by_owner(|| {
+        let (_, [query, base, index, ..]) = reads_by_owner(|| {
             with_read_owner(WriteOwner::MergedIndex, || {
                 with_read_owner(WriteOwner::BaseRelation, count_seek);
                 assert_eq!(current_read_owner(), WriteOwner::MergedIndex);
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn a_panic_restores_the_owner() {
-        let (_, [query, _, index, _]) = reads_by_owner(|| {
+        let (_, [query, _, index, ..]) = reads_by_owner(|| {
             let result = std::panic::catch_unwind(|| {
                 with_read_owner(WriteOwner::MergedIndex, || panic!("inside the scope"))
             });

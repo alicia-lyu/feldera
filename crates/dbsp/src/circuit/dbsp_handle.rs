@@ -1057,7 +1057,10 @@ impl Runtime {
                     }
                     Ok(Command::RunReads) => {
                         let reads = WriteOwner::ALL.map(RunReads::current_for);
-                        if status_sender.send(Ok(Response::RunReads(reads))).is_err() {
+                        if status_sender
+                            .send(Ok(Response::RunReads(Box::new(reads))))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1525,7 +1528,7 @@ enum Response {
     BootstrapComplete(bool),
     IsCompactionComplete(bool),
     IsBackgroundMergeIdle(bool),
-    RunReads([RunReads; WriteOwner::ALL.len()]),
+    RunReads(Box<[RunReads; WriteOwner::ALL.len()]>),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2803,7 +2806,7 @@ impl DBSPHandle {
         let mut reads = [RunReads::default(); WriteOwner::ALL.len()];
         self.broadcast_command(Command::RunReads, |_, response| {
             if let Response::RunReads(worker_reads) = response {
-                for (total, worker) in reads.iter_mut().zip(worker_reads) {
+                for (total, worker) in reads.iter_mut().zip(*worker_reads) {
                     *total += worker;
                 }
             }
@@ -3675,8 +3678,9 @@ pub(crate) mod tests {
         circuit.transaction().unwrap();
         let after = circuit.run_reads().unwrap();
         let read = |owner: WriteOwner| after[owner.index()].since(before[owner.index()]);
-        assert!(read(WriteOwner::Query).seeks > 0);
-        assert!(read(WriteOwner::Query).key_decodes > 0);
+        // The join's probes of its trace are the partner trace's reads.
+        assert!(read(WriteOwner::PartnerTrace).seeks > 0);
+        assert!(read(WriteOwner::PartnerTrace).key_decodes > 0);
         assert_eq!(read(WriteOwner::MergedIndex), RunReads::default());
         assert_eq!(read(WriteOwner::BaseRelation), RunReads::default());
 
