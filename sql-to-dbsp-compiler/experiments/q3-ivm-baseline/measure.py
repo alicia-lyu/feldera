@@ -26,6 +26,11 @@ WRITE_OWNERS = ("query", "base_relation", "merged_index")
 INDEX_READERS = ("session",)
 RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes",
                    "memory_key_reads", "memory_value_reads", "memory_weight_reads")
+# The scan session's moves per transaction (`SessionCounts`, measurement version 8).
+SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_steps", "positions",
+                        "payload_decodes_old", "payload_decodes_dlt", "cancelled")
+# How the reconstructed build's scan session passes untouched groups (`--session-pass`).
+SESSION_PASSES = ("seek", "step")
 
 
 def sha256(path: Path) -> str:
@@ -112,6 +117,85 @@ def index_read_problems(report: dict[str, Any]) -> list[str]:
     if summed is not None and not problems and summed != total:
         problems.append("sequence: index_run_reads are not the sums of the refreshes'")
     return problems
+
+
+def counter_problems(report: dict[str, Any], key: str, fields: tuple[str, ...]) -> list[str]:
+    """List where a driver report's per-refresh merged-index counters `key` are malformed.
+
+    A reconstructed report gives, for each refresh and for the sequence, every one of
+    `fields` as a non-negative integer, and the sequence's counts are the sums of the
+    refreshes'. A native report has no merged index, so all of them are `null`. A
+    report that names neither mode is not checked here.
+    """
+    mode = report.get("mode")
+    if mode not in ("native", "reconstructed"):
+        return []
+    places = [(f"refresh {item.get('refresh')}", item.get(key))
+              for item in report.get("refreshes", [])]
+    sequence = report.get("sequence", {}).get(key)
+    if mode == "native":
+        return [f"{place}: a native run reports {key}"
+                for place, value in [*places, ("sequence", sequence)] if value is not None]
+    problems: list[str] = []
+
+    def counts(place: str, found: Any) -> dict[str, int] | None:
+        values = {}
+        for field in fields:
+            value = found.get(field) if isinstance(found, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                problems.append(f"{place}: {key}.{field} is {value!r}")
+                return None
+            values[field] = value
+        return values
+
+    total = {field: 0 for field in fields}
+    for place, found in places:
+        for field, value in (counts(place, found) or {}).items():
+            total[field] += value
+    summed = counts("sequence", sequence)
+    if summed is not None and not problems and summed != total:
+        problems.append(f"sequence: {key} are not the sums of the refreshes'")
+    return problems
+
+
+def profiled_cpu_problems(report: dict[str, Any]) -> list[str]:
+    """List the refreshes whose CPU-profiler times (`profiled_cpu_ms.base` and `.q3`, both
+    modes, measurement version 6) are missing or not finite non-negative numbers."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    problems: list[str] = []
+    for item in report.get("refreshes", []):
+        cpu = item.get("profiled_cpu_ms")
+        for circuit in ("base", "q3"):
+            value = cpu.get(circuit) if isinstance(cpu, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value) or value < 0:
+                problems.append(f"refresh {item.get('refresh')}: "
+                                f"profiled_cpu_ms.{circuit} is {value!r}")
+    return problems
+
+
+def session_pass_problems(report: dict[str, Any], session_pass: str) -> list[str]:
+    """List a mismatch between the pass the runner asked for and the one the driver
+    reports: a reconstructed run reports it, and a native run, which has no scan
+    session, reports `null`."""
+    mode = report.get("mode")
+    if mode not in ("native", "reconstructed"):
+        return []
+    expected = session_pass if mode == "reconstructed" else None
+    reported = report.get("configuration", {}).get("session_pass")
+    if reported != expected:
+        return [f"configuration.session_pass is {reported!r}, expected {expected!r}"]
+    return []
+
+
+def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
+    """Every consistency check of one driver report."""
+    return (owner_write_problems(report) + index_read_problems(report)
+            + view_read_problems(report)
+            + counter_problems(report, "index_session_counts", SESSION_COUNT_FIELDS)
+            + counter_problems(report, "index_upkeep_run_reads", RUN_READ_FIELDS)
+            + profiled_cpu_problems(report) + session_pass_problems(report, session_pass))
 
 
 def view_read_problems(report: dict[str, Any]) -> list[str]:
@@ -246,33 +330,29 @@ def verify_membership(group: Path) -> None:
         raise RuntimeError("swap is enabled in run cgroup")
 
 
-def private_inputs(spec: dict[str, Any]) -> dict[str, str]:
-    """Copy all inputs inside the process cgroup, before driver startup."""
-    destination = Path(spec["run_dir"]) / "input"
-    destination.mkdir(parents=True)
-    copied: dict[str, str] = {}
+def file_identity(path: Path) -> dict[str, int]:
+    """The size and modification time of an input, which a run checks in place of a hash."""
+    status = path.stat()
+    return {"size": status.st_size, "mtime_ns": status.st_mtime_ns}
+
+
+def unchanged_inputs(spec: dict[str, Any]) -> None:
+    """Check that every shared input is the file the campaign hashed.
+
+    Every run of every campaign reads the same input files in place, so none is copied
+    (user decision of 2026-11-11). The campaign hashes each input once; a run checks
+    only that its size and modification time are those recorded beside the hash.
+    """
     for name, raw in spec["inputs"].items():
-        source = Path(raw)
-        target = destination / f"{name}{source.suffix}"
-        shutil.copyfile(source, target)
-        expected = spec["input_hashes"][name]
-        if sha256(target) != expected:
-            raise RuntimeError(f"private copy of {name} differs from recorded input hash")
-        copied[name] = str(target)
-    refreshes = []
-    for number, entry in enumerate(spec["refreshes"]):
-        refreshes.append({key: copied[f"refresh_{number}_{key}"] for key in entry})
-    refresh_path = destination / "refreshes.json"
-    write_json(refresh_path, refreshes)
-    copied["refresh_list"] = str(refresh_path)
-    return copied
+        if file_identity(Path(raw)) != spec["input_identities"][name]:
+            raise RuntimeError(f"input {name} changed after the campaign hashed it")
 
 
 def evict_from_page_cache(paths: list[Path]) -> dict[str, Any]:
     """Drop the page-cache pages of `paths` (Linux `posix_fadvise(DONTNEED)`).
 
-    Each file is first flushed with `fsync`, because dirty pages (the private copies,
-    just written) are not dropped. Failures are recorded per file, not raised, so
+    Each file is first flushed with `fsync`, because dirty pages (of a file just
+    written) are not dropped. Failures are recorded per file, not raised, so
     that an unsupported filesystem cannot abort a campaign. Where `os.posix_fadvise`
     does not exist (macOS), nothing is done and `evicted` is false.
     """
@@ -299,16 +379,18 @@ def run_inside_cgroup(spec_path: Path) -> None:
     verify_membership(group)
     if (group / "memory.max").read_text().strip() != str(spec["total_memory_bytes"]):
         raise RuntimeError("run cgroup has an unexpected total memory limit")
-    copied = private_inputs(spec)
-    # Start the driver with neither the sources nor their copies in the page cache.
-    write_json(Path(spec["run_dir"]) / "input-eviction.json", evict_from_page_cache(
-        [Path(raw) for raw in spec["inputs"].values()] + [Path(raw) for raw in copied.values()]))
+    unchanged_inputs(spec)
+    # Each run starts cold: no page of the shared inputs that an earlier run, or the
+    # campaign's hashing, left in the page cache survives into this one. The driver's
+    # reads then fault the pages again, charged to this run's cgroup.
+    eviction = evict_from_page_cache([Path(raw) for raw in spec["inputs"].values()])
+    write_json(Path(spec["run_dir"]) / "input-eviction.json", eviction)
     write_json(Path(spec["run_dir"]) / "cgroup-proof.json", {
         "cgroup": str(group), "memory_max": spec["total_memory_bytes"],
         "memory_swap_max": 0, "membership_verified": True,
-        "private_input_hashes_verified": True,
+        "input_identities_verified": True, "inputs_evicted": eviction["evicted"],
     })
-    command = driver_command(spec, copied)
+    command = driver_command(spec, spec["inputs"])
     os.execv(command[0], command)
 
 
@@ -340,6 +422,7 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.append("--front-code-byte-keys")
     if args.get("elide_value_headers"):
         command.append("--elide-value-headers")
+    command.extend(["--session-pass", args.get("session_pass", "seek")])
     return command
 
 
@@ -349,11 +432,9 @@ def build_executables(destination: Path) -> dict[str, Path]:
     if not cargo_target.is_absolute():
         cargo_target = (EXPERIMENT / cargo_target).resolve()
     binaries: dict[str, Path] = {}
+    # One generation serves both builds: the reconstructed view circuit is written by hand.
+    subprocess.run([str(EXPERIMENT / "generate.sh")], cwd=EXPERIMENT, check=True)
     for mode in MODES:
-        generate = [str(EXPERIMENT / "generate.sh")]
-        if mode == "merged-index":
-            generate.append("--q3-merged-index")
-        subprocess.run(generate, cwd=EXPERIMENT, check=True)
         build = ["cargo", "+1.96.1", "build", "--release", "--offline", "--locked", "-j2"]
         if mode == "merged-index":
             build.extend(["--features", "merged-index"])
@@ -366,13 +447,17 @@ def build_executables(destination: Path) -> dict[str, Path]:
 
 
 def qualification(system: str, limit: int | None, result: dict[str, Any],
-                  verify: bool = False, enforced: bool = False) -> dict[str, Any]:
+                  verify: bool = False, enforced: bool = False,
+                  cold: bool = False) -> dict[str, Any]:
     if system != "Linux":
         return {"status": "smoke", "reason": "total memory is not enforced on macOS"}
     if limit is None:
         return {"status": "nonqualifying", "reason": "no cgroup v2 total memory limit"}
     if not enforced:
         return {"status": "nonqualifying", "reason": "cgroup enforcement was not verified"}
+    if not cold:
+        return {"status": "nonqualifying",
+                "reason": "the shared inputs were not evicted from the page cache before the run"}
     if verify:
         return {"status": "nonqualifying", "reason": "independent verification was enabled"}
     loaded = result.get("load", {}).get("observed_storage_bytes")
@@ -392,9 +477,12 @@ def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
     swap_max_path = group / "memory.swap.max"
     memory_max = memory_max_path.read_text().strip() if memory_max_path.is_file() else None
     swap_max = swap_max_path.read_text().strip() if swap_max_path.is_file() else None
-    enforced = proof == {
+    # The proof's `inputs_evicted` is checked by `qualification`, not here: it is the
+    # run's cold start, not the cgroup's enforcement.
+    enforced = isinstance(proof, dict) and {
+        key: value for key, value in proof.items() if key != "inputs_evicted"} == {
         "cgroup": str(group), "memory_max": limit, "memory_swap_max": 0,
-        "membership_verified": True, "private_input_hashes_verified": True,
+        "membership_verified": True, "input_identities_verified": True,
     } and memory_max == str(limit) and swap_max == "0"
     counters = {}
     for name in ("memory.peak", "memory.events", "io.stat"):
@@ -428,6 +516,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="drop the redundant 16-byte header of every byte-string value in "
                              "storage files, and rebuild it on read (the merged index's value "
                              "level); native runs have no such values")
+    parser.add_argument("--session-pass", choices=SESSION_PASSES, default="seek",
+                        help="how the reconstructed build's scan session passes the untouched "
+                             "groups (default seek); native runs have no scan session")
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
@@ -464,6 +555,7 @@ def run(argv: list[str]) -> int:
                           "setup_full_compaction": args.setup_full_compaction,
                           "front_code_byte_keys": args.front_code_byte_keys,
                           "elide_value_headers": args.elide_value_headers,
+                          "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
         "inputs": {}, "executables": {}, "runs": [], "errors": [],
@@ -483,7 +575,8 @@ def run(argv: list[str]) -> int:
         for name, path in inputs.items():
             if not path.is_file():
                 raise FileNotFoundError(path)
-            manifest["inputs"][name] = {"path": str(path), "sha256": sha256(path)}
+            manifest["inputs"][name] = {"path": str(path), "sha256": sha256(path),
+                                        **file_identity(path)}
         if args.cgroup_root:
             cgroup_available(args.cgroup_root)
         binaries = build_executables(EXPERIMENT / "target" / "r5-executables" / campaign_id)
@@ -498,8 +591,9 @@ def run(argv: list[str]) -> int:
                 manifest["runs"].append(record)
                 spec = {"run_dir": str(run_dir), "executable": str(binaries[mode]),
                         "refreshes": refreshes, "inputs": {k: str(v) for k, v in inputs.items()},
-                        "input_hashes": {k: item["sha256"]
-                                         for k, item in manifest["inputs"].items()},
+                        "input_identities": {
+                            k: {"size": item["size"], "mtime_ns": item["mtime_ns"]}
+                            for k, item in manifest["inputs"].items()},
                         "args": {"cache_bytes": args.cache_bytes,
                                  "batch": args.batch,
                                  "memory_target_bytes": args.memory_target_bytes,
@@ -508,7 +602,8 @@ def run(argv: list[str]) -> int:
                                  "diagnostics": args.diagnostics,
                                  "setup_full_compaction": args.setup_full_compaction,
                                  "front_code_byte_keys": args.front_code_byte_keys,
-                                 "elide_value_headers": args.elide_value_headers}}
+                                 "elide_value_headers": args.elide_value_headers,
+                                 "session_pass": args.session_pass}}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",
@@ -521,8 +616,7 @@ def run(argv: list[str]) -> int:
                     completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True,
                                                text=True, preexec_fn=lambda: enter_cgroup(group))
                 else:
-                    command = driver_command(spec, {**spec["inputs"],
-                        "refresh_list": str(args.refresh_list.resolve())})
+                    command = driver_command(spec, spec["inputs"])
                     completed = subprocess.run(command, cwd=EXPERIMENT,
                                                capture_output=True, text=True)
                 record["returncode"] = completed.returncode
@@ -537,14 +631,14 @@ def run(argv: list[str]) -> int:
                 record["driver"] = raw
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
-                problems = (owner_write_problems(raw) + index_read_problems(raw)
-                            + view_read_problems(raw))
+                problems = report_problems(raw, args.session_pass)
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))
                 record["qualification"] = qualification(platform.system(),
                     args.total_memory_bytes, raw, verify=not args.no_verify,
-                    enforced=record.get("cgroup", {}).get("enforced", False))
+                    enforced=record.get("cgroup", {}).get("enforced", False),
+                    cold=(record.get("cgroup", {}).get("proof") or {}).get("inputs_evicted", False))
                 record["status"] = "complete"
                 write_json(report, manifest)
         manifest["status"] = "complete"

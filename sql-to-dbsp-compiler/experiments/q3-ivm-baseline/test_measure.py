@@ -120,15 +120,18 @@ class MeasureTest(unittest.TestCase):
     def test_linux_qualification_requires_storage_larger_than_limit(self) -> None:
         below = {"load": {"observed_storage_bytes": 100}}
         above = {"load": {"observed_storage_bytes": 101}}
-        self.assertEqual(measure.qualification("Linux", 100, below, enforced=True)["status"],
-                         "nonqualifying")
-        self.assertEqual(measure.qualification("Linux", 100, above, enforced=True)["status"],
-                         "qualifying")
+        self.assertEqual(measure.qualification("Linux", 100, below, enforced=True,
+                                               cold=True)["status"], "nonqualifying")
+        self.assertEqual(measure.qualification("Linux", 100, above, enforced=True,
+                                               cold=True)["status"], "qualifying")
+        warm = measure.qualification("Linux", 100, above, enforced=True)
+        self.assertEqual(warm["status"], "nonqualifying")
+        self.assertIn("not evicted", warm["reason"])
         self.assertEqual(measure.qualification("Darwin", 100, above)["status"], "smoke")
         self.assertEqual(measure.qualification("Linux", None, above)["status"],
                          "nonqualifying")
         self.assertEqual(measure.qualification("Linux", 100, above, verify=True,
-                                               enforced=True)["status"],
+                                               enforced=True, cold=True)["status"],
                          "nonqualifying")
         self.assertEqual(measure.qualification("Linux", 100, above)["status"],
                          "nonqualifying")
@@ -137,7 +140,7 @@ class MeasureTest(unittest.TestCase):
         report = {"measurement_version": 2,
                   "load": {"observed_storage_bytes": 99},
                   "sequence": {"observed_storage_bytes": 1_000_000}}
-        result = measure.qualification("Linux", 100, report, enforced=True)
+        result = measure.qualification("Linux", 100, report, enforced=True, cold=True)
         self.assertEqual(result["status"], "nonqualifying")
         self.assertIn("loaded storage", result["reason"])
 
@@ -145,30 +148,28 @@ class MeasureTest(unittest.TestCase):
         for loaded in (None, True, -1, "101"):
             with self.subTest(loaded=loaded):
                 report = {"load": {"observed_storage_bytes": loaded}}
-                result = measure.qualification("Linux", 100, report, enforced=True)
+                result = measure.qualification("Linux", 100, report, enforced=True, cold=True)
                 self.assertEqual(result["status"], "nonqualifying")
 
-    def test_private_input_copy_rewrites_refresh_paths(self) -> None:
+    def shared_input_spec(self, run_dir: Path) -> dict:
+        """A run spec over the shared inputs, with the identities the campaign recorded."""
         refreshes, files = measure.refresh_inputs(self.refresh)
-        spec = {"run_dir": str(self.root / "private-run"), "refreshes": refreshes,
+        spec = {"run_dir": str(run_dir), "refreshes": refreshes,
                 "inputs": {**{key: str(self.root / key)
                                for key in ("customer", "orders", "lineitem")},
-                           **{key: str(path) for key, path in files.items()}}}
-        spec["input_hashes"] = {key: measure.sha256(Path(path))
-                                for key, path in spec["inputs"].items()}
-        copied = measure.private_inputs(spec)
-        self.assertEqual(Path(copied["customer"]).read_text(), "customer")
-        private_refresh = json.loads(Path(copied["refresh_list"]).read_text())
-        self.assertEqual(Path(private_refresh[1]["rf2"]).read_text(), "rf2")
-        self.assertTrue(all(str(self.root / "private-run") in value
-                            for entry in private_refresh for value in entry.values()))
+                           **{key: str(path) for key, path in files.items()},
+                           "refresh_list": str(self.refresh)}}
+        spec["input_identities"] = {key: measure.file_identity(Path(path))
+                                    for key, path in spec["inputs"].items()}
+        return spec
 
-    def test_private_copy_rejects_changed_source(self) -> None:
-        spec = {"run_dir": str(self.root / "changed"),
-                "inputs": {"customer": str(self.root / "customer")},
-                "input_hashes": {"customer": "0" * 64}, "refreshes": []}
-        with self.assertRaisesRegex(RuntimeError, "differs from recorded input hash"):
-            measure.private_inputs(spec)
+    def test_shared_inputs_are_read_in_place_and_checked_unchanged(self) -> None:
+        spec = self.shared_input_spec(self.root / "shared-run")
+        measure.unchanged_inputs(spec)
+        self.assertFalse((self.root / "shared-run").exists(), "nothing is copied")
+        (self.root / "customer").write_text("customer, rewritten")
+        with self.assertRaisesRegex(RuntimeError, "input customer changed"):
+            measure.unchanged_inputs(spec)
 
     def test_eviction_advises_dontneed_on_every_file_after_flushing(self) -> None:
         paths = [self.root / "customer", self.root / "orders", self.root / "customer"]
@@ -204,21 +205,16 @@ class MeasureTest(unittest.TestCase):
         self.assertFalse(result["evicted"])
         self.assertIn("unavailable", result["reason"])
 
-    def test_cgroup_child_evicts_sources_and_copies(self) -> None:
-        refreshes, files = measure.refresh_inputs(self.refresh)
+    def test_cgroup_child_starts_cold_by_evicting_the_shared_inputs(self) -> None:
         group = self.root / "cgroup-evict"
         group.mkdir()
         (group / "memory.max").write_text("4096")
-        spec = {"run_dir": str(self.root / "evict-run"), "cgroup": str(group),
+        run_dir = self.root / "evict-run"
+        run_dir.mkdir()
+        spec = {**self.shared_input_spec(run_dir), "cgroup": str(group),
                 "total_memory_bytes": 4096, "executable": "/bin/driver",
-                "refreshes": refreshes,
-                "inputs": {**{key: str(self.root / key)
-                               for key in ("customer", "orders", "lineitem")},
-                           **{key: str(path) for key, path in files.items()}},
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
                          "compaction_timeout_secs": 5, "no_verify": True}}
-        spec["input_hashes"] = {key: measure.sha256(Path(path))
-                                for key, path in spec["inputs"].items()}
         spec_path = self.root / "evict-spec.json"
         spec_path.write_text(json.dumps(spec))
         with patch.object(measure, "verify_membership"), \
@@ -228,11 +224,10 @@ class MeasureTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop"):
                 measure.run_inside_cgroup(spec_path)
         evicted = {str(path) for path in evict.call_args.args[0]}
-        run_input = self.root / "evict-run" / "input"
-        self.assertIn(str(self.root / "customer"), evicted)
-        self.assertIn(str(run_input / "customer"), evicted)
-        self.assertIn(str(run_input / "refreshes.json"), evicted)
-        self.assertTrue((self.root / "evict-run" / "input-eviction.json").is_file())
+        self.assertEqual(evicted, set(spec["inputs"].values()))
+        self.assertTrue((run_dir / "input-eviction.json").is_file())
+        proof = json.loads((run_dir / "cgroup-proof.json").read_text())
+        self.assertTrue(proof["inputs_evicted"])
 
     def test_cgroup_limit_and_swap_are_checked(self) -> None:
         group = measure.configure_cgroup(self.root, "run", 1024)
@@ -241,22 +236,16 @@ class MeasureTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             measure.cgroup_available(self.root)
 
-    def test_cgroup_child_copies_before_driver_exec(self) -> None:
-        refreshes, files = measure.refresh_inputs(self.refresh)
+    def test_cgroup_child_runs_the_driver_on_the_shared_inputs(self) -> None:
         group = self.root / "cgroup"
         group.mkdir()
         (group / "memory.max").write_text("4096")
         run_dir = self.root / "run"
-        spec = {"run_dir": str(run_dir), "cgroup": str(group),
+        run_dir.mkdir()
+        spec = {**self.shared_input_spec(run_dir), "cgroup": str(group),
                 "total_memory_bytes": 4096, "executable": "/bin/driver",
-                "refreshes": refreshes,
-                "inputs": {**{key: str(self.root / key)
-                               for key in ("customer", "orders", "lineitem")},
-                           **{key: str(path) for key, path in files.items()}},
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
                          "compaction_timeout_secs": 5, "no_verify": True}}
-        spec["input_hashes"] = {key: measure.sha256(Path(path))
-                                for key, path in spec["inputs"].items()}
         spec_path = self.root / "spec.json"
         spec_path.write_text(json.dumps(spec))
         with patch.object(measure, "verify_membership") as membership, \
@@ -266,9 +255,9 @@ class MeasureTest(unittest.TestCase):
         membership.assert_called_once_with(group)
         command = execute.call_args.args[1]
         self.assertEqual(command[0], "/bin/driver")
-        customer = Path(command[command.index("--customer") + 1])
-        self.assertEqual(customer.read_text(), "customer")
-        self.assertTrue(customer.is_relative_to(run_dir / "input"))
+        self.assertEqual(command[command.index("--customer") + 1], str(self.root / "customer"))
+        self.assertEqual(command[command.index("--refresh-list") + 1], str(self.refresh))
+        self.assertFalse((run_dir / "input").exists(), "nothing is copied")
         self.assertEqual(command[command.index("--batch") + 1], "10000")
         evidence = measure.cgroup_evidence(group, run_dir, 4096)
         self.assertFalse(evidence["enforced"])
@@ -476,6 +465,102 @@ class MeasureTest(unittest.TestCase):
         # Key front coding and value-header elision are independent switches.
         self.assertFalse(
             measure.parse_args([*self.args, "--elide-value-headers"]).front_code_byte_keys)
+
+    @staticmethod
+    def counter_report(key: str, fields: tuple[str, ...], mode: str = "reconstructed") -> dict:
+        """A report whose sequence counters `key` are the sums of its two refreshes'."""
+        if mode == "native":
+            return {"mode": "native", "sequence": {key: None},
+                    "refreshes": [{"refresh": 1, key: None}]}
+        return {"mode": mode, "sequence": {key: {field: 3 for field in fields}},
+                "refreshes": [{"refresh": number, key: {field: number for field in fields}}
+                              for number in (1, 2)]}
+
+    def test_session_counts_and_upkeep_reads_are_complete_and_sum_to_the_sequence(self) -> None:
+        for key, fields in (("index_session_counts", measure.SESSION_COUNT_FIELDS),
+                            ("index_upkeep_run_reads", measure.RUN_READ_FIELDS)):
+            with self.subTest(key=key):
+                self.assertEqual(measure.counter_problems(
+                    self.counter_report(key, fields), key, fields), [])
+                self.assertEqual(measure.counter_problems(
+                    self.counter_report(key, fields, "native"), key, fields), [])
+
+                unsummed = self.counter_report(key, fields)
+                unsummed["sequence"][key][fields[0]] = 4
+                self.assertIn("not the sums",
+                              measure.counter_problems(unsummed, key, fields)[0])
+
+                missing = self.counter_report(key, fields)
+                del missing["refreshes"][1][key][fields[-1]]
+                self.assertIn(f"refresh 2: {key}.{fields[-1]} is None",
+                              measure.counter_problems(missing, key, fields)[0])
+
+                negative = self.counter_report(key, fields)
+                negative["refreshes"][0][key][fields[0]] = -1
+                self.assertIn("is -1", measure.counter_problems(negative, key, fields)[0])
+
+                native = self.counter_report(key, fields, "native")
+                native["sequence"][key] = {}
+                self.assertIn(f"a native run reports {key}",
+                              measure.counter_problems(native, key, fields)[0])
+
+    def test_profiled_cpu_times_are_required_in_both_modes(self) -> None:
+        for mode in ("native", "reconstructed"):
+            report = {"mode": mode, "refreshes": [
+                {"refresh": 1, "profiled_cpu_ms": {"base": 0.5, "q3": 0}}]}
+            self.assertEqual(measure.profiled_cpu_problems(report), [])
+            report["refreshes"][0]["profiled_cpu_ms"] = {"base": float("nan"), "q3": -1}
+            self.assertEqual(len(measure.profiled_cpu_problems(report)), 2)
+            report["refreshes"][0]["profiled_cpu_ms"] = None
+            self.assertIn("profiled_cpu_ms.base is None",
+                          measure.profiled_cpu_problems(report)[0])
+
+    def test_reported_session_pass_must_be_the_requested_one(self) -> None:
+        def report(mode: str, reported: object) -> dict:
+            return {"mode": mode, "configuration": {"session_pass": reported}}
+        self.assertEqual(measure.session_pass_problems(report("reconstructed", "step"), "step"), [])
+        self.assertIn("expected 'step'",
+                      measure.session_pass_problems(report("reconstructed", "seek"), "step")[0])
+        # Native has no scan session, whatever the runner asked for.
+        self.assertEqual(measure.session_pass_problems(report("native", None), "step"), [])
+        self.assertIn("expected None",
+                      measure.session_pass_problems(report("native", "seek"), "seek")[0])
+
+    def test_session_pass_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "session_pass": "step"}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        command = measure.driver_command(spec, inputs)
+        self.assertEqual(command[command.index("--session-pass") + 1], "step")
+        del spec["args"]["session_pass"]
+        command = measure.driver_command(spec, inputs)
+        self.assertEqual(command[command.index("--session-pass") + 1], "seek")
+        self.assertEqual(measure.parse_args(self.args).session_pass, "seek")
+        self.assertEqual(
+            measure.parse_args([*self.args, "--session-pass", "step"]).session_pass, "step")
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            measure.parse_args([*self.args, "--session-pass", "Seek"])
+
+    def test_both_builds_share_one_generation_without_options(self) -> None:
+        calls = []
+
+        def process(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        release = self.root / "cargo" / "release"
+        release.mkdir(parents=True)
+        (release / "q3-ivm-baseline").write_bytes(b"binary")
+        with patch.dict(measure.os.environ, {"CARGO_TARGET_DIR": str(self.root / "cargo")}), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            binaries = measure.build_executables(self.root / "executables")
+        generations = [command for command in calls if command[0].endswith("generate.sh")]
+        self.assertEqual(generations, [[str(measure.EXPERIMENT / "generate.sh")]])
+        self.assertEqual(set(binaries), set(measure.MODES))
+        builds = [command for command in calls if "build" in command]
+        self.assertEqual(["merged-index" in command for command in builds], [False, True])
 
     def test_cli_rejects_invalid_cache_and_timeout(self) -> None:
         with self.assertRaises(SystemExit):
