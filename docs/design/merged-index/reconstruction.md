@@ -65,11 +65,11 @@ Every delta row the view gets must carry its folded key (A2). A line item folds 
 
 Customers and orders fold from the net delta alone: an order folds at its own `o_custkey`, so customers need no side store. `OrphanLines` is part of base maintenance and sits beside `ManualIndex` as `Pipeline.orphans`. Native accepts orphan lines and never joins them. `prepare` rejects only a net delta that contradicts the state.
 
-`BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs and is not where support is decided. A request outside the touched groups is a broken contract: the reader returns an error and the join's `expect` in `merged-index-col/src/q3.rs` panics the worker. Folded keys stay unique because of the base tables' primary keys.
+`BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs and is not where support is decided. A request outside a reader's requests (the keys of its driving delta, which `capture` and the routing build from `Dlt`) is a broken contract: the partner read returns an error and the join's `expect` in `merged-index-col/src/q3.rs` panics the worker. Folded keys stay unique because of the base tables' primary keys.
 
 ## Cost of reconstruction
 
-The session decodes each touched group once, and collection projects each entry once into the typed rows of each reader that takes it (roadmap step 5 of [shared-traversal.md](shared-traversal.md)). The driving deltas are the readers' `Dlt` batches, moved out (`ΔO`, `ΔL`) or cloned (`ΔC`, which `C⁺` shares), and `C⁺`, `O⁻`, and `L⁻` are the readers' batches themselves; only `J⁺` is copied, row by row, into a partner vector. This copying and decoding is charged to Q3 maintenance. No cost figure is claimed here; see [measurement.md](measurement.md).
+The collection reads `Dlt` once, builds the driving deltas `ΔC`, `ΔO`, and `ΔL` once each, and each reader's requests (`C⁺` requests the customers of `ΔO`, `O⁻` those of `ΔC`, `J⁺` the nodes of `ΔL`), and scans each touched customer's group of `Old` once, reading and decoding only the entries that some reader keeps; each kept entry is unfolded once, straight into its reader's batch (roadmap step 5 of [shared-traversal.md](shared-traversal.md)). The partner batches are the requested slices of the index: `C⁺` holds `Old`'s row and `ΔC`'s rows of the customers of `ΔO`, `O⁻` the orders of the customers of `ΔC`, `J⁺` the joined orders at the nodes of `ΔL` (built at routing), and `L⁻` the lines at the nodes where `ΔJ` has a row. The driving deltas are moved to the circuit's input handles; the routing only borrows them, and nothing is cloned. This copying and decoding is charged to Q3 maintenance. No cost figure is claimed here; see [measurement.md](measurement.md).
 
 ## Verification (R4)
 
@@ -85,7 +85,7 @@ Other tests that bear on reconstruction:
 | Test | Location | Covers |
 | --- | --- | --- |
 | `supplied_snapshot_join_matches_native_signed_updates` | `crates/dbsp/src/operator/dynamic/join.rs` | The supplied-snapshot join equals the native join on simultaneous and multi-step transactions |
-| `readers_match_a_brute_force` (and the other `merged_index::reader` tests) | `crates/dbsp/src/trace/merged_index/reader/tests.rs` | Routing by stream, before and after reads, the driving delta, and no extra payload decode for a second reader |
+| `readers_match_a_brute_force` (and the other `merged_index::reader` tests) | `crates/dbsp/src/trace/merged_index/reader/tests.rs` | The driving deltas and requests of `capture`, the routing of kept entries by folded key, the `RowBuilder`, and one decode for an entry that two readers keep |
 | `Q3MergedIndexBindingTest` | `sql-to-dbsp-compiler/SQL-compiler` | The hook accepts the supported circuit and rejects others |
 | `rf1_rf2_match_full_join` | `q3-ivm-baseline/src/main.rs` | RF1 and RF2 against the full join (reconstructed mode) |
 | `native_deltas_match_full_join_across_updates` | same (both builds) | Customer-only and line-only changes, an order that moves, and an orphan line, against the full join |

@@ -202,63 +202,51 @@ On the worked transaction, with one group under `Seek` (the session's knob, belo
 
 ## The scan session
 
-One scan session executes buffered execution. It is schema-independent, and it drives the traversal: it passes the untouched groups, collects each touched group, and hands the group's buffers to the execution through a callback. The callback is the permanent interface (decision of 2026-11-09). In roadmap step 2 the callbacks are tests. Since step 5 the callback is `reader::collect`'s, which routes each group's entries into the typed readers ([Readers](#readers-step-5)); DBSP's joins evaluate `ΔJ` and `ΔV` (decision of 2026-11-11).
+One scan session executes buffered execution. It is schema-independent, and it is a cursor over the touched groups of `Old`: it passes the untouched groups, positions once at each touched group, and lets the caller scan the group's range entry by entry, deciding from the folded key alone whether to read an entry's payload. It buffers nothing and calls nothing back: the `on_group` callback of 2026-11-09 and the group buffers are gone (decision of 2026-11-12). Since step 5 the caller is `reader::route` and Q3's hook, which put each kept entry into the typed readers ([Readers](#readers-step-5)); DBSP's joins evaluate `ΔJ` and `ΔV` (decision of 2026-11-11).
 
 ### Inputs
 
 - `Old`, one pinned snapshot, read through `RunMerge`.
-- `Dlt`, the transaction's sorted run, read once by one forward cursor.
-- The trie, for the root domain's width.
-- The index definition `D` (`MergedIndexDefinition`), which supplies the trie (`D::TRIE`) and the payload decoder (`D::decode_payload(stream_id, bytes)`). The stream id selects the payload type, so decoding needs no `unfold`. The session is bound to `D`: `ScanSession<D>`, and nothing else is passed.
+- The touched groups: a sorted list of group prefixes, the first `1 + root_width` bytes of a key (the tag and value of the root domain). `reader::capture` builds it from `Dlt` in one pass before the session. The session never sees `Dlt`.
+- The index definition `D` (`MergedIndexDefinition`), which supplies the payload decoder (`D::decode_payload(stream_id, bytes)`). The stream id selects the payload type, so decoding needs no `unfold`. The session is bound to `D`: `ScanSession<D>`.
 - One knob, below.
 
-A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. The Java `MergedIndexValidator` rejects any other trie, so `root_width()` is a plain `usize`; it panics on a hand-built trie with no single root, and so does the session (decision of 2026-11-10: the compiler's validator is the only trie check).
+A trie has exactly one root domain (decision of 2026-11-09). Two root domains mean two key tries, each stored as its own merged index, and several streams may still reside at the root domain's node. The Java `MergedIndexValidator` rejects any other trie, so `root_width()` is a plain `usize`; it panics on a hand-built trie with no single root, and so does `capture` (decision of 2026-11-10: the compiler's validator is the only trie check).
 
-The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes, the tag and value of the root domain. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
+The groups are inferred from `Dlt`: the group of a `Dlt` key is its first `1 + root_width` bytes. The session needs no list of requests, since a touched customer is exactly a customer with a `Dlt` entry.
 
 ### Operations
 
 ```text
-ScanSession<D>(Old: snapshot → RunMerge, Dlt run, pass: Seek|Step)      trie = D::TRIE
+ScanSession<D>(Old: snapshot → RunMerge, touched: [group prefix], pass: Seek|Step)
 
-  Maintain(inputs: set of index ids, reject?, on_group: (group, buffers) -> ()):
-    for each group g in Dlt, in order:     g = first 1 + D::TRIE.root_width() bytes of a Dlt key
-      PassTo(g)
-      buffers ← Collect(g, inputs, reject), plus Dlt's entries under g (version Dlt)
-      on_group(g, buffers); release buffers
-
-  PassTo(g):                               untouched groups in between are never buffered
+  NextGroup():                             enters the next touched group g
     Seek: Old.seek(g)                      one logical seek if any run moves
-    Step: Old.step() while Old.key() < g
+    Step: Old.step() while Old.key() < g   the untouched groups in between are never read
 
-  Collect(g, inputs, reject):
-    while Old.key() starts with g:         Peek is the merged key, already read
-      id ← last byte of the key
-      if id ∉ inputs: Old.step()
-      else: Old.take → D::decode_payload(id, bytes) for each → buffer[id] (version Old)
-            if reject(any entry of the key): Skip(key without its trailing [0, id])
-            else: Old.step()
-
-  Skip(n):                                 n is the rejected entry's own node prefix
-    if Old.key() does not start with n: return
-    Seek: Old.seek(prefix_successor(n)), or exhaust Old on None
-    Step: Old.step() while Old.key() starts with n
+  Key():            Old.key() if it starts with g, else nothing      the merged key, already read; no value or weight
+  TakeAndDecode():  Old.take, D::decode_payload(id, bytes) for each  id is the last byte of the key
+  Step():           Old.step()
 ```
 
-The code differs from the write-up's pseudocode in two details:
+The caller's loop is alg:session's, without buffers (`reader::route` and Q3's hook are the body):
 
-- `Skip` ends on the first key outside the node, so `Collect` steps only when no skip happened. A step after a `Seek` skip would pass an unread key.
-- A key's entries are judged together: `Skip` runs when any entry of the key is rejected. `reject` sees only old entries; `Dlt` is read whole.
+```text
+capture(Dlt)                               touched groups, driving deltas, requests
+for g in touched:  session.NextGroup()
+  while session.Key():                     one contiguous scan of g's range, no skips
+    route(position)                        keep or not, from the key alone; TakeAndDecode once if kept
+    session.Step()
+```
 
-The traversal mirrors the write-up: `Maintain` is `alg:ivm-buffered`'s loop over touched groups, `Collect` is `alg:session`'s, and `Skip` is `alg:skip`'s. `Old.key()` is the merged key `RunMerge` has already read, which plays the role of `Peek`'s kept `next_entry`.
+The `reject` and `Skip` of the write-up's `alg:skip` are gone with the buffers. Skipping the subtrees that no reader requests inside a touched group is the deferred refinement ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)); the cursor's seek makes it a local change.
 
 ### Rules the session follows
 
-- The buffers keep `Old` and `Dlt` entries apart, unconsolidated (`prop:overlay`).
-- `Dlt` is read once, by one forward cursor, so its entries under a group are the next ones in its order.
-- A rejected entry stays in its buffer; `Skip` passes only the rest of its subtree.
-- The session does not seek past domains whose streams are not in `inputs`, such as Q3's invoices. Each such position costs a key decode and nothing else (decision of 2026-11-09).
-- `Old` and `Dlt` are merged only logically: the session compares forward cursors by key bytes and builds no merged run. A delta-only node, such as `(c5, o5)`, is part of `Dlt`'s entries under the group and needs no read of `Old`.
+- A payload is read, weight-summed (`RunMerge::take`), and decoded only when the caller takes the position. A position nobody keeps costs a key decode and a step, nothing more.
+- The session never reads `Dlt`. `Old` and `Dlt` stay apart and unconsolidated, since a join is bilinear (`prop:overlay`); the readers' requested slices combine them where a join needs the after state (`C⁺`).
+- The session does not seek past domains whose streams nobody keeps, such as Q3's invoices. Each such position costs a key decode and nothing else (decision of 2026-11-09).
+- A delta-only node, such as `(c5, o5)`, has no entry in `Old`; the routing steps it between the entries of `Old` in key order.
 
 ### Knob
 
@@ -266,7 +254,7 @@ The traversal mirrors the write-up: `Maintain` is `alg:ivm-buffered`'s loop over
 
 | Knob | Values | Compares |
 | --- | --- | --- |
-| `Pass` | `Seek`, `Step` | Passing an untouched group, or a rejected subtree, by one logical seek against stepping through its entries. One knob governs both. |
+| `Pass` | `Seek`, `Step` | Passing the untouched groups between two touched ones by one logical seek against stepping through their entries. |
 
 A group read has no exact-key probe (decision of 2026-11-09). A probe of the group's root entry with `seek_key_exact` moves a run whose filter admits the key onto it, but a run whose filter rejects the key stays behind and must be sought anyway, since it can still hold entries below the root. The per-run seeks are then those of a prefix seek, plus the filter checks. The saving of 2026-11-04 holds for path reads only, which take a single record.
 
@@ -275,11 +263,11 @@ A group read has no exact-key probe (decision of 2026-11-09). A probe of the gro
 `SessionCounts` holds:
 
 - `groups`;
-- `cursor_opens` (two: one logical cursor over `Old`, one over `Dlt`);
+- `cursor_opens` (one: the logical cursor over `Old`; since 2026-11-12 the session opens none over `Dlt`);
 - `logical_seeks`: seeks over `Old` that moved some run. A seek that finds `Old` already at or past its target costs nothing and counts nothing, so a first group that `Old` starts on counts no seek;
 - `logical_steps`;
 - `positions`: the first key of `Old`, and each key that a step or seek landed on. Each costs one key decode in a file run;
-- `payload_decodes_old` and `payload_decodes_dlt`: one per buffered entry;
+- `payload_decodes_old`: one per payload of a position that a reader kept; `payload_decodes_dlt`: one per `Dlt` entry that a driving delta took, filled in by `capture`, which reads `Dlt`;
 - `cancelled`: values whose weights cancelled across runs.
 
 DBSP's run cursors count the storage costs: per-run seeks, filter rejections, and key, value, and weight decodes. In-memory runs count their key, value, and weight accesses in separate fields, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see [decisions.md](decisions.md)), by the same rules as the file decodes: a landing reads a key, a value counts once per position, and each weight returned reads a weight. A memory access deserializes nothing, so the two kinds are never added.
@@ -288,39 +276,55 @@ DBSP's run cursors count the storage costs: per-run seeks, filter rejections, an
 
 | Owner | Holds |
 | --- | --- |
-| The session | `RunMerge` over `Old`, the cursor over `Dlt`, the knob, the current group's buffers, and `SessionCounts` |
-| The callback (`reader::collect`) | The routing of a group's entries into the readers, which hold the typed rows until `finish` |
+| The session | `RunMerge` over `Old`, the touched-group list, the knob, and `SessionCounts` |
+| The capture and the routing (`reader::capture`, `reader::route`, Q3's hook) | `Dlt`'s driving deltas and requests, and the kept entries as typed rows in the readers, which hold them until `finish` |
 | DBSP's joins | The evaluation of the delta rules, and derived deltas such as `ΔJ` |
 | DBSP's run cursors | The run counters: per-run seeks, key decodes, value decodes, and weight decodes |
 
 ## Readers (step 5)
 
-A *reader* is one partner read of one join (decision of 2026-11-11). It declares one stream of the index and a projection of that stream's entries into the join's typed rows `(K, V)`. Its buffer is its records, in the join's type.
+A *reader* is one partner read of one join (decisions of 2026-11-11 and 2026-11-12). It holds the requests of its driving delta, the delta input of the join it serves, and a partner batch holding only the rows that the driving delta requests: the requested slice of the index. The deltas are not the readers': `capture` builds `ΔC`, `ΔO`, and `ΔL` once each into the structure that the driver moves to the circuit (a `Delta<R>` per stream-driven reader, paired with its reader by `Capture`), and the routing borrows them. Its static plan is a `ReaderDefinition`, in the reader's type:
+
+| Constant or function | Meaning |
+| --- | --- |
+| `PARTNER_STREAM` | The index stream whose entries the partner batch keeps, or none, when the routing builds the rows (`J⁺`) |
+| `REQUEST_DEPTH` | The number of leading key fields that name the request node: 1 is the group, 2 is `(custkey, orderkey)`. The prefix width follows from the trie (`KeyTrie::prefix_width`). |
+| `DRIVING_DELTA` | `Stream(id)`: the `Dlt` rows of one stream, unfolded into a batch the reader owns. `Join`: the output of a join of other readers' rows, evaluated at routing; the reader keeps its requests only. |
+| `unfold`, `unfold_delta` | The functions from an index entry, its unfolded key and decoded payload, to a row of the partner batch and of the driving delta |
+
+Only the requests come from the data. The four Q3 readers:
+
+| Reader | Requests of | Keeps (partner rows) |
+| --- | --- | --- |
+| `C⁺` | `ΔO` | the customer of each order in `ΔO`, after: `Old`'s row and `ΔC`'s rows, consolidated |
+| `O⁻` | `ΔC` | all orders of each customer in `ΔC`, before |
+| `J⁺` | `ΔL` | `J` at each `(custkey, orderkey)` of `ΔL`, after, built at routing |
+| `L⁻` | `ΔJ`, requests only | the lines of each order where `ΔJ` has a row, before |
 
 ```text
-collect(session, readers):                 inputs = the readers' streams
-  session.Maintain(inputs, on_group = (g, buffers) ->
-    for each entry e of buffers, Old's then Dlt's:
-      key ← unfold(e.key)                  once per entry
-      for each reader r of e's stream: r.half(e's half).push(r.project(key, e.payload), e.weight)
-    drop buffers)
-  seal each reader: Old's rows → one batch, Dlt's rows → another
+capture(Dlt, readers):                         phase A: one pass over Dlt, in folded-key order
+  for each entry d: touched += group(d.key)
+    for each reader R with DRIVING_DELTA = Stream(d.stream):   decode and unfold d once
+      R.delta.push(R.unfold_delta(d), d.weight)                the one copy
+      R.requests += prefix(d.key, R.REQUEST_DEPTH)             sorted, since Dlt is sorted
+  seal each driving delta
+
+scan(session, readers):                        phase B: one contiguous scan per touched group
+  for g in touched:
+    for each Old position k, in folded-key order:
+      for each stored reader R: keep[R] = R.stream = stream(k) and prefix(k) ∈ R.requests   a forward pointer, no search
+      hook(k)                                 Q3: the customer step at the customer, the order step at each order,
+                                              including orders only ΔO mentions, stepped between the entries of Old
+      if any keeps k: decode k's payload once; each keeper unfolds it straight into its partner builder
 ```
 
-A sealed reader (`ReaderRuns`) gives three reads:
+Q3's hook computes `J` because the generic machinery has no notion of a join. At a customer it forms the customer after (`Old`'s rows plus `ΔC`'s); at an order it forms `J⁺`'s rows (customer after times order after) where `ΔL` is, and `ΔJ = ΔO ⋈ C⁺ + O⁻ ⋈ ΔC` where `ΔO` or `ΔC` is. A node where the two terms cancel has no row in `ΔJ` and is not requested by `L⁻`, so the requests equal the nodes of the circuit's own `ΔJ`, which is never handed over. Folded keys put a customer before its orders and each order before its lines, so one forward pass knows both terms before an order's lines arrive.
 
-| Read | Batches | Q3's use |
-| --- | --- | --- |
-| `before()` | `Old`'s | `O⁻`, `L⁻` |
-| `after()` | `Old`'s and `Dlt`'s, in one snapshot, unconsolidated (`prop:overlay`) | `C⁺`, and `J⁺`'s two lookups |
-| `delta()`, or `take_delta()` | `Dlt`'s, cloned, or moved out (the reader keeps an empty `Dlt` batch, so it must serve no after read) | the driving deltas: `ΔC` cloned (`C⁺` shares it), `ΔO` and `ΔL` moved |
+A `RowBuilder` pushes each row straight into DBSP's builder: one copy per kept row. It requires nondecreasing keys and errors on a key that goes back. The rows of one key may arrive in any order, because the packed payload bytes do not order like the typed values (little-endian integers, length-prefixed strings), so it sorts and consolidates the values of a key when the key ends.
 
-The batches hold every row of the touched groups. The join seeks only its driving delta's keys, so the kind of a read, path or range, follows from the reader's key: `C⁺` keyed by `custkey` takes one customer, and `O⁻` keyed by `custkey` takes the customer's subtree of orders. A key above a stream's own node, such as `O⁻`'s, is how a join key flows up the trie.
+The circuit's input handles take the driving deltas by move (`Delta::into_batch`); no after read shares them, so nothing is cloned. A partner read, called by the join, errors on a delta key outside its reader's requests.
 
-Differences from the write-up (`def:session`), and their costs:
-
-- Buffers are per reader, not per stream, so an entry that two readers take is stored twice, once in each shape. In Q3, an old order goes to `O⁻` and to `J⁺`'s orders reader. Index reads and payload decodes are unchanged.
-- `J⁺` reads two streams. It is not one reader but `J`'s join re-evaluated per requested path, over two one-stream readers; its rows are the one copy left at the DBSP boundary.
+A join with a snapshot reader lets its delta drive and does not sample the partner. Its calls on the partner batch, and its reader callback, are counted under the `requested_slice` read owner, apart from the DBSP operators' own reads of state and deltas.
 
 ## Current implementation against the write-up
 
@@ -399,6 +403,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - *Exit:* a property test against a brute-force reference that consolidates `Old`, groups `Dlt` by root, filters by prefix and `inputs`, and drops the rest of a rejected node's subtree. It ranges over three small tries (one with a two-byte root and two placements at the root node, one with no root placement), values near `0x00`, `0x01`, `0xFE`, and `0xFF` to force carry, multi-run snapshots with file runs, random `Dlt`, `inputs`, and rejection tests, and both passes. Counter tests show that positions outside `inputs`, and the position that ends a group, cost no value, weight, or payload decode; and pin the seek and step counts of the two passes on a six-group layout and on a rejected subtree. *Changed on 2026-11-09:* the `GroupStart` knob and the root probe were removed, and the proptest ran four knob combinations before. The session became `ScanSession<D: MergedIndexDefinition>`, and the proptest's three fixture tries became small definition types.
    - **COL counter tests, the A/B, and docs.** *Done 2026-11-09.* On the worked transaction in `merged-index-col/src/q3/tests.rs`, `Maintain({C, O, L})` over `CustomerOrdersLineitemDefinition`, which decodes through its `decode_payload`, under `Seek` pins the counts of [How the counters check the rules](#how-the-counters-check-the-rules) (`session_run_reads_on_the_worked_transaction`). An A/B test on the same kind of data, extended with untouched customers between touched ones and a synthetic segment filter, pins the run and session counters of both passes, derives each in a comment, and checks equal outputs (`the_passes_pass_untouched_groups_and_rejected_subtrees_in_different_ways`).
      - *Exit:* `CLAUDE.md` and `WORKFLOW.md` gain the new files, the knob, and test filters. The version-6 measurements predate lazy values; R5 timing of the passes belongs to step 6.
+     - *Revised 2026-11-12* (decisions of 2026-11-12 in [decisions.md](decisions.md)): the session no longer reads `Dlt`, buffers, or rejects, so the tests below are the 2026-11-09 and 2026-11-10 pins, as the readers then were. `session_run_reads_on_the_worked_transaction` is `collect_reads_the_index_once_and_the_readers_not_at_all`, and the A/B test is `the_passes_pass_untouched_groups_in_different_ways`. The worked transaction's counts are unchanged, because every entry of its one group is kept, except `cursor_opens` (2 to 1) and the reader of `Dlt`, which is now `capture`. The A/B scans every entry of `c5` and `c8`, with no reject: `Seek` is 3 logical seeks, 4 run seeks, 9 steps, 12 positions, and 9 value and weight decodes; `Step` is 18 steps and positions, as before.
 
      **Pinned: the worked transaction**, one group (`c5`), `Seek`, with `Old` as in the step 1 baseline (a file run holding `c5` through `c6`, a memory run holding `c7`) and `Dlt` as in the worked transaction:
 
@@ -535,8 +540,9 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - *New tests:*
      - the `merged_index::reader` tests, among them the property test `readers_match_a_brute_force`;
      - COL's `readers_match_a_brute_force`, renamed from `virtual_buffer_reads_match_a_brute_force`, whose before and after reads now cover the whole touched groups.
-   - *Not done:* reading the readers' rows without building batches (`J⁺`'s copy remains), and releasing each group before the next.
-6. **Measurement, new version.** *macOS part done 2026-11-11; Linux pending.* The version stays 10 (decision of 2026-11-11).
+   - *Revised 2026-11-12* (decisions of 2026-11-12 in [decisions.md](decisions.md)): each reader holds its driving delta's requests and keeps only the rows it requests; the deltas are built once into `DrivingDeltas` and borrowed by the routing ([Readers](#readers-step-5)). `reader::capture` replaces the session's reading of `Dlt`; `ScanSession` is a cursor over the touched groups (`new(old, touched, pass)`, `next_group`, `key`, `take_and_decode`, `step`); `GroupBuffers`, `on_group`, `reject`, `Projection`, `ReaderRuns`, `TouchedGroups`, `values_at`, and `RequestedRows` are gone. `ΔJ` and `J⁺` are computed at routing. No driving delta is cloned: `C⁺`'s batch holds `ΔC`'s rows of the customers of `ΔO`, so no after read shares a delta. The joins' reads of the batches are under the `requested_slice` read owner (measurement version 11).
+   - *Not done:* skipping the subtrees that no reader requests inside a touched group: the scan still reads a key at every position of a touched group ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
+6. **Measurement, new version.** *macOS part done 2026-11-11; Linux pending.* The version stayed 10 (decision of 2026-11-11). The reader change of 2026-11-12 bumps it to 11 (new read owner `requested_slice`; [measurement.md](measurement.md#report-fields)); the smoke rerun at version 11 is pending.
    - Done: the driver's `--session-pass seek|step` selects `Pass` (`configuration.session_pass`); `measure.py` forwards it and checks `index_session_counts`, `index_upkeep_run_reads`, and `profiled_cpu_ms`; `summarize.py` reports them. Every run reads one set of inputs in place and starts cold (decision of 2026-11-11).
    - Done: the macOS smoke run, both modes, both passes, three repetitions ([measurement.md](measurement.md#version-10-smoke-2026-11-11)). All state stayed in memory. The passes collected the same entries; Step reached about 400,000 more positions than Seek and took about 30 ms more `ivm_ms` over six refreshes.
    - Pending: the Linux pilot and campaign, four arms (prefix truncation × pass; [WORKFLOW.md](WORKFLOW.md#campaign-and-four-arms)).
@@ -555,27 +561,35 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 - `prefix_successor` returning `Option`, with `None` meaning the range runs to the end of the index, rather than a sentinel key.
 - `RunMerge` finding the minimum key by linear scan over its run cursors, not a heap. Snapshots hold few runs.
 - The once-filled value slot as the shape of lazy values in the file cursor (a `OnceCell`), with a hint field that keeps the last value cursor for `first_with_hint`.
-- `Maintain`'s `reject` as an optional per-entry test.
 - The counting rules of `RunReads`: opening a cursor counts the key and value it lands on; value seeks count no seek; each probe of a predicate seek counts a key or value decode; a reverse seek counts one key decode, though the file reader may read the key twice. Lazy values (step 2) change the first of these: a landing counts the key only. In-memory runs follow the same rules in their own fields (2026-11-10): a value counts once per position, through a `Cell<bool>` that every key move clears and every value move sets, and a predicate seek counts one key read for each probe.
 - The read owner reuses the `WriteOwner` enum, so one list names the components for reads and writes. It is a separate thread-local from the write owner, so a read scope never changes who owns files created inside it. `RunReads::current` stays the total over all owners.
 - A `filter_rejections` run counter, so that native join probes that a file filter answers stay visible.
 - A separate `weight_decodes` run counter. The file format stores a value and its weight apart: landing on a value deserializes the value, and the weight is deserialized only when `weight`, `map_times`, or `map_values` asks. `CursorList`'s zero-weight skip reads weights at entries that no reader takes, so a separate counter shows that cost. Folding weights into value decodes would hide it.
-- `cursor_opens` is the two logical cursors (one over `Old`, one over `Dlt`), not the run cursors.
+- `cursor_opens` is the logical cursors, not the run cursors: one, over `Old` (the session opened a second over `Dlt` until 2026-11-12).
 - `ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself, so the opening's key decode falls inside the session's counted region.
-- `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end.
+- `RunMerge::exhaust`, for a skipped prefix with no successor, rather than stepping to the end (unused by the session since 2026-11-12, which skips nothing inside a group).
 
 Step 4 (2026-11-10):
 
 - No `ERROR_VIEW` in the hand-written circuit; the generated circuit's error view is absent from the reconstructed build.
 - The IVM window (settled on 2026-11-11, measurement version 9): in reconstructed mode `q3_ms` and `ivm_ms` include the session's collection. Completing `Dlt` stays in `index_ms`. Since step 5 (version 10) `forward_ms` holds reconstructed mode's hand-off of the readers' `Dlt` batches, as it holds native's feed.
-- `on_group` takes the buffers by value, not by reference, so that `collect` can keep them until `finish`.
+- `on_group` took the buffers by value so that `collect` could keep them until `finish` (gone on 2026-11-12).
 - The compiler hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused; removing it is a follow-up.
 - Owner lookup sources: for an order that is not in the delta, the driver passes the pre-transaction `BaseState` and tests pass `Reference`, both counted under `BaseRelation`.
 
 Step 5 (2026-11-11):
 
-- `ReaderRuns::take_delta` leaves the reader an empty `Dlt` batch, so it is called only on readers whose after read is unused (orders by customer, line items).
-- Each group's `GroupBuffers` are built and then dropped once routed, rather than the session writing into the readers directly. `ScanSession` is unchanged.
-- The contract check: a partner read walks its driving delta's keys and errors on a customer outside the touched groups, as step 4's readers did.
-- A projection is a function pointer, `fn(&Key, &Payload) -> Result<(K, V), String>`, which errors on an entry of another stream.
+- (Superseded on 2026-11-12:) `ReaderRuns::take_delta`, `GroupBuffers`, and the projection as a function pointer. The reader types are replaced as the Readers section says.
 - `take_driving_deltas` errors on a second call in one transaction, rather than handing over empty deltas.
+
+Step 5, revised (2026-11-12):
+
+- The readers hold requests only; the deltas are a `Delta<R>` per stream-driven reader, owned by the caller of `capture` and paired with the reader by `Capture` (the user revised "each reader owns its driving delta" on 2026-11-12).
+- The names `requested_slice` (the read owner; the user chose it over `reader_batch`), `unfold` and `unfold_delta` (the user's name for the entry-to-row functions, which are not called projections), `DrivingDelta::{Stream, Join}`, and measurement version 11. These are recorded in [decisions.md](decisions.md).
+- A `ReaderDefinition` has a `PARTNER_STREAM` that may be `None`, and the generic machinery stops at stored readers. `J`'s evaluation is Q3's hook in `q3.rs`, not a generic `DrivingDelta::Join` (the user allowed a small hook if a generic join was disproportionately complex).
+- `ΔJ` is computed exactly, so that `L⁻`'s requests are the nodes where `ΔJ` has a row, not a superset (a node where the terms cancel is not requested). It is a request set only and is not handed to the circuit.
+- A `RowBuilder` errors on a key that goes back but sorts the values of one key locally, since the payload byte order is not the typed order. A key whose values all cancel is dropped.
+- The routing reads the readers' own in-memory driving deltas by cursor lookup, once per touched group, under the default read owner on the collecting thread, so they are not the index's reads and appear in no report. The one lookup of `ΔC` and `ΔO` at customer 5 in the worked transaction is two seeks and a few memory reads.
+- The reader callbacks verify every driving-delta key against the requests, which reads the circuit's delta once more under `requested_slice`.
+- A join with a snapshot reader lets its delta drive and does not sample the partner, so the partner's reads are the slice's, not an estimate's.
+- The readers sit behind one lock in `Q3State`, since their builders are not `Sync`.

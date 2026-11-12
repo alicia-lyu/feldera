@@ -488,16 +488,21 @@ Every run of every campaign reads one set of TPC-H input files in place; no run 
 
 The version 10 macOS smoke run uses the current default workload, with no setup compaction, and otherwise the settings of the version 6 smoke run.
 
-### 2026-11-12: Each reader owns its driving delta and keeps only the rows it drives
+### 2026-11-12: Each reader holds its driving delta's requests and keeps only the rows it drives
 
 The user decided on 2026-11-12, after the version 10 smoke run showed the joins probing whole touched-group batches and those reads counted with the DBSP operators' own:
 
-- **Each reader owns its own driving delta.** `C⁺` owns `ΔO`, `O⁻` owns `ΔC`, `J⁺` owns `ΔL`, and `L⁻` owns `ΔJ`. `ΔO`, `ΔC`, and `ΔL` are built once from `Dlt` before the scan, and any other use (an after read, the circuit's input handles) shares or moves them. The scan session needs `Dlt` only to learn the touched groups.
+- **Each reader holds the requests of its driving delta, not the delta.** A reader's requests are the sorted folded-key prefixes, cut at its request node, of its driving delta's keys: `C⁺` of `ΔO`, `O⁻` of `ΔC`, `J⁺` of `ΔL`, and `L⁻` of `ΔJ` (prefixes only). One pass over `Dlt` before the scan builds `ΔC`, `ΔO`, and `ΔL` once each into the hand-off structure (`DrivingDeltas`), which the driver moves into the circuit's input handles. The routing borrows them by reference where an after slice or `J⁺` needs delta rows (for example, a requested customer's `ΔC` rows are copied into `C⁺`'s slice). Nothing is shared by `Arc` or cloned. The scan session needs `Dlt` only to learn the touched groups. (The user's first wording of this decision, that each reader owns its driving delta, was revised the same day.)
 - **`ΔJ` and `J⁺` are computed at routing.** The folded keys put a customer before its orders and each order before its lines, so one forward pass knows both terms of `ΔJ` (`ΔO ⋈ C⁺` and `O⁻ ⋈ ΔC`) and `J⁺`'s two rows before an order's lines arrive. This revises the 2026-11-11 entry, which built `J⁺` per request after collection.
 - **The session is a cursor over the touched groups.** For each touched group it positions once at the customer record and scans the group's range end to end, with no skips inside the group. Routing decides from the folded key alone whether some reader keeps an entry; only a kept entry's payload is read, weight-summed, and decoded, and it is converted once, straight into the reader's batch builder. The group buffers go.
 - **The static part of the request rule lives in the reader's definition.** A reader's stream, request node, and driving delta are fixed by the circuit, as associated constants of its type; only the requests themselves come from the data. The definition stays generic over the index.
 - **The joins' reads of the readers' batches are counted under their own owner**, apart from the DBSP operators' reads of their own state and deltas.
-- **Terms.** Say "driving delta" throughout, never "driving stream". The function from an index entry to a join's typed row is not called a projection, which has a relational meaning. The view worker's counters are "DBSP operator reads".
+- **Terms.** Say "driving delta" throughout, never "driving stream". The function from an index entry to a join's typed row is not called a projection, which has a relational meaning; it is named `unfold` (`unfold_delta` for the driving delta's rows). The view worker's counters are "DBSP operator reads".
+
+The user amended this on the same day:
+
+- **The read owner is named `requested_slice`** (not `reader_batch`), and the summarizer's column group is "Requested slice seeks / reads" (`requested_slice_*`; the operators' counters are `dbsp_operator_*`). Measurement version 11.
+- **No whole clone of `ΔC`.** A reader's after read is its requested slice, built at routing: `C⁺`'s batch holds, for each customer that `ΔO` requests, `Old`'s row and that customer's `ΔC` rows, copied into `C⁺`'s builder (one copy per kept row). No after read holds the whole `ΔC` or `ΔO`, so `take_driving_deltas` moves `ΔC`, `ΔO`, and `ΔL` out of their owners with no clone.
 
 The whole-group over-read that remains, a key read per position of a touched group, is deferred ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
 
@@ -511,7 +516,7 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 | --- | --- | --- |
 | 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
 | 2026-11-11 | The driving deltas are pushed row by row into the view circuit's `ZSetHandle`s (measurement version 9). | 2026-11-11: the readers' `Dlt` batches are handed whole to `add_input_stream` handles (measurement version 10). |
-| 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader owns its driving delta and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
+| 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader holds its driving delta's requests and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
 | 2026-11-11 | Three `TransactionGenerator` sources emit the readers' `Dlt` batches at the commit flush, cloning all three. | 2026-11-11: DBSP's `Input` operator, as native mode uses; `ΔO` and `ΔL` moved, `ΔC` cloned. |
 | 2026-10-12 | Placement map from the same transaction's Orders rows; changes outside RF1/RF2 are unsupported by design. | 2026-11-10: general deltas; `prepare` gives each order owners and orphan lines wait in a side store. |
 | 2026-10-29 | The compiler hook generates the reconstructed circuit. | 2026-11-10: the hand-written `q3-trie-view-circuit` replaces it. |
