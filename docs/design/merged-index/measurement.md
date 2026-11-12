@@ -185,9 +185,9 @@ What the placement was:
 - **The counts are deterministic.** All three repetitions of each workload, mode, and pass gave identical run reads, session counts, and upkeep reads. Native's counts are identical across the two passes, as they must be, since native has no scan session.
 - **Versions 5 and 6 are not comparable.** They ran with setup compaction and, through version 6, with the `min_storage_bytes: Some(0)` override, so their runs were files. This run has neither.
 
-The sequence's counters, summed over the six refreshes (each the same in every repetition). View reads sum the view worker's owners; index reads are the scan session's (`index_run_reads.session`); upkeep is `index_upkeep_run_reads`. File decodes and filter rejections are 0 throughout and are left out.
+The sequence's counters, summed over the six refreshes (each the same in every repetition). DBSP operator reads sum the view worker's owners; index reads are the scan session's (`index_run_reads.session`); upkeep is `index_upkeep_run_reads`. File decodes and filter rejections are 0 throughout and are left out.
 
-| Workload | Mode | Pass | View seeks | View memory key / value / weight reads | Index seeks | Index memory key / value / weight reads | Upkeep seeks | Upkeep memory key / value / weight reads |
+| Workload | Mode | Pass | DBSP operator seeks | DBSP operator memory key / value / weight reads | Index seeks | Index memory key / value / weight reads | Upkeep seeks | Upkeep memory key / value / weight reads |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | clustered | native | either | 858 | 648 / 1,079 / 1,079 | — | — | — | — |
 | clustered | reconstructed | seek | 442 | 928 / 1,233 / 1,233 | 368 | 5,118 / 4,709 / 4,709 | 210 | 520 / 177 / 177 |
