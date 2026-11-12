@@ -175,6 +175,26 @@ def profiled_cpu_problems(report: dict[str, Any]) -> list[str]:
     return problems
 
 
+def delta_phase_problems(report: dict[str, Any]) -> list[str]:
+    """List the refreshes whose `delta_ms` (the preparation of the view circuit's transaction
+    delta, both modes, measurement version 11) is missing or not a finite non-negative number,
+    or exceeds `ivm_ms`, which includes it."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    problems: list[str] = []
+    for item in report.get("refreshes", []):
+        delta = item.get("delta_ms")
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)) \
+                or not math.isfinite(delta) or delta < 0:
+            problems.append(f"refresh {item.get('refresh')}: delta_ms is {delta!r}")
+            continue
+        ivm = item.get("ivm_ms")
+        if isinstance(ivm, (int, float)) and not isinstance(ivm, bool) and ivm < delta:
+            problems.append(f"refresh {item.get('refresh')}: ivm_ms {ivm!r} is below "
+                            f"delta_ms {delta!r}, which it includes")
+    return problems
+
+
 def session_pass_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """List a mismatch between the pass the runner asked for and the one the driver
     reports: a reconstructed run reports it, and a native run, which has no scan
@@ -195,7 +215,8 @@ def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
             + view_read_problems(report)
             + counter_problems(report, "index_session_counts", SESSION_COUNT_FIELDS)
             + counter_problems(report, "index_upkeep_run_reads", RUN_READ_FIELDS)
-            + profiled_cpu_problems(report) + session_pass_problems(report, session_pass))
+            + profiled_cpu_problems(report) + delta_phase_problems(report)
+            + session_pass_problems(report, session_pass))
 
 
 def view_read_problems(report: dict[str, Any]) -> list[str]:

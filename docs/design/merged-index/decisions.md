@@ -501,6 +501,17 @@ The user decided on 2026-11-12, after the version 10 smoke run showed the joins 
 
 The whole-group over-read that remains, a key read per position of a touched group, is deferred ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
 
+### 2026-11-12: Preparing the view's transaction delta is view work, in `delta_ms`
+
+The user decided on 2026-11-12 that preparing the view circuit's transaction delta is view maintenance in both modes, timed inside the IVM window as a new sub-phase, `delta_ms` (measurement version 11, shared with the reader redesign).
+
+- **Native:** the conversion of the net delta into the view circuit's input rows (`net_delta.apply_optional` into the input handles).
+- **Reconstructed:** building the driving deltas from `Dlt` and handing them to the input handles (`Pipeline::build_view_delta`, which today calls `feed_driving_deltas`). The collection's pass over `Dlt` that builds each reader's driving delta joins `delta_ms` once it is callable apart from the scan; until then it counts in `q3_ms`.
+- **`forward_ms`** keeps only the net-delta read (`workload::net_delta`), the same operation in both modes.
+- **`ivm_ms = delta_ms + q3_ms`.** `q3_ms` stays the view circuit's transaction, plus the scan session's collection in reconstructed mode. The report shows `delta_ms` beside `ivm_ms`, so a reader can compare the modes with and without it: the two operations are not identical.
+
+This revises the 2026-11-11 rule that the boundary copy lies outside the IVM window (measurement version 9).
+
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
 The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
@@ -510,6 +521,7 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
+| 2026-11-11 | The boundary copy of the driving deltas into the view circuit's input handles is outside the IVM window in both modes, in `forward_ms` (measurement version 9, kept in version 10). | 2026-11-12: preparing the view's transaction delta is view work, timed in `delta_ms` inside `ivm_ms` (measurement version 11). `forward_ms` keeps only the net-delta read. |
 | 2026-11-11 | The driving deltas are pushed row by row into the view circuit's `ZSetHandle`s (measurement version 9). | 2026-11-11: the readers' `Dlt` batches are handed whole to `add_input_stream` handles (measurement version 10). |
 | 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader owns its driving delta and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
 | 2026-11-11 | Three `TransactionGenerator` sources emit the readers' `Dlt` batches at the commit flush, cloning all three. | 2026-11-11: DBSP's `Input` operator, as native mode uses; `ΔO` and `ΔL` moved, `ΔC` cloned. |

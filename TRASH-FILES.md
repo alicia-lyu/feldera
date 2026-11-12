@@ -67,3 +67,8 @@ q3-ivm-baseline/src/lib.rs - moved to TRASH/q3-ivm-baseline-pre-split/ - stale g
 q3-ivm-baseline/src/stubs.rs - moved to TRASH/q3-ivm-baseline-pre-split/ - stale generated stubs for the removed single circuit
 sql-to-dbsp-compiler/target-check - moved to TRASH/sql-to-dbsp-compiler/target-check - regenerable cargo check target for Java tests; disk full
 TRASH/sql-to-dbsp-compiler/target-check - purged - dismissed 6 times; last: regenerable cargo check build cache, not useful
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.bak - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.bak - sed backup of edit
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/measure.py.bak - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/measure.py.bak - sed backup of edit
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/summarize.py.bak2 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/summarize.py.bak2 - sed backup of edit
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - sed backup
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - sed backup

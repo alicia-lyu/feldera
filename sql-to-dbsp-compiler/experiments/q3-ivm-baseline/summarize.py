@@ -10,8 +10,11 @@ reports, over the repetitions:
 - the sums over the refreshes of `foreground_ms` and the measurement-version-4 phases:
   `base_ms` (the base circuit plus the merged index's upkeep), `index_ms` (that upkeep, a
   sub-phase of `base_ms` that is never added to it again), `forward_ms` (reading the base net
-  delta and feeding the view circuit), `q3_ms` (the view circuit alone) and `ivm_ms` (equal to
-  `q3_ms`, the IVM figure). Base and IVM are always reported side by side;
+  delta), `delta_ms` (preparing the view circuit's transaction delta, measurement version 11),
+  `q3_ms` (the view circuit's transaction, with the scan session's collection in reconstructed
+  mode) and `ivm_ms` (`delta_ms + q3_ms`, the IVM figure; the two modes' `delta_ms` are not
+  identical operations, so compare with and without it). Base and IVM are always reported side
+  by side;
 - the sums over the refreshes of the CPU profiler's step CPU time per circuit,
   `refresh_profiled_cpu_base_ms` and `refresh_profiled_cpu_q3_ms` (`profiled_cpu_ms.base` and
   `.q3`): a cross-check of `base_ms` and `q3_ms`, not a phase;
@@ -59,11 +62,11 @@ import sys
 from typing import Any
 
 from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS, WRITE_OWNERS,
-                     counter_problems, index_read_problems, owner_write_problems,
-                     profiled_cpu_problems, view_read_problems)
+                     counter_problems, delta_phase_problems, index_read_problems,
+                     owner_write_problems, profiled_cpu_problems, view_read_problems)
 
-MEASUREMENT_VERSION = 10
-REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
+MEASUREMENT_VERSION = 11
+REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "delta_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
 # the window's cgroup delta has them.
@@ -115,7 +118,7 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     problems = (index_read_problems(driver) + view_read_problems(driver)
                 + counter_problems(driver, "index_session_counts", SESSION_COUNT_FIELDS)
                 + counter_problems(driver, "index_upkeep_run_reads", RUN_READ_FIELDS)
-                + profiled_cpu_problems(driver))
+                + profiled_cpu_problems(driver) + delta_phase_problems(driver))
     if problems:
         raise SummaryError(f"{where}: inconsistent counters: " + "; ".join(problems))
     for field in REFRESH_SUMS:
