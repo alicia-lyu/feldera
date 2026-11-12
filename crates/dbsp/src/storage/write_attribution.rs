@@ -51,14 +51,20 @@ pub enum WriteOwner {
     BaseRelation,
     /// The merged index that the harness maintains outside the circuit.
     MergedIndex,
+    /// The joins' reads of the readers' requested slices of the index: the
+    /// batches that the reconstructed view circuit's joins seek for their
+    /// partner rows. A read owner only: nothing is written under it, so its
+    /// write counts stay zero.
+    RequestedSlice,
 }
 
 impl WriteOwner {
     /// Every owner, in the order of [`WriteSnapshot::by_owner`].
-    pub const ALL: [WriteOwner; 3] = [
+    pub const ALL: [WriteOwner; 4] = [
         WriteOwner::Query,
         WriteOwner::BaseRelation,
         WriteOwner::MergedIndex,
+        WriteOwner::RequestedSlice,
     ];
 
     /// A stable lower-case name, used as a key in reports.
@@ -67,6 +73,7 @@ impl WriteOwner {
             WriteOwner::Query => "query",
             WriteOwner::BaseRelation => "base_relation",
             WriteOwner::MergedIndex => "merged_index",
+            WriteOwner::RequestedSlice => "requested_slice",
         }
     }
 
@@ -139,7 +146,7 @@ pub struct WriteSnapshot {
     /// attribution did.
     pub total: WriteCounts,
     /// The same writes split by owner, indexed like [`WriteOwner::ALL`].
-    pub by_owner: [WriteCounts; 3],
+    pub by_owner: [WriteCounts; WriteOwner::ALL.len()],
 }
 
 impl WriteSnapshot {
@@ -158,8 +165,10 @@ impl WriteSnapshot {
     }
 }
 
-static OPERATIONS_BY_OWNER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-static BYTES_BY_OWNER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static OPERATIONS_BY_OWNER: [AtomicU64; WriteOwner::ALL.len()] =
+    [const { AtomicU64::new(0) }; WriteOwner::ALL.len()];
+static BYTES_BY_OWNER: [AtomicU64; WriteOwner::ALL.len()] =
+    [const { AtomicU64::new(0) }; WriteOwner::ALL.len()];
 
 /// Number of counter updates that have started but not finished.
 static UPDATES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);

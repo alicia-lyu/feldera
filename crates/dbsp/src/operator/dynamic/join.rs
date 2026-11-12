@@ -9,8 +9,10 @@ use crate::circuit::splitter_output_chunk_size;
 use crate::dynamic::DynData;
 use crate::operator::async_stream_operators::{StreamingBinaryOperator, StreamingBinaryWrapper};
 use crate::operator::dynamic::concat::dyn_concat_accumulated;
-use crate::trace::cursor::SaturatingCursor;
+use crate::storage::write_attribution::WriteOwner;
+use crate::trace::cursor::{ReadOwnerCursor, SaturatingCursor};
 use crate::trace::spine_async::WithSnapshot;
+use crate::trace::with_read_owner;
 use crate::trace::{Spine, SpineSnapshot, Trace, TraceRole};
 use crate::{
     DBData, ZWeight,
@@ -1741,8 +1743,10 @@ where
             }
 
             let delta = self.delta.borrow_mut().take().expect("no input delta provided before flush");
+            // The reader callback and the reads of its batches count for the
+            // requested-slice owner, apart from the operator's own reads.
             let trace = match &self.snapshot_reader {
-                Some(reader) => reader(&delta),
+                Some(reader) => with_read_owner(WriteOwner::RequestedSlice, || reader(&delta)),
                 None => trace.unwrap(),
             };
 
@@ -1764,7 +1768,10 @@ where
             // to the delta's keys, and a saturating join synthesizes values for
             // trace keys the delta does not hold, so both force the delta to
             // drive and neither needs the estimate.
-            let swap = if fetched.is_some() || self.saturate {
+            // A partner supplied by a snapshot reader holds only the rows that
+            // the delta requests, so the delta drives, and the partner is not
+            // sampled: its reads are not the operator's.
+            let swap = if fetched.is_some() || self.saturate || self.snapshot_reader.is_some() {
                 false
             } else {
                 let (delta_key_count, trace_key_count) =
@@ -1778,6 +1785,14 @@ where
                 fetched.get_cursor()
             } else {
                 Box::new(trace.cursor())
+            };
+
+            // The partner's calls interleave with the delta cursor's, so each
+            // is charged to the requested-slice owner on its own.
+            let trace_cursor: Box<dyn Cursor<_, _, _, _> + '_> = if self.snapshot_reader.is_some() {
+                Box::new(ReadOwnerCursor::new(WriteOwner::RequestedSlice, trace_cursor))
+            } else {
+                trace_cursor
             };
 
             let trace_cursor = SaturatingCursor::new(
@@ -2209,6 +2224,71 @@ pub(crate) mod test {
         );
 
         circuit.kill().unwrap();
+    }
+
+    /// The reads of a supplied partner snapshot are the requested-slice
+    /// owner's; the operator's own reads (the delta's) stay with the query.
+    /// Doubling the partner's rows changes the former and not the latter.
+    #[cfg(feature = "backend-mode")]
+    #[test]
+    fn supplied_snapshot_join_charges_partner_reads_to_the_requested_slice() {
+        use crate::{
+            storage::write_attribution::WriteOwner, trace::BatchReaderFactories,
+            typed_batch::SpineSnapshot as TypedSpineSnapshot,
+        };
+        use std::sync::{Arc, Mutex};
+
+        fn snapshot(
+            batch: OrdIndexedZSet<u64, u64>,
+        ) -> TypedSpineSnapshot<OrdIndexedZSet<u64, u64>> {
+            let factories = BatchReaderFactories::new::<u64, u64, ZWeight>();
+            TypedBatch::new(crate::trace::SpineSnapshot::with_batches(
+                &factories,
+                vec![Arc::new(batch.into_inner())],
+            ))
+        }
+
+        // One transaction of the join with `partner` as the right side's
+        // current state, and the reads it made per owner.
+        fn partner_reads(
+            partner: OrdIndexedZSet<u64, u64>,
+        ) -> [crate::trace::RunReads; WriteOwner::ALL.len()] {
+            let right_current = Arc::new(Mutex::new(snapshot(partner)));
+            let right_reader = right_current.clone();
+            let (mut circuit, left_input) =
+                Runtime::init_circuit(CircuitConfig::from(1), move |circuit| {
+                    let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                    let (right, _right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+                    left.join_with_snapshot_readers(
+                        &right,
+                        move |_| right_reader.lock().unwrap().clone(),
+                        |_| snapshot(indexed_zset! {}),
+                        |key, left, right| Tup2(*key, Tup2(*left, *right)),
+                    )
+                    .accumulate_output();
+                    Ok(left_input)
+                })
+                .unwrap();
+            let before = circuit.run_reads().unwrap();
+            left_input.append(&mut vec![Tup2(1, Tup2(2, 1))]);
+            circuit.transaction().unwrap();
+            let after = circuit.run_reads().unwrap();
+            circuit.kill().unwrap();
+            std::array::from_fn(|i| after[i].since(before[i]))
+        }
+
+        let small = partner_reads(indexed_zset! {1 => {3 => 1}});
+        let large = partner_reads(indexed_zset! {1 => {3 => 1, 4 => 1, 5 => 1, 6 => 1}});
+        let slice = WriteOwner::RequestedSlice.index();
+        let query = WriteOwner::Query.index();
+
+        // The partner's rows are read for the requested-slice owner, and more
+        // of them cost more.
+        assert!(small[slice].memory_weight_reads > 0);
+        assert!(large[slice].memory_weight_reads > small[slice].memory_weight_reads);
+        // The query's reads are the delta's alone: the same whatever the partner.
+        assert_eq!(small[query], large[query]);
+        assert!(small[query].memory_key_reads > 0);
     }
 
     fn do_join_test(workers: usize, transaction: bool, balanced: bool) {

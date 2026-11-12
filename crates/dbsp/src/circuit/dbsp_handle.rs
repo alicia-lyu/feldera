@@ -1525,7 +1525,7 @@ enum Response {
     BootstrapComplete(bool),
     IsCompactionComplete(bool),
     IsBackgroundMergeIdle(bool),
-    RunReads([RunReads; 3]),
+    RunReads([RunReads; WriteOwner::ALL.len()]),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2799,8 +2799,8 @@ impl DBSPHandle {
     /// and subtract with [`RunReads::since`]. They cover what the circuit's
     /// operators read on the workers. Background compaction and auxiliary
     /// threads run elsewhere and are not included.
-    pub fn run_reads(&mut self) -> Result<[RunReads; 3], DbspError> {
-        let mut reads = [RunReads::default(); 3];
+    pub fn run_reads(&mut self) -> Result<[RunReads; WriteOwner::ALL.len()], DbspError> {
+        let mut reads = [RunReads::default(); WriteOwner::ALL.len()];
         self.broadcast_command(Command::RunReads, |_, response| {
             if let Response::RunReads(worker_reads) = response {
                 for (total, worker) in reads.iter_mut().zip(worker_reads) {
