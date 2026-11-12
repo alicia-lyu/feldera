@@ -536,8 +536,10 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - the `merged_index::reader` tests, among them the property test `readers_match_a_brute_force`;
      - COL's `readers_match_a_brute_force`, renamed from `virtual_buffer_reads_match_a_brute_force`, whose before and after reads now cover the whole touched groups.
    - *Not done:* reading the readers' rows without building batches (`J⁺`'s copy remains), and releasing each group before the next.
-6. **Measurement, new version.**
-   - Add the counters to `measure.py`, and run the native and reconstructed (buffered) modes on Linux, with the session's `Pass` knob as an A/B.
+6. **Measurement, new version.** *macOS part done 2026-11-11; Linux pending.* The version stays 10 (decision of 2026-11-11).
+   - Done: the driver's `--session-pass seek|step` selects `Pass` (`configuration.session_pass`); `measure.py` forwards it and checks `index_session_counts`, `index_upkeep_run_reads`, and `profiled_cpu_ms`; `summarize.py` reports them. Every run reads one set of inputs in place and starts cold (decision of 2026-11-11).
+   - Done: the macOS smoke run, both modes, both passes, three repetitions ([measurement.md](measurement.md#version-10-smoke-2026-11-11)). All state stayed in memory. The passes collected the same entries; Step reached about 400,000 more positions than Seek and took about 30 ms more `ivm_ms` over six refreshes.
+   - Pending: the Linux pilot and campaign, four arms (prefix truncation × pass; [WORKFLOW.md](WORKFLOW.md#campaign-and-four-arms)).
    - *Exit:* raw artifacts under `target/`; [measurement.md](measurement.md) reports base and IVM side by side.
 7. **Beyond RF1/RF2.** *Done 2026-11-10, as part of step 4.* `prepare` supports customer updates, line items added to existing orders, orders that change customer, and orphan line items. *Exit:* `general_transcript` passes in both modes.
 8. **Deferred:**

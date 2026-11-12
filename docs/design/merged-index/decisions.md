@@ -472,6 +472,22 @@ The user decided on 2026-11-11, for roadmap step 5:
 - **`J⁺` from two one-stream readers, per request.** `J` is not stored, so `J⁺` is `J`'s join re-evaluated on each requested `(custkey, orderkey)` path, over the after reads of the customers reader and of an orders reader keyed by `(custkey, orderkey)`. Building it at collection would join every order of each touched customer.
 - **The driving deltas come from the readers, through DBSP's `Input` operator.** The view circuit takes them as native mode does, through `Input`, in its value form (`add_input_stream`): before the transaction the driver hands each reader's `Dlt` batch to its handle, booked in `forward_ms` like native's feed. `ΔO` and `ΔL` are moved out of their readers; `ΔC` is cloned, since its batch is also half of `C⁺`. The `TransactionGenerator` sources that step 5 first used, which cloned all three inside the transaction, are withdrawn. This is measurement version 10.
 
+### 2026-11-11: The session-pass knob shares measurement version 10
+
+The driver's `--session-pass seek|step` (default `seek`) selects the scan session's `Pass` in reconstructed mode, and the report records it as `configuration.session_pass` (`null` in native mode). It shares measurement version 10, since no version 10 run had been recorded, as the publication change shared version 7 on 2026-11-10.
+
+### 2026-11-11: The Linux campaign crosses prefix truncation with the session pass
+
+The Linux pilot and campaign run four arms, a full 2×2: prefix truncation on (A) or off (B), crossed with the scan session's pass, `seek` or `step`. The arms are `A-seek`, `A-step`, `B-seek`, and `B-step`. All keep `--elide-value-headers` and drop `--setup-full-compaction`. Native runs in every arm, though neither factor changes it, and must match across the four. This amends the two-arm design of 2026-10-22 and 2026-11-09. The user calls the key encoding of `--front-code-byte-keys` prefix truncation from 2026-11-11.
+
+### 2026-11-11: One set of inputs, read in place; every run starts cold
+
+Every run of every campaign reads one set of TPC-H input files in place; no run copies them. Each run starts in a new process, with the inputs evicted from the page cache, or after a fixed warm-up routine; it never starts warm from an earlier run. `measure.py` checks each input's size and modification time against the campaign's hash record and evicts the inputs inside the run's cgroup before the driver starts. A run whose inputs were not evicted does not qualify. The runner has no warm-up routine; none is used.
+
+### 2026-11-11: The macOS smoke runs at the current defaults
+
+The version 10 macOS smoke run uses the current default workload, with no setup compaction, and otherwise the settings of the version 6 smoke run.
+
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
 The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
@@ -488,6 +504,8 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 | 2026-11-09 | `GroupStart::{PrefixSeek, ProbeThenRange}` A/B-tests the root probe; the 2026-11-04 root probe applies to buffered group reads. | 2026-11-09: group reads use no exact probe; path reads keep `seek_key_exact`. |
 | 2026-10-01 | `min_storage_bytes: Some(0)` in the harness's `runtime_config` (never recorded as a decision). | 2026-11-09: DBSP's default placement in both modes. |
 | 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |
+| 2026-10-22 and 2026-11-09 | The Linux campaign has two arms, with and without prefix truncation (then called front coding). | 2026-11-11: four arms, prefix truncation crossed with the session pass. |
+| Before 2026-11-11 | Each run copies every input into its own directory inside its cgroup (`private_inputs`). | 2026-11-11: one set of inputs, read in place; each run evicts it from the page cache and starts cold. |
 | 2026-10-22 | Keep `--setup-full-compaction` in both arms of the Linux front-coding A/B. | 2026-11-09: the campaign runs without setup compaction. |
 | 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |

@@ -183,7 +183,9 @@ all of those. `--cache-bytes` must be a whole number of MiB.
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
 `--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`,
-`--elide-value-headers`, `--cgroup-root`, `--total-memory-bytes`).
+`--elide-value-headers`, `--session-pass`, `--cgroup-root`, `--total-memory-bytes`). `--session-pass seek|step`
+(default `seek`, also a driver flag) selects how reconstructed mode's scan session passes the
+untouched groups; native ignores it and reports `configuration.session_pass` as `null`.
 
 `--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests
 full compaction for the circuit and the merged index and waits for compaction to finish, then
@@ -257,8 +259,9 @@ rather than corrupting results. Run them before building anything.
 
 ### State a clone needs
 
-- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. The branch is not
-  pushed: the user must push it or supply it (for example as a `git bundle`).
+- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. On 2026-11-11 the
+  local branch was ahead of `origin`: the user must push the verified commit, or supply it (for
+  example as a `git bundle`), before the Linux clone.
 - `q3-ivm-baseline/q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and
   `plan.json` are generated and git-ignored. `measure.py` runs `generate.sh` itself.
 - Raw artifacts (reports, run directories) are git-ignored and local to the machine.
@@ -385,13 +388,15 @@ Also:
 - Put `--storage-path` on a local ext4 or xfs filesystem, not tmpfs or an overlay filesystem. Storage
   files open with `O_DIRECT`, and `FBuf::ALIGNMENT` is 512 bytes (see
   [measurement.md](measurement.md#pending-linux-campaign)).
-- With `--cgroup-root`, every run copies all of its inputs into `<run dir>/input` (`private_inputs`
-  in `measure.py`: the three base files and every refresh file) and hashes the copy. The copies are
-  never deleted. Per-run input size is the size of the SF 10 `.tbl` files plus the refresh files:
-  measure it with `du -shc "$DBGEN_OUT"/*.tbl "$DBGEN_OUT"/*.u* "$DBGEN_OUT"/delete.*` and
-  adjust for the refresh files that `prepare_inputs.py` actually writes. Budget that figure times the run count, plus each
-  run's maintained storage (`<run dir>/storage`). One campaign of `--runs N` makes `2N` runs
-  (native and reconstructed), so one pilot command (`--runs 1`) makes two, and the four pilots make eight.
+- The inputs are shared: every run of every campaign reads `$DBGEN_OUT` and `$R5_INPUTS` in place,
+  and none copies them (decision of 2026-11-11). Budget them once: `du -shc "$DBGEN_OUT"/*.tbl
+  "$R5_INPUTS"`. Do not edit, touch, or regenerate them between runs: each run checks every input's
+  size and modification time against the campaign's hash record and fails if one changed.
+- Each run keeps its maintained storage (`<run dir>/storage`), and nothing deletes it. One campaign
+  of `--runs N` makes `2N` runs (native and reconstructed), so one pilot command (`--runs 1`) makes
+  two, the eight pilots make 16, and the eight campaigns make 48. Budget the inputs once plus 64
+  runs' storage, or 48 if the pilot's run directories are moved off the disk before the campaign.
+  The pilot's `load.observed_storage_bytes` gives the per-run figure.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
 
@@ -417,10 +422,16 @@ python3 measure.py \
   --batch 10000 \
   --no-verify \
   --front-code-byte-keys \
-  --elide-value-headers
+  --elide-value-headers \
+  --session-pass seek
 ```
 
-This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, and give each run its own `--report` and `--storage-path` (see "Campaign and prefix-truncation A/B" for naming). Run the four pilots in the order clustered A, clustered B, scattered A, scattered B. Why each flag:
+This is arm `A-seek` for clustered. The four arms differ in two flags ("Campaign and four arms"
+below): A keeps `--front-code-byte-keys` and B drops it, and `--session-pass` is `seek` or `step`.
+Give each pilot its own `--report` and `--storage-path`, named by arm and workload:
+`--report "$R5_OUT/pilot-<arm>-<workload>/manifest.json"` and
+`--storage-path "$R5_OUT/pilot-<arm>-<workload>/runs"`. Run the eight pilots in the order `A-seek`,
+`A-step`, `B-seek`, `B-step` for clustered, then the same for scattered. Why each flag:
 
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.
 - `--cache-bytes 134217728`: the 128 MiB worker cache (a whole number of MiB).
@@ -428,12 +439,16 @@ This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, a
 - `--runs 1`: one repetition per mode for the pilot. The campaign uses `--runs 3`.
 - `--batch 10000`: the loading target of 10,000 rows per transaction.
 - `--no-verify`: required for qualification (`qualification` rejects a verified run).
-- `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index.
-  Native runs write the same files with or without them.
+- `--front-code-byte-keys`, `--elide-value-headers`: the current disk format of the merged index
+  (`--front-code-byte-keys` is prefix truncation). Native runs write the same files with or
+  without them.
+- `--session-pass`: how reconstructed mode's scan session passes the untouched groups. Native has
+  no scan session; its report records `configuration.session_pass` as `null`.
 
-**Pilot pass criterion.** For each of the four pilots, and for both runs in its report (`runs[].qualification`), `status` must be
+**Pilot pass criterion.** For each of the eight pilots, and for both runs in its report (`runs[].qualification`), `status` must be
 `qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
-limit, the cgroup proof matched (`cgroup.enforced`), verification was off, and
+limit, the cgroup proof matched (`cgroup.enforced`), the shared inputs were evicted before the
+driver started (`cgroup.proof.inputs_evicted`), verification was off, and
 `load.observed_storage_bytes` exceeded the limit. Also check that the top-level `status` is
 `complete` and `errors` is empty. A qualifying pilot shows only that the loaded state exceeds the
 limit. It does not show memory pressure.
@@ -453,37 +468,61 @@ pressure:
 - `refreshes[].memory_pressure` shows what DBSP's level was; `cgroup.delta` (`pgscan`, `pgsteal`,
   `workingset_refault_*`, `memory_events.max`) shows what the kernel did. Report the two apart.
 
-### Campaign and prefix-truncation A/B
+### Campaign and four arms
 
-Run the campaign only after all four pilots pass and the pressure instrumentation exists
-([measurement.md](measurement.md#pending-linux-campaign)). It has two arms, each the pilot
-command with `--runs 3` and fresh `--report` and `--storage-path` values:
+Run the campaign only after all eight pilots pass and the pressure instrumentation exists
+([measurement.md](measurement.md#pending-linux-campaign)). It has four arms, prefix truncation
+crossed with the session pass (decision of 2026-11-11), each the pilot command with `--runs 3` and
+fresh `--report` and `--storage-path` values:
 
-- **Arm A:** the pilot flags as above, with `--front-code-byte-keys`.
-- **Arm B:** the same command without `--front-code-byte-keys`. Keep every other flag.
+| Arm | `--front-code-byte-keys` | `--session-pass` |
+| --- | --- | --- |
+| `A-seek` | yes | `seek` |
+| `A-step` | yes | `step` |
+| `B-seek` | no | `seek` |
+| `B-step` | no | `step` |
 
-Run them in the order clustered A, clustered B, scattered A, scattered B. Give each run its own
-directory named by arm and workload, with `--report "$R5_OUT/campaign-A-clustered/manifest.json"`
-and `--storage-path "$R5_OUT/campaign-A-clustered/runs"`, and so on. Check
-each manifest's `configuration.front_code_byte_keys` against its arm, and check that the input
-hashes match across all four reports. Native storage must be equal across arms. Then summarize the
-four manifests together:
+Keep every other flag. Run them in the order `A-seek`, `A-step`, `B-seek`, `B-step` for clustered,
+then the same for scattered. Give each run its own directory named by arm and workload, with
+`--report "$R5_OUT/campaign-A-seek-clustered/manifest.json"` and
+`--storage-path "$R5_OUT/campaign-A-seek-clustered/runs"`, and so on. Then check:
+
+- each manifest's `configuration.front_code_byte_keys` and `configuration.session_pass` against its
+  arm (`measure.py` already rejects a driver report whose `session_pass` is not the one it asked
+  for);
+- that the input hashes match across all eight manifests;
+- that native's storage and run reads are equal across the four arms of each workload.
+
+Then summarize the eight manifests together:
 
 ```bash
 python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
 ```
 
-`summarize.py` labels each manifest by its parent directory, which is why each needs its own. The
-two arms double both stages: the pilot is 2 arms × 2 workloads × 1 repetition × 2 modes = 8
-runs, and the campaign 2 × 2 × 3 × 2 = 24. Each run keeps its own input copy, so budget the disk
-for all 32, or for 24 if the pilot's run directories are moved off the disk before the campaign.
+`summarize.py` labels each manifest by its parent directory, which is why each needs its own, and
+its Markdown names each workload's session pass. The four arms quadruple both stages: the pilot is
+4 arms × 2 workloads × 1 repetition × 2 modes = 16 runs, and the campaign 4 × 2 × 3 × 2 = 48. The
+inputs are shared, so the disk holds them once, plus each run's storage (see "Storage path and disk
+budget").
+
+### Report back
+
+When the pilots, or the campaign, are done, report:
+
+- the pre-flight results, row by row, with the kernel version (`uname -r`) and the filesystem and
+  logical sector size of the storage path;
+- each manifest's `status` and `errors`, and each run's `qualification`;
+- whether the `clear_refs` and `memory.peak` resets worked (`sequence.window_peak_rss_error` and
+  `sequence.cgroup.peak.window_peak_supported`), and `cgroup.proof.inputs_evicted` per run;
+- the revision (`manifest.revision`) and `git_status_short`, which must be empty;
+- the paths of the manifests and of `summary.md`. Raw artifacts stay on the machine.
 
 ### Known limits
 
 - Without `--cgroup-root`, a Linux run is `nonqualifying` (reason "no cgroup v2 total memory
   limit"), yet the campaign still reports `status: complete`. Read each run's `qualification`.
 - `memory.peak`, `memory.events`, and `io.stat` are read once, after the run exits. They cover the
-  whole run, including the input-copy phase, loading, and setup compaction, not only maintenance.
+  whole run, including the input eviction, loading, and setup compaction, not only maintenance.
   The driver's `/proc/self/io` counters are per interval, but they are process-wide.
 - The driver now records maintenance-window memory evidence: per-refresh pressure levels
   (`refreshes[].memory_pressure`), `sequence.window_peak_rss_bytes`,

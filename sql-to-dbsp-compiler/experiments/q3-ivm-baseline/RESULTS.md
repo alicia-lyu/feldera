@@ -174,6 +174,10 @@ publication, and associated cleanup. `load.observed_storage_bytes` is the
 loaded storage observation used by the Linux size qualification check. Neither
 loading field is part of the refresh sequence.
 
+## R5 results, measurement versions 5 to 10
+
+The macOS smoke runs from measurement version 5 on are recorded in [measurement.md](../../../docs/design/merged-index/measurement.md): versions 5 and 6, and [version 10](../../../docs/design/merged-index/measurement.md#version-10-smoke-2026-11-11) (2026-11-11, both session passes).
+
 ## R5 results, measurement version 4 (macOS smoke, 2026-10-26)
 
 Version 4 maintains the merged index in the base runtime and books its upkeep in `base_ms`; `ivm_ms` is the view circuit alone. Everything else matches version 3. The revision is `572bd97a0`. These are smoke tests, not qualifying results, and the Linux-only window memory and cgroup fields are `null` by design.
