@@ -726,7 +726,7 @@ fn transact_inner(
     // The native view circuit takes the net delta as JSON rows; converting them into its input
     // handles is view work (`delta_ms`).
     #[cfg(not(feature = "merged-index"))]
-    let mut delta = {
+    let delta = {
         let delta_started = Instant::now();
         net_delta.apply_optional(None, pipeline.view.inputs())?;
         delta_started.elapsed()
