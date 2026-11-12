@@ -276,6 +276,25 @@ Selective execution visited only the instance nodes that requests needed, and ke
 
 Buffered execution replaces it as the fallback and as the only target. Reviving selective execution means restoring the request queues and `Visit` over the same `RunMerge`, `Old`, and `Dlt`, and showing (A3) for the circuit.
 
+### Status on 2026-11-12: requests apply at routing; skipping stays deferred
+
+The 2026-11-12 design (decisions.md) revives most of the request machinery inside one touched group, but not the skipping. The implementation sits between buffered and selective execution: *selective decoding with whole-group positioning*. With the deferred skip, it would become selective execution restricted to one group at a time.
+
+| Selective execution (above) | Status |
+| --- | --- |
+| Requests, anchored at the instance node of the driving row and cut to the reader's key | Adopted: request prefixes cut at the reader's request node (`REQUEST_DEPTH`) |
+| Static requests from base delta rows | Adopted: `reader::capture` builds them from `ΔC`, `ΔO`, and `ΔL` before the scan |
+| Dynamic requests from derived rows | Adopted for `ΔJ`, computed at the order node during routing |
+| Order of requests: a queue per reader, merged by prefix | Replaced: each reader has a sorted list and a forward pointer, and the one cursor's order drives them. `ΔJ`'s requests arise in key order, so no sorted insert is needed |
+| Ready pairs | Adopted for Q3's two joins, as Q3's hook (`q3.rs`): `ΔJ` and `J⁺` at each order before its lines. Not derived from the spec |
+| Kept path | Adopted: a requested customer's after row is kept while its group is scanned |
+| Width for child prefixes | Adopted: the request node's width comes from the trie |
+| (A3), available requests | Holds for Q3 by trie order (`ΔJ` at `(c, o)` needs only `ΔO(c, o)` and `ΔC(c)`). Not shown in general |
+| `Visit`: skip an unneeded child by one seek | Not adopted: a touched group is scanned end to end, and an unrequested entry costs a key read but no decode ([the next step of the over-read item](#whole-group-over-read-for-narrow-requests)) |
+| Result: unrequested entries never decoded | Partly: never decoded, but still reached |
+
+What remains deferred: `Visit` within a group, (A3) in general, and ready pairs derived from the spec.
+
 ## Whole-group over-read for narrow requests
 
 Deferred on 2026-11-12. The scan session visits every position of each touched customer's group, while the joins' partner reads need only a slice of it: an inserted line item needs its order and customer, not the customer's other orders and their lines.
@@ -283,7 +302,7 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 - **Evidence.** In the version 10 smoke run (`target/r5-v10-smoke/`, [measurement.md](measurement.md)), the session buffered 34 to 94 `Old` entries per touched group per refresh, against native's 73 to 134 DBSP operator key reads for the whole refresh. Each refresh touched 8 to 10 groups.
 - **The workloads do not test clustering.** At scale factor 0.01, clustered RF1 puts its 10 Orders on 8 to 10 Customers, so almost every touched customer receives one order. Reading a group once pays off only when one group serves many requests. A fair test needs many Orders per Customer.
 - **First mitigation (2026-11-12).** Each reader keeps only the rows its driving delta requests, and only those entries are decoded ([decisions.md](decisions.md)). The joins and their counters no longer see the over-read. The key read per position remains.
-- **Next step.** The routing cursor seeks past a subtree that no reader requests, such as an order with no change and no changed customer, together with its lines. This is close to the `Skip` of [selective execution](#selective-execution), restricted to one group.
+- **Next step.** The routing cursor seeks past a subtree that no reader requests, such as an order with no change and no changed customer, together with its lines. This is the `Visit` of [selective execution](#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred), restricted to one group; the requests it needs already exist at routing.
 
 ## General merged-index definition: later work
 

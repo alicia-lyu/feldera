@@ -504,6 +504,13 @@ The user amended this on the same day:
 - **The read owner is named `requested_slice`** (not `reader_batch`), and the summarizer's column group is "Requested slice seeks / reads" (`requested_slice_*`; the operators' counters are `dbsp_operator_*`). Measurement version 11.
 - **No whole clone of `ΔC`.** A reader's after read is its requested slice, built at routing: `C⁺`'s batch holds, for each customer that `ΔO` requests, `Old`'s row and that customer's `ΔC` rows, copied into `C⁺`'s builder (one copy per kept row). No after read holds the whole `ΔC` or `ΔO`, so `take_driving_deltas` moves `ΔC`, `ΔO`, and `ΔL` out of their owners with no clone.
 
+The user also decided the read owners and the IVM window on 2026-11-12:
+
+- **Read owners.** `requested_slice` counts the reconstructed joins' partner reads of the readers' slices and routing's reads of `ΔC` and `ΔO` rows (read by a forward merge with the scan, since both are sorted, because they build the slices). `partner_trace` counts the native joins' trace reads, partner sampling included. Delta-side reads stay under `query`, labeled "DBSP operator reads". Phase A's `Dlt` reads count under `merged_index`, so both modes' partner-read rows cover the same kind of work (native's traces are integrated, so they include this transaction's delta rows). The code has `requested_slice`; `partner_trace`, the forward merge, and phase A's owner are pending.
+- **`DrivingDelta`** (`Stream(id)` or `Join`) names how a reader's driving delta arises; the entry-to-row function is `unfold`.
+- **`delta_ms`.** Preparing the view's transaction delta is in the IVM window in both modes (native's JSON conversion; reconstructed mode's phase A and hand-off), and `forward_ms` keeps only the net-delta read. Measurement version 11. Pending in code.
+- **Relation to selective execution.** This design revives selective execution's requests, kept path, and ready pairs inside one touched group, but not `Visit` ([deferred.md](deferred.md#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred)).
+
 The whole-group over-read that remains, a key read per position of a touched group, is deferred ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
 
 ### 2026-11-10: Pipelining types take the suffix `Vector`
@@ -515,6 +522,7 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
+| 2026-11-09 | Selective execution's requests are withdrawn (deferred with `Visit`). | 2026-11-12, in part: requests, the kept path, and ready pairs apply at routing inside a touched group; `Visit` stays deferred. |
 | 2026-11-11 | The driving deltas are pushed row by row into the view circuit's `ZSetHandle`s (measurement version 9). | 2026-11-11: the readers' `Dlt` batches are handed whole to `add_input_stream` handles (measurement version 10). |
 | 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader holds its driving delta's requests and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
 | 2026-11-11 | Three `TransactionGenerator` sources emit the readers' `Dlt` batches at the commit flush, cloning all three. | 2026-11-11: DBSP's `Input` operator, as native mode uses; `ΔO` and `ΔL` moved, `ΔC` cloned. |
