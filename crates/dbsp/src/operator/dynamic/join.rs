@@ -2219,8 +2219,7 @@ pub(crate) mod test {
     fn supplied_snapshot_join_sees_a_delta_emitted_at_the_flush() {
         use crate::{
             circuit::circuit_builder::Circuit, operator::TransactionGenerator,
-            trace::BatchReaderFactories,
-            typed_batch::SpineSnapshot as TypedSpineSnapshot,
+            trace::BatchReaderFactories, typed_batch::SpineSnapshot as TypedSpineSnapshot,
         };
         use std::sync::{Arc, Mutex};
 

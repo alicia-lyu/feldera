@@ -11,6 +11,7 @@ use crate::{
 pub mod batch;
 pub mod ordered;
 pub mod packed;
+pub mod reader;
 pub mod run_merge;
 pub mod session;
 pub mod testing;
@@ -19,6 +20,7 @@ pub mod trie;
 pub use batch::MergedIndexBatch;
 pub use ordered::OrderedKey;
 pub use packed::{PackedField, PayloadDecoder, PayloadEncoder};
+pub use reader::{FilledReader, Half, Projection, Reader, ReaderRuns, TouchedGroups};
 pub use run_merge::RunMerge;
 pub use session::{Entry, GroupBuffers, Pass, ScanSession, SessionCounts, StreamBuffer};
 pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement, Via};
