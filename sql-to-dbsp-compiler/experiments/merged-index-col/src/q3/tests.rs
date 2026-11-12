@@ -1,7 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 use crate::{
-    build_batch, prefix_custkey, CustomerByCustkeyPayload,
-    LineitemByCustkeyOrderkeyLinenumberPayload, OrdersByCustkeyOrderkeyPayload, StoredPayload,
+    build_batch, prefix_custkey, CustomerByCustkeyKey, CustomerByCustkeyPayload,
+    LineitemByCustkeyOrderkeyLinenumberKey, LineitemByCustkeyOrderkeyLinenumberPayload,
+    OrdersByCustkeyOrderkeyKey, OrdersByCustkeyOrderkeyPayload, StoredPayload,
     INDEX_ID_CUSTOMER_BY_CUSTKEY, INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
     INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
 };
@@ -88,18 +91,23 @@ fn delta<K: DBData, V: DBData>(rows: Vec<(K, V, i64)>) -> SpineSnapshot<OrdIndex
     TypedBatch::new(batch.into_inner().into_ro_snapshot())
 }
 
+/// The rows of `batch` with nonzero weights. The cursor of a snapshot of
+/// several batches sums each row's weights across them.
 fn tuples<K: DBData, V: DBData>(
-    snapshot: &SpineSnapshot<OrdIndexedZSet<K, V>>,
+    batch: &impl BatchReader<Key = K, Val = V, DynR = DynZWeight, Time = ()>,
 ) -> Vec<(K, V, i64)> {
-    let mut cursor = snapshot.inner().cursor();
+    let mut cursor = batch.inner().cursor();
     let mut rows = Vec::new();
     while cursor.key_valid() {
         while cursor.val_valid() {
-            rows.push((
-                cursor.key().downcast_checked::<K>().clone(),
-                cursor.val().downcast_checked::<V>().clone(),
-                **cursor.weight(),
-            ));
+            let weight = **cursor.weight();
+            if weight != 0 {
+                rows.push((
+                    cursor.key().downcast_checked::<K>().clone(),
+                    cursor.val().downcast_checked::<V>().clone(),
+                    weight,
+                ));
+            }
             cursor.step_val();
         }
         cursor.step_key();
@@ -222,7 +230,9 @@ fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
             ),
         ]
     );
-    // The line items before the transaction are those of the node asked for.
+    // The line items before the transaction are every line item of the
+    // touched customers; the join seeks only the nodes it asks for, such as
+    // `(3, 20)`, and finds nothing at `(2, 21)`.
     let state_with_lines = published(
         vec![vec![line(2, 20, 1, 100, 1), line(3, 20, 5, 100, 1)]],
         vec![customer(2, "x", 1), customer(3, "y", 1)],
@@ -241,7 +251,10 @@ fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
     ]);
     assert_eq!(
         tuples(&state_with_lines.lineitems_before(&joined).unwrap()),
-        vec![(Tup2(3, 20), line_value(5, 100), 1)]
+        vec![
+            (Tup2(2, 20), line_value(1, 100), 1),
+            (Tup2(3, 20), line_value(5, 100), 1),
+        ]
     );
 }
 
@@ -381,9 +394,8 @@ fn reconstruction_chunks_use_native_ordering_and_consolidation() {
     assert!(actual.windows(2).all(|rows| rows[0].0 < rows[1].0));
 }
 
-/// The `Dlt` halves of the buffers reach the circuit's input handles as
-/// complete rows: each row carries its trie keys, and a moved line item
-/// appears under both customers.
+/// The driving deltas are the readers' `Dlt` batches: each row carries its
+/// trie keys, and a moved line item appears under both customers.
 #[test]
 fn driving_deltas_carry_trie_keys() {
     let state = published(
@@ -400,63 +412,34 @@ fn driving_deltas_carry_trie_keys() {
             line(3, 20, 1, 100, 1),
         ],
     );
-    let (mut circuit, (handles, outputs)) =
-        Runtime::init_circuit(CircuitConfig::with_workers(1), |circuit| {
-            let (customers, customer_handle) = circuit.add_input_zset::<CustomerRow>();
-            let (orders, order_handle) = circuit.add_input_zset::<OrderRow>();
-            let (lines, line_handle) = circuit.add_input_zset::<LineitemRow>();
-            Ok((
-                (customer_handle, order_handle, line_handle),
-                (customers.output(), orders.output(), lines.output()),
-            ))
-        })
-        .unwrap();
-    state
-        .push_driving_deltas(&handles.0, &handles.1, &handles.2)
-        .unwrap();
-    circuit.transaction().unwrap();
+    let (customers, orders, lines) = (
+        state.customer_deltas().unwrap(),
+        state.order_deltas().unwrap(),
+        state.line_deltas().unwrap(),
+    );
     state.finish().unwrap();
 
     assert_eq!(
-        zset_rows(&outputs.0.consolidate()),
+        tuples(&customers),
         vec![
-            (Tup2(2, SqlString::from("new")), 1),
-            (Tup2(2, SqlString::from("old")), -1),
+            (Tup1(2), Tup1(SqlString::from("new")), 1),
+            (Tup1(2), Tup1(SqlString::from("old")), -1),
         ]
     );
     assert_eq!(
-        zset_rows(&outputs.1.consolidate()),
-        vec![(Tup4(3, 21, Date::from_days(11), 7), 1)]
+        tuples(&orders),
+        vec![(Tup1(3), Tup3(21, Date::from_days(11), 7), 1)]
     );
     assert_eq!(
-        zset_rows(&outputs.2.consolidate()),
+        tuples(&lines),
         vec![
-            (
-                Tup6(2, 20, 1, money(100), discount(), Date::from_days(30)),
-                -1
-            ),
-            (
-                Tup6(3, 20, 1, money(100), discount(), Date::from_days(30)),
-                1
-            ),
+            (Tup2(2, 20), line_value(1, 100), -1),
+            (Tup2(3, 20), line_value(1, 100), 1),
         ]
     );
 }
 
-fn zset_rows<T: DBData>(zset: &OrdZSet<T>) -> Vec<(T, i64)> {
-    let mut cursor = zset.inner().cursor();
-    let mut rows = Vec::new();
-    while cursor.key_valid() {
-        rows.push((
-            cursor.key().downcast_checked::<T>().clone(),
-            **cursor.weight(),
-        ));
-        cursor.step_key();
-    }
-    rows
-}
-
-// ---- The virtual buffers against a brute force ----
+// ---- The readers against a brute force ----
 
 /// The summed weight of each `(key, payload)` over `runs`, zero sums dropped:
 /// the consolidated rows of an index state.
@@ -509,7 +492,7 @@ proptest! {
     /// a brute force over the consolidated `Old` and `Old + Dlt`, whatever the
     /// split of `Old` into runs and the pass.
     #[test]
-    fn virtual_buffer_reads_match_a_brute_force(
+    fn readers_match_a_brute_force(
         first_run in source_rows(),
         second_run in source_rows(),
         dlt_rows in source_rows(),
@@ -747,8 +730,8 @@ fn worked_runs() -> (MergedIndexBatch, MergedIndexBatch, MergedIndexBatch) {
 
 /// `collect` is the scan session of the worked transaction (see
 /// `session_run_reads_on_the_worked_transaction`), and `finish` reports what it
-/// read. The four readers then read the index not at all: they read the
-/// buffers.
+/// read. The four partner reads then read the index not at all: they read the
+/// readers' batches, which collection built.
 #[test]
 fn collect_reads_the_index_once_and_the_readers_not_at_all() {
     in_storage_runtime(|| {
