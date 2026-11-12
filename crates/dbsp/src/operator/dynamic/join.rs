@@ -2211,6 +2211,94 @@ pub(crate) mod test {
         circuit.kill().unwrap();
     }
 
+    /// A delta that a source emits only at the commit's flush reaches the
+    /// supplied-snapshot join in the same transaction: the join's accumulator
+    /// is flushed after the source, so it sees the source's flush output.
+    #[cfg(feature = "backend-mode")]
+    #[test]
+    fn supplied_snapshot_join_sees_a_delta_emitted_at_the_flush() {
+        use crate::{
+            circuit::circuit_builder::Circuit, operator::TransactionGenerator,
+            trace::BatchReaderFactories,
+            typed_batch::SpineSnapshot as TypedSpineSnapshot,
+        };
+        use std::sync::{Arc, Mutex};
+
+        fn snapshot(
+            batch: OrdIndexedZSet<u64, u64>,
+        ) -> TypedSpineSnapshot<OrdIndexedZSet<u64, u64>> {
+            let factories = BatchReaderFactories::new::<u64, u64, ZWeight>();
+            TypedBatch::new(crate::trace::SpineSnapshot::with_batches(
+                &factories,
+                vec![Arc::new(batch.into_inner())],
+            ))
+        }
+
+        // The deltas the sources emit at the next flush; empty on other steps.
+        let pending_left = Arc::new(Mutex::new(indexed_zset! {}));
+        let pending_right = Arc::new(Mutex::new(indexed_zset! {}));
+        let right_current = Arc::new(Mutex::new(snapshot(indexed_zset! {})));
+        let left_before = Arc::new(Mutex::new(snapshot(indexed_zset! {})));
+
+        let (left_source, right_source) = (pending_left.clone(), pending_right.clone());
+        let (right_reader, left_reader) = (right_current.clone(), left_before.clone());
+        let (mut circuit, (supplied, native)) =
+            Runtime::init_circuit(CircuitConfig::from(1), move |circuit| {
+                let left: Stream<_, OrdIndexedZSet<u64, u64>> =
+                    circuit.add_source(TransactionGenerator::new(move |flush| {
+                        if flush {
+                            std::mem::take(&mut *left_source.lock().unwrap())
+                        } else {
+                            indexed_zset! {}
+                        }
+                    }));
+                let right: Stream<_, OrdIndexedZSet<u64, u64>> =
+                    circuit.add_source(TransactionGenerator::new(move |flush| {
+                        if flush {
+                            std::mem::take(&mut *right_source.lock().unwrap())
+                        } else {
+                            indexed_zset! {}
+                        }
+                    }));
+                let supplied = left
+                    .join_with_snapshot_readers(
+                        &right,
+                        move |_| right_reader.lock().unwrap().clone(),
+                        move |_| left_reader.lock().unwrap().clone(),
+                        |key, left, right| Tup2(*key, Tup2(*left, *right)),
+                    )
+                    .accumulate_output();
+                let native = left
+                    .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                    .accumulate_output();
+                Ok((supplied, native))
+            })
+            .unwrap();
+
+        *pending_left.lock().unwrap() = indexed_zset! {1 => {2 => 1}};
+        *pending_right.lock().unwrap() = indexed_zset! {1 => {3 => 1}};
+        *right_current.lock().unwrap() = snapshot(indexed_zset! {1 => {3 => 1}});
+        circuit.transaction().unwrap();
+        let first = supplied.concat().consolidate();
+        assert_eq!(first, native.concat().consolidate());
+        assert_eq!(first, zset! {Tup2(1, Tup2(2, 3)) => 1});
+
+        // A transaction of several steps: the sources emit only at the flush.
+        *pending_left.lock().unwrap() = indexed_zset! {1 => {2 => -1}};
+        *pending_right.lock().unwrap() = indexed_zset! {1 => {3 => 1}};
+        *left_before.lock().unwrap() = snapshot(indexed_zset! {1 => {2 => 1}});
+        *right_current.lock().unwrap() = snapshot(indexed_zset! {1 => {3 => 2}});
+        circuit.start_transaction().unwrap();
+        circuit.step().unwrap();
+        circuit.step().unwrap();
+        circuit.commit_transaction().unwrap();
+        let second = supplied.concat().consolidate();
+        assert_eq!(second, native.concat().consolidate());
+        assert_eq!(second, zset! {Tup2(1, Tup2(2, 3)) => -1});
+
+        circuit.kill().unwrap();
+    }
+
     fn do_join_test(workers: usize, transaction: bool, balanced: bool) {
         let mut input1 = vec![
             vec![
