@@ -2,47 +2,67 @@
 //!
 //! The view is `V = L ⋈ (O ⋈ C)`. The caller maintains the secondary index,
 //! publishes the transaction's `Old` (the snapshot before it) and `Dlt` (its
-//! signed index changes), and [`Q3State::collect`] runs one scan session over
-//! them. The session routes each entry of a touched customer's group to the
-//! [`Reader`]s of its stream, which project it once into the joins' typed
-//! rows; the groups' raw buffers are dropped as they are routed.
+//! signed index changes), and [`Q3State::collect`] reads them once each:
 //!
-//! The four partner reads of the delta rules are the readers' batches: `C⁺`
-//! (customers, after), `O⁻` (orders by customer, before), and `L⁻` (line items,
-//! before) hand their batches to the joins as they are. `J⁺` is `J`'s join
-//! re-evaluated on the path of each requested `(custkey, orderkey)`, from the
-//! customers' and the orders-by-order readers' after reads; its rows are the
-//! one copy left at the DBSP boundary. The driving deltas are the readers'
-//! `Dlt` batches ([`Q3State::take_driving_deltas`]). A request outside the touched
-//! groups breaks the contract that every driving-delta key lies in a group
-//! that `Dlt` touches, and is an error.
+//! 1. A pass over `Dlt` ([`capture`]) lists the touched customers and builds
+//!    the driving deltas `ΔC`, `ΔO`, and `ΔL` and each reader's requests.
+//! 2. One scan session visits the touched customers' groups of `Old`. It
+//!    decides from the folded key alone whether a reader keeps an entry, and
+//!    reads, decodes, and unfolds a kept entry once.
+//!
+//! The four partner reads of the delta rules are four [`Reader`]s. Each owns
+//! its driving delta and keeps only the rows that it requests:
+//!
+//! | Reader | Owns | Keeps |
+//! | --- | --- | --- |
+//! | `C⁺` ([`CustomersAfter`]) | `ΔO` | the customers of `ΔO`, after: `Old`'s row and `ΔC`'s rows |
+//! | `O⁻` ([`OrdersBefore`]) | `ΔC` | the orders of each customer in `ΔC`, before |
+//! | `J⁺` ([`JoinedAfter`]) | `ΔL` | `J`'s rows at the `(custkey, orderkey)` of `ΔL`, after |
+//! | `L⁻` ([`LineitemsBefore`]) | `ΔJ`, as requests only | the line items of each order in `ΔJ`, before |
+//!
+//! The folded keys put a customer first, then each of its orders followed by
+//! its line items, so one forward pass over a group knows both terms of `ΔJ`
+//! (`ΔO ⋈ C⁺` and `O⁻ ⋈ ΔC`) and `J⁺`'s rows before an order's line items
+//! arrive. `J⁺` and `ΔJ` are therefore computed at routing: `J⁺`'s rows are
+//! pushed into its batch, and `ΔJ`'s keys are `L⁻`'s requests. `ΔJ` is not
+//! handed to the circuit, which computes its own through its join. The routing
+//! of the three stored readers is [`route`]; this module adds only what `J`
+//! needs (a hook of the generic reader machinery, which has no notion of a
+//! join).
+//!
+//! The circuit's driving deltas are the owners' batches, moved out
+//! ([`Q3State::take_driving_deltas`]); no after read shares them. A partner
+//! read errors on a delta key outside its reader's requests: every delta key
+//! lies in a request, and a request outside the touched groups breaks that
+//! contract.
 
 use std::{
     ops::AddAssign,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use dbsp::{
-    circuit::{splitter_output_chunk_size, RootCircuit},
-    dynamic::{DowncastTrait, Erase},
+    circuit::RootCircuit,
+    dynamic::DowncastTrait,
     storage::write_attribution::WriteOwner,
     trace::{
         merged_index::{
-            reader::collect, FilledReader, MergedIndexBatch, Pass, Reader, ReaderRuns, ScanSession,
-            SessionCounts, TouchedGroups,
+            capture, route, DeltaReader, DrivingDelta, MergedIndexBatch, OrderedKey, Pass,
+            Position, Reader, ReaderDefinition, ScanSession, SessionCounts, StoredReader,
         },
         with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
         SpineSnapshot as DynamicSnapshot,
     },
-    typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
+    typed_batch::{BatchReader, SpineSnapshot},
     utils::{Tup1, Tup2, Tup3, Tup4},
     DBData, OrdIndexedZSet, OrdZSet, Stream, ZWeight,
 };
 use feldera_sqllib::{Date, SqlDecimal, SqlString};
 
 use super::{
-    prefix_custkey, CustomerOrdersLineitemDefinition, Key, Payload, INDEX_ID_CUSTOMER_BY_CUSTKEY,
-    INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER, INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
+    prefix_custkey, prefix_custkey_orderkey, CustomerOrdersLineitemDefinition, Key, Payload,
+    INDEX_ID_CUSTOMER_BY_CUSTKEY, INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
+    INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY, TAG_CUSTKEY, TAG_ORDERKEY,
 };
 
 // A *vector* is DBSP's unit of pipelining: a weighted, key-sorted set of rows
@@ -53,14 +73,14 @@ use super::{
 pub type CustomerByCustkeyVector = OrdIndexedZSet<Tup1<i64>, Tup1<SqlString>>;
 /// The orders, indexed by their customer: `(orderkey, orderdate, shippriority)`.
 pub type OrdersByCustkeyVector = OrdIndexedZSet<Tup1<i64>, Tup3<i64, Date, i32>>;
-/// The orders, indexed by `(custkey, orderkey)`: `(orderdate, shippriority)`.
-pub type OrdersByCustkeyOrderkeyVector = OrdIndexedZSet<Tup2<i64, i64>, Tup2<Date, i32>>;
 /// The joined orders `J`, indexed by `(custkey, orderkey)`, the node at which
 /// `V` reads them: `(mktsegment, orderdate, shippriority)`.
 pub type JoinedByCustkeyOrderkeyVector = OrdIndexedZSet<Tup2<i64, i64>, Tup3<SqlString, Date, i32>>;
 /// The line items, indexed by `(custkey, orderkey)`.
 pub type LineitemByCustkeyOrderkeyVector =
     OrdIndexedZSet<Tup2<i64, i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>;
+
+type LineValue = Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
 
 pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 
@@ -82,44 +102,512 @@ impl AddAssign for SessionReads {
     }
 }
 
-/// The driving deltas of one transaction, `ΔC`, `ΔO`, and `ΔL`: the readers'
-/// `Dlt` batches, indexed by the joins' keys. Every row carries its trie keys.
+/// The driving deltas of one transaction, `ΔC`, `ΔO`, and `ΔL`: the batches
+/// that their owners built from `Dlt`, indexed by the joins' keys. Every row
+/// carries its trie keys.
 pub struct DrivingDeltas {
     pub customers: CustomerByCustkeyVector,
     pub orders: OrdersByCustkeyVector,
     pub lines: LineitemByCustkeyOrderkeyVector,
 }
 
-/// The sealed readers of one transaction, and what collecting them read.
-struct CollectedReaders {
-    customers: ReaderRuns<Tup1<i64>, Tup1<SqlString>>,
-    orders_by_customer: ReaderRuns<Tup1<i64>, Tup3<i64, Date, i32>>,
-    orders_by_order: ReaderRuns<Tup2<i64, i64>, Tup2<Date, i32>>,
-    lines: ReaderRuns<Tup2<i64, i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>,
-    touched: TouchedGroups,
-    reads: SessionReads,
-    /// Until [`Q3State::take_driving_deltas`] hands them over.
-    driving: Mutex<Option<DrivingDeltas>>,
+// ---- The four reader definitions: the static part of each partner read ----
+
+/// `C⁺`: the customers after the transaction, driven by `ΔO`. A path read of
+/// the Customer stream at `custkey`.
+pub struct CustomersAfter;
+
+impl ReaderDefinition for CustomersAfter {
+    type Index = Definition;
+    type Key = Tup1<i64>;
+    type Val = Tup1<SqlString>;
+    type DeltaKey = Tup1<i64>;
+    type DeltaVal = Tup3<i64, Date, i32>;
+    const PARTNER_STREAM: Option<u8> = Some(INDEX_ID_CUSTOMER_BY_CUSTKEY);
+    const REQUEST_DEPTH: usize = 1;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY);
+
+    fn unfold(key: &Key, payload: &Payload) -> Result<(Self::Key, Self::Val), String> {
+        match (key, payload) {
+            (Key::CustomerByCustkey(key), Payload::CustomerByCustkey(payload)) => {
+                Ok((Tup1(key.custkey), Tup1(payload.c_mktsegment.clone())))
+            }
+            other => Err(format!("expected a Customer entry, found {other:?}")),
+        }
+    }
+
+    fn unfold_delta(
+        key: &Key,
+        payload: &Payload,
+    ) -> Result<(Self::DeltaKey, Self::DeltaVal), String> {
+        unfold_order_by_custkey(key, payload)
+    }
 }
 
-impl CollectedReaders {
-    /// Checks that customer `custkey`'s group was collected.
-    fn require_touched(&self, custkey: i64) -> Result<(), String> {
-        if self.touched.contains(&prefix_custkey(custkey)) {
+/// `O⁻`: the orders before the transaction, driven by `ΔC`. A range read of
+/// the Orders stream below the customer.
+pub struct OrdersBefore;
+
+impl ReaderDefinition for OrdersBefore {
+    type Index = Definition;
+    type Key = Tup1<i64>;
+    type Val = Tup3<i64, Date, i32>;
+    type DeltaKey = Tup1<i64>;
+    type DeltaVal = Tup1<SqlString>;
+    const PARTNER_STREAM: Option<u8> = Some(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY);
+    const REQUEST_DEPTH: usize = 1;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(INDEX_ID_CUSTOMER_BY_CUSTKEY);
+
+    fn unfold(key: &Key, payload: &Payload) -> Result<(Self::Key, Self::Val), String> {
+        unfold_order_by_custkey(key, payload)
+    }
+
+    fn unfold_delta(
+        key: &Key,
+        payload: &Payload,
+    ) -> Result<(Self::DeltaKey, Self::DeltaVal), String> {
+        CustomersAfter::unfold(key, payload)
+    }
+}
+
+/// `J⁺`: the joined orders after the transaction, driven by `ΔL`. `J` is not
+/// stored: its rows are built at routing, from the customer and the order of
+/// each requested `(custkey, orderkey)` after the transaction.
+pub struct JoinedAfter;
+
+impl ReaderDefinition for JoinedAfter {
+    type Index = Definition;
+    type Key = Tup2<i64, i64>;
+    type Val = Tup3<SqlString, Date, i32>;
+    type DeltaKey = Tup2<i64, i64>;
+    type DeltaVal = LineValue;
+    const PARTNER_STREAM: Option<u8> = None;
+    const REQUEST_DEPTH: usize = 2;
+    const DRIVING_DELTA: DrivingDelta =
+        DrivingDelta::Stream(INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER);
+
+    fn unfold_delta(
+        key: &Key,
+        payload: &Payload,
+    ) -> Result<(Self::DeltaKey, Self::DeltaVal), String> {
+        unfold_line(key, payload)
+    }
+}
+
+/// `L⁻`: the line items before the transaction, driven by `ΔJ`. A range read
+/// of the Lineitem stream below the order. Its driving delta is a join: only
+/// the requests exist, and the routing computes them.
+pub struct LineitemsBefore;
+
+impl ReaderDefinition for LineitemsBefore {
+    type Index = Definition;
+    type Key = Tup2<i64, i64>;
+    type Val = LineValue;
+    type DeltaKey = Tup2<i64, i64>;
+    type DeltaVal = Tup3<SqlString, Date, i32>;
+    const PARTNER_STREAM: Option<u8> = Some(INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER);
+    const REQUEST_DEPTH: usize = 2;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Join;
+
+    fn unfold(key: &Key, payload: &Payload) -> Result<(Self::Key, Self::Val), String> {
+        unfold_line(key, payload)
+    }
+}
+
+/// A row of a reader's batch, or why the entry is not one.
+type Unfolded<K, V> = Result<(K, V), String>;
+
+fn unfold_order_by_custkey(
+    key: &Key,
+    payload: &Payload,
+) -> Unfolded<Tup1<i64>, Tup3<i64, Date, i32>> {
+    match (key, payload) {
+        (Key::OrdersByCustkeyOrderkey(key), Payload::OrdersByCustkeyOrderkey(payload)) => Ok((
+            Tup1(key.custkey),
+            Tup3(key.orderkey, payload.o_orderdate, payload.o_shippriority),
+        )),
+        other => Err(format!("expected an Orders entry, found {other:?}")),
+    }
+}
+
+fn unfold_line(key: &Key, payload: &Payload) -> Result<(Tup2<i64, i64>, LineValue), String> {
+    match (key, payload) {
+        (
+            Key::LineitemByCustkeyOrderkeyLinenumber(key),
+            Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
+        ) => Ok((
+            Tup2(key.custkey, key.orderkey),
+            Tup4(
+                key.linenumber,
+                payload.l_extendedprice,
+                payload.l_discount,
+                payload.l_shipdate,
+            ),
+        )),
+        other => Err(format!("expected a Lineitem entry, found {other:?}")),
+    }
+}
+
+// ---- Routing: what J needs beyond the generic reader machinery ----
+
+const WEIGHT_OVERFLOW: &str = "Q3 reconstructed join weight overflow";
+
+/// The rows of one customer's or one order's side of `J`: values with their
+/// weights.
+type Weighted<V> = Vec<(V, ZWeight)>;
+
+/// Sums the weights of equal values and drops the zero sums, in value order.
+fn consolidate<V: Ord>(mut rows: Weighted<V>) -> Result<Weighted<V>, String> {
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut merged: Weighted<V> = Vec::with_capacity(rows.len());
+    for (value, weight) in rows {
+        match merged.last_mut() {
+            Some((last, total)) if *last == value => {
+                *total = total.checked_add(weight).ok_or(WEIGHT_OVERFLOW)?;
+            }
+            _ => merged.push((value, weight)),
+        }
+    }
+    merged.retain(|(_, weight)| *weight != 0);
+    Ok(merged)
+}
+
+fn multiply(left: ZWeight, right: ZWeight) -> Result<ZWeight, String> {
+    left.checked_mul(right)
+        .ok_or_else(|| WEIGHT_OVERFLOW.to_owned())
+}
+
+/// The length of a group prefix: the customer field's tag and value.
+const GROUP_WIDTH: usize = 1 + <i64 as OrderedKey>::WIDTH;
+
+/// The customer of a group prefix.
+fn custkey_of_group(group: &[u8]) -> Result<i64, String> {
+    match group {
+        [tag, value @ ..] if *tag == TAG_CUSTKEY => <i64 as OrderedKey>::decode_ordered(value)
+            .ok_or_else(|| format!("group prefix {group:?} has a malformed custkey")),
+        _ => Err(format!(
+            "group prefix {group:?} does not start with the custkey tag"
+        )),
+    }
+}
+
+/// The order of a key below an order node: the customer field, then the
+/// orderkey field.
+fn orderkey_of(key: &[u8]) -> Result<i64, String> {
+    match key.get(GROUP_WIDTH..GROUP_WIDTH + 1 + <i64 as OrderedKey>::WIDTH) {
+        Some([tag, value @ ..]) if *tag == TAG_ORDERKEY => {
+            <i64 as OrderedKey>::decode_ordered(value)
+                .ok_or_else(|| format!("key {key:?} has a malformed orderkey"))
+        }
+        _ => Err(format!("key {key:?} is not below an order node")),
+    }
+}
+
+fn segment_of(payload: &Payload) -> Result<SqlString, String> {
+    match payload {
+        Payload::CustomerByCustkey(payload) => Ok(payload.c_mktsegment.clone()),
+        other => Err(format!("expected a Customer payload, found {other:?}")),
+    }
+}
+
+fn order_day_and_priority(payload: &Payload) -> Result<Tup2<Date, i32>, String> {
+    match payload {
+        Payload::OrdersByCustkeyOrderkey(payload) => {
+            Ok(Tup2(payload.o_orderdate, payload.o_shippriority))
+        }
+        other => Err(format!("expected an Orders payload, found {other:?}")),
+    }
+}
+
+/// One touched customer's group as the routing sees it.
+struct Group {
+    custkey: i64,
+    prefix: Vec<u8>,
+    /// `ΔC`'s rows of this customer, and `ΔO`'s rows of it by ascending
+    /// orderkey, which `next_delta_order` walks.
+    delta_customers: Weighted<Tup1<SqlString>>,
+    delta_orders: Weighted<Tup3<i64, Date, i32>>,
+    next_delta_order: usize,
+    /// Set once the customer's step is done. `customer_after` is the
+    /// customer's rows after the transaction, when someone needs them.
+    customer_done: bool,
+    customer_after: Weighted<SqlString>,
+}
+
+/// The four readers and the routing that computes `J⁺` and `ΔJ`.
+struct Routing<'r> {
+    customers: &'r mut Reader<CustomersAfter>,
+    orders: &'r mut Reader<OrdersBefore>,
+    joined: &'r mut Reader<JoinedAfter>,
+    lines: &'r mut Reader<LineitemsBefore>,
+}
+
+impl Routing<'_> {
+    /// Scans every touched group of `session`.
+    fn scan(&mut self, session: &mut ScanSession<'_, Definition>) -> Result<(), String> {
+        while let Some(prefix) = session.next_group() {
+            let mut group = self.begin(prefix)?;
+            while session.key().is_some() {
+                {
+                    let mut position = Position::at(session);
+                    self.hook(&mut group, &mut position)?;
+                    let readers: &mut [&mut dyn StoredReader<Definition>] =
+                        &mut [&mut *self.customers, &mut *self.orders, &mut *self.lines];
+                    route(&mut position, readers)?;
+                }
+                session.step();
+            }
+            self.end(&mut group)?;
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, prefix: &[u8]) -> Result<Group, String> {
+        let custkey = custkey_of_group(prefix)?;
+        // `ΔC` and `ΔO` have rows in this group only if their owners request it.
+        let delta_customers = if self.orders.requests_mut().has(prefix) {
+            self.orders.delta_rows_at(&Tup1(custkey))?
+        } else {
+            Vec::new()
+        };
+        let delta_orders = if self.customers.requests_mut().has(prefix) {
+            self.customers.delta_rows_at(&Tup1(custkey))?
+        } else {
+            Vec::new()
+        };
+        Ok(Group {
+            custkey,
+            prefix: prefix.to_vec(),
+            delta_customers,
+            delta_orders,
+            next_delta_order: 0,
+            customer_done: false,
+            customer_after: Vec::new(),
+        })
+    }
+
+    /// What the join adds at a position of `Old`, before the stored readers
+    /// route it: the customer step at the customer's entry, and the order step
+    /// at each order, including the orders that only `ΔO` mentions, which
+    /// have no entry in `Old` and are stepped in key order between entries.
+    fn hook(
+        &mut self,
+        group: &mut Group,
+        position: &mut Position<'_, '_, Definition>,
+    ) -> Result<(), String> {
+        let key = position.key().ok_or("a routed position has a key")?;
+        let stream = *key.last().ok_or("a folded key is not empty")?;
+        match stream {
+            INDEX_ID_CUSTOMER_BY_CUSTKEY => self.customer(group, Some(position)),
+            INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY => {
+                let order = orderkey_of(key)?;
+                self.customer_if_absent(group)?;
+                self.orders_before(group, order, false)?;
+                self.order(group, order, Some(position))
+            }
+            INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER => {
+                // A line item may follow no order entry of `Old`, when `ΔO` inserts its order.
+                let order = orderkey_of(key)?;
+                self.customer_if_absent(group)?;
+                self.orders_before(group, order, true)
+            }
+            other => Err(format!("unknown index stream {other}")),
+        }
+    }
+
+    /// The end of a group: the customer and the orders that no entry of
+    /// `Old` carried.
+    fn end(&mut self, group: &mut Group) -> Result<(), String> {
+        self.customer_if_absent(group)?;
+        self.orders_before(group, i64::MAX, true)
+    }
+
+    fn customer_if_absent(&mut self, group: &mut Group) -> Result<(), String> {
+        if group.customer_done {
             Ok(())
         } else {
-            Err(format!(
-                "customer {custkey} is outside the touched groups: Dlt has no entry for it"
-            ))
+            self.customer(group, None)
         }
+    }
+
+    /// The customer's step: computes its rows after the transaction (`Old`'s
+    /// plus `ΔC`'s) if `ΔO` or `ΔL` is in the group, and gives `ΔC`'s rows to
+    /// `C⁺`. `old` is the customer's entry, or `None` if `Old` has none.
+    fn customer(
+        &mut self,
+        group: &mut Group,
+        old: Option<&mut Position<'_, '_, Definition>>,
+    ) -> Result<(), String> {
+        group.customer_done = true;
+        let delta_orders_here = !group.delta_orders.is_empty();
+        let lines_here = self.joined.requests_mut().has_below(&group.prefix);
+        if !delta_orders_here && !lines_here {
+            return Ok(());
+        }
+
+        let mut rows: Weighted<SqlString> = Vec::new();
+        if let Some(position) = old {
+            for (payload, weight) in position.decoded()? {
+                rows.push((segment_of(payload)?, *weight));
+            }
+        }
+        for (Tup1(segment), weight) in &group.delta_customers {
+            rows.push((segment.clone(), *weight));
+            if delta_orders_here {
+                // `C⁺`'s slice is `Old`'s row, which `route` pushes, and `ΔC`'s.
+                self.customers
+                    .push_row(Tup1(group.custkey), Tup1(segment.clone()), *weight)?;
+            }
+        }
+        group.customer_after = consolidate(rows)?;
+        Ok(())
+    }
+
+    /// Steps the orders that only `ΔO` mentions: those with an orderkey below
+    /// `order`, or through it when `inclusive`.
+    fn orders_before(
+        &mut self,
+        group: &mut Group,
+        order: i64,
+        inclusive: bool,
+    ) -> Result<(), String> {
+        while let Some((Tup3(next, ..), _)) = group.delta_orders.get(group.next_delta_order) {
+            if *next > order || (*next == order && !inclusive) {
+                break;
+            }
+            let next = *next;
+            self.order(group, next, None)?;
+        }
+        Ok(())
+    }
+
+    /// The order step at `(group, order)`: builds `J⁺`'s rows if `ΔL` is at
+    /// the order, and requests the order's line items for `L⁻` if `ΔJ` has a
+    /// row at it. `old` is the order's entry in `Old`, or `None` if `Old` has
+    /// none. Orders arrive in ascending order, each once.
+    fn order(
+        &mut self,
+        group: &mut Group,
+        order: i64,
+        old: Option<&mut Position<'_, '_, Definition>>,
+    ) -> Result<(), String> {
+        let prefix = prefix_custkey_orderkey(group.custkey, order);
+        let delta_here = take_delta_orders(group, order)?;
+        let lines_here = self.joined.requests_mut().has(&prefix);
+        let customer_delta_here = !group.delta_customers.is_empty();
+
+        let mut order_before: Weighted<Tup2<Date, i32>> = Vec::new();
+        if let (Some(position), true) = (old, customer_delta_here || lines_here) {
+            for (payload, weight) in position.decoded()? {
+                order_before.push((order_day_and_priority(payload)?, *weight));
+            }
+        }
+
+        if lines_here {
+            // `J⁺`: the customer after, times the order after.
+            let order_after = consolidate(
+                order_before
+                    .iter()
+                    .chain(&delta_here)
+                    .map(|(value, weight)| (*value, *weight))
+                    .collect(),
+            )?;
+            for (segment, customer_weight) in &group.customer_after {
+                for (Tup2(date, priority), order_weight) in &order_after {
+                    self.joined.push_row(
+                        Tup2(group.custkey, order),
+                        Tup3(segment.clone(), *date, *priority),
+                        multiply(*customer_weight, *order_weight)?,
+                    )?;
+                }
+            }
+        }
+
+        // `ΔJ` at the order: `ΔO ⋈ C⁺` plus `O⁻ ⋈ ΔC`. It has a row there only
+        // if the two terms do not cancel.
+        let mut delta_joined: Weighted<Tup3<SqlString, Date, i32>> = Vec::new();
+        for (Tup2(date, priority), delta_weight) in &delta_here {
+            for (segment, customer_weight) in &group.customer_after {
+                delta_joined.push((
+                    Tup3(segment.clone(), *date, *priority),
+                    multiply(*delta_weight, *customer_weight)?,
+                ));
+            }
+        }
+        for (Tup2(date, priority), order_weight) in &order_before {
+            for (Tup1(segment), delta_weight) in &group.delta_customers {
+                delta_joined.push((
+                    Tup3(segment.clone(), *date, *priority),
+                    multiply(*order_weight, *delta_weight)?,
+                ));
+            }
+        }
+        if !consolidate(delta_joined)?.is_empty() {
+            self.lines.request(&prefix)?;
+        }
+        Ok(())
+    }
+}
+
+/// Takes `ΔO`'s rows of `order` out of the group's walk, as `(date, priority)`
+/// values. The walk is at the first row of `order` or below it, so a row of a
+/// smaller order left behind is an error.
+fn take_delta_orders(group: &mut Group, order: i64) -> Result<Weighted<Tup2<Date, i32>>, String> {
+    let mut rows = Vec::new();
+    while let Some((Tup3(next, date, priority), weight)) =
+        group.delta_orders.get(group.next_delta_order)
+    {
+        match (*next).cmp(&order) {
+            std::cmp::Ordering::Less => {
+                return Err(format!(
+                    "order {next} of ΔO was left behind by the walk at order {order}"
+                ));
+            }
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Equal => {
+                rows.push((Tup2(*date, *priority), *weight));
+                group.next_delta_order += 1;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+// ---- The state of one transaction ----
+
+/// The readers of one transaction, after collection, and what collecting
+/// them read.
+struct CollectedReaders {
+    customers: Reader<CustomersAfter>,
+    orders: Reader<OrdersBefore>,
+    joined: Reader<JoinedAfter>,
+    lines: Reader<LineitemsBefore>,
+    reads: SessionReads,
+    /// Until [`Q3State::take_driving_deltas`] hands them over.
+    driving: Option<DrivingDeltas>,
+}
+
+/// Checks that a delta key's request prefix is one of `reader`'s requests.
+fn require_requested<R: ReaderDefinition>(
+    reader: &Reader<R>,
+    prefix: &[u8],
+    what: &str,
+) -> Result<(), String> {
+    if reader.requests().contains(prefix) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} is outside the requests of this reader: its driving delta has no row for it"
+        ))
     }
 }
 
 struct ReadViews {
     old: SourceSnapshot,
     dlt: Arc<MergedIndexBatch>,
-    /// Set once by [`Q3State::collect`].
-    collected: OnceLock<CollectedReaders>,
+    /// Set once by [`Q3State::collect`]. The readers' builders are not `Sync`,
+    /// so the readers sit behind a lock that the joins' callbacks take.
+    collected: OnceLock<Mutex<CollectedReaders>>,
 }
 
 /// One externally prepared transaction's index views and readers, shared by
@@ -155,58 +643,68 @@ impl Q3State {
         Ok(())
     }
 
-    /// Runs the scan session over the published `Old` and `Dlt` and fills the
-    /// readers, which are kept until [`Self::finish`]. The index is read here,
-    /// on the calling thread under the merged index's read owner, and nowhere
-    /// else; the caller binds the runtime's buffer cache to this thread.
+    /// Reads `Dlt` and `Old` once each and fills the readers, which are kept
+    /// until [`Self::finish`]. The index is read here, on the calling thread
+    /// under the merged index's read owner, and nowhere else; the caller binds
+    /// the runtime's buffer cache to this thread.
     pub fn collect(&self, pass: Pass) -> Result<(), String> {
         let views = self.views()?;
         let before = RunReads::current_for(WriteOwner::MergedIndex);
-        let mut customers = Reader::new(INDEX_ID_CUSTOMER_BY_CUSTKEY, customer_by_custkey);
-        let mut orders_by_customer =
-            Reader::new(INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY, order_by_custkey);
-        let mut orders_by_order = Reader::new(
-            INDEX_ID_ORDERS_BY_CUSTKEY_ORDERKEY,
-            order_by_custkey_orderkey,
-        );
-        let mut lines = Reader::new(
-            INDEX_ID_LINEITEM_BY_CUSTKEY_ORDERKEY_LINENUMBER,
-            line_by_custkey_orderkey,
-        );
-        let (touched, counts) = with_read_owner(WriteOwner::MergedIndex, || {
-            let mut session = ScanSession::<Definition>::new(&views.old, &views.dlt, pass);
-            let readers: &mut [&mut dyn FilledReader<Definition>] = &mut [
-                &mut customers,
-                &mut orders_by_customer,
-                &mut orders_by_order,
-                &mut lines,
-            ];
-            let touched = collect(&mut session, readers)?;
-            Ok::<_, String>((touched, session.counts()))
+        let (mut collected, counts) = with_read_owner(WriteOwner::MergedIndex, || {
+            let mut customers = Reader::<CustomersAfter>::new()?;
+            let mut orders = Reader::<OrdersBefore>::new()?;
+            let mut joined = Reader::<JoinedAfter>::new()?;
+            let mut lines = Reader::<LineitemsBefore>::new()?;
+
+            let drivers: &mut [&mut dyn DeltaReader<Definition>] =
+                &mut [&mut customers, &mut orders, &mut joined, &mut lines];
+            let captured = capture::<Definition>(&views.dlt, drivers)?;
+
+            let mut session = ScanSession::<Definition>::new(&views.old, &captured.touched, pass);
+            Routing {
+                customers: &mut customers,
+                orders: &mut orders,
+                joined: &mut joined,
+                lines: &mut lines,
+            }
+            .scan(&mut session)?;
+            let counts = SessionCounts {
+                payload_decodes_dlt: captured.payload_decodes_dlt,
+                ..session.counts()
+            };
+            drop(session);
+
+            for reader in [
+                customers.seal_partner(),
+                orders.seal_partner(),
+                joined.seal_partner(),
+                lines.seal_partner(),
+            ] {
+                reader?;
+            }
+            Ok::<_, String>(((customers, orders, joined, lines), counts))
         })?;
         let run_reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
-        // `ΔO` and `ΔL` are moved out of readers that serve before reads only.
-        // `ΔC` is cloned: its batch is also half of `C⁺`, the customers' after read.
-        let customers = customers.seal();
-        let mut orders_by_customer = orders_by_customer.seal();
-        let mut lines = lines.seal();
+
+        // The owners' driving deltas are moved out, not cloned: no after read
+        // shares them. `ΔC` is `O⁻`'s, `ΔO` is `C⁺`'s, and `ΔL` is `J⁺`'s.
+        let (customers, orders, joined, _) = &mut collected;
         let driving = DrivingDeltas {
-            customers: customers.delta(),
-            orders: orders_by_customer.take_delta(),
-            lines: lines.take_delta(),
+            customers: orders.take_delta()?,
+            orders: customers.take_delta()?,
+            lines: joined.take_delta()?,
         };
-        let collected = CollectedReaders {
-            customers,
-            orders_by_customer,
-            orders_by_order: orders_by_order.seal(),
-            lines,
-            touched,
-            reads: SessionReads { counts, run_reads },
-            driving: Mutex::new(Some(driving)),
-        };
+        let (customers, orders, joined, lines) = collected;
         views
             .collected
-            .set(collected)
+            .set(Mutex::new(CollectedReaders {
+                customers,
+                orders,
+                joined,
+                lines,
+                reads: SessionReads { counts, run_reads },
+                driving: Some(driving),
+            }))
             .map_err(|_| "the published views were already collected".to_owned())
     }
 
@@ -218,10 +716,13 @@ impl Q3State {
         let views = views
             .take()
             .ok_or("no Q3 transaction views were published")?;
-        Ok(views
-            .collected
-            .get()
-            .map_or_else(SessionReads::default, |collected| collected.reads))
+        match views.collected.get() {
+            Some(collected) => Ok(collected
+                .lock()
+                .map_err(|_| "Q3 readers lock poisoned")?
+                .reads),
+            None => Ok(SessionReads::default()),
+        }
     }
 
     /// The published `Old` snapshot.
@@ -246,18 +747,15 @@ impl Q3State {
     /// circuit's input handles.
     pub fn take_driving_deltas(&self) -> Result<DrivingDeltas, String> {
         let views = self.views()?;
-        let mut driving = views
-            .collected_readers()?
+        let mut collected = views.collected_readers()?;
+        collected
             .driving
-            .lock()
-            .map_err(|_| "Q3 driving deltas lock poisoned")?;
-        driving
             .take()
             .ok_or_else(|| "the driving deltas were already taken".to_owned())
     }
 
-    /// `C⁺`: the customers after the transaction, driven by `ΔO`. A path read
-    /// of the Customer stream, so each key of the delta takes its customer.
+    /// `C⁺`: the customers after the transaction, driven by `ΔO`: for each
+    /// customer of `ΔO`, `Old`'s row and `ΔC`'s rows, consolidated.
     pub fn customers_after(
         &self,
         delta: &SpineSnapshot<OrdersByCustkeyVector>,
@@ -265,13 +763,17 @@ impl Q3State {
         let views = self.views()?;
         let collected = views.collected_readers()?;
         for Tup1(customer) in requested_keys(delta) {
-            collected.require_touched(customer)?;
+            require_requested(
+                &collected.customers,
+                &prefix_custkey(customer),
+                &format!("customer {customer}"),
+            )?;
         }
-        Ok(collected.customers.after())
+        collected.customers.partner()
     }
 
-    /// `O⁻`: the orders before the transaction, driven by `ΔC`. A range read
-    /// of the Orders stream below the customer.
+    /// `O⁻`: the orders before the transaction, driven by `ΔC`: every order
+    /// of each customer of `ΔC`.
     pub fn orders_before(
         &self,
         delta: &SpineSnapshot<CustomerByCustkeyVector>,
@@ -279,154 +781,61 @@ impl Q3State {
         let views = self.views()?;
         let collected = views.collected_readers()?;
         for Tup1(customer) in requested_keys(delta) {
-            collected.require_touched(customer)?;
+            require_requested(
+                &collected.orders,
+                &prefix_custkey(customer),
+                &format!("customer {customer}"),
+            )?;
         }
-        Ok(collected.orders_by_customer.before())
+        collected.orders.partner()
     }
 
     /// `J⁺`: the joined orders at the requested `(custkey, orderkey)` nodes
-    /// after the transaction, driven by `ΔL`. `J` is not stored, so this is
-    /// `J`'s join re-evaluated on each requested path: the customer of the
-    /// customers' after read times the order of the orders-by-order after
-    /// read, the weights multiplied.
+    /// after the transaction, driven by `ΔL`. `J` is not stored: the rows were
+    /// built at routing, from the customer after times the order after.
     pub fn joined_orders_after(
         &self,
         delta: &SpineSnapshot<LineitemByCustkeyOrderkeyVector>,
     ) -> Result<SpineSnapshot<JoinedByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        let customers = collected.customers.after();
-        let orders = collected.orders_by_order.after();
-        let mut output = RequestedRows::new();
         for Tup2(customer, order) in requested_keys(delta) {
-            collected.require_touched(customer)?;
-            let segments = values_at(&customers, &Tup1(customer));
-            for (Tup2(date, priority), order_weight) in values_at(&orders, &Tup2(customer, order)) {
-                for (Tup1(segment), customer_weight) in &segments {
-                    let weight = order_weight
-                        .checked_mul(*customer_weight)
-                        .ok_or("Q3 reconstructed join weight overflow")?;
-                    output.push(
-                        Tup2(customer, order),
-                        Tup3(segment.clone(), date, priority),
-                        weight,
-                    );
-                }
-            }
+            require_requested(
+                &collected.joined,
+                &prefix_custkey_orderkey(customer, order),
+                &format!("order ({customer}, {order})"),
+            )?;
         }
-        Ok(output.finish())
+        collected.joined.partner()
     }
 
-    /// `L⁻`: the line items before the transaction, driven by `ΔJ`. A range
-    /// read of the Lineitem stream below the order.
+    /// `L⁻`: the line items before the transaction, driven by `ΔJ`: every
+    /// line item of each order that `ΔJ` has a row at.
     pub fn lineitems_before(
         &self,
         delta: &SpineSnapshot<JoinedByCustkeyOrderkeyVector>,
     ) -> Result<SpineSnapshot<LineitemByCustkeyOrderkeyVector>, String> {
         let views = self.views()?;
         let collected = views.collected_readers()?;
-        for Tup2(customer, _) in requested_keys(delta) {
-            collected.require_touched(customer)?;
+        for Tup2(customer, order) in requested_keys(delta) {
+            require_requested(
+                &collected.lines,
+                &prefix_custkey_orderkey(customer, order),
+                &format!("order ({customer}, {order})"),
+            )?;
         }
-        Ok(collected.lines.before())
+        collected.lines.partner()
     }
 }
 
 impl ReadViews {
-    fn collected_readers(&self) -> Result<&CollectedReaders, String> {
+    fn collected_readers(&self) -> Result<MutexGuard<'_, CollectedReaders>, String> {
         self.collected
             .get()
-            .ok_or_else(|| "collect the touched groups before reading them".to_owned())
+            .ok_or_else(|| "collect the touched groups before reading them".to_owned())?
+            .lock()
+            .map_err(|_| "Q3 readers lock poisoned".to_owned())
     }
-}
-
-// The readers' projections: each takes one entry of its stream, with its key
-// unfolded and its payload decoded, and gives the join's typed row.
-
-/// A row of vector `B`, or why the entry is not one.
-type Projected<B> = Result<(<B as BatchReader>::Key, <B as BatchReader>::Val), String>;
-
-fn customer_by_custkey(
-    key: &Key,
-    payload: &Payload,
-) -> Result<(Tup1<i64>, Tup1<SqlString>), String> {
-    match (key, payload) {
-        (Key::CustomerByCustkey(key), Payload::CustomerByCustkey(payload)) => {
-            Ok((Tup1(key.custkey), Tup1(payload.c_mktsegment.clone())))
-        }
-        other => Err(format!("expected a Customer entry, found {other:?}")),
-    }
-}
-
-fn order_by_custkey(key: &Key, payload: &Payload) -> Projected<OrdersByCustkeyVector> {
-    match (key, payload) {
-        (Key::OrdersByCustkeyOrderkey(key), Payload::OrdersByCustkeyOrderkey(payload)) => Ok((
-            Tup1(key.custkey),
-            Tup3(key.orderkey, payload.o_orderdate, payload.o_shippriority),
-        )),
-        other => Err(format!("expected an Orders entry, found {other:?}")),
-    }
-}
-
-fn order_by_custkey_orderkey(
-    key: &Key,
-    payload: &Payload,
-) -> Projected<OrdersByCustkeyOrderkeyVector> {
-    match (key, payload) {
-        (Key::OrdersByCustkeyOrderkey(key), Payload::OrdersByCustkeyOrderkey(payload)) => Ok((
-            Tup2(key.custkey, key.orderkey),
-            Tup2(payload.o_orderdate, payload.o_shippriority),
-        )),
-        other => Err(format!("expected an Orders entry, found {other:?}")),
-    }
-}
-
-#[allow(clippy::type_complexity)]
-fn line_by_custkey_orderkey(
-    key: &Key,
-    payload: &Payload,
-) -> Result<
-    (
-        Tup2<i64, i64>,
-        Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>,
-    ),
-    String,
-> {
-    match (key, payload) {
-        (
-            Key::LineitemByCustkeyOrderkeyLinenumber(key),
-            Payload::LineitemByCustkeyOrderkeyLinenumber(payload),
-        ) => Ok((
-            Tup2(key.custkey, key.orderkey),
-            Tup4(
-                key.linenumber,
-                payload.l_extendedprice,
-                payload.l_discount,
-                payload.l_shipdate,
-            ),
-        )),
-        other => Err(format!("expected a Lineitem entry, found {other:?}")),
-    }
-}
-
-/// The values under `key` in `snapshot`, with their weights summed across its
-/// batches.
-fn values_at<K: DBData, V: DBData>(
-    snapshot: &SpineSnapshot<OrdIndexedZSet<K, V>>,
-    key: &K,
-) -> Vec<(V, ZWeight)> {
-    let mut cursor = snapshot.inner().cursor();
-    let mut values = Vec::new();
-    if cursor.seek_key_exact(key.erase(), None) {
-        while cursor.val_valid() {
-            values.push((
-                cursor.val().downcast_checked::<V>().clone(),
-                *cursor.weight().downcast_checked::<ZWeight>(),
-            ));
-            cursor.step_val();
-        }
-    }
-    values
 }
 
 /// The keys of a driving delta, in order.
@@ -438,47 +847,6 @@ fn requested_keys<K: DBData, V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<K, 
         cursor.step_key();
     }
     keys
-}
-
-/// Bounded sort chunks, combined through the native consolidated snapshot cursor.
-/// The snapshot still owns all result chunks; this is not a hard memory bound.
-/// This is the second of the two copies at the DBSP boundary: the reader's
-/// partner vector.
-struct RequestedRows<K: DBData, V: DBData> {
-    pending: Vec<Tup2<Tup2<K, V>, i64>>,
-    snapshot: SpineSnapshot<OrdIndexedZSet<K, V>>,
-}
-
-impl<K: DBData, V: DBData> RequestedRows<K, V> {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-            snapshot: TypedBatch::new(DynamicSnapshot::new(OrdIndexedZSet::<K, V>::factories())),
-        }
-    }
-
-    fn push(&mut self, key: K, value: V, weight: i64) {
-        if weight != 0 {
-            self.pending.push(Tup2(Tup2(key, value), weight));
-            if self.pending.len() >= splitter_output_chunk_size() {
-                self.flush();
-            }
-        }
-    }
-
-    fn flush(&mut self) {
-        if !self.pending.is_empty() {
-            let batch = OrdIndexedZSet::<K, V>::from_tuples((), std::mem::take(&mut self.pending));
-            self.snapshot
-                .inner_mut()
-                .extend_with_batches([Arc::new(batch.into_inner())]);
-        }
-    }
-
-    fn finish(mut self) -> SpineSnapshot<OrdIndexedZSet<K, V>> {
-        self.flush();
-        self.snapshot
-    }
 }
 
 /// `J = O ⋈ C` on `custkey`, with both historical operands read from the
