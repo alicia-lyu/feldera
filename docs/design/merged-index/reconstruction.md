@@ -40,7 +40,7 @@ Per transaction, the harness does the following in order (`q3-ivm-baseline/src/m
 1. Run the base transaction, then `prepare` its net delta into the complete rows of `Dlt` (`reconstruction::prepare`; see [General deltas](#general-deltas)). The CLI drivers' inputs are first checked by `BaseState::validate` (`workload.rs`).
 2. `ManualIndex::append` the rows. It yields `Old`, the snapshot before the append, and `Dlt`, the appended run. `prepare` and the append are timed as `index_ms`, inside `base_ms`.
 3. `Q3State::publish(old, dlt)`, then `Q3State::collect(pass)`: one scan session fills the typed readers. Before reads take `Old`'s batch; after reads take `Old`'s and `Dlt`'s, unconsolidated (`prop:overlay`).
-4. Run the view transaction. At its commit, the circuit's sources emit the readers' `Dlt` batches, the driving deltas, and the joins read the readers' batches.
+4. `Q3State::take_driving_deltas` hands the readers' `Dlt` batches to the view circuit's `add_input_stream` handles, timed in `forward_ms`. Then run the view transaction; at its commit, the joins read the readers' batches.
 5. `Q3State::finish()` releases the readers and returns the session's reads.
 
 `publish` returns an error if a previous publication has not been finished; `finish` returns an error if nothing was published (`merged-index-col/src/q3.rs`). Consequently several transactions cannot share one publication: each has its own `Old` and `Dlt`.
@@ -69,7 +69,7 @@ Customers and orders fold from the net delta alone: an order folds at its own `o
 
 ## Cost of reconstruction
 
-The session decodes each touched group once, and collection projects each entry once into the typed rows of each reader that takes it (roadmap step 5 of [shared-traversal.md](shared-traversal.md)). The driving deltas are clones of the readers' `Dlt` batches, and `C⁺`, `O⁻`, and `L⁻` are the readers' batches themselves; only `J⁺` is copied, row by row, into a partner vector. This copying and decoding is charged to Q3 maintenance. No cost figure is claimed here; see [measurement.md](measurement.md).
+The session decodes each touched group once, and collection projects each entry once into the typed rows of each reader that takes it (roadmap step 5 of [shared-traversal.md](shared-traversal.md)). The driving deltas are the readers' `Dlt` batches, moved out (`ΔO`, `ΔL`) or cloned (`ΔC`, which `C⁺` shares), and `C⁺`, `O⁻`, and `L⁻` are the readers' batches themselves; only `J⁺` is copied, row by row, into a partner vector. This copying and decoding is charged to Q3 maintenance. No cost figure is claimed here; see [measurement.md](measurement.md).
 
 ## Verification (R4)
 
@@ -85,7 +85,6 @@ Other tests that bear on reconstruction:
 | Test | Location | Covers |
 | --- | --- | --- |
 | `supplied_snapshot_join_matches_native_signed_updates` | `crates/dbsp/src/operator/dynamic/join.rs` | The supplied-snapshot join equals the native join on simultaneous and multi-step transactions |
-| `supplied_snapshot_join_sees_a_delta_emitted_at_the_flush` | same | A delta that a `TransactionGenerator` emits at the flush reaches the join in the same commit |
 | `readers_match_a_brute_force` (and the other `merged_index::reader` tests) | `crates/dbsp/src/trace/merged_index/reader/tests.rs` | Routing by stream, before and after reads, the driving delta, and no extra payload decode for a second reader |
 | `Q3MergedIndexBindingTest` | `sql-to-dbsp-compiler/SQL-compiler` | The hook accepts the supported circuit and rejects others |
 | `rf1_rf2_match_full_join` | `q3-ivm-baseline/src/main.rs` | RF1 and RF2 against the full join (reconstructed mode) |
