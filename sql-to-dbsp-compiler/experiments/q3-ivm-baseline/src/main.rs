@@ -31,7 +31,6 @@ use dbsp::storage::file::writer::{
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
 use dbsp::storage::write_attribution::WriteOwner;
-#[cfg(feature = "merged-index")]
 use dbsp::trace::merged_index::Pass;
 #[cfg(feature = "merged-index")]
 use dbsp::trace::with_read_owner;
@@ -344,6 +343,9 @@ struct Pipeline {
     orphans: OrphanLines,
     #[cfg(feature = "merged-index")]
     q3_state: Q3State,
+    /// How the view phase's scan session passes untouched groups (`--session-pass`).
+    #[cfg(feature = "merged-index")]
+    session_pass: Pass,
     /// The view circuit's input handles, which take each transaction's driving deltas.
     #[cfg(feature = "merged-index")]
     view_inputs: q3_trie_view_circuit::TrieInputs,
@@ -423,6 +425,8 @@ impl Pipeline {
             #[cfg(feature = "merged-index")]
             q3_state,
             #[cfg(feature = "merged-index")]
+            session_pass: Pass::Seek,
+            #[cfg(feature = "merged-index")]
             view_inputs,
             #[cfg(all(test, feature = "merged-index"))]
             view_worker_cache,
@@ -455,7 +459,7 @@ impl Pipeline {
     /// touched groups until the publication is finished. This is the transaction's only read of
     /// the index in the view phase.
     fn collect_groups(&self) -> Result<()> {
-        self.in_cache(|| self.q3_state.collect(Pass::Seek))
+        self.in_cache(|| self.q3_state.collect(self.session_pass))
             .map_err(anyhow::Error::msg)
     }
 
@@ -1040,6 +1044,23 @@ fn rss_bytes() -> u64 {
     }
 }
 
+/// The scan session's pass named on the command line.
+fn parse_pass(name: &str) -> Result<Pass> {
+    match name {
+        "seek" => Ok(Pass::Seek),
+        "step" => Ok(Pass::Step),
+        other => bail!("--session-pass must be seek or step, not {other}"),
+    }
+}
+
+/// The name of a pass in the report, as `--session-pass` spells it.
+fn pass_name(pass: Pass) -> &'static str {
+    match pass {
+        Pass::Seek => "seek",
+        Pass::Step => "step",
+    }
+}
+
 fn milliseconds(elapsed: Duration) -> f64 {
     elapsed.as_secs_f64() * 1000.0
 }
@@ -1071,6 +1092,10 @@ struct Config {
     /// storage files (the merged index's value level); see the DBSP dev
     /// tweak of the same name.
     elide_value_headers: bool,
+    /// How the reconstructed build's scan session passes untouched groups
+    /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
+    /// no session and ignores it.
+    session_pass: Option<Pass>,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -1080,6 +1105,10 @@ struct Config {
 impl Config {
     fn parse() -> Result<Self> {
         Self::from_args(std::env::args().skip(1))
+    }
+
+    fn session_pass(&self) -> Pass {
+        self.session_pass.unwrap_or(Pass::Seek)
     }
 
     fn from_args(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
@@ -1137,6 +1166,11 @@ impl Config {
                 "--setup-full-compaction" => config.setup_full_compaction = true,
                 "--front-code-byte-keys" => config.front_code_byte_keys = true,
                 "--elide-value-headers" => config.elide_value_headers = true,
+                "--session-pass" => {
+                    config.session_pass = Some(parse_pass(
+                        &args.next().context("--session-pass needs seek or step")?,
+                    )?)
+                }
                 "--r5" => config.r5 = true,
                 "--refresh-list" => {
                     config.refresh_list =
@@ -1768,6 +1802,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         })
         .transpose()?;
     let mut pipeline = Pipeline::new(pipeline_config)?;
+    #[cfg(feature = "merged-index")]
+    {
+        pipeline.session_pass = config.session_pass();
+    }
     let runtime = pipeline.runtime().clone();
     // The driver thread binds the runtime's buffer cache, as the workers do.
     runtime.with_buffer_cache(0, || {
@@ -2072,6 +2110,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "setup_full_compaction": config.setup_full_compaction,
             "front_code_byte_keys": config.front_code_byte_keys,
             "elide_value_headers": config.elide_value_headers,
+            "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
         },
@@ -2259,6 +2298,13 @@ mod tests {
         assert!(parse(&["--rf1-lines", "lineitem.tbl.u1"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
         assert!(parse(&["--dump-runtime-circuit"]).is_err());
+        assert!(parse(&["--session-pass"]).is_err());
+        assert!(parse(&["--session-pass", "Seek"]).is_err());
+        assert_eq!(parse(&[]).unwrap().session_pass(), Pass::Seek);
+        for name in ["seek", "step"] {
+            let pass = parse(&["--session-pass", name]).unwrap().session_pass();
+            assert_eq!(pass_name(pass), name);
+        }
         let config = parse(&[
             "--workers",
             "2",
@@ -3131,6 +3177,12 @@ mod measurement_tests {
                 > 0
         );
         assert_eq!(output["measurement_version"], 10);
+        let session_pass = &output["configuration"]["session_pass"];
+        if cfg!(feature = "merged-index") {
+            assert_eq!(session_pass, "seek");
+        } else {
+            assert!(session_pass.is_null());
+        }
         // Version 8 reports the merged index's run reads of the view phase as the scan
         // session's (`index_run_reads.session`, with the session's moves in
         // `index_session_counts`), and the reads of base maintenance apart
@@ -3286,6 +3338,32 @@ mod measurement_tests {
             .is_some());
         // Verification I/O and CPU counters are omitted from performance data.
         assert!(output["sequence"]["resources"]["unavailable"].is_string());
+        // The other pass collects the same groups and decodes the same payloads; only how it
+        // passes the untouched groups differs, and verification checks V under it too.
+        #[cfg(feature = "merged-index")]
+        let config = {
+            let config = Config {
+                session_pass: Some(Pass::Step),
+                storage_path: Some(directory.join("step-storage")),
+                report: Some(directory.join("step-report.json")),
+                ..config
+            };
+            run(&config, 1)?;
+            let stepped: Value =
+                serde_json::from_reader(File::open(config.report.as_ref().unwrap())?)?;
+            assert_eq!(stepped["configuration"]["session_pass"], "step");
+            for field in ["groups", "payload_decodes_old", "payload_decodes_dlt"] {
+                assert_eq!(
+                    stepped["sequence"]["index_session_counts"][field],
+                    output["sequence"]["index_session_counts"][field],
+                    "{field}"
+                );
+            }
+            Config {
+                session_pass: None,
+                ..config
+            }
+        };
         let config = Config {
             verify: false,
             storage_path: Some(directory.join("unverified-storage")),

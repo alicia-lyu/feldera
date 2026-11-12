@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 #[cfg(feature = "merged-index")]
 use dbsp::{
     dynamic::DowncastTrait,
-    trace::{merged_index::Pass, BatchReader as DynamicBatchReader, Cursor, WithSnapshot},
+    trace::{BatchReader as DynamicBatchReader, Cursor, WithSnapshot},
     typed_batch::{BatchReader, SpineSnapshot, TypedBatch},
     utils::{Tup1, Tup2, Tup3, Tup4},
     DBData, OrdIndexedZSet,
@@ -372,9 +372,16 @@ type Fixture = (&'static str, Change, bool);
 
 /// Runs the fixtures in order through a fresh pipeline, checking each against the references
 /// and the base relations, and returns the V transcript: each fixture's delta and view.
-fn replay(fixtures: Vec<Fixture>) -> Result<Vec<Value>> {
+/// `session_pass` is the reconstructed build's scan-session pass; the native build has no
+/// session.
+#[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
+fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
     let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
     let mut pipeline = Pipeline::new(config())?;
+    #[cfg(feature = "merged-index")]
+    {
+        pipeline.session_pass = session_pass;
+    }
     let mut state = Reference::default();
     let mut transcript = Vec::new();
 
@@ -432,7 +439,27 @@ fn write_transcript(variable: &str, transcript: &[Value]) -> Result<()> {
 /// also checked against the base relations, which the base circuit maintains.
 #[test]
 fn rf1_rf2_transcript() -> Result<()> {
-    let fixtures = vec![
+    let transcript = replay(rf1_rf2_fixtures(), Pass::Seek)?;
+    assert_eq!(transcript.len(), 13);
+    write_transcript("Q3_VERIFICATION_TRANSCRIPT", &transcript)
+}
+
+/// The scan session's other pass leaves every transcript unchanged, so it matches the native
+/// build's as `Seek`'s does.
+#[cfg(feature = "merged-index")]
+#[test]
+fn transcripts_do_not_depend_on_the_session_pass() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        assert_eq!(
+            replay(fixtures(), Pass::Step)?,
+            replay(fixtures(), Pass::Seek)?
+        );
+    }
+    Ok(())
+}
+
+fn rf1_rf2_fixtures() -> Vec<Fixture> {
+    vec![
         (
             "customers",
             Change {
@@ -485,10 +512,7 @@ fn rf1_rf2_transcript() -> Result<()> {
             false,
         ),
         ("empty-final", Change::default(), false),
-    ];
-    let transcript = replay(fixtures)?;
-    assert_eq!(transcript.len(), 13);
-    write_transcript("Q3_VERIFICATION_TRANSCRIPT", &transcript)
+    ]
 }
 
 /// A line item with a payload other than `line`'s, for an update.
@@ -506,7 +530,13 @@ fn repriced(order_key: i64, number: i32, price_cents: i64) -> Line {
 /// transaction. The reconstructed build's `Dlt` must be complete for every one of them.
 #[test]
 fn general_transcript() -> Result<()> {
-    let fixtures = vec![
+    let transcript = replay(general_fixtures(), Pass::Seek)?;
+    assert_eq!(transcript.len(), 13);
+    write_transcript("Q3_GENERAL_TRANSCRIPT", &transcript)
+}
+
+fn general_fixtures() -> Vec<Fixture> {
+    vec![
         (
             "customers",
             Change {
@@ -644,8 +674,5 @@ fn general_transcript() -> Result<()> {
             true,
         ),
         ("empty", Change::default(), false),
-    ];
-    let transcript = replay(fixtures)?;
-    assert_eq!(transcript.len(), 13);
-    write_transcript("Q3_GENERAL_TRANSCRIPT", &transcript)
+    ]
 }
