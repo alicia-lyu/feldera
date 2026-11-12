@@ -279,7 +279,8 @@ class MeasureTest(unittest.TestCase):
             "backend_write_by_owner": {
                 "query": {"operations": 2, "bytes": 200},
                 "base_relation": {"operations": 3, "bytes": 300},
-                "merged_index": {"operations": 5, "bytes": 500}}}
+                "merged_index": {"operations": 5, "bytes": 500},
+                "requested_slice": {"operations": 0, "bytes": 0}}}
         if mode == "native":
             resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
             resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
@@ -334,31 +335,47 @@ class MeasureTest(unittest.TestCase):
                       measure.index_read_problems(native)[0])
 
     def test_view_reads_leave_the_index_to_the_session_and_sum_to_the_sequence(self) -> None:
-        def view(index_seeks: int, query_seeks: int) -> dict:
+        def view(index_seeks: int, query_seeks: int, slice_seeks: int = 0) -> dict:
             reads = {owner: {field: 0 for field in measure.RUN_READ_FIELDS}
                      for owner in measure.WRITE_OWNERS}
             reads["merged_index"]["seeks"] = index_seeks
             reads["query"]["seeks"] = query_seeks
+            reads["requested_slice"]["seeks"] = slice_seeks
             return reads
         report = self.index_report()
         for refresh in report["refreshes"]:
             # The scan session reads the index on the driver's thread, and the view worker none.
-            refresh["view_run_reads"] = view(0, 5)
-        report["sequence"]["view_run_reads"] = view(0, 10)
+            # The joins read the readers' requested slices.
+            refresh["view_run_reads"] = view(0, 5, 2)
+        report["sequence"]["view_run_reads"] = view(0, 10, 4)
         self.assertEqual(measure.view_read_problems(report), [])
 
         report["sequence"]["view_run_reads"]["query"]["seeks"] = 11
         self.assertIn("not the sums", measure.view_read_problems(report)[0])
+        report["sequence"]["view_run_reads"]["query"]["seeks"] = 10
 
         report["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 5
         self.assertIn("view_run_reads.merged_index.seeks is 5, expected 0",
                       measure.view_read_problems(report)[0])
+
+        # A reconstructed run reports requested-slice reads.
+        no_slice = self.index_report()
+        for refresh in no_slice["refreshes"]:
+            refresh["view_run_reads"] = view(0, 5)
+        no_slice["sequence"]["view_run_reads"] = view(0, 10)
+        self.assertIn("reports no view_run_reads.requested_slice reads",
+                      measure.view_read_problems(no_slice)[0])
 
         native = {"mode": "native", "sequence": {"view_run_reads": view(0, 3)},
                   "refreshes": [{"refresh": 1, "view_run_reads": view(0, 3)}]}
         self.assertEqual(measure.view_read_problems(native), [])
         native["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 1
         self.assertIn("expected 0", measure.view_read_problems(native)[0])
+        # ...and none in a native run.
+        native["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 0
+        native["refreshes"][0]["view_run_reads"]["requested_slice"]["seeks"] = 1
+        self.assertIn("view_run_reads.requested_slice.seeks is 1, expected 0 in a native run",
+                      measure.view_read_problems(native)[0])
 
         missing = {"mode": "native", "sequence": {}, "refreshes": [{"refresh": 1}]}
         self.assertIn("view_run_reads.query.seeks is None",
@@ -379,6 +396,16 @@ class MeasureTest(unittest.TestCase):
         no_owners = self.owner_report()
         del no_owners["refreshes"][0]["resources"]["backend_write_by_owner"]
         self.assertIn("missing", measure.owner_write_problems(no_owners)[0])
+
+    def test_the_requested_slice_owner_writes_nothing(self) -> None:
+        report = self.owner_report()
+        owners = report["sequence"]["resources"]["backend_write_by_owner"]
+        owners["requested_slice"] = {"operations": 1, "bytes": 0}
+        owners["query"] = {"operations": 1, "bytes": 200}
+        problems = measure.owner_write_problems(report)
+        self.assertEqual(len(problems), 2)
+        for problem in problems:
+            self.assertIn("read owner requested_slice", problem)
 
     def test_native_runs_report_no_merged_index_writes(self) -> None:
         report = self.owner_report("native")

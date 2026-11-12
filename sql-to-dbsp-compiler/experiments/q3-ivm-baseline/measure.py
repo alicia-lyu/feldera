@@ -19,7 +19,10 @@ from typing import Any
 
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
-WRITE_OWNERS = ("query", "base_relation", "merged_index")
+# The owners of `WriteOwner::ALL` (measurement version 11): the components that write storage and
+# whose reads are counted. `requested_slice` is a read owner only (the joins' reads of the readers'
+# requested slices of the index), so no write is ever counted under it.
+WRITE_OWNERS = ("query", "base_relation", "merged_index", "requested_slice")
 # The merged index's readers, and the run counts reported for each (measurement version 8). The
 # view phase reads the index only through its scan session, so there is one reader. The decodes
 # are file runs'; the memory reads are in-memory runs', kept apart from them.
@@ -205,8 +208,10 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
     `WRITE_OWNERS`, with every `RUN_READ_FIELDS` a non-negative integer, and the
     sequence's counts are the sums of the refreshes'. Nothing the view worker runs
     reads under `merged_index`: the scan session reads the index on the driver's
-    thread, and its reads are in `index_run_reads`, not here. A report that names
-    neither mode is not checked here.
+    thread, and its reads are in `index_run_reads`, not here. The joins' reads of the
+    readers' requested slices are under `requested_slice` (measurement version 11): a
+    reconstructed run must report some over the sequence, and a native run none. A
+    report that names neither mode is not checked here.
     """
     mode = report.get("mode")
     if mode not in ("native", "reconstructed"):
@@ -237,9 +242,17 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
             if index_part != 0:
                 problems.append(f"{place}: view_run_reads.merged_index.{field} is {index_part}, "
                                 "expected 0")
+            slice_part = found[("requested_slice", field)]
+            if mode == "native" and slice_part != 0:
+                problems.append(f"{place}: view_run_reads.requested_slice.{field} is "
+                                f"{slice_part}, expected 0 in a native run")
     summed = counts("sequence", report.get("sequence", {}).get("view_run_reads"))
     if summed is not None and not problems and summed != total:
         problems.append("sequence: view_run_reads are not the sums of the refreshes'")
+    if summed is not None and mode == "reconstructed" and not problems:
+        if not any(summed[("requested_slice", field)] for field in RUN_READ_FIELDS):
+            problems.append("sequence: a reconstructed run reports no view_run_reads."
+                            "requested_slice reads")
     return problems
 
 
@@ -268,6 +281,8 @@ def owner_write_problems(report: dict[str, Any]) -> list[str]:
             if by_owner != resources[total_name]:
                 problems.append(f"{place}: owners write {by_owner} {field}, "
                                 f"total is {resources[total_name]}")
+        if any(owners["requested_slice"].values()):
+            problems.append(f"{place}: writes are attributed to the read owner requested_slice")
         if report.get("mode") == "native" and any(owners["merged_index"].values()):
             problems.append(f"{place}: a native run reports merged-index writes")
     return problems

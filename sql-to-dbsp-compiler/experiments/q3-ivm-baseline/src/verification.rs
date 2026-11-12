@@ -134,10 +134,10 @@ fn discount(value: i64) -> Result<SqlDecimal<4, 2>> {
     SqlDecimal::new(i128::from(value), 2).context("invalid line discount")
 }
 
-/// Checks the four partner reads against brute force over the references, for every touched
-/// customer. The readers read one scan session's buffers, so the check collects them in a
-/// state of its own, from the published `Old` and `Dlt`, and leaves the pipeline's for the
-/// view circuit.
+/// Checks the four partner reads against brute force over the references: each reader's
+/// requested slice, at the requests that the references' own driving deltas make. The check
+/// collects the readers in a state of its own, from the published `Old` and `Dlt`, and leaves the
+/// pipeline's for the view circuit.
 #[cfg(feature = "merged-index")]
 fn check_readers(
     q3: &Q3State,
@@ -158,53 +158,113 @@ fn check_readers(
     Ok(())
 }
 
+/// The index state of a reference: what `ManualIndex` holds when it is in step with it. An order
+/// is at its customer (whether or not that customer exists), and a line item is at its order's
+/// customer, if its order exists; an orphan line item is in the side store, not the index.
+#[cfg(feature = "merged-index")]
+struct IndexState {
+    customers: BTreeMap<i64, String>,
+    /// `(custkey, orderkey)` to `(date, shippriority)`.
+    orders: BTreeMap<(i64, i64), (String, i32)>,
+    /// `(custkey, orderkey, linenumber)` to the line item.
+    lines: BTreeMap<(i64, i64, i32), Line>,
+}
+
+#[cfg(feature = "merged-index")]
+impl IndexState {
+    fn of(reference: &Reference) -> Self {
+        let owner = |order_key: i64| reference.orders.get(&order_key).map(|o| o.customer_key);
+        Self {
+            customers: reference
+                .customers
+                .iter()
+                .map(|(key, row)| (*key, row.segment.clone()))
+                .collect(),
+            orders: reference
+                .orders
+                .values()
+                .map(|o| ((o.customer_key, o.key), (o.date.clone(), o.ship_priority)))
+                .collect(),
+            lines: reference
+                .lines
+                .values()
+                .filter_map(|l| owner(l.order_key).map(|c| ((c, l.order_key, l.number), l.clone())))
+                .collect(),
+        }
+    }
+
+    /// `J = O ⋈ C`: the orders whose customer exists, with the customer's segment.
+    fn joined(&self) -> BTreeSet<(i64, i64, String, String, i32)> {
+        self.orders
+            .iter()
+            .filter_map(|((c, o), (date, priority))| {
+                self.customers
+                    .get(c)
+                    .map(|segment| (*c, *o, segment.clone(), date.clone(), *priority))
+            })
+            .collect()
+    }
+}
+
+/// The nodes `(custkey, orderkey)` of the rows in which two sets differ.
+#[cfg(feature = "merged-index")]
+fn differing_nodes<K: Ord + Clone, V: PartialEq>(
+    before: &BTreeMap<K, V>,
+    after: &BTreeMap<K, V>,
+    node: impl Fn(&K) -> (i64, i64),
+) -> BTreeSet<(i64, i64)> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key) != after.get(*key))
+        .map(node)
+        .collect()
+}
+
 #[cfg(feature = "merged-index")]
 fn check_collected_readers(
     q3: &Q3State,
     before: &Reference,
     after: &Reference,
-    change: &Change,
+    _change: &Change,
 ) -> Result<()> {
-    // The touched customers: those the logical change names, and the owners of every order it
-    // changes, before and after (a moved order touches both).
-    let changed_orders: HashSet<i64> = change
-        .orders
-        .iter()
-        .map(|(o, _)| o.key)
-        .chain(change.lines.iter().map(|(l, _)| l.order_key))
-        .collect();
-    let mut touched: BTreeSet<i64> = change.customers.iter().map(|(c, _)| c.key).collect();
-    touched.extend(change.orders.iter().map(|(o, _)| o.customer_key));
-    for reference in [before, after] {
-        touched.extend(
-            changed_orders
-                .iter()
-                .filter_map(|key| reference.orders.get(key))
-                .map(|o| o.customer_key),
-        );
-    }
-    // Every `(custkey, orderkey)` node below a touched customer, before or after.
-    let nodes: BTreeSet<(i64, i64)> = [before, after]
-        .into_iter()
-        .flat_map(|reference| reference.orders.values())
-        .filter(|o| touched.contains(&o.customer_key))
-        .map(|o| (o.customer_key, o.key))
+    // The driving deltas are the differences of the two index states, by brute force from the
+    // references, independent of `prepare`: `ΔC` names the customers whose row differs, `ΔO` the
+    // owners (before and after) of the orders whose entry differs, and `ΔL` the nodes of the line
+    // items whose entry differs.
+    let (old, new) = (IndexState::of(before), IndexState::of(after));
+    let customers_of_delta_customers: BTreeSet<i64> =
+        differing_nodes(&old.customers, &new.customers, |c| (*c, 0))
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+    let customers_of_delta_orders: BTreeSet<i64> =
+        differing_nodes(&old.orders, &new.orders, |(c, o)| (*c, *o))
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+    let nodes_of_delta_lines = differing_nodes(&old.lines, &new.lines, |(c, o, _)| (*c, *o));
+    // `ΔJ = J(after) - J(before)` has a row at the nodes of the rows in which the two differ.
+    let (joined_before, joined_after) = (old.joined(), new.joined());
+    let nodes_of_delta_joined: BTreeSet<(i64, i64)> = joined_before
+        .symmetric_difference(&joined_after)
+        .map(|(c, o, ..)| (*c, *o))
         .collect();
 
     let orders_delta = snapshot(
-        touched
+        customers_of_delta_orders
             .iter()
             .map(|c| (Tup1(*c), Tup3(0, Date::from_days(0), 0), 1))
             .collect(),
     );
     let customers_delta = snapshot(
-        touched
+        customers_of_delta_customers
             .iter()
             .map(|c| (Tup1(*c), Tup1(SqlString::from("request")), 1))
             .collect(),
     );
     let lines_delta = snapshot(
-        nodes
+        nodes_of_delta_lines
             .iter()
             .map(|(c, o)| {
                 (
@@ -221,7 +281,7 @@ fn check_collected_readers(
             .collect(),
     );
     let joined_delta = snapshot(
-        nodes
+        nodes_of_delta_joined
             .iter()
             .map(|(c, o)| {
                 (
@@ -233,11 +293,11 @@ fn check_collected_readers(
             .collect(),
     );
 
-    // C⁺: the touched customers after the change.
+    // C⁺: the customers of `ΔO`, after the change.
     let mut expected_customers = Vec::new();
-    for c in &touched {
-        if let Some(row) = after.customers.get(c) {
-            expected_customers.push((Tup1(*c), Tup1(SqlString::from(row.segment.as_str())), 1));
+    for c in &customers_of_delta_orders {
+        if let Some(segment) = new.customers.get(c) {
+            expected_customers.push((Tup1(*c), Tup1(SqlString::from(segment.as_str())), 1));
         }
     }
     expected_customers.sort();
@@ -249,18 +309,12 @@ fn check_collected_readers(
         expected_customers
     );
 
-    // O⁻: the orders of the touched customers before the change.
+    // O⁻: the orders of the customers of `ΔC`, before the change.
     let mut expected_orders = Vec::new();
-    for row in before
-        .orders
-        .values()
-        .filter(|o| touched.contains(&o.customer_key))
-    {
-        expected_orders.push((
-            Tup1(row.customer_key),
-            Tup3(row.key, date(&row.date)?, row.ship_priority),
-            1,
-        ));
+    for ((c, o), (day, priority)) in &old.orders {
+        if customers_of_delta_customers.contains(c) {
+            expected_orders.push((Tup1(*c), Tup3(*o, date(day)?, *priority), 1));
+        }
     }
     expected_orders.sort();
     assert_eq!(
@@ -271,21 +325,15 @@ fn check_collected_readers(
         expected_orders
     );
 
-    // J⁺: the joined orders after the change, at their `(custkey, orderkey)` nodes.
+    // J⁺: the joined orders after the change, at the nodes of `ΔL`.
     let mut expected_joined = Vec::new();
-    for (c, o) in &nodes {
-        if let (Some(customer), Some(order)) = (after.customers.get(c), after.orders.get(o)) {
-            if order.customer_key == *c {
-                expected_joined.push((
-                    Tup2(*c, *o),
-                    Tup3(
-                        SqlString::from(customer.segment.as_str()),
-                        date(&order.date)?,
-                        order.ship_priority,
-                    ),
-                    1,
-                ));
-            }
+    for (c, o, segment, day, priority) in &joined_after {
+        if nodes_of_delta_lines.contains(&(*c, *o)) {
+            expected_joined.push((
+                Tup2(*c, *o),
+                Tup3(SqlString::from(segment.as_str()), date(day)?, *priority),
+                1,
+            ));
         }
     }
     expected_joined.sort();
@@ -297,14 +345,11 @@ fn check_collected_readers(
         expected_joined
     );
 
-    // L⁻: the lines before the change of each order, at the order's customer then. An orphan
-    // line is in no group.
+    // L⁻: the lines before the change at the nodes where `ΔJ` has a row, each at the order's
+    // customer then. An orphan line is in no group.
     let mut expected_lines = Vec::new();
-    for (c, o) in &nodes {
-        if before.orders.get(o).map(|order| order.customer_key) != Some(*c) {
-            continue;
-        }
-        for row in before.lines.values().filter(|l| l.order_key == *o) {
+    for ((c, o, _), row) in &old.lines {
+        if nodes_of_delta_joined.contains(&(*c, *o)) {
             expected_lines.push((
                 Tup2(*c, *o),
                 Tup4(

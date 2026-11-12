@@ -76,4 +76,4 @@ for script in "${experiment_dir}/generate.sh" "${experiment_dir}/verify.sh" "${c
   run_check "shell-syntax-$(basename "$(dirname "${script}")")-$(basename "${script}" .sh)" bash -n "${script}"
 done
 run_check whitespace git -C "${experiment_dir}" diff --check -- . ../merged-index-col
-echo "RF1/RF2 and general suites, reader projections, and exact transaction transcripts agree."
+echo "RF1/RF2 and general suites, reader rows, and exact transaction transcripts agree."

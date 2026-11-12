@@ -16,7 +16,8 @@ reports, over the repetitions:
   `refresh_profiled_cpu_base_ms` and `refresh_profiled_cpu_q3_ms` (`profiled_cpu_ms.base` and
   `.q3`): a cross-check of `base_ms` and `q3_ms`, not a phase;
 - `sequence.resources.backend_write_by_owner`: write operations and bytes of
-  `query`, `base_relation` and `merged_index`, plus the totals
+  `query`, `base_relation`, `merged_index` and `requested_slice` (a read owner, so always zero),
+  plus the totals
   `backend_write_operations` and `backend_write_bytes`;
 - `sequence.observed_storage_bytes`, and `sequence.resources.peak_rss_bytes`
   (the process-lifetime high-water mark, which includes loading);
@@ -28,11 +29,17 @@ reports, over the repetitions:
   provides (`cgroup_delta_*`: `pgscan`, `pgsteal`, the workingset refaults, the memory events
   and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
   reset worked) and the maximum sampled `memory.current`;
-- `sequence.view_run_reads`, the view worker's run reads summed over the owners
-  (`view_seeks`, `view_filter_rejections`, `view_key_decodes`, `view_value_decodes`,
-  `view_weight_decodes`, `view_memory_key_reads`, `view_memory_value_reads`,
-  `view_memory_weight_reads`), in both modes: the join traces' partner reads in native mode, the index
-  readers' and the rest of the view circuit's in reconstructed mode;
+- `sequence.view_run_reads`, the view worker's run reads, in two groups (measurement version 11).
+  The DBSP operators' own reads, summed over the owners other than `requested_slice`
+  (`dbsp_operator_seeks`, `dbsp_operator_filter_rejections`, `dbsp_operator_key_decodes`,
+  `dbsp_operator_value_decodes`, `dbsp_operator_weight_decodes`, `dbsp_operator_memory_key_reads`,
+  `dbsp_operator_memory_value_reads`, `dbsp_operator_memory_weight_reads`): in native mode the
+  join traces' partner reads and the deltas', in reconstructed mode the deltas' alone. The joins'
+  reads of the readers' requested slices (`requested_slice_seeks`,
+  `requested_slice_filter_rejections`, `requested_slice_key_decodes`,
+  `requested_slice_value_decodes`, `requested_slice_weight_decodes`,
+  `requested_slice_memory_key_reads`, `requested_slice_memory_value_reads`,
+  `requested_slice_memory_weight_reads`): none in native mode;
 - for the merged-index mode only, under the mode's `index_run_reads`: the scan session's run
   reads of the index in the view phase (`sequence.index_run_reads.session`: `index_seeks`,
   `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
@@ -44,7 +51,7 @@ reports, over the repetitions:
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 10, a field is missing or not a finite non-negative number, a
+measurement version 11, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -62,7 +69,9 @@ from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS
                      counter_problems, index_read_problems, owner_write_problems,
                      profiled_cpu_problems, view_read_problems)
 
-MEASUREMENT_VERSION = 10
+MEASUREMENT_VERSION = 11
+# The read owner of the joins' reads of the readers' requested slices.
+REQUESTED_SLICE = "requested_slice"
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
@@ -136,12 +145,17 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     metrics["write_bytes_total"] = number(driver, (*resources, "backend_write_bytes"), where)
     metrics["observed_storage_bytes"] = number(driver, ("sequence", "observed_storage_bytes"), where)
     metrics["peak_rss_bytes"] = number(driver, (*resources, "peak_rss_bytes"), where)
-    # The view worker's run reads over all owners: in native mode the join traces' partner
-    # reads, in reconstructed mode the index readers' and the rest of the view circuit's.
+    # The view worker's run reads (measurement version 11). The DBSP operators' own reads are
+    # those of every owner but `requested_slice`: in native mode the join traces' partner reads
+    # and the deltas', in reconstructed mode the deltas' alone. The joins' reads of the readers'
+    # requested slices are the `requested_slice` owner's.
     for field in RUN_READ_FIELDS:
-        metrics[f"view_{field}"] = sum(
+        metrics[f"dbsp_operator_{field}"] = sum(
             number(driver, ("sequence", "view_run_reads", owner, field), where)
-            for owner in WRITE_OWNERS)
+            for owner in WRITE_OWNERS if owner != REQUESTED_SLICE)
+    for field in RUN_READ_FIELDS:
+        metrics[f"requested_slice_{field}"] = number(
+            driver, ("sequence", "view_run_reads", REQUESTED_SLICE, field), where)
     metrics.update(window_memory_metrics(driver, where))
     return metrics
 
@@ -305,7 +319,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
             cells = [format_value(workload["modes"][mode]["metrics"][name][stat])
                      for mode in MODES for stat in STATISTICS]
             lines.append(f"| `{name}` | " + " | ".join(cells) + " |")
-        lines.append("")
+        lines += ["", "`dbsp_operator_*` are the DBSP operators' own run reads on the view "
+                      "worker; `requested_slice_*` are the joins' run reads of the readers' "
+                      "requested slices (none in native mode).", ""]
         for mode in MODES:
             reads = workload["modes"][mode].get("index_run_reads")
             if not reads:

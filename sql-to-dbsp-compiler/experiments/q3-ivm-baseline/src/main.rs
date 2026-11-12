@@ -598,7 +598,7 @@ struct Measurements {
     index_layout: Option<Value>,
     /// The view worker's run reads in the view transactions, per read owner, indexed like
     /// `WriteOwner::ALL` (both modes).
-    view_reads: [RunReads; 3],
+    view_reads: [RunReads; WriteOwner::ALL.len()],
     /// The CPU profiler's step CPU time of each circuit in the measured transactions, a
     /// cross-check of the phase timers. `None` while the pipeline is not profiling.
     profiled_cpu: Option<ProfiledCpu>,
@@ -1665,10 +1665,13 @@ fn phase_json(stats: &Measurements) -> Value {
     })
 }
 
-/// The view worker's run reads per read owner: the join traces' partner reads in native mode are
-/// under `query`; in reconstructed mode the index readers are under `merged_index`. The fields
-/// are those of `RunReads`: file runs' decodes and in-memory runs' reads count apart.
-fn view_reads_json(reads: &[RunReads; 3]) -> Result<Value> {
+/// The view worker's run reads per read owner (measurement version 11): in native mode the
+/// operators' own reads, the join traces' partner reads among them, are under `query`. In
+/// reconstructed mode `query` holds the operators' own reads (the deltas'), and the joins' reads
+/// of the readers' batches are under `requested_slice`. Nothing the worker runs reads under
+/// `merged_index`: the scan session reads the index on the driver's thread. The fields are those
+/// of `RunReads`: file runs' decodes and in-memory runs' reads count apart.
+fn view_reads_json(reads: &[RunReads; WriteOwner::ALL.len()]) -> Result<Value> {
     WriteOwner::ALL
         .into_iter()
         .map(|owner| {
@@ -1908,7 +1911,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut sequence_session_reads = SessionReads::default();
     #[cfg(feature = "merged-index")]
     let mut sequence_upkeep_reads = RunReads::default();
-    let mut sequence_view_reads = [RunReads::default(); 3];
+    let mut sequence_view_reads = [RunReads::default(); WriteOwner::ALL.len()];
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
@@ -2083,7 +2086,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 10,
+        "measurement_version": 11,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -3176,7 +3179,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 10);
+        assert_eq!(output["measurement_version"], 11);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -3235,28 +3238,43 @@ mod measurement_tests {
             assert!(output["sequence"]["index_run_reads"].is_null());
         }
         // The view worker's reads, per owner, in both modes. Nothing the worker runs reads under
-        // `merged_index`: the scan session reads the index on the driver's thread.
+        // `merged_index`: the scan session reads the index on the driver's thread. The joins'
+        // reads of the readers' batches are under `requested_slice` in reconstructed mode, and
+        // none are in native mode.
+        let reads_fields = [
+            "seeks",
+            "filter_rejections",
+            "key_decodes",
+            "value_decodes",
+            "weight_decodes",
+            "memory_key_reads",
+            "memory_value_reads",
+            "memory_weight_reads",
+        ];
+        let owner_total = |view: &Value, owner: &str| -> u64 {
+            reads_fields
+                .iter()
+                .map(|field| view[owner][field].as_u64().unwrap())
+                .sum()
+        };
         for refresh in refreshes {
             let view = &refresh["view_run_reads"];
-            for owner in ["query", "base_relation", "merged_index"] {
+            for owner in ["query", "base_relation", "merged_index", "requested_slice"] {
                 assert!(view[owner]["seeks"].is_u64(), "{refresh}");
             }
-            for field in [
-                "seeks",
-                "filter_rejections",
-                "key_decodes",
-                "value_decodes",
-                "weight_decodes",
-                "memory_key_reads",
-                "memory_value_reads",
-                "memory_weight_reads",
-            ] {
-                assert_eq!(
-                    view["merged_index"][field].as_u64().unwrap(),
-                    0,
-                    "{refresh}"
-                );
+            assert_eq!(owner_total(view, "merged_index"), 0, "{refresh}");
+            if !cfg!(feature = "merged-index") {
+                assert_eq!(owner_total(view, "requested_slice"), 0, "{refresh}");
             }
+        }
+        // A refresh that changes nothing reads no slice, so the reconstructed run is checked as a
+        // whole.
+        if cfg!(feature = "merged-index") {
+            let slice_reads: u64 = refreshes
+                .iter()
+                .map(|refresh| owner_total(&refresh["view_run_reads"], "requested_slice"))
+                .sum();
+            assert!(slice_reads > 0);
         }
         let view_seeks: u64 = refreshes
             .iter()
@@ -3985,7 +4003,7 @@ mod native_worked_transaction_tests {
                 transact(pipeline, state, worked_change(), true, &mut stats)?;
                 Ok(stats)
             })?;
-        let [query, base_relation, merged_index] = stats.view_reads;
+        let [query, base_relation, merged_index, requested_slice] = stats.view_reads;
         println!(
             "native {}: pressure {pressures}; files {files}\n  reads {query:?}",
             arm.name()
@@ -3993,6 +4011,7 @@ mod native_worked_transaction_tests {
         assert_eq!(Totals::of(&query), tally_totals());
         assert_eq!(base_relation, RunReads::default());
         assert_eq!(merged_index, RunReads::default());
+        assert_eq!(requested_slice, RunReads::default());
         Ok((query, pressures, files))
     }
 
@@ -4100,8 +4119,8 @@ mod session_worked_transaction_tests {
         other_reads: RunReads,
     }
 
-    /// Runs the arm's transactions, then the session over the last transaction's `Old` and
-    /// `Dlt`, and the view circuit on the driving deltas it buffered.
+    /// Runs the arm's transactions, then the capture of `Dlt` and the session over the last
+    /// transaction's `Old`, and the view circuit on the driving deltas the owners built.
     fn run_arm(arm: Arm) -> Result<Observed> {
         let (mut pipeline, storage) = start(arm)?;
         let ((old_runs, dlt_shape, session, reads, other_reads), pressures, files) =
@@ -4183,26 +4202,30 @@ mod session_worked_transaction_tests {
     ///
     /// Derivation. `Old` is the load's one run of eight keys in index order: c5, o3, l7, l8,
     /// o4, l9, c6, c7. `Dlt` is the transaction's net delta: c5 (-BUILDING, +AUTOMOBILE; one key,
-    /// two entries), o5, l10, and l11, four keys and five entries. The session finds one group,
-    /// c5, and buffers `(old, dlt)` entries (1, 2) of customers, (2, 1) of orders, and (3, 2) of
-    /// line items.
+    /// two entries), o5, l10, and l11, four keys and five entries. The capture reads `Dlt` once:
+    /// one touched group, c5; `dC` (c5's two entries) drives `O-`, `dO` (o5) drives `C+`, and
+    /// `dL` (l10 and l11) drives `J+`, so all five entries are decoded. The session scans c5's
+    /// group and every entry of it is kept: `C+` keeps c5, `O-` keeps o3 and o4 (`dC` requests
+    /// c5), and `L-` keeps l7, l8, and l9 (`dJ` has a row at (5, 3), (5, 4), and (5, 5)).
     ///
     /// - `Old` opens on c5, the smallest key, so the seek to c5's prefix moves nothing: no
     ///   logical seek. Six steps reach o3, l7, l8, o4, l9, and c6, which ends the group, so
     ///   there are 7 positions (c7 is never reached), 6 payload decodes of `Old`, and 5 of
-    ///   `Dlt`.
+    ///   `Dlt`. The session opens one cursor, over `Old`.
     /// - `Old`'s run: 7 key reads (the positions), and 6 value and 6 weight reads (the six
-    ///   entries taken; c6 only ends the group). `Dlt`'s run is read whole: 4 key reads (the
-    ///   step past l11 lands on nothing), 5 value, and 5 weight reads. A run in a file counts
-    ///   them as decodes, and a run in memory as memory reads. In all: 11 key, 11 value, and 11
-    ///   weight reads.
+    ///   entries taken; c6 only ends the group). `Dlt`'s run is read whole by the capture: 4 key
+    ///   reads (the step past l11 lands on nothing), 5 value, and 5 weight reads. A run in a
+    ///   file counts them as decodes, and a run in memory as memory reads. In all: 11 key, 11
+    ///   value, and 11 weight reads.
     /// - No seek reaches a run, so no seek or filter rejection is counted.
+    /// - The routing's own reads of the readers' in-memory driving deltas (`dC` and `dO` at c5:
+    ///   two seeks, 2 key, 3 value, and 3 weight memory reads) are another owner's.
     fn check(observed: &Observed) {
         assert_eq!(
             observed.counts,
             SessionCounts {
                 groups: 1,
-                cursor_opens: 2,
+                cursor_opens: 1,
                 logical_seeks: 0,
                 logical_steps: 6,
                 positions: 7,
@@ -4211,7 +4234,16 @@ mod session_worked_transaction_tests {
                 cancelled: 0,
             }
         );
-        assert_eq!(observed.other_reads, RunReads::default());
+        assert_eq!(
+            observed.other_reads,
+            RunReads {
+                seeks: 2,
+                memory_key_reads: 2,
+                memory_value_reads: 3,
+                memory_weight_reads: 3,
+                ..RunReads::default()
+            }
+        );
         assert_eq!(observed.old_runs.len(), 1, "Old is not one run");
         assert_eq!(observed.old_runs[0].1, 8);
         assert_eq!(observed.dlt.1, 5);

@@ -592,12 +592,14 @@ fn require_requested<R: ReaderDefinition>(
     reader: &Reader<R>,
     prefix: &[u8],
     what: &str,
+    reader_name: &str,
 ) -> Result<(), String> {
     if reader.requests().contains(prefix) {
         Ok(())
     } else {
         Err(format!(
-            "{what} is outside the requests of this reader: its driving delta has no row for it"
+            "{what} is outside the requests of {reader_name} ({} requests): its driving delta has no row for it",
+            reader.requests().len()
         ))
     }
 }
@@ -767,6 +769,7 @@ impl Q3State {
                 &collected.customers,
                 &prefix_custkey(customer),
                 &format!("customer {customer}"),
+                "C⁺",
             )?;
         }
         collected.customers.partner()
@@ -785,6 +788,7 @@ impl Q3State {
                 &collected.orders,
                 &prefix_custkey(customer),
                 &format!("customer {customer}"),
+                "O⁻",
             )?;
         }
         collected.orders.partner()
@@ -804,6 +808,7 @@ impl Q3State {
                 &collected.joined,
                 &prefix_custkey_orderkey(customer, order),
                 &format!("order ({customer}, {order})"),
+                "J⁺",
             )?;
         }
         collected.joined.partner()
@@ -822,6 +827,7 @@ impl Q3State {
                 &collected.lines,
                 &prefix_custkey_orderkey(customer, order),
                 &format!("order ({customer}, {order})"),
+                "L⁻",
             )?;
         }
         collected.lines.partner()
