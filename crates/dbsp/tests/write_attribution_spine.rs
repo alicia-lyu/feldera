@@ -120,6 +120,11 @@ fn compaction_inherits_the_spines_owner() {
     let snapshot = write_snapshot();
     assert_eq!(snapshot.owners_sum(), snapshot.total);
     for owner in WriteOwner::ALL {
+        if owner == WriteOwner::RequestedSlice {
+            // A read owner: nothing is written under it.
+            assert_eq!(snapshot.owner(owner).bytes, 0);
+            continue;
+        }
         assert!(snapshot.owner(owner).bytes > 0, "{owner:?} wrote nothing");
     }
     let logged: u64 = flushes.iter().map(|flush| flush.bytes).sum();
