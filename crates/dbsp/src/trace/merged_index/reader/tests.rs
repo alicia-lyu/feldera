@@ -383,41 +383,69 @@ fn requests_move_forward_and_refuse_to_go_back() {
 
 // ---- RowBuilder ----
 
-#[test]
-fn a_row_builder_sorts_and_consolidates_the_values_of_a_key() {
-    let mut builder = RowBuilder::<u8, u8>::new();
-    // The values of key 1 arrive out of order, with one repeated and one that cancels.
-    for (key, value, weight) in [
-        (1, 9, 1),
-        (1, 3, 2),
-        (1, 9, 2),
-        (1, 5, 1),
-        (1, 5, -1),
-        (2, 1, 1),
-        (3, 4, 1),
-        (3, 4, -1),
-        (4, 7, 1),
-    ] {
-        builder.push(key, value, weight).unwrap();
+/// One entry of `rows`, then its end.
+fn entry(builder: &mut RowBuilder<u8, i64>, rows: &[(u8, i64, ZWeight)]) -> Result<(), String> {
+    for &(key, value, weight) in rows {
+        builder.push(key, value, weight)?;
     }
+    builder.end_entry()
+}
+
+#[test]
+fn a_row_builder_reorders_the_rows_of_one_entry_into_typed_order() {
+    // Packed integers are little-endian, so the byte order of `256` (`00 01`) is below that of
+    // `1` (`01 00`): `Dlt`'s `-old` (256) arrives before its `+new` (1), against the typed order.
+    let mut builder = RowBuilder::<u8, i64>::new();
+    entry(&mut builder, &[(7, 256, -1), (7, 1, 1)]).unwrap();
     let batch = builder.finish().unwrap();
-    // Key 3 has only a cancelling value, so it is dropped.
     assert_eq!(
-        rows::<u8, u8>(batch.inner()),
-        vec![(1, 3, 2), (1, 9, 3), (2, 1, 1), (4, 7, 1)]
+        rows::<u8, i64>(batch.inner()),
+        vec![(7, 1, 1), (7, 256, -1)]
     );
 }
 
 #[test]
-fn a_row_builder_refuses_a_key_that_goes_back() {
-    let mut builder = RowBuilder::<u8, u8>::new();
-    builder.push(5, 1, 1).unwrap();
-    builder.push(5, 0, 1).unwrap();
-    let error = builder.push(4, 1, 1).unwrap_err();
-    assert!(error.contains("key order"), "{error}");
+fn an_old_row_replaced_by_a_dlt_pair_consolidates_to_the_new_row() {
+    // `Old` has c5 (+1); `Dlt` has -c5 and +c5': three rows of one entry.
+    let mut builder = RowBuilder::<u8, i64>::new();
+    entry(&mut builder, &[(5, 10, 1), (5, 10, -1), (5, 11, 1)]).unwrap();
+    // A later entry of the same key, and then another key, in ascending order.
+    entry(&mut builder, &[(5, 12, 2)]).unwrap();
+    entry(&mut builder, &[(6, 1, 1)]).unwrap();
+    // An entry whose rows all cancel leaves nothing, not even its key.
+    entry(&mut builder, &[(8, 1, 1), (8, 1, -1)]).unwrap();
+    entry(&mut builder, &[(9, 1, 1)]).unwrap();
+    let batch = builder.finish().unwrap();
+    assert_eq!(
+        rows::<u8, i64>(batch.inner()),
+        vec![(5, 11, 1), (5, 12, 2), (6, 1, 1), (9, 1, 1)]
+    );
 }
 
-// ---- Static plans against the trie ----
+#[test]
+fn a_row_builder_refuses_rows_of_different_entries_out_of_order() {
+    let mut builder = RowBuilder::<u8, i64>::new();
+    entry(&mut builder, &[(5, 3, 1)]).unwrap();
+    // A smaller key, a smaller value of the same key, and the same row again.
+    for (key, value) in [(4, 1), (5, 2), (5, 3)] {
+        let mut builder = RowBuilder::<u8, i64>::new();
+        entry(&mut builder, &[(5, 3, 1)]).unwrap();
+        let error = entry(&mut builder, &[(key, value, 1)]).unwrap_err();
+        assert!(error.contains("ascending order across entries"), "{error}");
+    }
+    // No sort rescues it: the earlier entry's rows were already pushed.
+    entry(&mut builder, &[(5, 4, 1)]).unwrap();
+}
+
+#[test]
+fn a_row_builder_refuses_more_than_three_rows_in_one_entry() {
+    let mut builder = RowBuilder::<u8, i64>::new();
+    for value in 0..MAX_ROWS_PER_ENTRY as i64 {
+        builder.push(1, value, 1).unwrap();
+    }
+    let error = builder.push(1, 99, 1).unwrap_err();
+    assert!(error.contains("more than 3 rows"), "{error}");
+}
 
 #[test]
 fn a_reader_checks_its_definition_against_the_trie() {
@@ -482,7 +510,7 @@ fn stream_driven_readers_take_their_driving_deltas_and_requests_from_dlt() {
         row(Key::A(1), 12, 1),
         row(Key::B(3, 1), 30, 1),
     ];
-    let mut collected = collect_all(&old, &dlt, &[], Pass::Seek).unwrap();
+    let collected = collect_all(&old, &dlt, &[], Pass::Seek).unwrap();
 
     assert_eq!(collected.captured.touched, [group_of(1), group_of(3)]);
     // `BByA` is driven by the `A` entries: group 1. `AFromB` by the `B` entries: group 3.
@@ -552,7 +580,7 @@ fn an_entry_outside_every_request_is_dropped_unread() {
 fn no_driving_change_means_no_rows_and_no_payload_read() {
     let old = vec![vec![row(Key::A(1), 10, 1), row(Key::B(1, 1), 20, 1)]];
     for pass in [Pass::Seek, Pass::Step] {
-        let mut collected = collect_all(&old, &[], &[], pass).unwrap();
+        let collected = collect_all(&old, &[], &[], pass).unwrap();
         assert!(collected.captured.touched.is_empty());
         assert!(partner_rows(&collected.b_by_a).is_empty());
         assert!(partner_rows(&collected.a_from_b).is_empty());
@@ -581,7 +609,7 @@ fn a_delta_row_conversion_that_goes_back_is_an_error() {
     let mut reversing = Reader::<Reversing>::new().unwrap();
     let mut delta = Delta::<Reversing>::new().unwrap();
     let error = capture(&dlt, &mut [&mut Capture::new(&mut reversing, &mut delta)]).unwrap_err();
-    assert!(error.contains("key order"), "{error}");
+    assert!(error.contains("ascending order"), "{error}");
 }
 
 #[test]
@@ -618,14 +646,16 @@ fn a_derived_reader_takes_the_rows_the_routing_builds() {
     let mut derived = Reader::<DerivedAtPath>::new().unwrap();
     derived.push_row(Tup2(1, 2), 5, 3).unwrap();
     derived.push_row(Tup2(1, 2), 4, 1).unwrap();
+    derived.end_entry().unwrap();
+    derived.push_ordered_row(Tup2(2, 0), 1, 1).unwrap();
     assert!(derived.partner().is_err());
     derived.seal_partner().unwrap();
     assert_eq!(
         partner_rows(&derived),
-        vec![(Tup2(1, 2), 4, 1), (Tup2(1, 2), 5, 3)]
+        vec![(Tup2(1, 2), 4, 1), (Tup2(1, 2), 5, 3), (Tup2(2, 0), 1, 1)]
     );
     // A sealed reader takes no more rows.
-    assert!(derived.push_row(Tup2(2, 0), 1, 1).is_err());
+    assert!(derived.push_row(Tup2(3, 0), 1, 1).is_err());
 }
 
 // ---- Against a brute force ----
@@ -664,12 +694,28 @@ fn raw_key() -> impl Strategy<Value = Key> {
     ]
 }
 
-fn rows_strategy() -> impl Strategy<Value = Vec<Row>> {
-    vec((raw_key(), 0u8..3, -2i64..=2), 0..12).prop_map(|rows| {
-        rows.into_iter()
-            .filter(|(_, _, weight)| *weight != 0)
-            .map(|(key, payload, weight)| row(key, payload, weight))
-            .collect()
+/// A logical `Old` (each key holds one payload with weight 1 or 2), split at random into two
+/// runs, and a `Dlt` that replaces, deletes, or inserts some keys: for each changed key, `-old`
+/// if it has one and `+new` if it gets one. A folded key then yields at most three rows (its `Old`
+/// row and `Dlt`'s pair), as the index guarantees.
+fn old_runs_and_dlt() -> impl Strategy<Value = (Vec<Vec<Row>>, Vec<Row>)> {
+    let old = proptest::collection::btree_map(raw_key(), (0u8..3, 1i64..=2, any::<bool>()), 0..10);
+    let changes = proptest::collection::btree_map(raw_key(), proptest::option::of(0u8..3), 0..8);
+    (old, changes).prop_map(|(old, changes)| {
+        let mut runs = vec![Vec::new(), Vec::new()];
+        for (key, (payload, weight, second)) in &old {
+            runs[usize::from(*second)].push(row(key.clone(), *payload, *weight));
+        }
+        let mut dlt = Vec::new();
+        for (key, new) in changes {
+            if let Some((payload, weight, _)) = old.get(&key) {
+                dlt.push(row(key.clone(), *payload, -*weight));
+            }
+            if let Some(payload) = new {
+                dlt.push(row(key, payload, 1));
+            }
+        }
+        (runs, dlt)
     })
 }
 
@@ -679,8 +725,7 @@ proptest! {
     /// split of `Old` into runs and the pass.
     #[test]
     fn readers_match_a_brute_force(
-        old in vec(rows_strategy(), 1..3),
-        dlt in rows_strategy(),
+        (old, dlt) in old_runs_and_dlt(),
         paths in vec((0u8..4, 0u8..3), 0..4),
         step_pass in any::<bool>(),
     ) {
@@ -688,7 +733,7 @@ proptest! {
         paths.sort_unstable();
         paths.dedup();
         let pass = if step_pass { Pass::Step } else { Pass::Seek };
-        let mut collected = collect_all(&old, &dlt, &paths, pass).unwrap();
+        let collected = collect_all(&old, &dlt, &paths, pass).unwrap();
         let old_entries = consolidate(&old);
         let dlt_entries = consolidate([&dlt]);
 

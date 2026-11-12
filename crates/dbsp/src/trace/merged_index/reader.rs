@@ -40,10 +40,11 @@
 //! 3. Each reader unfolds a kept entry once, straight into its partner
 //!    builder.
 //!
-//! A [`RowBuilder`] takes rows in ascending key order and errors on a key that
-//! goes back. The rows of one key may arrive in any order: the packed payload
-//! bytes of the index do not order like the typed values, so the builder sorts
-//! and consolidates the values of a key when the key ends.
+//! A [`RowBuilder`] takes the rows of one folded key (at most three) as an
+//! entry, which it may reorder and consolidate, because the packed payload
+//! bytes of the index do not order like the typed values. Across entries the
+//! rows must already arrive in strictly ascending order, and the builder
+//! errors otherwise: it never sorts more than one entry.
 //!
 //! Whether a read is a path or a range read follows from the reader's request
 //! node: the join seeks its driving delta's keys in the partner batch.
@@ -206,16 +207,32 @@ impl Requests {
     }
 }
 
-/// Builds an indexed Z-set one row at a time, straight into DBSP's builder.
+/// The most rows one entry may hold: an `Old` row, and `Dlt`'s `-old` and `+new` of the same
+/// folded key.
+pub const MAX_ROWS_PER_ENTRY: usize = 3;
+
+/// Builds an indexed Z-set straight into DBSP's builder, one *entry* at a time. An entry is the
+/// rows that one folded key yields: its `Old` row, and `Dlt`'s `-old` and `+new` rows, so at most
+/// [`MAX_ROWS_PER_ENTRY`]. Rows are [`push`](Self::push)ed into the open entry, and
+/// [`end_entry`](Self::end_entry) closes it.
 ///
-/// Keys must be nondecreasing: a key that goes back is an error. The rows of
-/// one key may come in any order. They are held in a scratch vector until the
-/// key ends, then sorted, consolidated (weights of equal values summed, zero
-/// sums dropped), and pushed. A key whose values all cancel is dropped.
+/// Within an entry the rows may arrive in any order. They are sorted by `(key, value)` and
+/// consolidated (weights of equal rows summed, zero sums dropped), so an `Old` row that a `Dlt`
+/// pair replaces consolidates to the new row. The reorder is needed because the packed payload
+/// bytes of the index do not order like the typed values (little-endian integers, length-prefixed
+/// strings): the `-old` and `+new` of one folded key arrive in byte order, which is not always
+/// typed order.
+///
+/// Across entries the rows must already arrive in strictly ascending `(key, value)` order, which
+/// the folded keys' order gives the readers; the builder errors otherwise, and never sorts
+/// beyond one entry. It also errors if one entry holds more than [`MAX_ROWS_PER_ENTRY`] rows.
 pub struct RowBuilder<K: DBData, V: DBData> {
     builder: <Inner<K, V> as DynBatch>::Builder,
-    key: Option<K>,
-    values: Vec<(V, ZWeight)>,
+    /// The open entry.
+    entry: Vec<(K, V, ZWeight)>,
+    /// The last row pushed to the builder, and whether its key still awaits its `push_key`.
+    last: Option<(K, V)>,
+    key_open: bool,
 }
 
 impl<K: DBData, V: DBData> Default for RowBuilder<K, V> {
@@ -228,61 +245,72 @@ impl<K: DBData, V: DBData> RowBuilder<K, V> {
     pub fn new() -> Self {
         Self {
             builder: Builder::new_builder(&OrdIndexedZSet::<K, V>::factories()),
-            key: None,
-            values: Vec::new(),
+            entry: Vec::with_capacity(MAX_ROWS_PER_ENTRY),
+            last: None,
+            key_open: false,
         }
     }
 
-    /// Adds one row.
+    /// Adds one row to the open entry. Errors if the entry already holds
+    /// [`MAX_ROWS_PER_ENTRY`] rows.
     pub fn push(&mut self, key: K, value: V, weight: ZWeight) -> Result<(), String> {
-        match &self.key {
-            Some(last) if *last == key => {}
-            Some(last) if *last > key => {
-                return Err(format!(
-                    "rows must arrive in key order: {key:?} comes after {last:?}"
-                ));
-            }
-            _ => {
-                self.end_key()?;
-                self.key = Some(key);
-            }
+        if self.entry.len() == MAX_ROWS_PER_ENTRY {
+            return Err(format!(
+                "one folded key yields more than {MAX_ROWS_PER_ENTRY} rows: {key:?}, {value:?}"
+            ));
         }
-        self.values.push((value, weight));
+        self.entry.push((key, value, weight));
         Ok(())
     }
 
-    /// Completes the batch.
-    pub fn finish(mut self) -> Result<OrdIndexedZSet<K, V>, String> {
-        self.end_key()?;
-        Ok(TypedBatch::new(self.builder.done()))
-    }
-
-    /// Pushes the values of the key that has just ended.
-    fn end_key(&mut self) -> Result<(), String> {
-        let Some(mut key) = self.key.take() else {
-            return Ok(());
-        };
-        self.values.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut pushed_any = false;
-        let mut values = std::mem::take(&mut self.values).into_iter().peekable();
-        while let Some((mut value, mut weight)) = values.next() {
-            while let Some((_, next_weight)) = values.next_if(|(next, _)| *next == value) {
+    /// Closes the open entry: sorts and consolidates its rows, and pushes them. Errors if a row
+    /// does not come strictly after the last row of an earlier entry.
+    pub fn end_entry(&mut self) -> Result<(), String> {
+        let mut rows = std::mem::take(&mut self.entry);
+        rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        let mut rows = rows.into_iter().peekable();
+        while let Some((key, value, mut weight)) = rows.next() {
+            while let Some((_, _, next_weight)) =
+                rows.next_if(|(next_key, next_value, _)| *next_key == key && *next_value == value)
+            {
                 weight = weight
                     .checked_add(next_weight)
                     .ok_or("reader row weight overflow")?;
             }
             if weight != 0 {
-                self.builder
-                    .push_val_diff_mut(value.erase_mut(), weight.erase_mut());
-                pushed_any = true;
+                self.emit(key, value, weight)?;
             }
         }
-        if pushed_any {
-            self.builder.push_key_mut(key.erase_mut());
+        Ok(())
+    }
+
+    /// Completes the batch, closing the open entry.
+    pub fn finish(mut self) -> Result<OrdIndexedZSet<K, V>, String> {
+        self.end_entry()?;
+        if let (true, Some((key, _))) = (self.key_open, self.last.as_ref()) {
+            self.builder.push_key(key.erase());
         }
-        // Reuse the scratch allocation for the next key.
-        self.values.clear();
+        Ok(TypedBatch::new(self.builder.done()))
+    }
+
+    /// Pushes one consolidated row, which must come strictly after the last.
+    fn emit(&mut self, key: K, value: V, weight: ZWeight) -> Result<(), String> {
+        if let Some((last_key, last_value)) = self.last.as_mut() {
+            if (&key, &value) <= (&*last_key, &*last_value) {
+                return Err(format!(
+                    "rows must arrive in ascending order across entries: ({key:?}, {value:?}) \
+                     comes after ({last_key:?}, {last_value:?})"
+                ));
+            }
+            if *last_key != key {
+                self.builder.push_key(last_key.erase());
+                self.key_open = false;
+            }
+        }
+        // The builder copies the row; the last row is kept to check the order of the next.
+        self.builder.push_val_diff(value.erase(), weight.erase());
+        self.key_open = true;
+        self.last = Some((key, value));
         Ok(())
     }
 }
@@ -303,6 +331,9 @@ pub trait DeltaReader<D: MergedIndexDefinition> {
         weight: ZWeight,
     ) -> Result<(), String>;
 
+    /// Ends the entry that the last `capture` calls took: the rows of one folded key.
+    fn end_entry(&mut self) -> Result<(), String>;
+
     /// Ends the capture: seals the driving delta.
     fn seal_delta(&mut self) -> Result<(), String>;
 }
@@ -313,8 +344,11 @@ pub trait StoredReader<D: MergedIndexDefinition> {
     /// alone. Moves forward: ask in folded-key order.
     fn keeps(&mut self, folded: &[u8]) -> bool;
 
-    /// Unfolds a kept entry into the partner batch.
+    /// Unfolds one row of a kept entry into the partner batch's open entry.
     fn push(&mut self, key: &D::Key, payload: &D::Payload, weight: ZWeight) -> Result<(), String>;
+
+    /// Ends the entry: the rows of the kept folded key have all been pushed.
+    fn end_entry(&mut self) -> Result<(), String>;
 }
 
 /// A partner batch under construction, then sealed and shared with the join.
@@ -327,26 +361,6 @@ enum PartnerRows<K: DBData, V: DBData> {
 enum DeltaRows<K: DBData, V: DBData> {
     Building(Box<RowBuilder<K, V>>),
     Sealed(Box<OrdIndexedZSet<K, V>>),
-}
-
-/// The values and weights under `key` of a sealed driving delta. These are
-/// the routing's own reads of the reader's in-memory batch, so they are not
-/// counted for the merged index, whose reads the session makes.
-fn rows_at<K: DBData, V: DBData>(batch: &OrdIndexedZSet<K, V>, key: &K) -> Vec<(V, ZWeight)> {
-    with_read_owner(WriteOwner::Query, || {
-        let mut cursor = batch.inner().cursor();
-        let mut rows = Vec::new();
-        if cursor.seek_key_exact(key.erase(), None) {
-            while cursor.val_valid() {
-                rows.push((
-                    cursor.val().downcast_checked::<V>().clone(),
-                    *cursor.weight().downcast_checked::<ZWeight>(),
-                ));
-                cursor.step_val();
-            }
-        }
-        rows
-    })
 }
 
 /// One partner read: the requests of its driving delta, and its partner batch.
@@ -428,6 +442,26 @@ impl<R: ReaderDefinition> Reader<R> {
         }
     }
 
+    /// Ends the partner batch's open entry (see [`RowBuilder`]): the routing calls it after the
+    /// rows that it built from one folded key.
+    pub fn end_entry(&mut self) -> Result<(), String> {
+        match &mut self.partner {
+            PartnerRows::Building(builder) => builder.end_entry(),
+            PartnerRows::Sealed(_) => Err("the partner batch is already sealed".into()),
+        }
+    }
+
+    /// Adds a row that the routing built in ascending order, as an entry of its own.
+    pub fn push_ordered_row(
+        &mut self,
+        key: R::Key,
+        value: R::Val,
+        weight: ZWeight,
+    ) -> Result<(), String> {
+        self.push_row(key, value, weight)?;
+        self.end_entry()
+    }
+
     /// Seals the partner batch, once the routing is done.
     pub fn seal_partner(&mut self) -> Result<(), String> {
         if let PartnerRows::Building(builder) = &mut self.partner {
@@ -474,11 +508,13 @@ impl<R: ReaderDefinition> Delta<R> {
         }
     }
 
-    /// The rows under `key`: values with their weights. For the routing, which
-    /// needs the delta's rows at the node it passes.
-    pub fn rows_at(&self, key: &R::DeltaKey) -> Result<Vec<(R::DeltaVal, ZWeight)>, String> {
+    /// A cursor for the routing, which merges the delta's keys forward alongside its scan.
+    pub fn cursor(&self) -> Result<DeltaCursor<'_, R>, String> {
         match &self.rows {
-            DeltaRows::Sealed(batch) => Ok(rows_at(batch, key)),
+            // Opening the cursor lands on the first key, which is a read.
+            DeltaRows::Sealed(batch) => Ok(DeltaCursor {
+                cursor: with_read_owner(WriteOwner::RequestedSlice, || batch.inner().cursor()),
+            }),
             DeltaRows::Building(_) => Err("the driving delta is not sealed yet".into()),
         }
     }
@@ -489,6 +525,44 @@ impl<R: ReaderDefinition> Delta<R> {
             DeltaRows::Sealed(batch) => Ok(*batch),
             DeltaRows::Building(_) => Err("the driving delta is not sealed yet".into()),
         }
+    }
+}
+
+/// A forward cursor over a [`Delta`], for the routing. The touched groups arrive in key order,
+/// so the routing needs the delta's rows at each in turn: the cursor steps forward over the
+/// keys it has passed and never seeks. The delta's keys are the groups that the readers request,
+/// so each key stepped over is one the scan visits anyway.
+///
+/// These are reads the routing makes to build the readers' slices, so they are counted under
+/// [`WriteOwner::RequestedSlice`], not the merged index's or the DBSP operators'.
+pub struct DeltaCursor<'a, R: ReaderDefinition> {
+    cursor: <Inner<R::DeltaKey, R::DeltaVal> as DynBatchReader>::Cursor<'a>,
+}
+
+impl<R: ReaderDefinition> DeltaCursor<'_, R> {
+    /// The values under `key`, with their weights, or none if the delta has no such key. Keys
+    /// must be asked for in strictly ascending order: a key's values are read once, from the
+    /// position that stepping onto the key gives, with no rewind.
+    pub fn rows_at(&mut self, key: &R::DeltaKey) -> Vec<(R::DeltaVal, ZWeight)> {
+        with_read_owner(WriteOwner::RequestedSlice, || {
+            while self.cursor.key_valid()
+                && self.cursor.key().downcast_checked::<R::DeltaKey>() < key
+            {
+                self.cursor.step_key();
+            }
+            let mut rows = Vec::new();
+            if self.cursor.key_valid() && self.cursor.key().downcast_checked::<R::DeltaKey>() == key
+            {
+                while self.cursor.val_valid() {
+                    rows.push((
+                        self.cursor.val().downcast_checked::<R::DeltaVal>().clone(),
+                        *self.cursor.weight().downcast_checked::<ZWeight>(),
+                    ));
+                    self.cursor.step_val();
+                }
+            }
+            rows
+        })
     }
 }
 
@@ -532,6 +606,13 @@ impl<R: ReaderDefinition> DeltaReader<R::Index> for Capture<'_, R> {
         }
     }
 
+    fn end_entry(&mut self) -> Result<(), String> {
+        match &mut self.delta.rows {
+            DeltaRows::Building(builder) => builder.end_entry(),
+            DeltaRows::Sealed(_) => Err("the driving delta is already sealed".into()),
+        }
+    }
+
     fn seal_delta(&mut self) -> Result<(), String> {
         if let DeltaRows::Building(builder) = &mut self.delta.rows {
             let builder = std::mem::take(builder);
@@ -560,6 +641,10 @@ impl<R: ReaderDefinition> StoredReader<R::Index> for Reader<R> {
     ) -> Result<(), String> {
         let (row_key, row_value) = R::unfold(key, payload)?;
         self.push_row(row_key, row_value, weight)
+    }
+
+    fn end_entry(&mut self) -> Result<(), String> {
+        Reader::end_entry(self)
     }
 }
 
@@ -611,6 +696,13 @@ pub fn capture<D: MergedIndexDefinition>(
                     reader.capture(&folded, &key, &payload, weight)?;
                 }
                 cursor.step_val();
+            }
+            // The rows of this folded key are one entry.
+            for reader in readers
+                .iter_mut()
+                .filter(|reader| reader.driving_stream() == Some(stream))
+            {
+                reader.end_entry()?;
             }
         }
         cursor.step_key();
@@ -678,6 +770,7 @@ pub fn route<D: MergedIndexDefinition>(
             for (payload, weight) in decoded {
                 reader.push(&key, payload, *weight)?;
             }
+            reader.end_entry()?;
         }
     }
     Ok(())
