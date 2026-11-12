@@ -20,9 +20,11 @@ from typing import Any
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
 # The owners of `WriteOwner::ALL` (measurement version 11): the components that write storage and
-# whose reads are counted. `requested_slice` is a read owner only (the joins' reads of the readers'
-# requested slices of the index), so no write is ever counted under it.
-WRITE_OWNERS = ("query", "base_relation", "merged_index", "requested_slice")
+# whose reads are counted. `requested_slice` (the joins' reads of the readers' requested slices of
+# the index, reconstructed mode) and `partner_trace` (the joins' reads of their traces, native
+# mode) are read owners only, so no write is ever counted under them.
+WRITE_OWNERS = ("query", "base_relation", "merged_index", "requested_slice", "partner_trace")
+READ_ONLY_OWNERS = ("requested_slice", "partner_trace")
 # The merged index's readers, and the run counts reported for each (measurement version 8). The
 # view phase reads the index only through its scan session, so there is one reader. The decodes
 # are file runs'; the memory reads are in-memory runs', kept apart from them.
@@ -195,7 +197,7 @@ def session_pass_problems(report: dict[str, Any], session_pass: str) -> list[str
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """Every consistency check of one driver report."""
     return (owner_write_problems(report) + index_read_problems(report)
-            + view_read_problems(report)
+            + view_read_problems(report) + driver_read_problems(report)
             + counter_problems(report, "index_session_counts", SESSION_COUNT_FIELDS)
             + counter_problems(report, "index_upkeep_run_reads", RUN_READ_FIELDS)
             + profiled_cpu_problems(report) + session_pass_problems(report, session_pass))
@@ -210,8 +212,10 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
     reads under `merged_index`: the scan session reads the index on the driver's
     thread, and its reads are in `index_run_reads`, not here. The joins' reads of the
     readers' requested slices are under `requested_slice` (measurement version 11): a
-    reconstructed run must report some over the sequence, and a native run none. A
-    report that names neither mode is not checked here.
+    reconstructed run must report some over the sequence, and a native run none. The joins'
+    reads of their traces are under `partner_trace`: a native run must report some over the
+    sequence, and a reconstructed run none. A report that names neither mode is not
+    checked here.
     """
     mode = report.get("mode")
     if mode not in ("native", "reconstructed"):
@@ -246,13 +250,59 @@ def view_read_problems(report: dict[str, Any]) -> list[str]:
             if mode == "native" and slice_part != 0:
                 problems.append(f"{place}: view_run_reads.requested_slice.{field} is "
                                 f"{slice_part}, expected 0 in a native run")
+            trace_part = found[("partner_trace", field)]
+            if mode == "reconstructed" and trace_part != 0:
+                problems.append(f"{place}: view_run_reads.partner_trace.{field} is "
+                                f"{trace_part}, expected 0 in a reconstructed run")
     summed = counts("sequence", report.get("sequence", {}).get("view_run_reads"))
     if summed is not None and not problems and summed != total:
         problems.append("sequence: view_run_reads are not the sums of the refreshes'")
-    if summed is not None and mode == "reconstructed" and not problems:
-        if not any(summed[("requested_slice", field)] for field in RUN_READ_FIELDS):
-            problems.append("sequence: a reconstructed run reports no view_run_reads."
-                            "requested_slice reads")
+    if summed is not None and not problems:
+        partner = "requested_slice" if mode == "reconstructed" else "partner_trace"
+        if not any(summed[(partner, field)] for field in RUN_READ_FIELDS):
+            problems.append(f"sequence: a {mode} run reports no view_run_reads.{partner} reads")
+    return problems
+
+
+def driver_read_problems(report: dict[str, Any]) -> list[str]:
+    """List where a driver report's `driver_run_reads` are malformed.
+
+    `driver_run_reads` (measurement version 11) are the reads the driver's thread made while
+    collecting the readers, per owner of `WRITE_OWNERS`. A native run has none (`null`). A
+    reconstructed run reports every owner with every `RUN_READ_FIELDS` a non-negative integer,
+    the sequence's counts are the sums of the refreshes', and the driver reads under no owner
+    but the index's (`merged_index`) and the requested slice's (`requested_slice`).
+    """
+    mode = report.get("mode")
+    if mode not in ("native", "reconstructed"):
+        return []
+    places = [("sequence", report.get("sequence", {}).get("driver_run_reads"))]
+    places += [(f"refresh {item.get('refresh')}", item.get("driver_run_reads"))
+               for item in report.get("refreshes", [])]
+    problems: list[str] = []
+    if mode == "native":
+        return [f"{place}: a native run reports driver_run_reads"
+                for place, reads in places if reads is not None]
+    totals: dict[tuple[str, str], int] = {}
+    for place, reads in places:
+        for owner in WRITE_OWNERS:
+            for field in RUN_READ_FIELDS:
+                value = reads.get(owner, {}).get(field) if isinstance(reads, dict) else None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    problems.append(f"{place}: driver_run_reads.{owner}.{field} is {value!r}")
+                    return problems
+                if owner not in ("merged_index", "requested_slice") and value != 0:
+                    problems.append(f"{place}: driver_run_reads.{owner}.{field} is {value}, "
+                                    "expected 0")
+                if place != "sequence":
+                    totals[(owner, field)] = totals.get((owner, field), 0) + value
+    sequence = places[0][1]
+    # The sequence comes first in `places`, so its sums are checked against the refreshes' here.
+    for owner in WRITE_OWNERS:
+        for field in RUN_READ_FIELDS:
+            if sequence[owner][field] != totals.get((owner, field), 0):
+                problems.append("sequence: driver_run_reads are not the sums of the refreshes'")
+                return problems
     return problems
 
 

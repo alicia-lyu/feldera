@@ -273,13 +273,13 @@ mod tests {
         let before = ResourceSnapshot {
             backend_write_operations: 3,
             backend_write_bytes: 30,
-            writes: snapshot_of([(1, 10), (1, 10), (1, 10), (0, 0)]),
+            writes: snapshot_of([(1, 10), (1, 10), (1, 10), (0, 0), (0, 0)]),
             ..zero_snapshot()
         };
         let after = ResourceSnapshot {
             backend_write_operations: 7,
             backend_write_bytes: 300,
-            writes: snapshot_of([(2, 100), (2, 100), (3, 100), (0, 0)]),
+            writes: snapshot_of([(2, 100), (2, 100), (3, 100), (0, 0), (0, 0)]),
             ..zero_snapshot()
         };
         let delta = before.delta(&after);
@@ -293,11 +293,11 @@ mod tests {
             owners["merged_index"],
             json!({"operations": 2, "bytes": 90})
         );
-        // The requested-slice owner is a read owner: nothing is written under it.
-        assert_eq!(
-            owners["requested_slice"],
-            json!({"operations": 0, "bytes": 0})
-        );
+        // The requested-slice and partner-trace owners are read owners: nothing is written
+        // under them.
+        for owner in ["requested_slice", "partner_trace"] {
+            assert_eq!(owners[owner], json!({"operations": 0, "bytes": 0}));
+        }
         for (field, total) in [
             ("operations", "backend_write_operations"),
             ("bytes", "backend_write_bytes"),
@@ -331,7 +331,7 @@ mod tests {
             backend_write_operations: 3,
             backend_read_bytes: 20,
             backend_write_bytes: 30,
-            writes: snapshot_of([(1, 10), (1, 10), (1, 10), (0, 0)]),
+            writes: snapshot_of([(1, 10), (1, 10), (1, 10), (0, 0), (0, 0)]),
             cpu_microseconds: 100,
             peak_rss_bytes: 1_000,
             os_physical_read_bytes: None,
@@ -342,7 +342,7 @@ mod tests {
             backend_write_operations: 7,
             backend_read_bytes: 200,
             backend_write_bytes: 300,
-            writes: snapshot_of([(2, 100), (2, 100), (3, 100), (0, 0)]),
+            writes: snapshot_of([(2, 100), (2, 100), (3, 100), (0, 0), (0, 0)]),
             cpu_microseconds: 150,
             peak_rss_bytes: 2_000,
             os_physical_read_bytes: None,

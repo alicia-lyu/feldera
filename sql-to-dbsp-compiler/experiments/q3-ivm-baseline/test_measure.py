@@ -280,7 +280,8 @@ class MeasureTest(unittest.TestCase):
                 "query": {"operations": 2, "bytes": 200},
                 "base_relation": {"operations": 3, "bytes": 300},
                 "merged_index": {"operations": 5, "bytes": 500},
-                "requested_slice": {"operations": 0, "bytes": 0}}}
+                "requested_slice": {"operations": 0, "bytes": 0},
+                "partner_trace": {"operations": 0, "bytes": 0}}}
         if mode == "native":
             resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
             resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
@@ -335,12 +336,14 @@ class MeasureTest(unittest.TestCase):
                       measure.index_read_problems(native)[0])
 
     def test_view_reads_leave_the_index_to_the_session_and_sum_to_the_sequence(self) -> None:
-        def view(index_seeks: int, query_seeks: int, slice_seeks: int = 0) -> dict:
+        def view(index_seeks: int, query_seeks: int, slice_seeks: int = 0,
+                 trace_seeks: int = 0) -> dict:
             reads = {owner: {field: 0 for field in measure.RUN_READ_FIELDS}
                      for owner in measure.WRITE_OWNERS}
             reads["merged_index"]["seeks"] = index_seeks
             reads["query"]["seeks"] = query_seeks
             reads["requested_slice"]["seeks"] = slice_seeks
+            reads["partner_trace"]["seeks"] = trace_seeks
             return reads
         report = self.index_report()
         for refresh in report["refreshes"]:
@@ -366,8 +369,8 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("reports no view_run_reads.requested_slice reads",
                       measure.view_read_problems(no_slice)[0])
 
-        native = {"mode": "native", "sequence": {"view_run_reads": view(0, 3)},
-                  "refreshes": [{"refresh": 1, "view_run_reads": view(0, 3)}]}
+        native = {"mode": "native", "sequence": {"view_run_reads": view(0, 3, 0, 2)},
+                  "refreshes": [{"refresh": 1, "view_run_reads": view(0, 3, 0, 2)}]}
         self.assertEqual(measure.view_read_problems(native), [])
         native["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 1
         self.assertIn("expected 0", measure.view_read_problems(native)[0])
@@ -376,6 +379,17 @@ class MeasureTest(unittest.TestCase):
         native["refreshes"][0]["view_run_reads"]["requested_slice"]["seeks"] = 1
         self.assertIn("view_run_reads.requested_slice.seeks is 1, expected 0 in a native run",
                       measure.view_read_problems(native)[0])
+        native["refreshes"][0]["view_run_reads"]["requested_slice"]["seeks"] = 0
+
+        # A native run reports partner-trace reads, and a reconstructed run none.
+        no_trace = {"mode": "native", "sequence": {"view_run_reads": view(0, 3)},
+                    "refreshes": [{"refresh": 1, "view_run_reads": view(0, 3)}]}
+        self.assertIn("a native run reports no view_run_reads.partner_trace reads",
+                      measure.view_read_problems(no_trace)[0])
+        report["refreshes"][0]["view_run_reads"]["merged_index"]["seeks"] = 0
+        report["refreshes"][0]["view_run_reads"]["partner_trace"]["seeks"] = 1
+        self.assertIn("view_run_reads.partner_trace.seeks is 1, expected 0 in a reconstructed",
+                      measure.view_read_problems(report)[0])
 
         missing = {"mode": "native", "sequence": {}, "refreshes": [{"refresh": 1}]}
         self.assertIn("view_run_reads.query.seeks is None",

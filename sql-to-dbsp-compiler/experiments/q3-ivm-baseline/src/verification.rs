@@ -146,6 +146,7 @@ fn check_readers(
     change: &Change,
 ) -> Result<()> {
     let readers = Q3State::default();
+    readers.enable_contract_check();
     readers
         .publish(
             q3.old().map_err(anyhow::Error::msg)?,
@@ -423,6 +424,7 @@ type Fixture = (&'static str, Change, bool);
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
     let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
     let mut pipeline = Pipeline::new(config())?;
+    pipeline.enable_contract_check();
     #[cfg(feature = "merged-index")]
     {
         pipeline.session_pass = session_pass;

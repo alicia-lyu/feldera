@@ -29,17 +29,16 @@ reports, over the repetitions:
   provides (`cgroup_delta_*`: `pgscan`, `pgsteal`, the workingset refaults, the memory events
   and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
   reset worked) and the maximum sampled `memory.current`;
-- `sequence.view_run_reads`, the view worker's run reads, in two groups (measurement version 11).
-  The DBSP operators' own reads, summed over the owners other than `requested_slice`
-  (`dbsp_operator_seeks`, `dbsp_operator_filter_rejections`, `dbsp_operator_key_decodes`,
-  `dbsp_operator_value_decodes`, `dbsp_operator_weight_decodes`, `dbsp_operator_memory_key_reads`,
-  `dbsp_operator_memory_value_reads`, `dbsp_operator_memory_weight_reads`): in native mode the
-  join traces' partner reads and the deltas', in reconstructed mode the deltas' alone. The joins'
-  reads of the readers' requested slices (`requested_slice_seeks`,
-  `requested_slice_filter_rejections`, `requested_slice_key_decodes`,
-  `requested_slice_value_decodes`, `requested_slice_weight_decodes`,
-  `requested_slice_memory_key_reads`, `requested_slice_memory_value_reads`,
-  `requested_slice_memory_weight_reads`): none in native mode;
+- `sequence.view_run_reads`, the view worker's run reads, in three groups (measurement version 11),
+  each with the eight `RunReads` fields (`seeks`, `filter_rejections`, `key_decodes`,
+  `value_decodes`, `weight_decodes`, `memory_key_reads`, `memory_value_reads`,
+  `memory_weight_reads`):
+  `dbsp_operator_<field>`, the DBSP operators' own reads (every owner but `requested_slice` and
+  `partner_trace`: the deltas', and the rest of the circuit's);
+  `partner_trace_<field>`, the joins' reads of their partner traces (native mode only);
+  `requested_slice_<field>`, the joins' reads of the readers' requested slices (reconstructed mode
+  only), plus the routing's reads of the driving deltas on the driver's thread
+  (`sequence.driver_run_reads.requested_slice`), which the raw report keeps apart;
 - for the merged-index mode only, under the mode's `index_run_reads`: the scan session's run
   reads of the index in the view phase (`sequence.index_run_reads.session`: `index_seeks`,
   `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
@@ -66,12 +65,14 @@ import sys
 from typing import Any
 
 from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS, WRITE_OWNERS,
-                     counter_problems, index_read_problems, owner_write_problems,
-                     profiled_cpu_problems, view_read_problems)
+                     counter_problems, driver_read_problems, index_read_problems,
+                     owner_write_problems, profiled_cpu_problems, view_read_problems)
 
 MEASUREMENT_VERSION = 11
-# The read owner of the joins' reads of the readers' requested slices.
+# The read owners of the joins' reads of the readers' requested slices (reconstructed mode) and of
+# their partner traces (native mode).
 REQUESTED_SLICE = "requested_slice"
+PARTNER_TRACE = "partner_trace"
 REFRESH_SUMS = ("foreground_ms", "base_ms", "index_ms", "forward_ms", "q3_ms", "ivm_ms")
 STATISTICS = ("median", "min", "max")
 # `memory.stat` counters and `memory.events` entries reported as `cgroup_delta_*` metrics when
@@ -122,6 +123,7 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     if not isinstance(refreshes, list) or not refreshes:
         raise SummaryError(f"{where}: no refreshes in the driver report")
     problems = (index_read_problems(driver) + view_read_problems(driver)
+                + driver_read_problems(driver)
                 + counter_problems(driver, "index_session_counts", SESSION_COUNT_FIELDS)
                 + counter_problems(driver, "index_upkeep_run_reads", RUN_READ_FIELDS)
                 + profiled_cpu_problems(driver))
@@ -146,16 +148,23 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
     metrics["observed_storage_bytes"] = number(driver, ("sequence", "observed_storage_bytes"), where)
     metrics["peak_rss_bytes"] = number(driver, (*resources, "peak_rss_bytes"), where)
     # The view worker's run reads (measurement version 11). The DBSP operators' own reads are
-    # those of every owner but `requested_slice`: in native mode the join traces' partner reads
-    # and the deltas', in reconstructed mode the deltas' alone. The joins' reads of the readers'
-    # requested slices are the `requested_slice` owner's.
+    # those of every owner but the two read owners of the partner side. The joins' reads of their
+    # partner traces (native) are the `partner_trace` owner's. The joins' reads of the readers'
+    # requested slices (reconstructed) are the `requested_slice` owner's, with the routing's
+    # reads of the driving deltas on the driver's thread, which the raw report keeps apart.
     for field in RUN_READ_FIELDS:
         metrics[f"dbsp_operator_{field}"] = sum(
             number(driver, ("sequence", "view_run_reads", owner, field), where)
-            for owner in WRITE_OWNERS if owner != REQUESTED_SLICE)
+            for owner in WRITE_OWNERS if owner not in (REQUESTED_SLICE, PARTNER_TRACE))
+    for field in RUN_READ_FIELDS:
+        metrics[f"partner_trace_{field}"] = number(
+            driver, ("sequence", "view_run_reads", PARTNER_TRACE, field), where)
+    driver_reads = driver["sequence"].get("driver_run_reads")
     for field in RUN_READ_FIELDS:
         metrics[f"requested_slice_{field}"] = number(
-            driver, ("sequence", "view_run_reads", REQUESTED_SLICE, field), where)
+            driver, ("sequence", "view_run_reads", REQUESTED_SLICE, field), where) + (
+            0 if driver_reads is None else number(
+                driver, ("sequence", "driver_run_reads", REQUESTED_SLICE, field), where))
     metrics.update(window_memory_metrics(driver, where))
     return metrics
 
@@ -320,8 +329,10 @@ def render_markdown(summary: dict[str, Any]) -> str:
                      for mode in MODES for stat in STATISTICS]
             lines.append(f"| `{name}` | " + " | ".join(cells) + " |")
         lines += ["", "`dbsp_operator_*` are the DBSP operators' own run reads on the view "
-                      "worker; `requested_slice_*` are the joins' run reads of the readers' "
-                      "requested slices (none in native mode).", ""]
+                      "worker; `partner_trace_*` are the joins' run reads of their partner "
+                      "traces (native mode only); `requested_slice_*` are the joins' run reads "
+                      "of the readers' requested slices, with the routing's reads of the "
+                      "driving deltas (reconstructed mode only).", ""]
         for mode in MODES:
             reads = workload["modes"][mode].get("index_run_reads")
             if not reads:

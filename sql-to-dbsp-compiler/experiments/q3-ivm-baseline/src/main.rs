@@ -356,6 +356,15 @@ struct Pipeline {
 }
 
 impl Pipeline {
+    /// Makes the partner reads check that every key of the circuit's delta is one of their
+    /// reader's requests (reconstructed mode; nothing in native mode). Tests and validation
+    /// runs enable it. A measured run (`--no-verify`) never does, so no measured counter
+    /// includes the check's walk of the circuit's delta.
+    fn enable_contract_check(&self) {
+        #[cfg(feature = "merged-index")]
+        self.q3_state.enable_contract_check();
+    }
+
     /// Builds both circuits in one runtime, base first. The CPU profiler is enabled in both.
     fn new(config: CircuitConfig) -> Result<Self> {
         #[cfg(feature = "merged-index")]
@@ -1693,6 +1702,15 @@ fn index_reads_json(reads: &SessionReads) -> Result<Value> {
     Ok(json!({"session": serde_json::to_value(reads.run_reads)?}))
 }
 
+/// Every run read the driver's thread made while collecting the readers (measurement version
+/// 11), per read owner: the index's, which are also in `index_run_reads`, and the routing's reads
+/// of the driving deltas under `requested_slice`. No other owner reads there. The summarizer adds
+/// the `requested_slice` part to the view worker's.
+#[cfg(feature = "merged-index")]
+fn driver_reads_json(reads: &SessionReads) -> Result<Value> {
+    view_reads_json(&reads.driver_reads)
+}
+
 /// What the scan session did, summed over the view transactions: groups handed out, logical
 /// seeks and steps over `Old`, positions reached, and payloads decoded from `Old` and `Dlt`.
 #[cfg(feature = "merged-index")]
@@ -1805,6 +1823,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         })
         .transpose()?;
     let mut pipeline = Pipeline::new(pipeline_config)?;
+    if config.verify {
+        pipeline.enable_contract_check();
+    }
     #[cfg(feature = "merged-index")]
     {
         pipeline.session_pass = config.session_pass();
@@ -2010,12 +2031,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             sequence_upkeep_reads += measurement.upkeep_reads;
             report["index_run_reads"] = index_reads_json(&measurement.session_reads)?;
             report["index_session_counts"] = session_counts_json(&measurement.session_reads)?;
+            report["driver_run_reads"] = driver_reads_json(&measurement.session_reads)?;
             report["index_upkeep_run_reads"] = upkeep_reads_json(&measurement.upkeep_reads)?;
         }
         #[cfg(not(feature = "merged-index"))]
         {
             report["index_run_reads"] = Value::Null;
             report["index_session_counts"] = Value::Null;
+            report["driver_run_reads"] = Value::Null;
             report["index_upkeep_run_reads"] = Value::Null;
         }
         report["index_layout"] = json!(measurement.index_layout);
@@ -2036,6 +2059,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let sequence_index_run_reads = index_reads_json(&sequence_session_reads)?;
     #[cfg(feature = "merged-index")]
     let sequence_index_session_counts = session_counts_json(&sequence_session_reads)?;
+    #[cfg(feature = "merged-index")]
+    let sequence_driver_run_reads = driver_reads_json(&sequence_session_reads)?;
+    #[cfg(not(feature = "merged-index"))]
+    let sequence_driver_run_reads = Value::Null;
     #[cfg(feature = "merged-index")]
     let sequence_index_upkeep_run_reads = upkeep_reads_json(&sequence_upkeep_reads)?;
     #[cfg(not(feature = "merged-index"))]
@@ -2151,6 +2178,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "manual_index_file_backed": manual_file_backed,
             "index_run_reads": sequence_index_run_reads,
             "index_session_counts": sequence_index_session_counts,
+            "driver_run_reads": sequence_driver_run_reads,
             "index_upkeep_run_reads": sequence_index_upkeep_run_reads,
             "view_run_reads": view_reads_json(&sequence_view_reads)?,
             "manual_index_storage": manual_storage,
@@ -2927,6 +2955,7 @@ mod reconstructed_tests {
             ..Config::default()
         };
         let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
+        pipeline.enable_contract_check();
         measurement::drain_until(Duration::from_secs(30), || {
             Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
         })
@@ -3228,10 +3257,25 @@ mod measurement_tests {
                 sequence["index_session_counts"]["groups"].as_u64().unwrap(),
                 groups
             );
+            // The driver thread's reads while collecting, per owner: the index's, the routing's
+            // under `requested_slice`, and none for any other owner.
+            for refresh in refreshes {
+                let driver = &refresh["driver_run_reads"];
+                assert_eq!(
+                    driver["merged_index"], refresh["index_run_reads"]["session"],
+                    "{refresh}"
+                );
+                for owner in ["query", "base_relation", "partner_trace"] {
+                    for field in ["seeks", "memory_key_reads", "key_decodes"] {
+                        assert_eq!(driver[owner][field].as_u64().unwrap(), 0, "{refresh}");
+                    }
+                }
+            }
         } else {
             for refresh in refreshes {
                 assert!(refresh["index_run_reads"].is_null(), "{refresh}");
                 assert!(refresh["index_session_counts"].is_null(), "{refresh}");
+                assert!(refresh["driver_run_reads"].is_null(), "{refresh}");
                 assert!(refresh["index_upkeep_run_reads"].is_null(), "{refresh}");
                 assert!(refresh["index_layout"].is_null(), "{refresh}");
             }
@@ -3259,33 +3303,45 @@ mod measurement_tests {
         };
         for refresh in refreshes {
             let view = &refresh["view_run_reads"];
-            for owner in ["query", "base_relation", "merged_index", "requested_slice"] {
+            for owner in [
+                "query",
+                "base_relation",
+                "merged_index",
+                "requested_slice",
+                "partner_trace",
+            ] {
                 assert!(view[owner]["seeks"].is_u64(), "{refresh}");
             }
             assert_eq!(owner_total(view, "merged_index"), 0, "{refresh}");
-            if !cfg!(feature = "merged-index") {
-                assert_eq!(owner_total(view, "requested_slice"), 0, "{refresh}");
-            }
+            // The partner side is the trace's in native mode and the slice's in reconstructed.
+            let absent = if cfg!(feature = "merged-index") {
+                "partner_trace"
+            } else {
+                "requested_slice"
+            };
+            assert_eq!(owner_total(view, absent), 0, "{refresh}");
         }
-        // A refresh that changes nothing reads no slice, so the reconstructed run is checked as a
-        // whole.
-        if cfg!(feature = "merged-index") {
-            let slice_reads: u64 = refreshes
-                .iter()
-                .map(|refresh| owner_total(&refresh["view_run_reads"], "requested_slice"))
-                .sum();
-            assert!(slice_reads > 0);
-        }
+        // A refresh that changes nothing reads no partner, so each mode is checked as a whole.
+        let partner_owner = if cfg!(feature = "merged-index") {
+            "requested_slice"
+        } else {
+            "partner_trace"
+        };
+        let partner_reads: u64 = refreshes
+            .iter()
+            .map(|refresh| owner_total(&refresh["view_run_reads"], partner_owner))
+            .sum();
+        assert!(partner_reads > 0);
         let view_seeks: u64 = refreshes
             .iter()
             .map(|refresh| {
-                refresh["view_run_reads"]["query"]["seeks"]
+                refresh["view_run_reads"]["partner_trace"]["seeks"]
                     .as_u64()
                     .unwrap()
             })
             .sum();
         assert_eq!(
-            output["sequence"]["view_run_reads"]["query"]["seeks"],
+            output["sequence"]["view_run_reads"]["partner_trace"]["seeks"],
             view_seeks
         );
         if !cfg!(feature = "merged-index") {
@@ -3775,6 +3831,7 @@ mod worked_transaction {
                 arm.name()
             ));
         let pipeline = Pipeline::new(runtime_config(&arm.config(), Some(&storage))?)?;
+        pipeline.enable_contract_check();
         if matches!(arm, Arm::Pressured) {
             measurement::drain_until(Duration::from_secs(30), || {
                 Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
@@ -4003,16 +4060,23 @@ mod native_worked_transaction_tests {
                 transact(pipeline, state, worked_change(), true, &mut stats)?;
                 Ok(stats)
             })?;
-        let [query, base_relation, merged_index, requested_slice] = stats.view_reads;
+        let [query, base_relation, merged_index, requested_slice, partner_trace] = stats.view_reads;
+        // The DBSP operators' reads: the joins' probes of their traces (`partner_trace`) and
+        // everything else they read (`query`), the deltas among it.
+        let mut operators = query;
+        operators += partner_trace;
         println!(
-            "native {}: pressure {pressures}; files {files}\n  reads {query:?}",
+            "native {}: pressure {pressures}; files {files}\n  query {query:?}\n  partner trace {partner_trace:?}",
             arm.name()
         );
-        assert_eq!(Totals::of(&query), tally_totals());
+        assert_eq!(Totals::of(&operators), tally_totals());
+        // The partner traces are read, and apart from the deltas.
+        assert!(Totals::of(&partner_trace).keys > 0);
+        assert!(Totals::of(&query).keys > 0);
         assert_eq!(base_relation, RunReads::default());
         assert_eq!(merged_index, RunReads::default());
         assert_eq!(requested_slice, RunReads::default());
-        Ok((query, pressures, files))
+        Ok((operators, pressures, files))
     }
 
     #[test]
@@ -4218,8 +4282,10 @@ mod session_worked_transaction_tests {
     ///   file counts them as decodes, and a run in memory as memory reads. In all: 11 key, 11
     ///   value, and 11 weight reads.
     /// - No seek reaches a run, so no seek or filter rejection is counted.
-    /// - The routing's own reads of the readers' in-memory driving deltas (`dC` and `dO` at c5:
-    ///   two seeks, 2 key, 3 value, and 3 weight memory reads) are another owner's.
+    /// - The routing's reads of the driving deltas it merges forward alongside the scan (`dC` and
+    ///   `dO` at c5: no seek, 2 key reads for the two cursors' first keys, and 3 value and 3
+    ///   weight memory reads) are the `requested_slice` owner's, and nothing is read under
+    ///   `query`.
     fn check(observed: &Observed) {
         assert_eq!(
             observed.counts,
@@ -4237,7 +4303,6 @@ mod session_worked_transaction_tests {
         assert_eq!(
             observed.other_reads,
             RunReads {
-                seeks: 2,
                 memory_key_reads: 2,
                 memory_value_reads: 3,
                 memory_weight_reads: 3,

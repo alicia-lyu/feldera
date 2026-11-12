@@ -19,7 +19,8 @@ def owners(query: int, base: int, index: int) -> dict[str, dict[str, int]]:
     return {"query": {"operations": query, "bytes": query * 100},
             "base_relation": {"operations": base, "bytes": base * 100},
             "merged_index": {"operations": index, "bytes": index * 100},
-            "requested_slice": {"operations": 0, "bytes": 0}}
+            "requested_slice": {"operations": 0, "bytes": 0},
+            "partner_trace": {"operations": 0, "bytes": 0}}
 
 
 def index_reads(seeks: int) -> dict[str, dict[str, int]]:
@@ -32,16 +33,26 @@ def index_reads(seeks: int) -> dict[str, dict[str, int]]:
             for reader in summarize.INDEX_READERS}
 
 
-def view_reads(query: int, requested_slice: int = 0) -> dict[str, dict[str, int]]:
-    """The view worker's reads: `query` of every count under `query`, and `requested_slice` of
-    every count under `requested_slice`. The scan session reads the index on the driver's thread,
-    so the worker reads nothing under `merged_index`."""
+def view_reads(query: int, requested_slice: int = 0,
+               partner_trace: int = 0) -> dict[str, dict[str, int]]:
+    """The view worker's reads: `query` of every count under `query`, `requested_slice` under
+    `requested_slice`, and `partner_trace` under `partner_trace`. The scan session reads the index
+    on the driver's thread, so the worker reads nothing under `merged_index`."""
     return {
         "query": {field: query for field in summarize.RUN_READ_FIELDS},
         "base_relation": {field: 0 for field in summarize.RUN_READ_FIELDS},
         "merged_index": {field: 0 for field in summarize.RUN_READ_FIELDS},
         "requested_slice": {field: requested_slice for field in summarize.RUN_READ_FIELDS},
+        "partner_trace": {field: partner_trace for field in summarize.RUN_READ_FIELDS},
     }
+
+
+def driver_reads(requested_slice: int, index: int = 1) -> dict[str, dict[str, int]]:
+    """The driver thread's reads while collecting: the index's (`merged_index`) and the routing's
+    `requested_slice` ones, and nothing under any other owner."""
+    reads = view_reads(0, requested_slice)
+    reads["merged_index"] = {field: index for field in summarize.RUN_READ_FIELDS}
+    return reads
 
 
 def session_counts(groups: int) -> dict[str, int]:
@@ -76,8 +87,10 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
                                       "q3": 1.5 * scale * number}}
                  for number in (1, 2)]
     for refresh in refreshes:
-        refresh["view_run_reads"] = view_reads(10 * refresh["refresh"],
-                                               0 if native else 3 * refresh["refresh"])
+        refresh["view_run_reads"] = view_reads(
+            10 * refresh["refresh"], 0 if native else 3 * refresh["refresh"],
+            4 * refresh["refresh"] if native else 0)
+        refresh["driver_run_reads"] = None if native else driver_reads(refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
         "measurement_version": 11, "os": "linux",
@@ -86,7 +99,8 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
             "index_run_reads": None if native else index_reads(int(3 * scale)),
             "index_session_counts": None if native else session_counts(3),
             "index_upkeep_run_reads": None if native else upkeep_reads(3),
-            "view_run_reads": view_reads(30, 0 if native else 9),
+            "view_run_reads": view_reads(30, 0 if native else 9, 12 if native else 0),
+            "driver_run_reads": None if native else driver_reads(3, 2),
             "end_to_end_ms": 100.0 * scale, "observed_storage_bytes": 1000 + int(scale),
             "window_peak_rss_bytes": 7_000_000 + int(scale),
             "window_end_rss_bytes": 6_000_000 + int(scale), "cgroup": None,
@@ -180,8 +194,12 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(merged["metrics"]["dbsp_operator_seeks"]["median"], 30)
         # The joins' reads of the requested slices are the reconstructed mode's alone.
         self.assertEqual(native["metrics"]["requested_slice_seeks"]["median"], 0)
-        self.assertEqual(merged["metrics"]["requested_slice_seeks"]["median"], 9)
-        self.assertEqual(merged["metrics"]["requested_slice_memory_weight_reads"]["median"], 9)
+        # The worker's 9 and the driver's routing reads, which the raw report keeps apart, 3.
+        self.assertEqual(merged["metrics"]["requested_slice_seeks"]["median"], 12)
+        self.assertEqual(merged["metrics"]["requested_slice_memory_weight_reads"]["median"], 12)
+        # The native joins' trace reads are the partner trace's, and none in reconstructed mode.
+        self.assertEqual(native["metrics"]["partner_trace_seeks"]["median"], 12)
+        self.assertEqual(merged["metrics"]["partner_trace_seeks"]["median"], 0)
         self.assertTrue(markdown.endswith("|\n"))
         self.assertNotIn("  \n", markdown)
 
@@ -368,6 +386,16 @@ class SummarizeTest(unittest.TestCase):
             item["view_run_reads"]["requested_slice"] = {
                 field: 0 for field in summarize.RUN_READ_FIELDS}
         self.failing(content, "reports no view_run_reads.requested_slice reads")
+        # The partner trace is the native mode's alone, and a native run has some.
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        refresh = content["runs"][1]["driver"]["refreshes"][0]
+        refresh["view_run_reads"]["partner_trace"]["seeks"] += 1
+        self.failing(content, "view_run_reads.partner_trace.seeks")
+        # The driver thread reads under no owner but the index's and the requested slice's.
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        refresh = content["runs"][1]["driver"]["refreshes"][0]
+        refresh["driver_run_reads"]["query"]["seeks"] = 1
+        self.failing(content, "driver_run_reads.query.seeks")
 
     def test_repetition_count_mismatch_is_an_error(self) -> None:
         self.failing(manifest({"native": [1.0, 2.0, 3.0], "merged-index": [1.0, 2.0]}),
