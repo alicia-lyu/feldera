@@ -5,15 +5,19 @@
 //! signed index changes), and [`Q3State::collect`] reads them once each:
 //!
 //! 1. A pass over `Dlt` ([`capture`]) lists the touched customers and builds
-//!    the driving deltas `ΔC`, `ΔO`, and `ΔL` and each reader's requests.
+//!    the driving deltas `ΔC`, `ΔO`, and `ΔL` once each, into the hand-off
+//!    structure [`DrivingDeltas`], and each reader's requests.
 //! 2. One scan session visits the touched customers' groups of `Old`. It
 //!    decides from the folded key alone whether a reader keeps an entry, and
 //!    reads, decodes, and unfolds a kept entry once.
 //!
-//! The four partner reads of the delta rules are four [`Reader`]s. Each owns
-//! its driving delta and keeps only the rows that it requests:
+//! The four partner reads of the delta rules are four [`Reader`]s. Each holds
+//! the request prefixes of its driving delta and keeps only the rows that it
+//! requests; the deltas are not the readers': the routing borrows `ΔC` and
+//! `ΔO` for the rows it needs (a requested customer's `ΔC` rows are copied
+//! into `C⁺`'s slice), and the driver moves all three to the circuit:
 //!
-//! | Reader | Owns | Keeps |
+//! | Reader | Requests of | Keeps |
 //! | --- | --- | --- |
 //! | `C⁺` ([`CustomersAfter`]) | `ΔO` | the customers of `ΔO`, after: `Old`'s row and `ΔC`'s rows |
 //! | `O⁻` ([`OrdersBefore`]) | `ΔC` | the orders of each customer in `ΔC`, before |
@@ -30,7 +34,7 @@
 //! needs (a hook of the generic reader machinery, which has no notion of a
 //! join).
 //!
-//! The circuit's driving deltas are the owners' batches, moved out
+//! The circuit's driving deltas are the batches that `capture` built, moved out
 //! ([`Q3State::take_driving_deltas`]); no after read shares them. A partner
 //! read errors on a delta key outside its reader's requests: every delta key
 //! lies in a request, and a request outside the touched groups breaks that
@@ -47,8 +51,9 @@ use dbsp::{
     storage::write_attribution::WriteOwner,
     trace::{
         merged_index::{
-            capture, route, DeltaReader, DrivingDelta, MergedIndexBatch, OrderedKey, Pass,
-            Position, Reader, ReaderDefinition, ScanSession, SessionCounts, StoredReader,
+            capture, route, Capture, Delta, DeltaReader, DrivingDelta, MergedIndexBatch,
+            OrderedKey, Pass, Position, Reader, ReaderDefinition, ScanSession, SessionCounts,
+            StoredReader,
         },
         with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
         SpineSnapshot as DynamicSnapshot,
@@ -103,7 +108,7 @@ impl AddAssign for SessionReads {
 }
 
 /// The driving deltas of one transaction, `ΔC`, `ΔO`, and `ΔL`: the batches
-/// that their owners built from `Dlt`, indexed by the joins' keys. Every row
+/// that `capture` built from `Dlt`, indexed by the joins' keys. Every row
 /// carries its trie keys.
 pub struct DrivingDeltas {
     pub customers: CustomerByCustkeyVector,
@@ -334,8 +339,12 @@ struct Group {
     customer_after: Weighted<SqlString>,
 }
 
-/// The four readers and the routing that computes `J⁺` and `ΔJ`.
+/// The four readers, the two driving deltas whose rows the routing reads, and the routing that
+/// computes `J⁺` and `ΔJ`. The deltas are borrowed: the caller of `capture` owns them.
 struct Routing<'r> {
+    /// `ΔC`, which `O⁻` requests, and `ΔO`, which `C⁺` requests.
+    delta_customers: &'r Delta<OrdersBefore>,
+    delta_orders: &'r Delta<CustomersAfter>,
     customers: &'r mut Reader<CustomersAfter>,
     orders: &'r mut Reader<OrdersBefore>,
     joined: &'r mut Reader<JoinedAfter>,
@@ -364,14 +373,14 @@ impl Routing<'_> {
 
     fn begin(&mut self, prefix: &[u8]) -> Result<Group, String> {
         let custkey = custkey_of_group(prefix)?;
-        // `ΔC` and `ΔO` have rows in this group only if their owners request it.
+        // `ΔC` and `ΔO` have rows in this group only if `C⁺` and `O⁻` request it.
         let delta_customers = if self.orders.requests_mut().has(prefix) {
-            self.orders.delta_rows_at(&Tup1(custkey))?
+            self.delta_customers.rows_at(&Tup1(custkey))?
         } else {
             Vec::new()
         };
         let delta_orders = if self.customers.requests_mut().has(prefix) {
-            self.customers.delta_rows_at(&Tup1(custkey))?
+            self.delta_orders.rows_at(&Tup1(custkey))?
         } else {
             Vec::new()
         };
@@ -652,18 +661,28 @@ impl Q3State {
     pub fn collect(&self, pass: Pass) -> Result<(), String> {
         let views = self.views()?;
         let before = RunReads::current_for(WriteOwner::MergedIndex);
-        let (mut collected, counts) = with_read_owner(WriteOwner::MergedIndex, || {
+        let (collected, driving, counts) = with_read_owner(WriteOwner::MergedIndex, || {
             let mut customers = Reader::<CustomersAfter>::new()?;
             let mut orders = Reader::<OrdersBefore>::new()?;
             let mut joined = Reader::<JoinedAfter>::new()?;
             let mut lines = Reader::<LineitemsBefore>::new()?;
 
-            let drivers: &mut [&mut dyn DeltaReader<Definition>] =
-                &mut [&mut customers, &mut orders, &mut joined, &mut lines];
+            // The driving deltas: `ΔO` of `C⁺`, `ΔC` of `O⁻`, and `ΔL` of `J⁺`. `L⁻`'s is a
+            // join, so it has requests only. The readers keep the requests, not the deltas.
+            let mut delta_orders = Delta::<CustomersAfter>::new()?;
+            let mut delta_customers = Delta::<OrdersBefore>::new()?;
+            let mut delta_lines = Delta::<JoinedAfter>::new()?;
+            let drivers: &mut [&mut dyn DeltaReader<Definition>] = &mut [
+                &mut Capture::new(&mut customers, &mut delta_orders),
+                &mut Capture::new(&mut orders, &mut delta_customers),
+                &mut Capture::new(&mut joined, &mut delta_lines),
+            ];
             let captured = capture::<Definition>(&views.dlt, drivers)?;
 
             let mut session = ScanSession::<Definition>::new(&views.old, &captured.touched, pass);
             Routing {
+                delta_customers: &delta_customers,
+                delta_orders: &delta_orders,
                 customers: &mut customers,
                 orders: &mut orders,
                 joined: &mut joined,
@@ -684,18 +703,16 @@ impl Q3State {
             ] {
                 reader?;
             }
-            Ok::<_, String>(((customers, orders, joined, lines), counts))
+            // The deltas are moved out, not cloned: no after read shares them.
+            let driving = DrivingDeltas {
+                customers: delta_customers.into_batch()?,
+                orders: delta_orders.into_batch()?,
+                lines: delta_lines.into_batch()?,
+            };
+            Ok::<_, String>(((customers, orders, joined, lines), driving, counts))
         })?;
         let run_reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
 
-        // The owners' driving deltas are moved out, not cloned: no after read
-        // shares them. `ΔC` is `O⁻`'s, `ΔO` is `C⁺`'s, and `ΔL` is `J⁺`'s.
-        let (customers, orders, joined, _) = &mut collected;
-        let driving = DrivingDeltas {
-            customers: orders.take_delta()?,
-            orders: customers.take_delta()?,
-            lines: joined.take_delta()?,
-        };
         let (customers, orders, joined, lines) = collected;
         views
             .collected

@@ -2,12 +2,13 @@
 //! routing of one scan session fills.
 //!
 //! A circuit keeps DBSP's own operators. Only the partner reads of its joins
-//! are taken from the merged index. Each read is a [`Reader`]. It owns:
+//! are taken from the merged index. Each read is a [`Reader`]. It holds:
 //!
-//! * a *driving delta*, the delta input of the join that the reader serves,
-//!   as a typed batch built from `Dlt` ([`DrivingDelta::Stream`]), or, when
-//!   the delta is the output of another join, only its *requests*
-//!   ([`DrivingDelta::Join`]);
+//! * the *requests* of its *driving delta*, the delta input of the join that
+//!   the reader serves. The delta itself is not the reader's: [`capture`]
+//!   builds it into a [`Delta`] that the caller owns and moves to the
+//!   circuit, and the routing only borrows it. A driving delta that is the
+//!   output of another join ([`DrivingDelta::Join`]) is requests only;
 //! * a *partner batch*, the rows of the other input that the driving delta
 //!   asks for, which the join seeks. It holds only the requested slice of
 //!   the index: the rows of the requested nodes, not of the whole touched
@@ -29,9 +30,9 @@
 //! # A transaction
 //!
 //! 1. [`capture`] reads `Dlt` once. It lists the touched groups, hands each
-//!    delta entry to the readers it drives (which unfold it straight into
-//!    their driving-delta builder, one copy, and note its request), and
-//!    counts the payloads it decodes.
+//!    delta entry to the readers it drives ([`Capture`]: the entry is unfolded
+//!    straight into the [`Delta`], one copy, and its request is noted by the
+//!    reader), and counts the payloads it decodes.
 //! 2. A [`ScanSession`] visits the touched groups of `Old`. For each position,
 //!    the routing asks each reader from the folded key alone whether it keeps
 //!    the entry ([`StoredReader::keeps`]). [`route`] reads and decodes the
@@ -322,12 +323,10 @@ enum PartnerRows<K: DBData, V: DBData> {
     Sealed(Arc<Inner<K, V>>),
 }
 
-/// A driving delta under construction, then sealed and owned until the
-/// driver takes it for the circuit's input handle.
+/// A driving delta under construction, then sealed.
 enum DeltaRows<K: DBData, V: DBData> {
     Building(Box<RowBuilder<K, V>>),
     Sealed(Box<OrdIndexedZSet<K, V>>),
-    Taken,
 }
 
 /// The values and weights under `key` of a sealed driving delta. These are
@@ -350,7 +349,7 @@ fn rows_at<K: DBData, V: DBData>(batch: &OrdIndexedZSet<K, V>, key: &K) -> Vec<(
     })
 }
 
-/// One partner read: its requests, its driving delta, and its partner batch.
+/// One partner read: the requests of its driving delta, and its partner batch.
 pub struct Reader<R: ReaderDefinition> {
     /// Byte length of a request prefix: the first `REQUEST_DEPTH` fields of a
     /// key, each a tag and a value.
@@ -360,8 +359,6 @@ pub struct Reader<R: ReaderDefinition> {
 
     requests: Requests,
     partner: PartnerRows<R::Key, R::Val>,
-    /// `None` for a driving delta that is a join.
-    delta: Option<DeltaRows<R::DeltaKey, R::DeltaVal>>,
 }
 
 impl<R: ReaderDefinition> Reader<R> {
@@ -398,8 +395,6 @@ impl<R: ReaderDefinition> Reader<R> {
             delta_width: delta_width.unwrap_or(request_width),
             requests: Requests::default(),
             partner: PartnerRows::Building(Box::default()),
-            delta: matches!(R::DRIVING_DELTA, DrivingDelta::Stream(_))
-                .then(|| DeltaRows::Building(Box::default())),
         })
     }
 
@@ -455,34 +450,63 @@ impl<R: ReaderDefinition> Reader<R> {
             .extend_with_batches([Arc::clone(batch)]);
         Ok(snapshot)
     }
+}
 
-    /// The rows of the driving delta under `key`: values with their weights.
-    /// For the routing, which needs the delta's rows at the node it passes.
-    pub fn delta_rows_at(&self, key: &R::DeltaKey) -> Result<Vec<(R::DeltaVal, ZWeight)>, String> {
-        match &self.delta {
-            Some(DeltaRows::Sealed(batch)) => Ok(rows_at(batch, key)),
-            Some(DeltaRows::Building(_)) => Err("the driving delta is not sealed yet".into()),
-            Some(DeltaRows::Taken) => Err("the driving delta was already taken".into()),
-            None => Err("this reader's driving delta is a join, which holds no batch".into()),
+/// The driving delta of reader `R`, built by [`capture`] from `Dlt`'s entries of its
+/// driving stream. The reader does not own it: whoever calls `capture` does, and moves it
+/// to the circuit's input handle ([`Delta::into_batch`]), while the routing borrows it for
+/// the rows it needs ([`Delta::rows_at`]).
+pub struct Delta<R: ReaderDefinition> {
+    rows: DeltaRows<R::DeltaKey, R::DeltaVal>,
+}
+
+impl<R: ReaderDefinition> Delta<R> {
+    /// An empty delta to build. `R` must be driven by a stream of the index; a
+    /// [`DrivingDelta::Join`] has no batch.
+    pub fn new() -> Result<Self, String> {
+        match R::DRIVING_DELTA {
+            DrivingDelta::Stream(_) => Ok(Self {
+                rows: DeltaRows::Building(Box::default()),
+            }),
+            DrivingDelta::Join => {
+                Err("a driving delta that is a join holds no batch, only requests".into())
+            }
         }
     }
 
-    /// Moves the driving delta out for the circuit's input handle. Nothing is
-    /// cloned: no other holder shares the batch.
-    pub fn take_delta(&mut self) -> Result<OrdIndexedZSet<R::DeltaKey, R::DeltaVal>, String> {
-        match self.delta.replace(DeltaRows::Taken) {
-            Some(DeltaRows::Sealed(batch)) => Ok(*batch),
-            Some(DeltaRows::Building(_)) => Err("the driving delta is not sealed yet".into()),
-            Some(DeltaRows::Taken) => Err("the driving delta was already taken".into()),
-            None => {
-                self.delta = None;
-                Err("this reader's driving delta is a join, which holds no batch".into())
-            }
+    /// The rows under `key`: values with their weights. For the routing, which
+    /// needs the delta's rows at the node it passes.
+    pub fn rows_at(&self, key: &R::DeltaKey) -> Result<Vec<(R::DeltaVal, ZWeight)>, String> {
+        match &self.rows {
+            DeltaRows::Sealed(batch) => Ok(rows_at(batch, key)),
+            DeltaRows::Building(_) => Err("the driving delta is not sealed yet".into()),
+        }
+    }
+
+    /// Moves the batch out for the circuit's input handle. Nothing is cloned.
+    pub fn into_batch(self) -> Result<OrdIndexedZSet<R::DeltaKey, R::DeltaVal>, String> {
+        match self.rows {
+            DeltaRows::Sealed(batch) => Ok(*batch),
+            DeltaRows::Building(_) => Err("the driving delta is not sealed yet".into()),
         }
     }
 }
 
-impl<R: ReaderDefinition> DeltaReader<R::Index> for Reader<R> {
+/// A reader paired with its driving delta, as [`capture`] drives them: each `Dlt` entry of
+/// the driving stream is unfolded into the delta, and its request prefix is noted by the
+/// reader.
+pub struct Capture<'a, R: ReaderDefinition> {
+    reader: &'a mut Reader<R>,
+    delta: &'a mut Delta<R>,
+}
+
+impl<'a, R: ReaderDefinition> Capture<'a, R> {
+    pub fn new(reader: &'a mut Reader<R>, delta: &'a mut Delta<R>) -> Self {
+        Self { reader, delta }
+    }
+}
+
+impl<R: ReaderDefinition> DeltaReader<R::Index> for Capture<'_, R> {
     fn driving_stream(&self) -> Option<u8> {
         match R::DRIVING_DELTA {
             DrivingDelta::Stream(stream) => Some(stream),
@@ -498,20 +522,20 @@ impl<R: ReaderDefinition> DeltaReader<R::Index> for Reader<R> {
         weight: ZWeight,
     ) -> Result<(), String> {
         let prefix = folded
-            .get(..self.delta_width)
+            .get(..self.reader.delta_width)
             .ok_or_else(|| format!("delta key {folded:?} is shorter than its request prefix"))?;
-        self.requests.push(prefix)?;
+        self.reader.requests.push(prefix)?;
         let (delta_key, delta_value) = R::unfold_delta(key, payload)?;
-        match &mut self.delta {
-            Some(DeltaRows::Building(builder)) => builder.push(delta_key, delta_value, weight),
-            _ => Err("the driving delta is not being built".into()),
+        match &mut self.delta.rows {
+            DeltaRows::Building(builder) => builder.push(delta_key, delta_value, weight),
+            DeltaRows::Sealed(_) => Err("the driving delta is already sealed".into()),
         }
     }
 
     fn seal_delta(&mut self) -> Result<(), String> {
-        if let Some(DeltaRows::Building(builder)) = &mut self.delta {
+        if let DeltaRows::Building(builder) = &mut self.delta.rows {
             let builder = std::mem::take(builder);
-            self.delta = Some(DeltaRows::Sealed(Box::new((*builder).finish()?)));
+            self.delta.rows = DeltaRows::Sealed(Box::new((*builder).finish()?));
         }
         Ok(())
     }

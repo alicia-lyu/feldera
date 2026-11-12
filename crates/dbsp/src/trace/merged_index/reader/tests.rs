@@ -253,6 +253,10 @@ struct Collected {
     a_from_b: Reader<AFromB>,
     b_at_path: Reader<BAtPath>,
     derived: Reader<DerivedAtPath>,
+    /// The driving deltas, which the readers do not own.
+    delta_b_by_a: Delta<BByA>,
+    delta_a_from_b: Delta<AFromB>,
+    delta_derived: Delta<DerivedAtPath>,
     captured: Captured,
     counts: SessionCounts,
 }
@@ -280,9 +284,17 @@ fn collect_all(
         b_at_path.request(&path_of(a, b))?;
     }
 
+    let mut delta_b_by_a = Delta::<BByA>::new()?;
+    let mut delta_a_from_b = Delta::<AFromB>::new()?;
+    let mut delta_derived = Delta::<DerivedAtPath>::new()?;
+    // `b_at_path` is driven by a join: requests only, and no delta to capture.
     let captured = capture(
         &dlt,
-        &mut [&mut b_by_a, &mut a_from_b, &mut b_at_path, &mut derived],
+        &mut [
+            &mut Capture::new(&mut b_by_a, &mut delta_b_by_a),
+            &mut Capture::new(&mut a_from_b, &mut delta_a_from_b),
+            &mut Capture::new(&mut derived, &mut delta_derived),
+        ],
     )?;
     let mut session = ScanSession::<Pairs>::new(&old, &captured.touched, pass);
     while session.next_group().is_some() {
@@ -309,6 +321,9 @@ fn collect_all(
         a_from_b,
         b_at_path,
         derived,
+        delta_b_by_a,
+        delta_a_from_b,
+        delta_derived,
         captured,
         counts,
     })
@@ -477,38 +492,23 @@ fn stream_driven_readers_take_their_driving_deltas_and_requests_from_dlt() {
     assert!(requests_of(&collected.b_at_path).is_empty());
 
     // Each driving delta is the `Dlt` batch of its stream, unfolded.
-    let delta_a = collected.b_by_a.take_delta().unwrap();
+    let delta_a = collected.delta_b_by_a.into_batch().unwrap();
     assert_eq!(
         rows::<u8, u8>(delta_a.inner()),
         vec![(1, 10, -1), (1, 12, 1)]
     );
-    let delta_b = collected.a_from_b.take_delta().unwrap();
+    let delta_b = collected.delta_a_from_b.into_batch().unwrap();
     assert_eq!(
         rows::<u8, Tup2<u8, u8>>(delta_b.inner()),
         vec![(3, Tup2(1, 30), 1)]
     );
-    let delta_path = collected.derived.take_delta().unwrap();
+    let delta_path = collected.delta_derived.into_batch().unwrap();
     assert_eq!(
         rows::<Tup2<u8, u8>, u8>(delta_path.inner()),
         vec![(Tup2(3, 1), 30, 1)]
     );
-    // A delta is taken once, and a join holds none.
-    assert!(
-        collected
-            .b_by_a
-            .take_delta()
-            .err()
-            .unwrap()
-            .contains("already taken")
-    );
-    assert!(
-        collected
-            .b_at_path
-            .take_delta()
-            .err()
-            .unwrap()
-            .contains("is a join")
-    );
+    // A join's driving delta holds no batch.
+    assert!(Delta::<BAtPath>::new().err().unwrap().contains("is a join"));
 
     // The partner batches hold only the requested slice. `BByA` requests
     // group 1: its `B` row. `AFromB` requests group 3: `Old` has no `A(3)`.
@@ -557,7 +557,7 @@ fn no_driving_change_means_no_rows_and_no_payload_read() {
         assert!(partner_rows(&collected.b_by_a).is_empty());
         assert!(partner_rows(&collected.a_from_b).is_empty());
         assert!(requests_of(&collected.b_by_a).is_empty());
-        assert!(rows::<u8, u8>(collected.b_by_a.take_delta().unwrap().inner()).is_empty());
+        assert!(rows::<u8, u8>(collected.delta_b_by_a.into_batch().unwrap().inner()).is_empty());
         assert_eq!(collected.counts.groups, 0);
         assert_eq!(collected.counts.payload_decodes_old, 0);
         assert_eq!(collected.counts.payload_decodes_dlt, 0);
@@ -579,7 +579,8 @@ fn a_dlt_entry_nobody_drives_costs_no_decode() {
 fn a_delta_row_conversion_that_goes_back_is_an_error() {
     let dlt: MergedIndexBatch = memory_run(&[row(Key::A(1), 1, 1), row(Key::A(2), 1, 1)]);
     let mut reversing = Reader::<Reversing>::new().unwrap();
-    let error = capture(&dlt, &mut [&mut reversing]).unwrap_err();
+    let mut delta = Delta::<Reversing>::new().unwrap();
+    let error = capture(&dlt, &mut [&mut Capture::new(&mut reversing, &mut delta)]).unwrap_err();
     assert!(error.contains("key order"), "{error}");
 }
 
@@ -607,7 +608,8 @@ fn a_conversion_error_stops_the_collection() {
     }
     let dlt: MergedIndexBatch = memory_run(&[row(Key::A(1), 1, 1)]);
     let mut wrong = Reader::<Wrong>::new().unwrap();
-    let error = capture(&dlt, &mut [&mut wrong]).unwrap_err();
+    let mut delta = Delta::<Wrong>::new().unwrap();
+    let error = capture(&dlt, &mut [&mut Capture::new(&mut wrong, &mut delta)]).unwrap_err();
     assert!(error.contains("expected a B key"), "{error}");
 }
 
@@ -722,7 +724,7 @@ proptest! {
             })
             .collect();
         prop_assert_eq!(
-            summed(rows::<u8, u8>(collected.b_by_a.take_delta().unwrap().inner())),
+            summed(rows::<u8, u8>(collected.delta_b_by_a.into_batch().unwrap().inner())),
             summed(expected_delta_a)
         );
 
