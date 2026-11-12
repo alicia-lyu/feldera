@@ -20,9 +20,12 @@ pub mod trie;
 pub use batch::MergedIndexBatch;
 pub use ordered::OrderedKey;
 pub use packed::{PackedField, PayloadDecoder, PayloadEncoder};
-pub use reader::{FilledReader, Half, Projection, Reader, ReaderRuns, TouchedGroups};
+pub use reader::{
+    Captured, DeltaReader, DrivingDelta, Position, Reader, ReaderDefinition, Requests, RowBuilder,
+    StoredReader, capture, route,
+};
 pub use run_merge::RunMerge;
-pub use session::{Entry, GroupBuffers, Pass, ScanSession, SessionCounts, StreamBuffer};
+pub use session::{Pass, ScanSession, SessionCounts};
 pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement, Via};
 
 /// Terminates the key fields of a folded key. No domain may use it as a tag.

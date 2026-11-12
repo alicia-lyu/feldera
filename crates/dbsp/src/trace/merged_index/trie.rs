@@ -193,6 +193,37 @@ impl KeyTrie {
             .width
     }
 
+    /// The domains on the path of the placement with id `stream_id`, root
+    /// first, or `None` if the trie has no such placement.
+    pub fn stream_path(&self, stream_id: u8) -> Option<Vec<&'static str>> {
+        self.placements()
+            .into_iter()
+            .find(|placed| placed.id == stream_id)
+            .map(|placed| placed.path)
+    }
+
+    /// The length in bytes of the first `depth` fields of a key of the stream
+    /// `stream_id`: each field is its domain's tag and encoded value. A
+    /// request at the node of depth `depth` is a prefix of this length.
+    /// `depth == 1` is the group prefix (`1 + root_width()`).
+    pub fn prefix_width(&self, stream_id: u8, depth: usize) -> Result<usize, String> {
+        let path = self
+            .stream_path(stream_id)
+            .ok_or_else(|| format!("trie `{}` has no stream {stream_id}", self.name))?;
+        let fields = path.get(..depth).ok_or_else(|| {
+            format!(
+                "stream {stream_id} has {} fields, fewer than the depth {depth}",
+                path.len()
+            )
+        })?;
+        fields.iter().try_fold(0, |width, name| {
+            let domain = self
+                .domain(name)
+                .ok_or_else(|| format!("domain `{name}` is not declared"))?;
+            Ok(width + 1 + domain.width)
+        })
+    }
+
     fn domain(&self, name: &str) -> Option<&'static Domain> {
         self.domains.iter().find(|domain| domain.name == name)
     }

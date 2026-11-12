@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::{collection::vec, prelude::*};
 
@@ -13,6 +13,7 @@ use crate::{
             run_merge::tests::{memory_run, snapshot},
         },
     },
+    utils::Tup2,
 };
 
 // ---- Fixture: two one-byte levels, `A` at `a` (id 1) and `B` at `a.b` (id 2) ----
@@ -107,26 +108,128 @@ impl MergedIndexDefinition for Pairs {
     }
 }
 
-// ---- Three readers: `A` by `a`, `B` by `a` (a range), and `B` by `(a, b)` (a path) ----
+// ---- Four readers, one of each static plan the Q3 circuit uses ----
 
-fn a_by_a(key: &Key, payload: &u8) -> Result<(u8, u8), String> {
-    match key {
-        Key::A(a) => Ok((*a, *payload)),
-        other => Err(format!("expected an A key, found {other:?}")),
+/// Like `O⁻`: the `B` rows of the groups that `A` entries of `Dlt` touch, `(a, (b, p))`.
+struct BByA;
+
+impl ReaderDefinition for BByA {
+    type Index = Pairs;
+    type Key = u8;
+    type Val = Tup2<u8, u8>;
+    type DeltaKey = u8;
+    type DeltaVal = u8;
+    const PARTNER_STREAM: Option<u8> = Some(B);
+    const REQUEST_DEPTH: usize = 1;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(A);
+
+    fn unfold(key: &Key, payload: &u8) -> Result<(u8, Tup2<u8, u8>), String> {
+        match key {
+            Key::B(a, b) => Ok((*a, Tup2(*b, *payload))),
+            other => Err(format!("expected a B key, found {other:?}")),
+        }
+    }
+
+    fn unfold_delta(key: &Key, payload: &u8) -> Result<(u8, u8), String> {
+        match key {
+            Key::A(a) => Ok((*a, *payload)),
+            other => Err(format!("expected an A key, found {other:?}")),
+        }
     }
 }
 
-fn b_by_a(key: &Key, payload: &u8) -> Result<(u8, Tup2<u8, u8>), String> {
-    match key {
-        Key::B(a, b) => Ok((*a, Tup2(*b, *payload))),
-        other => Err(format!("expected a B key, found {other:?}")),
+/// Like `C⁺`: the `A` rows of the groups that `B` entries of `Dlt` touch, `(a, p)`.
+struct AFromB;
+
+impl ReaderDefinition for AFromB {
+    type Index = Pairs;
+    type Key = u8;
+    type Val = u8;
+    type DeltaKey = u8;
+    type DeltaVal = Tup2<u8, u8>;
+    const PARTNER_STREAM: Option<u8> = Some(A);
+    const REQUEST_DEPTH: usize = 1;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(B);
+
+    fn unfold(key: &Key, payload: &u8) -> Result<(u8, u8), String> {
+        match key {
+            Key::A(a) => Ok((*a, *payload)),
+            other => Err(format!("expected an A key, found {other:?}")),
+        }
+    }
+
+    fn unfold_delta(key: &Key, payload: &u8) -> Result<(u8, Tup2<u8, u8>), String> {
+        match key {
+            Key::B(a, b) => Ok((*a, Tup2(*b, *payload))),
+            other => Err(format!("expected a B key, found {other:?}")),
+        }
     }
 }
 
-fn b_by_ab(key: &Key, payload: &u8) -> Result<(Tup2<u8, u8>, u8), String> {
-    match key {
-        Key::B(a, b) => Ok((Tup2(*a, *b), *payload)),
-        other => Err(format!("expected a B key, found {other:?}")),
+/// Like `L⁻`: the `B` rows at the `(a, b)` nodes that a join requested.
+struct BAtPath;
+
+impl ReaderDefinition for BAtPath {
+    type Index = Pairs;
+    type Key = Tup2<u8, u8>;
+    type Val = u8;
+    type DeltaKey = Tup2<u8, u8>;
+    type DeltaVal = u8;
+    const PARTNER_STREAM: Option<u8> = Some(B);
+    const REQUEST_DEPTH: usize = 2;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Join;
+
+    fn unfold(key: &Key, payload: &u8) -> Result<(Tup2<u8, u8>, u8), String> {
+        match key {
+            Key::B(a, b) => Ok((Tup2(*a, *b), *payload)),
+            other => Err(format!("expected a B key, found {other:?}")),
+        }
+    }
+}
+
+/// Like `J⁺`: no stored partner, driven by the `B` entries of `Dlt` at the `(a, b)` node.
+struct DerivedAtPath;
+
+impl ReaderDefinition for DerivedAtPath {
+    type Index = Pairs;
+    type Key = Tup2<u8, u8>;
+    type Val = u8;
+    type DeltaKey = Tup2<u8, u8>;
+    type DeltaVal = u8;
+    const PARTNER_STREAM: Option<u8> = None;
+    const REQUEST_DEPTH: usize = 2;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(B);
+
+    fn unfold_delta(key: &Key, payload: &u8) -> Result<(Tup2<u8, u8>, u8), String> {
+        match key {
+            Key::B(a, b) => Ok((Tup2(*a, *b), *payload)),
+            other => Err(format!("expected a B key, found {other:?}")),
+        }
+    }
+}
+
+/// Reverses the order of the keys: its driving delta must be refused.
+struct Reversing;
+
+impl ReaderDefinition for Reversing {
+    type Index = Pairs;
+    type Key = u8;
+    type Val = u8;
+    type DeltaKey = u8;
+    type DeltaVal = u8;
+    const PARTNER_STREAM: Option<u8> = Some(A);
+    const REQUEST_DEPTH: usize = 1;
+    const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(A);
+
+    fn unfold(key: &Key, payload: &u8) -> Result<(u8, u8), String> {
+        match key {
+            Key::A(a) => Ok((u8::MAX - *a, *payload)),
+            other => Err(format!("expected an A key, found {other:?}")),
+        }
+    }
+
+    fn unfold_delta(key: &Key, payload: &u8) -> Result<(u8, u8), String> {
+        Self::unfold(key, payload)
     }
 }
 
@@ -136,41 +239,82 @@ fn row(key: Key, payload: u8, weight: ZWeight) -> Row {
     (Pairs::fold(&key).as_bytes().to_vec(), vec![payload], weight)
 }
 
-/// What the three readers hold after one session.
+fn group_of(a: u8) -> Vec<u8> {
+    KeyEncoder::new().field(1, &a).prefix()
+}
+
+fn path_of(a: u8, b: u8) -> Vec<u8> {
+    KeyEncoder::new().field(1, &a).field(2, &b).prefix()
+}
+
+/// What the readers hold after one transaction.
 struct Collected {
-    a_by_a: ReaderRuns<u8, u8>,
-    b_by_a: ReaderRuns<u8, Tup2<u8, u8>>,
-    b_by_ab: ReaderRuns<Tup2<u8, u8>, u8>,
-    touched: TouchedGroups,
+    b_by_a: Reader<BByA>,
+    a_from_b: Reader<AFromB>,
+    b_at_path: Reader<BAtPath>,
+    derived: Reader<DerivedAtPath>,
+    captured: Captured,
     counts: SessionCounts,
 }
 
-fn collect_all(old: &[Vec<Row>], dlt: &[Row]) -> Result<Collected, String> {
+/// Captures `dlt`, scans the touched groups of `old` once, and routes each
+/// position to the three stored readers. `b_at_path` has no driving stream, so
+/// the test asks for the `(a, b)` nodes that `requested_paths` lists.
+fn collect_all(
+    old: &[Vec<Row>],
+    dlt: &[Row],
+    requested_paths: &[(u8, u8)],
+    pass: Pass,
+) -> Result<Collected, String> {
     let old = snapshot::<Vec<u8>>(
         &old.iter()
             .map(|rows| (rows.clone(), false))
             .collect::<Vec<_>>(),
     );
     let dlt: MergedIndexBatch = memory_run(dlt);
-    let mut session = ScanSession::<Pairs>::new(&old, &dlt, Pass::Seek);
-    let mut a_reader = Reader::<Pairs, _, _>::new(A, a_by_a);
-    let mut b_range = Reader::<Pairs, _, _>::new(B, b_by_a);
-    let mut b_path = Reader::<Pairs, _, _>::new(B, b_by_ab);
-    let touched = collect(
-        &mut session,
-        &mut [&mut a_reader, &mut b_range, &mut b_path],
+    let mut b_by_a = Reader::<BByA>::new()?;
+    let mut a_from_b = Reader::<AFromB>::new()?;
+    let mut b_at_path = Reader::<BAtPath>::new()?;
+    let mut derived = Reader::<DerivedAtPath>::new()?;
+    for &(a, b) in requested_paths {
+        b_at_path.request(&path_of(a, b))?;
+    }
+
+    let captured = capture(
+        &dlt,
+        &mut [&mut b_by_a, &mut a_from_b, &mut b_at_path, &mut derived],
     )?;
+    let mut session = ScanSession::<Pairs>::new(&old, &captured.touched, pass);
+    while session.next_group().is_some() {
+        while session.key().is_some() {
+            {
+                let mut position = Position::at(&mut session);
+                route(
+                    &mut position,
+                    &mut [&mut b_by_a, &mut a_from_b, &mut b_at_path],
+                )?;
+            }
+            session.step();
+        }
+    }
+    let mut counts = session.counts();
+    drop(session);
+    counts.payload_decodes_dlt = captured.payload_decodes_dlt;
+    b_by_a.seal_partner()?;
+    a_from_b.seal_partner()?;
+    b_at_path.seal_partner()?;
+    derived.seal_partner()?;
     Ok(Collected {
-        a_by_a: a_reader.seal(),
-        b_by_a: b_range.seal(),
-        b_by_ab: b_path.seal(),
-        touched,
-        counts: session.counts(),
+        b_by_a,
+        a_from_b,
+        b_at_path,
+        derived,
+        captured,
+        counts,
     })
 }
 
-/// The rows of a batch or snapshot, with their weights, as its cursor yields
-/// them: a snapshot of several batches yields each batch's row apart.
+/// The rows of a batch or snapshot, with their weights, as its cursor yields them.
 fn rows<K: DBData, V: DBData>(batch: &impl DynamicBatchReader<Time = ()>) -> Vec<(K, V, ZWeight)> {
     let mut cursor = batch.cursor();
     let mut rows = Vec::new();
@@ -188,138 +332,298 @@ fn rows<K: DBData, V: DBData>(batch: &impl DynamicBatchReader<Time = ()>) -> Vec
     rows
 }
 
-/// The batches of an after read, apart.
-fn halves<K: DBData, V: DBData>(
-    runs: &ReaderRuns<K, V>,
-) -> (Vec<(K, V, ZWeight)>, Vec<(K, V, ZWeight)>) {
-    (rows(runs.before().inner()), rows(runs.delta().inner()))
+fn partner_rows<R: ReaderDefinition>(reader: &Reader<R>) -> Vec<(R::Key, R::Val, ZWeight)> {
+    rows(reader.partner().unwrap().inner())
 }
 
-fn group_of(a: u8) -> Vec<u8> {
-    KeyEncoder::new().field(1, &a).prefix()
+fn requests_of<R: ReaderDefinition>(reader: &Reader<R>) -> Vec<Vec<u8>> {
+    reader.requests().iter().map(<[u8]>::to_vec).collect()
 }
 
-// ---- Tests ----
+// ---- Requests ----
 
 #[test]
-fn readers_take_the_rows_of_their_stream_in_the_touched_groups() {
+fn requests_move_forward_and_refuse_to_go_back() {
+    let mut requests = Requests::default();
+    for prefix in [[1, 2], [1, 2], [1, 5], [3, 0]] {
+        requests.push(&prefix).unwrap();
+    }
+    // A repeat of the last request is ignored; going back is an error.
+    assert_eq!(requests.len(), 3);
+    assert!(requests.push(&[2, 0]).unwrap_err().contains("goes back"));
+
+    // Group-level questions and path-level questions interleave in key order.
+    assert!(!requests.has(&[0, 9]));
+    assert!(requests.has_below(&[1]));
+    assert!(requests.has(&[1, 2]));
+    assert!(!requests.has(&[1, 3]));
+    assert!(requests.has(&[1, 5]));
+    assert!(!requests.has_below(&[2]));
+    assert!(requests.has_below(&[3]));
+    assert!(!requests.has_below(&[4]));
+    assert!(requests.contains(&[1, 5]));
+    assert!(!requests.contains(&[2, 0]));
+    assert!(Requests::default().is_empty());
+}
+
+// ---- RowBuilder ----
+
+#[test]
+fn a_row_builder_sorts_and_consolidates_the_values_of_a_key() {
+    let mut builder = RowBuilder::<u8, u8>::new();
+    // The values of key 1 arrive out of order, with one repeated and one that cancels.
+    for (key, value, weight) in [
+        (1, 9, 1),
+        (1, 3, 2),
+        (1, 9, 2),
+        (1, 5, 1),
+        (1, 5, -1),
+        (2, 1, 1),
+        (3, 4, 1),
+        (3, 4, -1),
+        (4, 7, 1),
+    ] {
+        builder.push(key, value, weight).unwrap();
+    }
+    let batch = builder.finish().unwrap();
+    // Key 3 has only a cancelling value, so it is dropped.
+    assert_eq!(
+        rows::<u8, u8>(batch.inner()),
+        vec![(1, 3, 2), (1, 9, 3), (2, 1, 1), (4, 7, 1)]
+    );
+}
+
+#[test]
+fn a_row_builder_refuses_a_key_that_goes_back() {
+    let mut builder = RowBuilder::<u8, u8>::new();
+    builder.push(5, 1, 1).unwrap();
+    builder.push(5, 0, 1).unwrap();
+    let error = builder.push(4, 1, 1).unwrap_err();
+    assert!(error.contains("key order"), "{error}");
+}
+
+// ---- Static plans against the trie ----
+
+#[test]
+fn a_reader_checks_its_definition_against_the_trie() {
+    // The widths follow from the trie: one tag and one value byte per field.
+    assert_eq!(Reader::<BByA>::new().unwrap().request_width(), 2);
+    assert_eq!(Reader::<AFromB>::new().unwrap().request_width(), 2);
+    assert_eq!(Reader::<BAtPath>::new().unwrap().request_width(), 4);
+    assert_eq!(Reader::<DerivedAtPath>::new().unwrap().request_width(), 4);
+
+    /// A request node deeper than the stream's path.
+    struct TooDeep;
+    impl ReaderDefinition for TooDeep {
+        type Index = Pairs;
+        type Key = u8;
+        type Val = u8;
+        type DeltaKey = u8;
+        type DeltaVal = u8;
+        const PARTNER_STREAM: Option<u8> = Some(A);
+        const REQUEST_DEPTH: usize = 2;
+        const DRIVING_DELTA: DrivingDelta = DrivingDelta::Join;
+    }
+    assert!(
+        Reader::<TooDeep>::new()
+            .err()
+            .unwrap()
+            .contains("fewer than")
+    );
+
+    /// A stream the trie does not have.
+    struct NoSuchStream;
+    impl ReaderDefinition for NoSuchStream {
+        type Index = Pairs;
+        type Key = u8;
+        type Val = u8;
+        type DeltaKey = u8;
+        type DeltaVal = u8;
+        const PARTNER_STREAM: Option<u8> = Some(9);
+        const REQUEST_DEPTH: usize = 1;
+        const DRIVING_DELTA: DrivingDelta = DrivingDelta::Join;
+    }
+    assert!(
+        Reader::<NoSuchStream>::new()
+            .err()
+            .unwrap()
+            .contains("no stream 9")
+    );
+}
+
+// ---- Driving deltas and requests ----
+
+#[test]
+fn stream_driven_readers_take_their_driving_deltas_and_requests_from_dlt() {
     let old = vec![vec![
         row(Key::A(1), 10, 1),
         row(Key::B(1, 1), 20, 1),
-        row(Key::B(1, 2), 21, 1),
         row(Key::A(2), 11, 1),
         row(Key::B(2, 1), 23, 1),
     ]];
-    // Replace `A(1)`'s payload and add `B(1, 3)`; group 2 is untouched.
+    // Replace `A(1)`'s payload and insert `B(3, 1)`; group 2 is untouched.
     let dlt = vec![
         row(Key::A(1), 10, -1),
         row(Key::A(1), 12, 1),
-        row(Key::B(1, 3), 22, 1),
+        row(Key::B(3, 1), 30, 1),
     ];
-    let collected = collect_all(&old, &dlt).unwrap();
+    let mut collected = collect_all(&old, &dlt, &[], Pass::Seek).unwrap();
 
+    assert_eq!(collected.captured.touched, [group_of(1), group_of(3)]);
+    // `BByA` is driven by the `A` entries: group 1. `AFromB` by the `B` entries: group 3.
+    assert_eq!(requests_of(&collected.b_by_a), [group_of(1)]);
+    assert_eq!(requests_of(&collected.a_from_b), [group_of(3)]);
+    assert_eq!(requests_of(&collected.derived), [path_of(3, 1)]);
+    assert!(requests_of(&collected.b_at_path).is_empty());
+
+    // Each driving delta is the `Dlt` batch of its stream, unfolded.
+    let delta_a = collected.b_by_a.take_delta().unwrap();
     assert_eq!(
-        halves(&collected.a_by_a),
-        (vec![(1, 10, 1)], vec![(1, 10, -1), (1, 12, 1)])
+        rows::<u8, u8>(delta_a.inner()),
+        vec![(1, 10, -1), (1, 12, 1)]
     );
+    let delta_b = collected.a_from_b.take_delta().unwrap();
     assert_eq!(
-        halves(&collected.b_by_a),
-        (
-            vec![(1, Tup2(1, 20), 1), (1, Tup2(2, 21), 1)],
-            vec![(1, Tup2(3, 22), 1)]
-        )
+        rows::<u8, Tup2<u8, u8>>(delta_b.inner()),
+        vec![(3, Tup2(1, 30), 1)]
     );
+    let delta_path = collected.derived.take_delta().unwrap();
     assert_eq!(
-        halves(&collected.b_by_ab),
-        (
-            vec![(Tup2(1, 1), 20, 1), (Tup2(1, 2), 21, 1)],
-            vec![(Tup2(1, 3), 22, 1)]
-        )
+        rows::<Tup2<u8, u8>, u8>(delta_path.inner()),
+        vec![(Tup2(3, 1), 30, 1)]
     );
-    assert!(collected.touched.contains(&group_of(1)));
-    assert!(!collected.touched.contains(&group_of(2)));
-    assert_eq!(collected.touched.len(), 1);
+    // A delta is taken once, and a join holds none.
+    assert!(
+        collected
+            .b_by_a
+            .take_delta()
+            .err()
+            .unwrap()
+            .contains("already taken")
+    );
+    assert!(
+        collected
+            .b_at_path
+            .take_delta()
+            .err()
+            .unwrap()
+            .contains("is a join")
+    );
+
+    // The partner batches hold only the requested slice. `BByA` requests
+    // group 1: its `B` row. `AFromB` requests group 3: `Old` has no `A(3)`.
+    assert_eq!(partner_rows(&collected.b_by_a), vec![(1, Tup2(1, 20), 1)]);
+    assert!(partner_rows(&collected.a_from_b).is_empty());
+    // The `B(2, 1)` of the untouched group 2 is in no reader.
 }
 
 #[test]
-fn the_after_read_keeps_old_and_dlt_apart() {
-    let old = vec![vec![row(Key::A(1), 10, 1)]];
-    let dlt = vec![row(Key::A(1), 10, -1), row(Key::A(1), 12, 1)];
-    let collected = collect_all(&old, &dlt).unwrap();
-
-    // The after read is two batches; `Old`'s row of `(1, 10)` and `Dlt`'s
-    // deletion of it stay in different batches, so only a reader sums them.
-    let after = collected.a_by_a.after();
-    let batches = after.inner().batches();
-    assert_eq!(batches.len(), 2);
-    assert_eq!(rows::<u8, u8>(&*batches[0]), vec![(1, 10, 1)]);
-    assert_eq!(rows::<u8, u8>(&*batches[1]), vec![(1, 10, -1), (1, 12, 1)]);
-    assert_eq!(
-        summed(rows::<u8, u8>(after.inner())),
-        BTreeMap::from([((1, 12), 1)])
-    );
-    assert_eq!(collected.a_by_a.before().inner().batches().len(), 1);
-}
-
-#[test]
-fn taking_the_delta_moves_it_and_leaves_the_before_read() {
-    let old = vec![vec![row(Key::B(1, 1), 20, 1)]];
-    let dlt = vec![row(Key::B(1, 2), 21, 1)];
-    let mut collected = collect_all(&old, &dlt).unwrap();
-
-    let delta = collected.b_by_a.take_delta();
-    assert_eq!(
-        rows::<u8, Tup2<u8, u8>>(delta.inner()),
-        vec![(1, Tup2(2, 21), 1)]
-    );
-    assert_eq!(
-        rows::<u8, Tup2<u8, u8>>(collected.b_by_a.before().inner()),
-        vec![(1, Tup2(1, 20), 1)]
-    );
-    // The reader's `Dlt` batch is now empty, so its after read is its before read.
-    assert!(rows::<u8, Tup2<u8, u8>>(collected.b_by_a.delta().inner()).is_empty());
-    assert_eq!(
-        summed(rows::<u8, Tup2<u8, u8>>(collected.b_by_a.after().inner())),
-        BTreeMap::from([((1, Tup2(1, 20)), 1)])
-    );
-
-    // An after snapshot that still shares the batch makes the take a copy.
-    let after = collected.b_by_ab.after();
-    let shared = collected.b_by_ab.take_delta();
-    assert_eq!(
-        rows::<Tup2<u8, u8>, u8>(shared.inner()),
-        vec![(Tup2(1, 2), 21, 1)]
-    );
-    assert_eq!(
-        summed(rows::<Tup2<u8, u8>, u8>(after.inner())),
-        BTreeMap::from([((Tup2(1, 1), 20), 1), ((Tup2(1, 2), 21), 1)])
-    );
-}
-
-#[test]
-fn a_second_reader_of_a_stream_costs_no_payload_decode() {
+fn an_entry_outside_every_request_is_dropped_unread() {
     let old = vec![vec![
         row(Key::A(1), 10, 1),
         row(Key::B(1, 1), 20, 1),
         row(Key::B(1, 2), 21, 1),
     ]];
-    let dlt = vec![row(Key::B(1, 3), 22, 1)];
-    let collected = collect_all(&old, &dlt).unwrap();
+    // `Dlt` touches group 1 through an `A` entry only. `BAtPath` requests
+    // `(1, 2)` alone.
+    let dlt = vec![row(Key::A(1), 11, 1)];
+    let collected = collect_all(&old, &dlt, &[(1, 2)], Pass::Seek).unwrap();
 
-    // Two readers take stream `B`, but each entry is decoded once.
-    assert_eq!(collected.counts.payload_decodes_old, 3);
+    // `A(1)` is requested by nobody (`AFromB` is driven by `B` entries), and
+    // of the two `B` entries only the requested `(1, 2)` and group 1's `B`
+    // rows for `BByA` are kept: `BByA` keeps both, `BAtPath` only `(1, 2)`.
+    assert!(partner_rows(&collected.a_from_b).is_empty());
+    assert_eq!(
+        partner_rows(&collected.b_by_a),
+        vec![(1, Tup2(1, 20), 1), (1, Tup2(2, 21), 1)]
+    );
+    assert_eq!(
+        partner_rows(&collected.b_at_path),
+        vec![(Tup2(1, 2), 21, 1)]
+    );
+    // Payloads read: `B(1,1)` and `B(1,2)` for `BByA`, with `B(1,2)` shared by
+    // `BAtPath`: two decodes, not three. `A(1)` is read by nobody.
+    assert_eq!(collected.counts.payload_decodes_old, 2);
+    // `Dlt`'s one entry drives `BByA`: one decode.
     assert_eq!(collected.counts.payload_decodes_dlt, 1);
 }
 
 #[test]
-fn a_projection_error_stops_the_collection() {
-    let old = snapshot::<Vec<u8>>(&[(vec![row(Key::A(1), 10, 1)], false)]);
-    let dlt: MergedIndexBatch = memory_run(&[row(Key::A(1), 12, 1)]);
-    let mut session = ScanSession::<Pairs>::new(&old, &dlt, Pass::Seek);
-    // A reader declared for stream `A` with a projection of `B` keys.
-    let mut wrong = Reader::<Pairs, _, _>::new(A, b_by_ab);
-    let error = collect(&mut session, &mut [&mut wrong]).unwrap_err();
+fn no_driving_change_means_no_rows_and_no_payload_read() {
+    let old = vec![vec![row(Key::A(1), 10, 1), row(Key::B(1, 1), 20, 1)]];
+    for pass in [Pass::Seek, Pass::Step] {
+        let mut collected = collect_all(&old, &[], &[], pass).unwrap();
+        assert!(collected.captured.touched.is_empty());
+        assert!(partner_rows(&collected.b_by_a).is_empty());
+        assert!(partner_rows(&collected.a_from_b).is_empty());
+        assert!(requests_of(&collected.b_by_a).is_empty());
+        assert!(rows::<u8, u8>(collected.b_by_a.take_delta().unwrap().inner()).is_empty());
+        assert_eq!(collected.counts.groups, 0);
+        assert_eq!(collected.counts.payload_decodes_old, 0);
+        assert_eq!(collected.counts.payload_decodes_dlt, 0);
+    }
+}
+
+#[test]
+fn a_dlt_entry_nobody_drives_costs_no_decode() {
+    // Only `BAtPath` has no driving stream; with `Dlt` entries of `A` and `B`,
+    // each entry is decoded once if some reader drives it.
+    let dlt = vec![row(Key::A(1), 10, 1), row(Key::B(1, 1), 20, 1)];
+    let collected = collect_all(&[], &dlt, &[], Pass::Seek).unwrap();
+    // `A(1)` drives `BByA`; `B(1,1)` drives `AFromB` and `DerivedAtPath`
+    // (two readers, one decode).
+    assert_eq!(collected.counts.payload_decodes_dlt, 2);
+}
+
+#[test]
+fn a_delta_row_conversion_that_goes_back_is_an_error() {
+    let dlt: MergedIndexBatch = memory_run(&[row(Key::A(1), 1, 1), row(Key::A(2), 1, 1)]);
+    let mut reversing = Reader::<Reversing>::new().unwrap();
+    let error = capture(&dlt, &mut [&mut reversing]).unwrap_err();
+    assert!(error.contains("key order"), "{error}");
+}
+
+#[test]
+fn a_conversion_error_stops_the_collection() {
+    // A reader that converts the wrong stream's entries.
+    struct Wrong;
+    impl ReaderDefinition for Wrong {
+        type Index = Pairs;
+        type Key = Tup2<u8, u8>;
+        type Val = u8;
+        type DeltaKey = Tup2<u8, u8>;
+        type DeltaVal = u8;
+        const PARTNER_STREAM: Option<u8> = Some(A);
+        const REQUEST_DEPTH: usize = 1;
+        const DRIVING_DELTA: DrivingDelta = DrivingDelta::Stream(A);
+
+        fn unfold(key: &Key, payload: &u8) -> Result<(Tup2<u8, u8>, u8), String> {
+            BAtPath::unfold(key, payload)
+        }
+
+        fn unfold_delta(key: &Key, payload: &u8) -> Result<(Tup2<u8, u8>, u8), String> {
+            BAtPath::unfold(key, payload)
+        }
+    }
+    let dlt: MergedIndexBatch = memory_run(&[row(Key::A(1), 1, 1)]);
+    let mut wrong = Reader::<Wrong>::new().unwrap();
+    let error = capture(&dlt, &mut [&mut wrong]).unwrap_err();
     assert!(error.contains("expected a B key"), "{error}");
+}
+
+#[test]
+fn a_derived_reader_takes_the_rows_the_routing_builds() {
+    let mut derived = Reader::<DerivedAtPath>::new().unwrap();
+    derived.push_row(Tup2(1, 2), 5, 3).unwrap();
+    derived.push_row(Tup2(1, 2), 4, 1).unwrap();
+    assert!(derived.partner().is_err());
+    derived.seal_partner().unwrap();
+    assert_eq!(
+        partner_rows(&derived),
+        vec![(Tup2(1, 2), 4, 1), (Tup2(1, 2), 5, 3)]
+    );
+    // A sealed reader takes no more rows.
+    assert!(derived.push_row(Tup2(2, 0), 1, 1).is_err());
 }
 
 // ---- Against a brute force ----
@@ -336,24 +640,10 @@ fn consolidate<'a>(runs: impl IntoIterator<Item = &'a Vec<Row>>) -> BTreeMap<(Ke
         .collect()
 }
 
-/// `reader`'s expected rows: the consolidated entries of `stream` in the
-/// touched groups, projected.
-fn expected<K: DBData, V: DBData>(
-    entries: &BTreeMap<(Key, u8), ZWeight>,
-    touched: &BTreeSet<u8>,
-    project: Projection<Pairs, K, V>,
-) -> BTreeMap<(K, V), ZWeight> {
-    let mut rows = BTreeMap::new();
-    for ((key, payload), weight) in entries {
-        let a = match key {
-            Key::A(a) | Key::B(a, _) => *a,
-        };
-        if let (true, Ok((k, v))) = (touched.contains(&a), project(key, payload)) {
-            *rows.entry((k, v)).or_default() += weight;
-        }
+fn group_value(key: &Key) -> u8 {
+    match key {
+        Key::A(a) | Key::B(a, _) => *a,
     }
-    rows.retain(|_, weight| *weight != 0);
-    rows
 }
 
 fn summed<K: DBData, V: DBData>(rows: Vec<(K, V, ZWeight)>) -> BTreeMap<(K, V), ZWeight> {
@@ -382,40 +672,102 @@ fn rows_strategy() -> impl Strategy<Value = Vec<Row>> {
 }
 
 proptest! {
+    /// Every reader's requests, driving delta, and partner batch equal what a
+    /// brute force over the consolidated `Old` and `Dlt` gives, whatever the
+    /// split of `Old` into runs and the pass.
     #[test]
-    fn readers_match_a_brute_force(old in vec(rows_strategy(), 1..3), dlt in rows_strategy()) {
-        let collected = collect_all(&old, &dlt).unwrap();
+    fn readers_match_a_brute_force(
+        old in vec(rows_strategy(), 1..3),
+        dlt in rows_strategy(),
+        paths in vec((0u8..4, 0u8..3), 0..4),
+        step_pass in any::<bool>(),
+    ) {
+        let mut paths = paths;
+        paths.sort_unstable();
+        paths.dedup();
+        let pass = if step_pass { Pass::Step } else { Pass::Seek };
+        let mut collected = collect_all(&old, &dlt, &paths, pass).unwrap();
         let old_entries = consolidate(&old);
         let dlt_entries = consolidate([&dlt]);
-        let touched: BTreeSet<u8> = dlt_entries
-            .keys()
-            .map(|(key, _)| match key { Key::A(a) | Key::B(a, _) => *a })
-            .collect();
-        prop_assert_eq!(collected.touched.len(), touched.len());
-        for a in &touched {
-            prop_assert!(collected.touched.contains(&group_of(*a)));
-        }
 
-        macro_rules! check {
-            ($runs:expr, $project:expr) => {
-                prop_assert_eq!(
-                    summed(rows($runs.before().inner())),
-                    expected(&old_entries, &touched, $project)
-                );
-                prop_assert_eq!(
-                    summed(rows($runs.delta().inner())),
-                    expected(&dlt_entries, &touched, $project)
-                );
-                let mut after = expected(&old_entries, &touched, $project);
-                for (row, weight) in expected(&dlt_entries, &touched, $project) {
-                    *after.entry(row).or_default() += weight;
+        let touched: BTreeSet<u8> = dlt_entries.keys().map(|(key, _)| group_value(key)).collect();
+        prop_assert_eq!(
+            collected.captured.touched.clone(),
+            touched.iter().map(|a| group_of(*a)).collect::<Vec<_>>()
+        );
+
+        // `BByA`: driven by `A` entries; keeps `B` rows of the groups they touch.
+        let a_groups: BTreeSet<u8> = dlt_entries
+            .keys()
+            .filter(|(key, _)| matches!(key, Key::A(_)))
+            .map(|(key, _)| group_value(key))
+            .collect();
+        prop_assert_eq!(
+            requests_of(&collected.b_by_a),
+            a_groups.iter().map(|a| group_of(*a)).collect::<Vec<_>>()
+        );
+        let expected_b_by_a: Vec<_> = old_entries
+            .iter()
+            .filter_map(|((key, payload), weight)| match key {
+                Key::B(a, b) if a_groups.contains(a) => Some((*a, Tup2(*b, *payload), *weight)),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(summed(partner_rows(&collected.b_by_a)), summed(expected_b_by_a));
+        let expected_delta_a: Vec<_> = dlt_entries
+            .iter()
+            .filter_map(|((key, payload), weight)| match key {
+                Key::A(a) => Some((*a, *payload, *weight)),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(
+            summed(rows::<u8, u8>(collected.b_by_a.take_delta().unwrap().inner())),
+            summed(expected_delta_a)
+        );
+
+        // `AFromB`: driven by `B` entries; keeps `A` rows of the groups they touch.
+        let b_groups: BTreeSet<u8> = dlt_entries
+            .keys()
+            .filter(|(key, _)| matches!(key, Key::B(..)))
+            .map(|(key, _)| group_value(key))
+            .collect();
+        prop_assert_eq!(
+            requests_of(&collected.a_from_b),
+            b_groups.iter().map(|a| group_of(*a)).collect::<Vec<_>>()
+        );
+        let expected_a_from_b: Vec<_> = old_entries
+            .iter()
+            .filter_map(|((key, payload), weight)| match key {
+                Key::A(a) if b_groups.contains(a) => Some((*a, *payload, *weight)),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(summed(partner_rows(&collected.a_from_b)), summed(expected_a_from_b));
+
+        // `BAtPath`: the requested `(a, b)` nodes, kept only in touched groups.
+        let expected_b_at_path: Vec<_> = old_entries
+            .iter()
+            .filter_map(|((key, payload), weight)| match key {
+                Key::B(a, b) if touched.contains(a) && paths.contains(&(*a, *b)) => {
+                    Some((Tup2(*a, *b), *payload, *weight))
                 }
-                after.retain(|_, weight| *weight != 0);
-                prop_assert_eq!(summed(rows($runs.after().inner())), after);
-            };
-        }
-        check!(collected.a_by_a, a_by_a);
-        check!(collected.b_by_a, b_by_a);
-        check!(collected.b_by_ab, b_by_ab);
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(summed(partner_rows(&collected.b_at_path)), summed(expected_b_at_path));
+
+        // `DerivedAtPath`: requests at the `(a, b)` node of each `B` entry.
+        let b_paths: BTreeSet<(u8, u8)> = dlt_entries
+            .keys()
+            .filter_map(|(key, _)| match key {
+                Key::B(a, b) => Some((*a, *b)),
+                Key::A(_) => None,
+            })
+            .collect();
+        prop_assert_eq!(
+            requests_of(&collected.derived),
+            b_paths.iter().map(|(a, b)| path_of(*a, *b)).collect::<Vec<_>>()
+        );
     }
 }

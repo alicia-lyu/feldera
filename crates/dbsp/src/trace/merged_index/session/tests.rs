@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use proptest::{
     collection::{btree_set, vec},
-    option,
     prelude::*,
     test_runner::{Config, TestCaseError, TestRunner},
 };
@@ -10,7 +11,7 @@ use crate::trace::{
     RunReads,
     merged_index::{
         ColumnRef, Domain, FoldedKey, KeyEncoder, KeyTrie, Node, Payload, Placement,
-        run_merge::tests::{memory_run, reads_of, snapshot},
+        run_merge::tests::{reads_of, snapshot},
     },
     test::run_in_circuit_with_storage,
 };
@@ -21,11 +22,14 @@ type Row = (Vec<u8>, Vec<u8>, ZWeight);
 /// One run of `Old`, and whether it is stored in a file.
 type OldRun = (Vec<Row>, bool);
 
-/// A group's expected buffers: `(old, dlt)` entries by stream id.
-type Expected = BTreeMap<u8, (Vec<Entry<u8>>, Vec<Entry<u8>>)>;
-
-/// What one run of the session hands to its callback.
-type Groups = Vec<(Vec<u8>, GroupBuffers<u8>)>;
+/// What one pass over a touched group saw: the folded key of every position
+/// in order, and the decoded entries of the positions that the test kept.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Visited {
+    group: Vec<u8>,
+    positions: Vec<Vec<u8>>,
+    kept: Vec<(Vec<u8>, Vec<(u8, ZWeight)>)>,
+}
 
 const PASSES: [Pass; 2] = [Pass::Seek, Pass::Step];
 
@@ -233,131 +237,107 @@ fn row(key: Vec<u8>, payload: u8, weight: ZWeight) -> Row {
     (key, vec![payload], weight)
 }
 
-fn ids(ids: &[u8]) -> BTreeSet<u8> {
-    ids.iter().copied().collect()
+/// The folded key of the group of `a` in [`TWO_LEVELS`]: the tag and value of
+/// the root domain.
+fn group_of(a: u8) -> Vec<u8> {
+    KeyEncoder::new().field(1, &a).prefix()
 }
 
-/// Runs a session over `old` and `dlt`, rejecting old entries whose payload
-/// byte is in `rejected`, and returns every group with the counts.
+/// Runs a session over `old` and the touched groups. At each position of a
+/// group it reads and decodes the payload of exactly the keys that `keep`
+/// accepts, and steps on. Returns what it saw in each group.
 fn run_session<D: MergedIndexDefinition<Payload = u8>>(
     old: &SpineSnapshot<MergedIndexBatch>,
-    dlt: &MergedIndexBatch,
+    touched: &[Vec<u8>],
     pass: Pass,
-    inputs: &BTreeSet<u8>,
-    rejected: Option<&BTreeSet<u8>>,
-) -> Result<(Groups, SessionCounts), String> {
-    let mut session = ScanSession::<D>::new(old, dlt, pass);
-    let mut groups = Vec::new();
-    let mut reject = rejected.map(|bytes| move |entry: &Entry<u8>| bytes.contains(&entry.payload));
-    session.maintain(
-        inputs,
-        reject
-            .as_mut()
-            .map(|reject| reject as &mut dyn FnMut(&Entry<u8>) -> bool),
-        |group, buffers| {
-            groups.push((group.to_vec(), buffers));
-            Ok(())
-        },
-    )?;
-    Ok((groups, session.counts()))
+    keep: impl Fn(&[u8]) -> bool,
+) -> Result<(Vec<Visited>, SessionCounts), String> {
+    let mut session = ScanSession::<D>::new(old, touched, pass);
+    let mut visited = Vec::new();
+    while let Some(group) = session.next_group() {
+        let mut seen = Visited {
+            group: group.to_vec(),
+            positions: Vec::new(),
+            kept: Vec::new(),
+        };
+        while let Some(key) = session.key() {
+            let key = key.to_vec();
+            if keep(&key) {
+                let entries = session.take_and_decode()?;
+                seen.kept.push((key.clone(), entries));
+            }
+            seen.positions.push(key);
+            session.step();
+        }
+        visited.push(seen);
+    }
+    Ok((visited, session.counts()))
+}
+
+/// Keeps the keys of the streams in `streams`.
+fn of_streams(streams: &[u8]) -> impl Fn(&[u8]) -> bool {
+    let streams: BTreeSet<u8> = streams.iter().copied().collect();
+    move |key| key.last().is_some_and(|id| streams.contains(id))
 }
 
 // ---- The reference: consolidated brute force ----
 
-/// The summed weight of each `(key, payload)`, runs consolidated first as
-/// `build_batch` does, zero sums dropped.
-fn consolidate<'a>(
-    runs: impl IntoIterator<Item = &'a Vec<Row>>,
-) -> BTreeMap<(Vec<u8>, Vec<u8>), ZWeight> {
-    let mut sums = BTreeMap::new();
-    for rows in runs {
-        let mut within_run = BTreeMap::new();
+/// The consolidated entries of each key across `runs`: payload bytes (as the
+/// test's decoded byte) with their weights summed, zero sums dropped. A run
+/// consolidates its own duplicates first, as `build_batch` does. Also returns
+/// every key that some run still holds: those are the positions.
+fn consolidate(runs: &[OldRun]) -> (BTreeMap<Vec<u8>, Vec<(u8, ZWeight)>>, BTreeSet<Vec<u8>>) {
+    let mut sums: BTreeMap<(Vec<u8>, u8), ZWeight> = BTreeMap::new();
+    let mut positions = BTreeSet::new();
+    for (rows, _) in runs {
+        let mut within_run: BTreeMap<(Vec<u8>, u8), ZWeight> = BTreeMap::new();
         for (key, payload, weight) in rows {
-            *within_run
-                .entry((key.clone(), payload.clone()))
-                .or_insert(0) += weight;
+            *within_run.entry((key.clone(), payload[0])).or_insert(0) += weight;
         }
-        for (entry, weight) in within_run.into_iter().filter(|&(_, weight)| weight != 0) {
-            *sums.entry(entry).or_insert(0) += weight;
+        for ((key, payload), weight) in within_run {
+            if weight != 0 {
+                positions.insert(key.clone());
+                *sums.entry((key, payload)).or_insert(0) += weight;
+            }
         }
     }
-    sums.retain(|_, weight| *weight != 0);
-    sums
+    let mut entries: BTreeMap<Vec<u8>, Vec<(u8, ZWeight)>> = BTreeMap::new();
+    for ((key, payload), weight) in sums {
+        if weight != 0 {
+            entries.entry(key).or_default().push((payload, weight));
+        }
+    }
+    (entries, positions)
 }
 
-/// What `maintain` must hand to its callback: the groups of `dlt` in order;
-/// in each, the consolidated old entries of `inputs` under the group, minus
-/// the rest of the subtree of any node with a rejected entry, and the delta's
-/// entries of `inputs` under the group.
+/// What a scan must see: in each touched group, every key of `Old` under it in
+/// order, and the consolidated entries of the keys that `keep` accepts. A kept
+/// key whose entries all cancel is kept with no entry.
 fn reference(
-    group_width: usize,
     old_runs: &[OldRun],
-    dlt: &[Row],
-    inputs: &BTreeSet<u8>,
-    rejected: Option<&BTreeSet<u8>>,
-) -> Vec<(Vec<u8>, Expected)> {
-    let old = consolidate(old_runs.iter().map(|(rows, _)| rows));
-    let mut old_by_key: BTreeMap<&Vec<u8>, Vec<(&Vec<u8>, ZWeight)>> = BTreeMap::new();
-    for ((key, payload), weight) in &old {
-        old_by_key.entry(key).or_default().push((payload, *weight));
-    }
-    let dlt = consolidate([&dlt.to_vec()]);
-    let groups: BTreeSet<Vec<u8>> = dlt
-        .keys()
-        .map(|(key, _)| key[..group_width].to_vec())
-        .collect();
-
-    let entry = |key: &Vec<u8>, payload: &Vec<u8>, weight: ZWeight| Entry {
-        key: key.clone(),
-        payload: payload[0],
-        weight,
-    };
-    groups
-        .into_iter()
+    touched: &[Vec<u8>],
+    keep: &dyn Fn(&[u8]) -> bool,
+) -> Vec<Visited> {
+    let (entries, positions) = consolidate(old_runs);
+    touched
+        .iter()
         .map(|group| {
-            let mut expected = Expected::new();
-            let mut skipped: Option<Vec<u8>> = None;
-            for (key, values) in &old_by_key {
-                if !key.starts_with(&group) {
-                    continue;
-                }
-                if skipped.as_ref().is_some_and(|node| key.starts_with(node)) {
-                    continue;
-                }
-                skipped = None;
-                let id = *key.last().unwrap();
-                if !inputs.contains(&id) {
-                    continue;
-                }
-                let entries: Vec<_> = values
-                    .iter()
-                    .map(|&(payload, weight)| entry(key, payload, weight))
-                    .collect();
-                if rejected.is_some_and(|bytes| entries.iter().any(|e| bytes.contains(&e.payload)))
-                {
-                    skipped = Some(key[..key.len() - 2].to_vec());
-                }
-                expected.entry(id).or_default().0.extend(entries);
+            let positions: Vec<Vec<u8>> = positions
+                .iter()
+                .filter(|key| key.starts_with(group))
+                .cloned()
+                .collect();
+            let kept = positions
+                .iter()
+                .filter(|key| keep(key))
+                .map(|key| (key.clone(), entries.get(key).cloned().unwrap_or_default()))
+                .collect();
+            Visited {
+                group: group.clone(),
+                positions,
+                kept,
             }
-            for ((key, payload), &weight) in &dlt {
-                let id = *key.last().unwrap();
-                if key.starts_with(&group) && inputs.contains(&id) {
-                    expected
-                        .entry(id)
-                        .or_default()
-                        .1
-                        .push(entry(key, payload, weight));
-                }
-            }
-            (group, expected)
         })
-        .collect()
-}
-
-fn expected_of(buffers: &GroupBuffers<u8>) -> Expected {
-    buffers
-        .streams()
-        .map(|(id, buffer)| (id, (buffer.old.clone(), buffer.dlt.clone())))
         .collect()
 }
 
@@ -427,9 +407,9 @@ fn fold(trie: &KeyTrie, raw: &RawRow) -> Row {
 struct Case {
     trie: usize,
     old_runs: Vec<(Vec<RawRow>, bool)>,
-    dlt: Vec<RawRow>,
-    inputs: BTreeSet<u8>,
-    rejected: Option<BTreeSet<u8>>,
+    /// Rows whose groups are the touched groups.
+    touching: Vec<RawRow>,
+    kept_streams: BTreeSet<u8>,
 }
 
 fn case() -> impl Strategy<Value = Case> {
@@ -437,15 +417,13 @@ fn case() -> impl Strategy<Value = Case> {
         0..TRIES.len(),
         vec((vec(raw_row(), 0..10), any::<bool>()), 0..4),
         vec(raw_row(), 0..8),
-        btree_set(1u8..=5, 1..6),
-        option::of(btree_set(0u8..3, 1..3)),
+        btree_set(1u8..=5, 0..6),
     )
-        .prop_map(|(trie, old_runs, dlt, inputs, rejected)| Case {
+        .prop_map(|(trie, old_runs, touching, kept_streams)| Case {
             trie,
             old_runs,
-            dlt,
-            inputs,
-            rejected,
+            touching,
+            kept_streams,
         })
 }
 
@@ -459,7 +437,8 @@ fn check_case(case: &Case) -> Result<(), TestCaseError> {
     }
 }
 
-/// Both passes hand over the buffers of the reference.
+/// Both passes visit every key of each touched group and decode exactly the
+/// kept entries, as the reference does.
 fn check_case_of<D: MergedIndexDefinition<Payload = u8>>(case: &Case) -> Result<(), TestCaseError> {
     let trie = &D::TRIE;
     let old_runs: Vec<OldRun> = case
@@ -467,41 +446,32 @@ fn check_case_of<D: MergedIndexDefinition<Payload = u8>>(case: &Case) -> Result<
         .iter()
         .map(|(rows, in_file)| (rows.iter().map(|raw| fold(trie, raw)).collect(), *in_file))
         .collect();
-    let dlt: Vec<Row> = case.dlt.iter().map(|raw| fold(trie, raw)).collect();
+    let group_width = 1 + trie.root_width();
+    let touched: Vec<Vec<u8>> = case
+        .touching
+        .iter()
+        .map(|raw| fold(trie, raw).0[..group_width].to_vec())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let old = snapshot::<Vec<u8>>(&old_runs);
-    let dlt_run = memory_run::<Vec<u8>>(&dlt);
-    let group_width = 1 + trie.root_width();
-    let expected = reference(
-        group_width,
-        &old_runs,
-        &dlt,
-        &case.inputs,
-        case.rejected.as_ref(),
-    );
-    let buffered_old: usize = expected
+    let kept_streams: Vec<u8> = case.kept_streams.iter().copied().collect();
+    let expected = reference(&old_runs, &touched, &of_streams(&kept_streams));
+    let kept_payloads: usize = expected
         .iter()
-        .flat_map(|(_, streams)| streams.values().map(|(old, _)| old.len()))
-        .sum();
-    let buffered_dlt: usize = expected
-        .iter()
-        .flat_map(|(_, streams)| streams.values().map(|(_, dlt)| dlt.len()))
+        .flat_map(|visited| visited.kept.iter().map(|(_, entries)| entries.len()))
         .sum();
 
     for pass in PASSES {
-        let (groups, counts) =
-            run_session::<D>(&old, &dlt_run, pass, &case.inputs, case.rejected.as_ref())
-                .map_err(TestCaseError::fail)?;
-        let actual: Vec<_> = groups
-            .iter()
-            .map(|(group, buffers)| (group.clone(), expected_of(buffers)))
-            .collect();
-        prop_assert_eq!(&actual, &expected, "pass {:?}", pass);
+        let (visited, counts) = run_session::<D>(&old, &touched, pass, of_streams(&kept_streams))
+            .map_err(TestCaseError::fail)?;
+        prop_assert_eq!(&visited, &expected, "pass {:?}", pass);
 
-        // One decode per buffered entry; a cancelled value is never decoded.
-        prop_assert_eq!(counts.groups, expected.len() as u64);
-        prop_assert_eq!(counts.payload_decodes_old, buffered_old as u64);
-        prop_assert_eq!(counts.payload_decodes_dlt, buffered_dlt as u64);
+        // One decode per kept payload; a cancelled value is never decoded.
+        prop_assert_eq!(counts.groups, touched.len() as u64);
+        prop_assert_eq!(counts.payload_decodes_old, kept_payloads as u64);
+        prop_assert_eq!(counts.cursor_opens, 1);
         if pass == Pass::Step {
             prop_assert_eq!(counts.logical_seeks, 0);
         }
@@ -510,7 +480,7 @@ fn check_case_of<D: MergedIndexDefinition<Payload = u8>>(case: &Case) -> Result<
 }
 
 #[test]
-fn both_passes_buffer_what_the_brute_force_reference_does() {
+fn both_passes_scan_the_touched_groups_as_the_brute_force_reference_does() {
     run_in_circuit_with_storage(|| {
         let mut runner = TestRunner::new(Config::with_cases(400));
         runner
@@ -529,10 +499,10 @@ fn six_groups() -> Vec<Row> {
 }
 
 #[test]
-fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_decode() {
+fn positions_nobody_keeps_and_the_group_end_cost_no_value_weight_or_payload_decode() {
     run_in_circuit_with_storage(|| {
-        // Old: A(1), B(1,1), A(2), B(2,1). The delta touches group 1, and only
-        // stream 1 (A) is an input.
+        // Old: A(1), B(1,1), A(2), B(2,1). Group 1 is touched, and the test
+        // keeps only stream 1 (A).
         let old = snapshot(&[(
             vec![
                 row(a_key(1), 1, 1),
@@ -542,23 +512,20 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
             ],
             true,
         )]);
-        let dlt = memory_run(&[row(a_key(1), 9, 1)]);
         for pass in PASSES {
-            let ((groups, counts), reads) = reads_of(|| {
-                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1]), None).unwrap()
+            let ((visited, counts), reads) = reads_of(|| {
+                run_session::<TwoLevelsIndex>(&old, &[group_of(1)], pass, of_streams(&[1])).unwrap()
             });
-            assert_eq!(groups.len(), 1);
-            assert_eq!(groups[0].1.old(1).len(), 1);
-            assert_eq!(groups[0].1.dlt(1).len(), 1);
+            assert_eq!(visited.len(), 1);
+            assert_eq!(visited[0].positions, [a_key(1), b_key(1, 1)]);
+            assert_eq!(visited[0].kept, [(a_key(1), vec![(1, 1)])]);
 
             // Positions: A(1) at open, B(1,1), and A(2), which ends the group.
             // Each costs a key decode. Only A(1) is taken, so one value, one
-            // weight, and one payload are decoded. `Dlt` is a memory run of
-            // one row: its one key is read at open, and its one value and
-            // weight are taken with it, so one memory access of each kind.
+            // weight, and one payload are decoded. The session never reads
+            // `Dlt`, so no memory run is read.
             assert_eq!(counts.positions, 3, "{pass:?}");
             assert_eq!(counts.payload_decodes_old, 1);
-            assert_eq!(counts.payload_decodes_dlt, 1);
             assert_eq!(counts.logical_steps, 2);
             assert_eq!(
                 reads,
@@ -566,9 +533,6 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
                     key_decodes: 3,
                     value_decodes: 1,
                     weight_decodes: 1,
-                    memory_key_reads: 1,
-                    memory_value_reads: 1,
-                    memory_weight_reads: 1,
                     ..RunReads::default()
                 },
                 "{pass:?}"
@@ -577,44 +541,38 @@ fn positions_outside_inputs_and_the_group_end_cost_no_value_weight_or_payload_de
     });
 }
 
-/// `Old` is `six_groups`; the delta touches groups 2 and 5. Positions in
-/// order: A1 B1 A2 B2 A3 B3 A4 B4 A5 B5 A6 B6 (a letter for the stream, a
-/// digit for the group). Only stream 1 is an input.
+/// `Old` is `six_groups`; groups 2 and 5 are touched. Positions in order: A1
+/// B1 A2 B2 A3 B3 A4 B4 A5 B5 A6 B6 (a letter for the stream, a digit for the
+/// group). The test keeps stream 1.
 #[test]
 fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
     run_in_circuit_with_storage(|| {
         let old = snapshot(&[(six_groups(), true)]);
-        let dlt = memory_run(&[row(a_key(2), 9, 1), row(a_key(5), 9, 1)]);
-        let inputs = ids(&[1]);
+        let touched = [group_of(2), group_of(5)];
         let mut outputs = Vec::new();
         let mut measured = Vec::new();
         for pass in PASSES {
-            let ((groups, counts), reads) = reads_of(|| {
-                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &inputs, None).unwrap()
+            let ((visited, counts), reads) = reads_of(|| {
+                run_session::<TwoLevelsIndex>(&old, &touched, pass, of_streams(&[1])).unwrap()
             });
-            outputs.push(groups);
+            outputs.push(visited);
             measured.push((counts, reads));
         }
         assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(outputs[0].len(), 2);
 
-        // Seek. Open on A1 (1 position). Group 2: the seek lands
-        // on A2 (position 2); collect takes A2, steps to B2 (3) and A3 (4),
-        // which ends the group. Group 5: the seek from A3 lands on A5 (5);
-        // collect steps to B5 (6) and A6 (7). Two seeks, four steps, seven
-        // positions with a key decode each, two payloads. `Dlt` is a memory
-        // run of two rows, A2 and A5, and the session reads it whole: two key
-        // reads (the open and the step to A5; the step past A5 lands on
-        // nothing), and one value and one weight for each row. Its reads are
-        // the same for both passes, because `Dlt` is not seeked.
+        // Seek. Open on A1 (1 position). Group 2: the seek lands on A2
+        // (position 2); the scan takes A2, steps to B2 (3) and A3 (4), which
+        // ends the group. Group 5: the seek from A3 lands on A5 (5); the scan
+        // steps to B5 (6) and A6 (7). Two seeks, four steps, seven positions
+        // with a key decode each, two payloads.
         let (counts, reads) = &measured[0];
         assert_eq!(counts.groups, 2);
-        assert_eq!(counts.cursor_opens, 2);
+        assert_eq!(counts.cursor_opens, 1);
         assert_eq!(counts.logical_seeks, 2);
         assert_eq!(counts.logical_steps, 4);
         assert_eq!(counts.positions, 7);
         assert_eq!(counts.payload_decodes_old, 2);
-        assert_eq!(counts.payload_decodes_dlt, 2);
         assert_eq!(
             *reads,
             RunReads {
@@ -622,16 +580,13 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
                 key_decodes: 7,
                 value_decodes: 2,
                 weight_decodes: 2,
-                memory_key_reads: 2,
-                memory_value_reads: 2,
-                memory_weight_reads: 2,
                 ..RunReads::default()
             }
         );
 
-        // Step. Group 2 steps A1, B1 to reach A2 (2 steps), then
-        // 2 steps end the group. Group 5 steps A3, B3, A4, B4 to reach A5 (4
-        // steps), then 2. Ten steps, eleven positions, no seek.
+        // Step. Group 2 steps A1, B1 to reach A2 (2 steps), then 2 steps end
+        // the group. Group 5 steps A3, B3, A4, B4 to reach A5 (4 steps), then
+        // 2. Ten steps, eleven positions, no seek.
         let (counts, reads) = &measured[1];
         assert_eq!(counts.logical_seeks, 0);
         assert_eq!((counts.logical_steps, counts.positions), (10, 11));
@@ -641,9 +596,6 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
                 key_decodes: 11,
                 value_decodes: 2,
                 weight_decodes: 2,
-                memory_key_reads: 2,
-                memory_value_reads: 2,
-                memory_weight_reads: 2,
                 ..RunReads::default()
             }
         );
@@ -651,76 +603,65 @@ fn seeking_and_stepping_pass_untouched_groups_with_the_same_outputs() {
 }
 
 #[test]
-fn a_rejected_node_is_passed_by_one_seek_or_by_steps() {
+fn a_group_is_scanned_contiguously_with_no_skip() {
     run_in_circuit_with_storage(|| {
-        // Group 1's root entry has payload 9, which the test rejects. The rest
-        // of its node, B(1,1) and B(1,2), is passed unread.
+        // Group 1 holds A(1) and three B entries, and nobody keeps any B.
+        // The scan still reads a key at each of the five positions (the four
+        // of the group and the one that ends it): skipping what nobody
+        // requests is a deferred refinement.
         let old = snapshot(&[(
             vec![
-                row(a_key(1), 9, 1),
+                row(a_key(1), 1, 1),
                 row(b_key(1, 1), 1, 1),
                 row(b_key(1, 2), 1, 1),
+                row(b_key(1, 3), 1, 1),
                 row(a_key(2), 1, 1),
             ],
             true,
         )]);
-        let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-        let rejected = ids(&[9]);
-
-        for pass in [Pass::Seek, Pass::Step] {
-            let ((groups, counts), reads) = reads_of(|| {
-                run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1, 2]), Some(&rejected))
-                    .unwrap()
+        for pass in PASSES {
+            let ((visited, counts), reads) = reads_of(|| {
+                run_session::<TwoLevelsIndex>(&old, &[group_of(1)], pass, of_streams(&[1])).unwrap()
             });
-            // The rejected entry stays buffered; the B entries are not.
-            assert_eq!(groups[0].1.old(1).len(), 1);
-            assert!(groups[0].1.old(2).is_empty());
-            assert_eq!(counts.payload_decodes_old, 1);
+            assert_eq!(visited[0].positions.len(), 4);
+            assert_eq!((counts.logical_steps, counts.positions), (4, 5), "{pass:?}");
+            assert_eq!(reads.key_decodes, 5);
             assert_eq!(reads.value_decodes, 1);
-            assert_eq!(reads.weight_decodes, 1);
-            // `Dlt` is one memory row: its key, value, and weight, once each.
-            assert_eq!(
-                (
-                    reads.memory_key_reads,
-                    reads.memory_value_reads,
-                    reads.memory_weight_reads
-                ),
-                (1, 1, 1)
-            );
-            match pass {
-                // One seek to [1, 2]: A(1), then A(2) are the only key decodes.
-                Pass::Seek => {
-                    assert_eq!((counts.logical_seeks, counts.logical_steps), (1, 0));
-                    assert_eq!((counts.positions, reads.key_decodes), (2, 2));
-                }
-                // Steps through B(1,1), B(1,2), and A(2).
-                Pass::Step => {
-                    assert_eq!((counts.logical_seeks, counts.logical_steps), (0, 3));
-                    assert_eq!((counts.positions, reads.key_decodes), (4, 4));
-                }
-            }
         }
     });
 }
 
 #[test]
-fn a_prefix_with_no_successor_is_skipped_to_the_end() {
-    // Root tag and value are all 0xFF, so the rejected node has no successor
-    // and the skip runs to the end of the index.
-    let root_entry = KeyEncoder::new()
-        .field(u8::MAX, &u8::MAX)
-        .finish(1)
-        .as_bytes()
-        .to_vec();
-    let old = snapshot(&[(vec![row(root_entry.clone(), 9, 1)], false)]);
-    let dlt = memory_run(&[row(root_entry, 5, 1)]);
-    let rejected = ids(&[9]);
-    for pass in [Pass::Seek, Pass::Step] {
-        let (groups, counts) =
-            run_session::<TwoLevelsIndex>(&old, &dlt, pass, &ids(&[1]), Some(&rejected)).unwrap();
-        assert_eq!(groups[0].1.old(1).len(), 1);
-        assert_eq!(counts.logical_seeks, u64::from(pass == Pass::Seek));
-        assert_eq!(counts.logical_steps, u64::from(pass == Pass::Step));
+fn a_taken_position_is_taken_once() {
+    let old = snapshot(&[(vec![row(a_key(1), 7, 3)], false)]);
+    let touched = [group_of(1)];
+    let mut session = ScanSession::<TwoLevelsIndex>::new(&old, &touched, Pass::Seek);
+    assert_eq!(session.next_group(), Some(group_of(1).as_slice()));
+    assert_eq!(session.take_and_decode(), Ok(vec![(7, 3)]));
+    assert_eq!(session.take_and_decode(), Ok(vec![]));
+    assert_eq!(session.counts().payload_decodes_old, 1);
+    session.step();
+    assert_eq!(session.key(), None);
+    assert!(session.next_group().is_none());
+}
+
+#[test]
+fn nothing_is_read_outside_the_touched_groups_and_an_empty_list_touches_no_group() {
+    let old = snapshot(&[(six_groups(), false)]);
+    let mut session = ScanSession::<TwoLevelsIndex>::new(&old, &[], Pass::Seek);
+    assert!(session.next_group().is_none());
+    assert_eq!(session.key(), None);
+    assert!(session.take_and_decode().is_err());
+    assert_eq!(session.counts().groups, 0);
+
+    // A group past the end of `Old` is entered and holds no position.
+    let touched = [group_of(9)];
+    for pass in PASSES {
+        let (visited, counts) =
+            run_session::<TwoLevelsIndex>(&old, &touched, pass, of_streams(&[1, 2])).unwrap();
+        assert_eq!(visited[0].positions, Vec::<Vec<u8>>::new());
+        assert_eq!(counts.groups, 1);
+        assert_eq!(counts.payload_decodes_old, 0);
     }
 }
 
@@ -730,8 +671,7 @@ fn a_prefix_with_no_successor_is_skipped_to_the_end() {
 fn a_malformed_old_key_is_an_error() {
     // [1, 1, 5, 5] has no terminator before the id.
     let old = snapshot(&[(vec![row(vec![1, 1, 5, 5], 1, 1)], false)]);
-    let dlt = memory_run(&[row(a_key(1), 5, 1)]);
-    let error = run_session::<TwoLevelsIndex>(&old, &dlt, Pass::Seek, &ids(&[1]), None)
+    let error = run_session::<TwoLevelsIndex>(&old, &[group_of(1)], Pass::Seek, |_| true)
         .err()
         .unwrap();
     assert!(error.contains("malformed folded key"), "{error}");
@@ -739,26 +679,23 @@ fn a_malformed_old_key_is_an_error() {
 
 #[test]
 fn a_decode_error_stops_the_session() {
-    let old = snapshot(&[(vec![row(a_key(1), 1, 1)], false)]);
-    // The delta's payload is empty, which the decoder rejects.
-    let dlt = memory_run(&[(a_key(1), Vec::<u8>::new(), 1)]);
-    let mut session = ScanSession::<TwoLevelsIndex>::new(&old, &dlt, Pass::Seek);
-    let result = session.maintain(&ids(&[1]), None, |_, _| panic!("no group completes"));
-    assert_eq!(result, Err("empty payload".to_string()));
+    // The old payload is empty, which the decoder rejects.
+    let old = snapshot(&[(vec![(a_key(1), Vec::<u8>::new(), 1)], false)]);
+    let result = run_session::<TwoLevelsIndex>(&old, &[group_of(1)], Pass::Seek, |_| true);
+    assert_eq!(result.err(), Some("empty payload".to_string()));
 }
 
 #[test]
 fn the_decoder_is_chosen_by_the_stream_id() {
     // A(1) is stream 1 and B(1, 1) is stream 2, which the definition cannot
-    // decode. Asking for stream 1 alone never reaches that decoder.
+    // decode. Keeping stream 1 alone never reaches that decoder.
     let old = snapshot(&[(vec![row(a_key(1), 1, 1), row(b_key(1, 1), 1, 1)], false)]);
-    let dlt = memory_run(&[row(a_key(1), 5, 1), row(b_key(1, 1), 5, 1)]);
-    let (groups, _) =
-        run_session::<StreamOneIndex>(&old, &dlt, Pass::Seek, &ids(&[1]), None).unwrap();
-    assert_eq!(groups[0].1.old(1).len(), 1);
-    assert_eq!(groups[0].1.dlt(1).len(), 1);
+    let touched = [group_of(1)];
+    let (visited, _) =
+        run_session::<StreamOneIndex>(&old, &touched, Pass::Seek, of_streams(&[1])).unwrap();
+    assert_eq!(visited[0].kept.len(), 1);
 
     let error =
-        run_session::<StreamOneIndex>(&old, &dlt, Pass::Seek, &ids(&[1, 2]), None).unwrap_err();
+        run_session::<StreamOneIndex>(&old, &touched, Pass::Seek, of_streams(&[1, 2])).unwrap_err();
     assert_eq!(error, "unknown stream 2");
 }

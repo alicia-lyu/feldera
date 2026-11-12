@@ -483,6 +483,29 @@ fn root_width_is_the_width_of_the_only_top_level_domain() {
 }
 
 #[test]
+fn prefix_width_counts_a_tag_and_a_value_per_field() {
+    // COL: Customer (id 1) at `custkey`, Orders (id 2) at `custkey.orderkey`,
+    // Lineitem (id 3) at `custkey.orderkey.linenumber`, with widths 8, 8, 4.
+    assert_eq!(COL_TRIE.prefix_width(1, 1), Ok(9));
+    assert_eq!(COL_TRIE.prefix_width(2, 1), Ok(9));
+    assert_eq!(COL_TRIE.prefix_width(2, 2), Ok(18));
+    assert_eq!(COL_TRIE.prefix_width(3, 3), Ok(23));
+    assert_eq!(COL_TRIE.prefix_width(3, 0), Ok(0));
+    assert_eq!(
+        COL_TRIE.prefix_width(1, 1).unwrap(),
+        1 + COL_TRIE.root_width()
+    );
+    assert!(COL_TRIE.prefix_width(1, 2).unwrap_err().contains("fewer"));
+    assert!(
+        COL_TRIE
+            .prefix_width(9, 1)
+            .unwrap_err()
+            .contains("no stream 9")
+    );
+    assert_eq!(COL_TRIE.stream_path(2), Some(vec!["custkey", "orderkey"]));
+}
+
+#[test]
 #[should_panic(expected = "0 top-level nodes, not one")]
 fn root_width_panics_without_a_top_level_node() {
     fixture_trie(&[]).root_width();

@@ -1,154 +1,79 @@
 //! The scan session: one forward pass over a merged index per transaction.
 //!
 //! View maintenance needs, for each *touched group* (for Q3, a customer that
-//! the transaction's delta mentions), the old entries of that group, and the
-//! delta's entries for it. [`ScanSession`] hands them to the caller group by
-//! group, in index order, and reads the index so that each old entry is read
-//! once and untouched groups are passed, not read. The pseudocode is
-//! `alg:session`, `alg:skip`, and `alg:ivm-buffered` of the write-up, and the
-//! rules are in `docs/design/merged-index/shared-traversal.md`.
+//! the transaction's delta mentions), the old entries of that group that some
+//! reader keeps. [`ScanSession`] is a cursor over the touched groups' ranges of
+//! `Old`: for each group it positions once, then the caller scans the group's
+//! range contiguously, entry by entry, and decides from the folded key alone
+//! whether to read an entry's payload. The pseudocode is `alg:session` and
+//! `alg:ivm-buffered` of the write-up, and the rules are in
+//! `docs/design/merged-index/shared-traversal.md`.
 //!
 //! # Inputs
 //!
 //! * `Old`, a pinned snapshot of the index before the transaction, read
 //!   through [`RunMerge`].
-//! * `Dlt`, the transaction's signed changes to the index, one in-memory run,
-//!   read once by one forward cursor.
-//! * The index definition `D` ([`MergedIndexDefinition`]), which gives the trie
-//!   (`D::TRIE`) and the payload decoder (`D::decode_payload`). A trie has one
-//!   root domain, so a group is the first `1 + root width` bytes of a key: the
-//!   root domain's tag and value.
+//! * The touched groups, as a sorted list of group prefixes (the root domain's
+//!   tag and value, `1 + root width` bytes). The session never sees `Dlt`:
+//!   whoever builds the list reads `Dlt` once, before the session
+//!   ([`reader::capture`](super::reader::capture)).
+//! * The index definition `D` ([`MergedIndexDefinition`]), which gives the
+//!   payload decoder (`D::decode_payload`).
 //!
-//! The groups are inferred from `Dlt`: a touched group is one that has a `Dlt`
-//! entry, so the session needs no list of requests.
+//! # Moves
 //!
-//! # What the session buffers
+//! * [`ScanSession::next_group`] positions `Old` at the first key at or past
+//!   the next touched group: one logical seek under [`Pass::Seek`], steps under
+//!   [`Pass::Step`] (the untouched groups in between are passed, not read).
+//! * [`ScanSession::key`] is the folded key at the position while it lies in
+//!   the group, and nothing at the position that ends the group. It reads no
+//!   value or weight.
+//! * [`ScanSession::take_and_decode`] reads the position's payloads, sums their
+//!   weights across runs, and decodes them. A caller calls it only for an entry
+//!   that some reader keeps, so a payload nobody keeps costs no value read, no
+//!   weight read, and no decode.
+//! * [`ScanSession::step`] moves to the next position. The group's range is
+//!   scanned with no skips: skipping the subtrees that no reader requests is a
+//!   deferred refinement (`deferred.md`).
 //!
-//! For each group, [`ScanSession::maintain`] collects the entries of the
-//! requested streams (index ids) into a [`GroupBuffers`] and hands them to the
-//! caller's `on_group` by value. `Old` and `Dlt` entries stay
-//! apart and unconsolidated, since a join is bilinear (`prop:overlay`).
-//! A position of `Old` whose stream is not requested costs a key decode and
-//! nothing else, as does the position that ends a group.
+//! `Old` entries and the delta's entries stay apart and unconsolidated by the
+//! session, since a join is bilinear (`prop:overlay`).
 //!
 //! # Knob
 //!
 //! [`Pass`] chooses between two ways of doing the same work, for A/B tests:
-//! seek against step, for untouched groups and rejected subtrees. Both buffer
-//! the same entries. A group read has no exact-key probe: a run whose filter
-//! rejects the group's root key can still hold entries below it, so the run
-//! must be sought anyway (decision of 2026-11-09).
+//! seek against step, for the untouched groups between two touched ones. A
+//! group read has no exact-key probe: a run whose filter rejects the group's
+//! root key can still hold entries below it, so the run must be sought anyway
+//! (decision of 2026-11-09).
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
-    ops::AddAssign,
-};
+use std::{marker::PhantomData, ops::AddAssign};
 
 use serde::Serialize;
 
-use crate::{
-    ZWeight,
-    dynamic::DowncastTrait,
-    trace::{BatchReader, Cursor, SpineSnapshot},
-};
+use crate::{ZWeight, dynamic::DowncastTrait, trace::SpineSnapshot};
 
-use super::{INDEX_TAG, MergedIndexBatch, MergedIndexDefinition, RunMerge, prefix_successor};
+use super::{INDEX_TAG, MergedIndexBatch, MergedIndexDefinition, RunMerge};
 
-type DeltaCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
-
-/// How the session passes entries that it buffers nothing from: the untouched
-/// groups between two touched ones, and the rest of a rejected subtree.
+/// How the session passes entries that it keeps nothing from: the untouched
+/// groups between two touched ones.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pass {
-    /// One logical seek to the first key past them.
+    /// One logical seek to the first key of the next touched group.
     Seek,
     /// Steps through them, one position at a time.
     Step,
-}
-
-/// One entry of the index: a folded key, its decoded payload, and its weight.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Entry<P> {
-    pub key: Vec<u8>,
-    pub payload: P,
-    pub weight: ZWeight,
-}
-
-impl<P> Entry<P> {
-    /// The id of the entry's stream: the last byte of its folded key.
-    pub fn stream_id(&self) -> u8 {
-        *self.key.last().expect("a folded key is not empty")
-    }
-}
-
-/// The entries of one stream in one group, in key order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StreamBuffer<P> {
-    /// Entries of the index before the transaction.
-    pub old: Vec<Entry<P>>,
-    /// Entries of the transaction's delta.
-    pub dlt: Vec<Entry<P>>,
-}
-
-// Not derived: a derive would require `P: Default`.
-impl<P> Default for StreamBuffer<P> {
-    fn default() -> Self {
-        Self {
-            old: Vec::new(),
-            dlt: Vec::new(),
-        }
-    }
-}
-
-/// A group's buffers, one per requested stream that has an entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupBuffers<P> {
-    streams: BTreeMap<u8, StreamBuffer<P>>,
-}
-
-impl<P> Default for GroupBuffers<P> {
-    fn default() -> Self {
-        Self {
-            streams: BTreeMap::new(),
-        }
-    }
-}
-
-impl<P> GroupBuffers<P> {
-    /// The buffer of stream `id`, or `None` if it has no entry in this group.
-    pub fn stream(&self, id: u8) -> Option<&StreamBuffer<P>> {
-        self.streams.get(&id)
-    }
-
-    /// The old entries of stream `id`, in key order.
-    pub fn old(&self, id: u8) -> &[Entry<P>] {
-        self.stream(id).map_or(&[], |buffer| &buffer.old)
-    }
-
-    /// The delta's entries of stream `id`, in key order.
-    pub fn dlt(&self, id: u8) -> &[Entry<P>] {
-        self.stream(id).map_or(&[], |buffer| &buffer.dlt)
-    }
-
-    /// The nonempty buffers, by ascending stream id.
-    pub fn streams(&self) -> impl Iterator<Item = (u8, &StreamBuffer<P>)> {
-        self.streams.iter().map(|(&id, buffer)| (id, buffer))
-    }
-
-    fn stream_mut(&mut self, id: u8) -> &mut StreamBuffer<P> {
-        self.streams.entry(id).or_default()
-    }
 }
 
 /// What the session did. The storage costs of these moves are in
 /// [`RunReads`](crate::trace::RunReads), which the cursors keep.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SessionCounts {
-    /// Groups handed to `on_group`.
+    /// Groups the session positioned on.
     pub groups: u64,
-    /// Logical cursors opened: one over `Old` and one over `Dlt`. `Old`'s
-    /// logical cursor is one run cursor per run.
+    /// Logical cursors opened: one over `Old`, which is one run cursor per
+    /// run. The delta is read before the session, so the session opens no
+    /// cursor on it.
     pub cursor_opens: u64,
     /// Seeks over `Old` that moved some run. A seek that finds `Old` already
     /// at or past its target moves nothing and counts nothing. One logical
@@ -160,12 +85,14 @@ pub struct SessionCounts {
     /// key a step or seek landed on. Each costs one key decode in a
     /// file run.
     pub positions: u64,
-    /// Payloads of `Old` decoded: one per buffered old entry.
+    /// Payloads of `Old` decoded: one per entry that a reader kept.
     pub payload_decodes_old: u64,
-    /// Payloads of `Dlt` decoded: one per buffered delta entry.
+    /// Payloads of `Dlt` decoded: one per delta entry that a reader's driving
+    /// delta took. The session does not read `Dlt`; the capture before it
+    /// does, and fills this count in when it hands the session's counts on.
     pub payload_decodes_dlt: u64,
     /// Values of `Old` whose weights cancelled across runs. They cost a
-    /// value and a weight decode each and are not buffered.
+    /// value and a weight decode each and are not kept.
     pub cancelled: u64,
 }
 
@@ -183,44 +110,43 @@ impl AddAssign for SessionCounts {
     }
 }
 
-/// A forward pass over `Old` and `Dlt` of the index that `D` defines; see the
-/// [module docs](self).
+/// A cursor over the touched groups of `Old` of the index that `D` defines;
+/// see the [module docs](self).
 pub struct ScanSession<'a, D: MergedIndexDefinition> {
     old: RunMerge<'a>,
-    dlt: DeltaCursor<'a>,
     pass: Pass,
 
-    /// The length of a group's prefix: the root domain's tag and value.
-    group_width: usize,
+    /// The touched groups, ascending, and how many the session has entered.
+    touched: &'a [Vec<u8>],
+    entered: usize,
 
     counts: SessionCounts,
     definition: PhantomData<D>,
 }
 
 impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
-    /// Opens the session's cursors over `old` and `dlt`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `D::TRIE` is not a valid trie (see [`KeyTrie::root_width`]).
-    ///
-    /// [`KeyTrie::root_width`]: super::KeyTrie::root_width
+    /// Opens the session's cursor over `old`. `touched` lists the group
+    /// prefixes to visit, strictly ascending.
     pub fn new(
         old: &'a SpineSnapshot<MergedIndexBatch>,
-        dlt: &'a MergedIndexBatch,
+        touched: &'a [Vec<u8>],
         pass: Pass,
     ) -> Self {
+        debug_assert!(
+            touched.windows(2).all(|pair| pair[0] < pair[1]),
+            "touched groups must be strictly ascending"
+        );
         let old = RunMerge::new(old);
         let mut counts = SessionCounts {
-            cursor_opens: 2,
+            cursor_opens: 1,
             ..SessionCounts::default()
         };
         counts.positions += u64::from(old.key().is_some());
         Self {
             old,
-            dlt: dlt.cursor(),
             pass,
-            group_width: 1 + D::TRIE.root_width(),
+            touched,
+            entered: 0,
             counts,
             definition: PhantomData,
         }
@@ -234,166 +160,57 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
         }
     }
 
-    /// Hands the caller each touched group, in index order, with the entries
-    /// of the streams in `inputs` (index ids). Reads `Dlt` once, so a second
-    /// call finds no group.
-    ///
-    /// * Payloads are decoded by `D::decode_payload` from the stream id and the
-    ///   stored bytes, once per buffered entry. A decode error stops the
-    ///   session.
-    /// * `reject`, if given, judges each buffered *old* entry. When some entry
-    ///   of an old key is rejected, the entry stays in its buffer, and the
-    ///   session passes the rest of the key's node and everything below it in
-    ///   `Old` (`Skip`), because no consumer needs them. `Dlt` entries are
-    ///   never rejected: the delta is read whole.
-    /// * `on_group(group prefix, buffers)` runs once per group and takes the
-    ///   buffers by value, so the caller decides when to release them: it can
-    ///   drop them on return, or keep a transaction's groups until its
-    ///   consumers finish.
-    pub fn maintain(
-        &mut self,
-        inputs: &BTreeSet<u8>,
-        mut reject: Option<&mut dyn FnMut(&Entry<D::Payload>) -> bool>,
-        mut on_group: impl FnMut(&[u8], GroupBuffers<D::Payload>) -> Result<(), String>,
-    ) -> Result<(), String> {
-        while self.dlt.key_valid() {
-            let group = self.next_group()?;
-            self.counts.groups += 1;
-            self.pass_to(&group);
-
-            let mut buffers = GroupBuffers::default();
-            self.collect_old(&group, inputs, &mut reject, &mut buffers)?;
-            self.collect_delta(&group, inputs, &mut buffers)?;
-            on_group(&group, buffers)?;
-        }
-        Ok(())
-    }
-
-    /// The group of the delta's next key.
-    fn next_group(&self) -> Result<Vec<u8>, String> {
-        let key = self.dlt.key().downcast_checked::<Vec<u8>>();
-        key.get(..self.group_width)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| format!("delta key {key:?} is shorter than a group prefix"))
-    }
-
-    /// Brings `Old` to the first key at or past `group`. The untouched groups
-    /// in between are never buffered.
-    fn pass_to(&mut self, group: &[u8]) {
+    /// Enters the next touched group: brings `Old` to the first key at or past
+    /// the group's prefix (the untouched groups in between are never read) and
+    /// returns the prefix, or `None` once every touched group is done.
+    pub fn next_group(&mut self) -> Option<&'a [u8]> {
+        let group = self.touched.get(self.entered)?;
+        self.entered += 1;
+        self.counts.groups += 1;
         match self.pass {
             Pass::Seek => self.seek_old(group),
             Pass::Step => {
-                while self.old.key().is_some_and(|key| key < group) {
-                    self.step_old();
+                while self.old.key().is_some_and(|key| key < group.as_slice()) {
+                    self.step();
                 }
             }
         }
+        Some(group)
     }
 
-    /// `Collect`: buffers the entries of `Old` under `group` whose stream is in
-    /// `inputs`, stepping through every position of the group. Ends on the
-    /// first position past the group, whose key it has read and nothing more.
-    fn collect_old(
-        &mut self,
-        group: &[u8],
-        inputs: &BTreeSet<u8>,
-        reject: &mut Option<&mut dyn FnMut(&Entry<D::Payload>) -> bool>,
-        buffers: &mut GroupBuffers<D::Payload>,
-    ) -> Result<(), String> {
-        loop {
-            let Some(position) = self.old.key().filter(|key| key.starts_with(group)) else {
-                return Ok(());
-            };
-            let (node_len, id) = split_key(position)?;
-            if !inputs.contains(&id) {
-                self.step_old();
-                continue;
-            }
-
-            let key = position.to_vec();
-            let mut taken = Vec::new();
-            let payload_decodes = &mut self.counts.payload_decodes_old;
-            self.old.take(|payload, weight| {
-                *payload_decodes += 1;
-                let payload = D::decode_payload(id, payload.downcast_checked::<Vec<u8>>())?;
-                taken.push(Entry {
-                    key: key.clone(),
-                    payload,
-                    weight,
-                });
-                Ok::<(), String>(())
-            })?;
-
-            let rejected = reject
-                .as_mut()
-                .is_some_and(|reject| taken.iter().any(reject));
-            if !taken.is_empty() {
-                buffers.stream_mut(id).old.extend(taken);
-            }
-            if rejected {
-                // The skip ends on a key outside the node, so no step follows.
-                self.skip(&key[..node_len]);
-            } else {
-                self.step_old();
-            }
-        }
+    /// The folded key at the position, if it lies in the current group; `None`
+    /// at the position that ends the group, whose key has been read and
+    /// nothing more.
+    pub fn key(&self) -> Option<&[u8]> {
+        let group = self
+            .entered
+            .checked_sub(1)
+            .map(|last| &self.touched[last])?;
+        self.old.key().filter(|key| key.starts_with(group))
     }
 
-    /// `Skip`: passes the rest of the node with prefix `node` in `Old`. The
-    /// position is a key of the node.
-    fn skip(&mut self, node: &[u8]) {
-        match self.pass {
-            Pass::Seek => match prefix_successor(node) {
-                Some(successor) => self.seek_old(&successor),
-                None => {
-                    // The node's range runs to the end of the index.
-                    self.counts.logical_seeks += 1;
-                    self.old.exhaust();
-                }
-            },
-            Pass::Step => {
-                while self.old.key().is_some_and(|key| key.starts_with(node)) {
-                    self.step_old();
-                }
-            }
-        }
-    }
-
-    /// Buffers the delta's entries under `group` whose stream is in `inputs`.
-    /// The delta is sorted, so they are the next ones in its order.
-    fn collect_delta(
-        &mut self,
-        group: &[u8],
-        inputs: &BTreeSet<u8>,
-        buffers: &mut GroupBuffers<D::Payload>,
-    ) -> Result<(), String> {
-        while self.dlt.key_valid() {
-            let key = self.dlt.key().downcast_checked::<Vec<u8>>().clone();
-            if !key.starts_with(group) {
-                break;
-            }
-            let (_, id) = split_key(&key)?;
-            if inputs.contains(&id) {
-                while self.dlt.val_valid() {
-                    let weight = *self.dlt.weight().downcast_checked::<ZWeight>();
-                    self.counts.payload_decodes_dlt += 1;
-                    let payload =
-                        D::decode_payload(id, self.dlt.val().downcast_checked::<Vec<u8>>())?;
-                    buffers.stream_mut(id).dlt.push(Entry {
-                        key: key.clone(),
-                        payload,
-                        weight,
-                    });
-                    self.dlt.step_val();
-                }
-            }
-            self.dlt.step_key();
-        }
-        Ok(())
+    /// Reads the position's payloads: each distinct payload with its weight
+    /// summed over the runs, decoded by `D::decode_payload` from the stream
+    /// id, the last byte of the key. Counts one decode per payload. A second
+    /// call at the same position finds nothing.
+    pub fn take_and_decode(&mut self) -> Result<Vec<(D::Payload, ZWeight)>, String> {
+        let key = self
+            .key()
+            .ok_or("take_and_decode outside a group's range")?;
+        let (_, stream_id) = split_key(key)?;
+        let mut taken = Vec::new();
+        let payload_decodes = &mut self.counts.payload_decodes_old;
+        self.old.take(|payload, weight| {
+            *payload_decodes += 1;
+            let payload = D::decode_payload(stream_id, payload.downcast_checked::<Vec<u8>>())?;
+            taken.push((payload, weight));
+            Ok::<(), String>(())
+        })?;
+        Ok(taken)
     }
 
     /// Steps `Old` past its current position.
-    fn step_old(&mut self) {
+    pub fn step(&mut self) {
         self.counts.logical_steps += 1;
         self.old.step();
         self.counts.positions += u64::from(self.old.key().is_some());
@@ -410,7 +227,7 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
 
 /// Splits a folded key `<node prefix> 0 <id>` into the length of the node
 /// prefix, which is the key without its trailing `[0, id]`, and the id.
-fn split_key(key: &[u8]) -> Result<(usize, u8), String> {
+pub fn split_key(key: &[u8]) -> Result<(usize, u8), String> {
     match key {
         [.., terminator, id] if *terminator == INDEX_TAG => Ok((key.len() - 2, *id)),
         _ => Err(format!(
