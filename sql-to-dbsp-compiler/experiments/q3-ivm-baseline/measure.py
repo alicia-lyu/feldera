@@ -422,7 +422,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="fully compact the circuit and the merged index after loading, "
                              "before the refreshes; its cost is reported in the load section")
     parser.add_argument("--front-code-byte-keys", action="store_true",
-                        help="front-code byte-string keys in storage files (the merged "
+                        help="prefix-truncate byte-string keys in storage files (the merged "
                              "index's key level); native runs have no such keys")
     parser.add_argument("--elide-value-headers", action="store_true",
                         help="drop the redundant 16-byte header of every byte-string value in "

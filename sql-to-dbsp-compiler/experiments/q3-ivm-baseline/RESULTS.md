@@ -275,6 +275,6 @@ Each cell is the median of three repetitions, with the minimum and maximum in br
 - **Peak RSS** is the process's high-water mark since start, so it includes loading and setup compaction. It is not a maintenance-only figure.
 - **Timing.** In these runs the reconstructed mode's `index + q3` was higher than native mode's in every workload. The runs are too short and too small to attribute that difference: the state fits in memory, no repetition lasted more than about 140 ms, and decoding CPU is not measured separately. Make no performance claim from this table. The `q3` column includes base-relation maintenance, which both modes share (see "Timing definitions"). These runs remain measurement version 2.
 
-The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../../../docs/design/merged-index/history.md). They were measured before POSIX flush fix `f7fec2391`, with byte-string values, no setup compaction, and no front coding. They are not results for the current configuration.
+The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../../../docs/design/merged-index/history.md). They were measured before POSIX flush fix `f7fec2391`, with byte-string values, no setup compaction, and no prefix truncation. They are not results for the current configuration.
 
 The Linux campaign is a separate pending milestone. Its plan is in [measurement.md](../../../docs/design/merged-index/measurement.md), and its commands are in the [Linux handoff](../../../docs/design/merged-index/WORKFLOW.md#linux-handoff).

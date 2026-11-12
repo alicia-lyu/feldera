@@ -193,11 +193,11 @@ compaction before the refreshes is the more realistic workload (decision of 2026
 to isolate the fragmentation effect: both modes then start from one run per Spine.
 
 `--front-code-byte-keys` (also a driver flag) sets DBSP's `front_code_byte_keys` dev tweak. Every
-storage file writer then front-codes data blocks whose keys are raw byte strings with no auxiliary
+storage file writer then prefix-truncates data blocks whose keys are raw byte strings with no auxiliary
 data, which in this experiment is only the merged index's key level; native runs write the same
 files as without it. The report's `front_coding` holds the writer's counters: blocks written
-front-coded, `layout_fallbacks` (eligible blocks the encoder did not understand, which should be 0),
-and `size_fallbacks` (blocks that front coding would not have shrunk by a 512-byte sector).
+prefix-truncated, `layout_fallbacks` (eligible blocks the encoder did not understand, which should be 0),
+and `size_fallbacks` (blocks that prefix truncation would not have shrunk by a 512-byte sector).
 
 `--elide-value-headers` (also a driver flag) sets DBSP's `elide_value_headers` dev tweak. It is
 independent of `--front-code-byte-keys`, so each is measured on its own. Every storage file writer
@@ -420,7 +420,7 @@ python3 measure.py \
   --elide-value-headers
 ```
 
-This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, and give each run its own `--report` and `--storage-path` (see "Campaign and front-coding A/B" for naming). Run the four pilots in the order clustered A, clustered B, scattered A, scattered B. Why each flag:
+This is arm A. Run arm B with the same command minus `--front-code-byte-keys`, and give each run its own `--report` and `--storage-path` (see "Campaign and prefix-truncation A/B" for naming). Run the four pilots in the order clustered A, clustered B, scattered A, scattered B. Why each flag:
 
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.
 - `--cache-bytes 134217728`: the 128 MiB worker cache (a whole number of MiB).
@@ -453,7 +453,7 @@ pressure:
 - `refreshes[].memory_pressure` shows what DBSP's level was; `cgroup.delta` (`pgscan`, `pgsteal`,
   `workingset_refault_*`, `memory_events.max`) shows what the kernel did. Report the two apart.
 
-### Campaign and front-coding A/B
+### Campaign and prefix-truncation A/B
 
 Run the campaign only after all four pilots pass and the pressure instrumentation exists
 ([measurement.md](measurement.md#pending-linux-campaign)). It has two arms, each the pilot

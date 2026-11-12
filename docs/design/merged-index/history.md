@@ -4,6 +4,8 @@ Dated records of work and measurements that no longer describe the current confi
 Each section is a snapshot. It is not authoritative, and its figures are not comparable with
 current ones unless it says so. Current facts live in the topic files listed in the
 [reading guide](README.md#reading-guide). Raw artifacts named here were local and git-ignored.
+"Front coding" in these records is now called prefix truncation (2026-11-11); the code's
+identifiers (`--front-code-byte-keys`, `front_code.rs`) keep the old name.
 
 ## 2026-10-06: compatibility gaps before R3
 

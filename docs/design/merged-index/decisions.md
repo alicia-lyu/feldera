@@ -7,6 +7,8 @@ Entries come from two sources:
 - the user's answers during the documentation review of 2026-10-12;
 - dated user directives in the former `history/architectural-note-rewrite.md` and `slides-oct-8/advisor-working-style-2026-10-08.md`, both now archived under `TRASH/`.
 
+Terminology: entries before 2026-11-11 say "front coding" for the key encoding of `--front-code-byte-keys`; the user renamed it "prefix truncation" on 2026-11-11. The code's identifiers keep the old name.
+
 ## Current decisions
 
 ### 2026-10-12: One DBSP worker
