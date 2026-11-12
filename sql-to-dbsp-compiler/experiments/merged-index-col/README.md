@@ -10,16 +10,16 @@ Commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). T
 
 The `q3` module reconstructs the four native accumulated reads from COL snapshots that the harness maintains outside the circuit. The harness-side `ManualIndex` (in [`q3-ivm-baseline`](../q3-ivm-baseline/README.md)) appends to the index; this library never does. `q3.rs` contains no insertion call.
 
-`Q3State::publish` supplies one transaction's `Old` snapshot and its `Dlt` run. `Q3State::collect` then runs one scan session and buffers the touched groups; the harness pushes the driving deltas with `push_driving_deltas`. Call `Q3State::finish` after the transaction commits and before publishing another; it releases the groups and returns the session's reads. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract. Every delta row must carry its trie keys, which the harness's `reconstruction::prepare` ensures for any change of the base tables.
+`Q3State::publish` supplies one transaction's `Old` snapshot and its `Dlt` run. `Q3State::collect` then runs one scan session and fills four typed readers (dbsp's `merged_index::reader`). The view circuit's sources take the driving deltas, the readers' `Dlt` batches, through `customer_deltas`, `order_deltas`, and `line_deltas`. Call `Q3State::finish` after the transaction commits and before publishing another; it releases the readers and returns the session's reads. [reconstruction.md](../../../docs/design/merged-index/reconstruction.md) gives the full transaction contract. Every delta row must carry its trie keys, which the harness's `reconstruction::prepare` ensures for any change of the base tables.
 
-Each reader receives a transaction delta, takes the requested keys from it, and reads the matching version of the buffered groups through a borrowing `VirtualBuffer`: the before reads take `Old`, and the after reads take `Old` then `Dlt`, unconsolidated. The result types are named `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`):
+Collection projects each entry of a touched customer's group, once, into the typed rows of every reader of its stream. A reader holds two batches, `Old`'s and `Dlt`'s; the before reads take `Old`'s, and the after reads take both in one snapshot, unconsolidated. The result types are named `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`):
 
-- `customers_after` reads each requested customer's entry in the after version.
-- `orders_before` reads the Orders of each requested customer in the before version.
-- `lineitems_before` reads the line items of each requested `(customer, order)` in the before version.
-- `joined_orders_after` reconstructs `J⁺` for the `(customer, order)` pairs in `ΔL`. It reads the Customer and the Order on the path in the after version, then multiplies their signed weights.
+- `customers_after` returns the customers reader's after snapshot.
+- `orders_before` returns the orders-by-customer reader's before snapshot.
+- `lineitems_before` returns the line-items reader's before snapshot.
+- `joined_orders_after` reconstructs `J⁺` for the `(customer, order)` pairs in `ΔL`. It looks each pair up in the customers' and the orders-by-order readers' after snapshots, then multiplies their signed weights.
 
-The readers open no cursor on the index: the session read each touched group once. Each reader copies its rows into a transient native indexed vector, which it returns as a `SpineSnapshot`. The reader never builds an accumulated `J` relation. Decoding, copying, and sorting these rows are charged to Q3 maintenance. No hard memory bound is claimed.
+The first three check that each requested customer was collected and hand over the reader's whole batches, which hold every row of the touched groups; the join seeks only the keys it needs. Only `J⁺` copies rows, into a transient native indexed vector. No reader builds an accumulated `J` relation, or opens a cursor on the index. An entry that two readers take is stored twice, once in each reader's shape. Decoding, projecting, and sorting are charged to Q3 maintenance. No hard memory bound is claimed.
 
 The join readers (`join_orders_customers`, `join_lineitems_orders`) call `expect` on reader errors. A request outside the touched groups therefore panics the worker; `reconstruction::prepare` makes `Dlt` complete, so a harness-fed change never makes one.
 

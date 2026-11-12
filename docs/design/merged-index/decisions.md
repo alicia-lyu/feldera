@@ -461,6 +461,15 @@ The user decided on 2026-11-11 that completing the base delta into trie-keyed `D
 
 The user also decided that the boundary copy of the driving deltas into the view circuit's input handles is outside the IVM window in both modes. Native's feed of the net delta was already in `forward_ms`; reconstructed mode's `push_driving_deltas` moves there from `q3_ms`. The scan session's collection, which does the partner reads, stays in `q3_ms`. This is measurement version 9.
 
+### 2026-11-11: DBSP's operators stay; the partner reads become typed readers
+
+The user decided on 2026-11-11, for roadmap step 5:
+
+- **The circuit is the plan.** The view circuit keeps DBSP's own operators, and only the joins' partner reads come from the scan session. A query is specified by its DBSP circuit, with trie-keyed joins (A1). This withdraws the step-5 design of one operator whose `on_group` callback evaluates `ΔJ` and `ΔV` per group, and with it the per-group release of the buffers: DBSP flushes `V` only after `J`, so the readers stay until `finish`.
+- **One typed buffer per reader, filled at collection.** A reader declares one stream and a projection into its join's typed rows. When the session collects a group, each entry is routed to the readers of its stream and projected once (`merged_index::reader`). A reader's buffer is its records, two batches of the join's type (`Old`'s and `Dlt`'s), not references into a shared buffer. This departs from the write-up's buffer per stream (`def:session`): an entry that two readers take is stored twice. Index reads are unchanged.
+- **`J⁺` from two one-stream readers, per request.** `J` is not stored, so `J⁺` is `J`'s join re-evaluated on each requested `(custkey, orderkey)` path, over the after reads of the customers reader and of an orders reader keyed by `(custkey, orderkey)`. Building it at collection would join every order of each touched customer.
+- **The driving deltas come from the readers.** The view circuit's input handles are replaced by sources that emit the readers' `Dlt` batches at the commit flush (`TransactionGenerator`), so the push of the driving deltas is gone. This is measurement version 10.
+
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
 The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
@@ -469,6 +478,8 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
+| 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
+| 2026-11-11 | The push of the driving deltas into the view circuit's input handles is booked in `forward_ms` (measurement version 9). | 2026-11-11: reconstructed mode has no push; the circuit's sources take the readers' `Dlt` batches (measurement version 10). |
 | 2026-10-12 | Placement map from the same transaction's Orders rows; changes outside RF1/RF2 are unsupported by design. | 2026-11-10: general deltas; `prepare` gives each order owners and orphan lines wait in a side store. |
 | 2026-10-29 | The compiler hook generates the reconstructed circuit. | 2026-11-10: the hand-written `q3-trie-view-circuit` replaces it. |
 | 2026-11-09 | `GroupStart::{PrefixSeek, ProbeThenRange}` A/B-tests the root probe; the 2026-11-04 root probe applies to buffered group reads. | 2026-11-09: group reads use no exact probe; path reads keep `seek_key_exact`. |

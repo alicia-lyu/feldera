@@ -74,8 +74,8 @@ In reconstructed mode the harness maintains the merged index in `ManualIndex`, o
 circuits, on an auxiliary thread of the runtime that hosts both circuits (booked as base maintenance since
 measurement version 4). Per
 transaction it converts the base circuit's net delta into signed index rows (`reconstruction::prepare`), appends them, then
-publishes `Old` (the index before the append) and `Dlt` (the appended run). One scan session buffers the touched groups, and
-the harness pushes the driving deltas into the view circuit's input handles; the groups are kept until the view transaction
+publishes `Old` (the index before the append) and `Dlt` (the appended run). One scan session fills the typed readers, and
+the view circuit's sources take the driving deltas from them at the commit; the readers are kept until the view transaction
 finishes. Any delta of the base tables is supported: `prepare` gives each changed order its owners, and line items with no order
 wait in `OrphanLines`. The index is fed from the net delta and not from the
 driver's logical change, so a workload with upserts would feed it correctly too. The contract and its limits are in

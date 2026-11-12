@@ -7,7 +7,7 @@
 >
 > **Notation:** `X⁻` and `X⁺` are the states before and after the transaction. `Δ` is a transaction delta, and a "run" is an immutable sorted collection. A derived row is named by its instance node, such as `((custkey, orderkey) = (c5, o5))`.
 >
-> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10). Step 4, the hand-written view circuit, is implemented (2026-11-10) and carries step 7: the circuit admits general deltas. Step 5 and later are not. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, 2026-11-09, and 2026-11-10 (including the step-4 entries).
+> **Status:** the algorithm is settled in the write-up. Roadmap step 1, the run counters, is implemented and reported by the R5 harness in both modes. Step 2, decode-free storage and the buffered scan session, is implemented (2026-11-09), and in-memory runs count their accesses in separate fields (2026-11-10). Step 3, publishing `(Old, Dlt)`, is implemented (2026-11-10). Step 4, the hand-written view circuit, is implemented (2026-11-10) and carries step 7: the circuit admits general deltas. Step 5, typed readers filled at collection, is implemented (2026-11-11). Step 6 is not. This doc is the meta plan for the coding steps. Choices marked *unconfirmed* await the user. The confirmed ones are in [decisions.md](decisions.md) under 2026-10-29, 2026-11-03, 2026-11-09, 2026-11-10 (including the step-4 entries), and 2026-11-11 (step 5).
 
 This doc covers:
 
@@ -103,7 +103,7 @@ Under (A1) and (A2), this computes the view change exactly, and it reads each co
 
 #### Buffers shared across operators
 
-`J` and `V` can stay separate DBSP operators that hold references to the same group buffers, so each old entry is still read once. DBSP flushes an operator only after its predecessors have flushed, so `V` starts only after `J` has passed every touched customer. The buffers of all touched groups then stay until `V` finishes. Releasing each group before the next is collected needs the two joins to take turns per group, as the session's callback does ([The scan session](#the-scan-session)).
+`J` and `V` stay separate DBSP operators (decision of 2026-11-11), and each old entry is still read from the index once. DBSP flushes an operator only after its predecessors have flushed, so `V` starts only after `J` has passed every touched customer. What a transaction collected therefore stays until `V` finishes. The implementation keeps no group buffers past collection: each entry is projected into the typed buffers of its readers, and the group's raw buffers are dropped ([Readers](#readers-step-5)). Releasing each group before the next is collected would need the two joins to take turns per group, which DBSP's scheduler does not do.
 
 ### Worked transaction
 
@@ -120,7 +120,7 @@ Each of `c5`, `o3`, `l7`, `l8`, `o4`, and `l9` is read from `Old` once, and `c6`
 
 ### The boundary with DBSP
 
-In DBSP, each join is an operator of its own, scheduled separately. Each receives its whole driving delta at the commit flush. The session therefore runs inside one operator that holds the joins whose partner reads share its groups, with any selections and projections between them. The operator receives `Old` and `Dlt`, and emits ordinary weighted deltas. DBSP's scheduler is unchanged. Operators downstream of the last join run as usual.
+In DBSP, each join is an operator of its own, scheduled separately. Each receives its whole driving delta at the commit flush. The circuit keeps them (decision of 2026-11-11): the circuit is the plan, and only each join's partner read is taken from the session, as the batches of a typed reader. Selections, groupings, and every other operator stay DBSP's. DBSP's scheduler is unchanged.
 
 ## Audit of the write-up
 
@@ -156,10 +156,10 @@ The facts were checked against the code on 2026-11-09.
 | seek to a group | `CursorList::seek_key` seeks every run, then re-merges. | The session's `PassTo`, which counts logical seeks; the run cursors count per-run seeks. |
 | `Collect`'s range test | `key().starts_with(prefix)` after a step, as in `scan` and the merged-index tests. | None. |
 | decode | `unfold` and `decode_payload` in the client crate. | Decode only buffered entries, from key bytes ([No extra decoding](#no-extra-decoding)). |
-| the four readers | The four functions in `merged-index-col/src/q3.rs` (`customers_after`, `orders_before`, `joined_orders_after`, `lineitems_before`). Since step 4 each is a description (before or after, path or range, and its streams) read through a `VirtualBuffer`, a borrowing view of the touched groups that `Q3State::collect` buffered: `Old` for a before read, `Old` then `Dlt` unconsolidated for an after read (`prop:overlay`). They open no cursor on the index. A request outside the touched groups returns an error, which the joins' `expect` turns into a panic of the worker. | Replaced by the operator's callback (roadmap step 5). |
-| session operator | `add_ternary_operator` and `add_quaternary_operator` (`circuit_builder.rs`). Existing users include `GroupTransform` (ternary) and `AsofJoin` (quaternary). Accumulators in front supply each whole delta at the flush. Output is chunked by `splitter_output_chunk_size`. | A new operator. |
-| snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`), runs `Q3State::collect` once, and pushes the driving deltas into the view circuit's input handles (`push_driving_deltas`). The join's read functions read the collected groups at the flush. `Q3State::finish` releases the groups and returns the `SessionReads`. | The two copies at the DBSP boundary (step 4 below). |
-| joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer. Step 4 keeps the two joins as separate operators, so `Q3State` holds every touched group from `collect` until `finish`. | One operator whose callback evaluates both joins per group and releases each group on return (step 5). |
+| the four readers | `customers_after`, `orders_before`, `joined_orders_after`, and `lineitems_before` in `merged-index-col/src/q3.rs`. Since step 5 the first, second, and fourth return a typed reader's batches (`Old`'s for a before read, `Old`'s and `Dlt`'s unconsolidated for an after read, `prop:overlay`), and `J⁺` is `J`'s join on each requested path over two readers ([Readers](#readers-step-5)). They open no cursor on the index. A request outside the touched groups returns an error, which the joins' `expect` turns into a panic of the worker. | None (step 5). |
+| session operator | Not built. DBSP's joins stay, and the session runs in `Q3State::collect` (decision of 2026-11-11). | None. |
+| snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`) and runs `Q3State::collect` once, which fills the readers. At the commit, the view circuit's `TransactionGenerator` sources emit the readers' `Dlt` batches as the driving deltas, and the joins read the readers' batches. `Q3State::finish` releases the readers and returns the `SessionReads`. | None (step 5). One copy remains: `J⁺`'s partner rows. |
+| joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer, so `Q3State` holds the readers from `collect` until `finish`. | Kept (decision of 2026-11-11). |
 | `Dlt` complete under (A2) | The base transaction runs first. `reconstruction::prepare` folds its net delta into index rows, and `ManualIndex::append` builds the run before the view transaction starts. Each changed order gets a before owner and an after owner; a moved order takes its line items with it, read from `Old`; line items with no owner wait in `OrphanLines`. The owner of an order that is not in the delta comes from the base `Orders` state: the pre-transaction `BaseState` (driver) or `Reference` (tests), counted under `BaseRelation`. | None (step 4). The view circuit's inputs come from `Dlt`. |
 | counters | Buffer-cache hits and misses, and Bloom and range filter statistics. `RunReads` (`trace/cursor/run_reads.rs`) counts per-run seeks in both run cursors, and filter rejections and key, value, and weight decodes in the file cursor, as per-thread running totals split by read owner (`with_read_owner`). `DBSPHandle::run_reads` reports the workers' totals. `SessionCounts` (`merged_index/session.rs`) counts the session's logical moves and payload decodes. | None. |
 
@@ -202,7 +202,7 @@ On the worked transaction, with one group under `Seek` (the session's knob, belo
 
 ## The scan session
 
-One scan session executes buffered execution. It is schema-independent, and it drives the traversal: it passes the untouched groups, collects each touched group, and hands the group's buffers to the execution through a callback. The callback is the permanent interface (decision of 2026-11-09). In roadmap step 2 the callbacks are tests. In step 5 the view operator supplies the callback that evaluates `ΔJ` and `ΔV` over the buffers and emits rows.
+One scan session executes buffered execution. It is schema-independent, and it drives the traversal: it passes the untouched groups, collects each touched group, and hands the group's buffers to the execution through a callback. The callback is the permanent interface (decision of 2026-11-09). In roadmap step 2 the callbacks are tests. Since step 5 the callback is `reader::collect`'s, which routes each group's entries into the typed readers ([Readers](#readers-step-5)); DBSP's joins evaluate `ΔJ` and `ΔV` (decision of 2026-11-11).
 
 ### Inputs
 
@@ -289,8 +289,38 @@ DBSP's run cursors count the storage costs: per-run seeks, filter rejections, an
 | Owner | Holds |
 | --- | --- |
 | The session | `RunMerge` over `Old`, the cursor over `Dlt`, the knob, the current group's buffers, and `SessionCounts` |
-| The execution (the callback) | The evaluation of the delta rules over a group's buffers, and any derived deltas such as `ΔJ` |
+| The callback (`reader::collect`) | The routing of a group's entries into the readers, which hold the typed rows until `finish` |
+| DBSP's joins | The evaluation of the delta rules, and derived deltas such as `ΔJ` |
 | DBSP's run cursors | The run counters: per-run seeks, key decodes, value decodes, and weight decodes |
+
+## Readers (step 5)
+
+A *reader* is one partner read of one join (decision of 2026-11-11). It declares one stream of the index and a projection of that stream's entries into the join's typed rows `(K, V)`. Its buffer is its records, in the join's type.
+
+```text
+collect(session, readers):                 inputs = the readers' streams
+  session.Maintain(inputs, on_group = (g, buffers) ->
+    for each entry e of buffers, Old's then Dlt's:
+      key ← unfold(e.key)                  once per entry
+      for each reader r of e's stream: r.half(e's half).push(r.project(key, e.payload), e.weight)
+    drop buffers)
+  seal each reader: Old's rows → one batch, Dlt's rows → another
+```
+
+A sealed reader (`ReaderRuns`) gives three reads:
+
+| Read | Batches | Q3's use |
+| --- | --- | --- |
+| `before()` | `Old`'s | `O⁻`, `L⁻` |
+| `after()` | `Old`'s and `Dlt`'s, in one snapshot, unconsolidated (`prop:overlay`) | `C⁺`, and `J⁺`'s two lookups |
+| `delta()` | `Dlt`'s, cloned | the driving deltas `ΔC`, `ΔO`, and `ΔL` |
+
+The batches hold every row of the touched groups. The join seeks only its driving delta's keys, so the kind of a read, path or range, follows from the reader's key: `C⁺` keyed by `custkey` takes one customer, and `O⁻` keyed by `custkey` takes the customer's subtree of orders. A key above a stream's own node, such as `O⁻`'s, is how a join key flows up the trie.
+
+Differences from the write-up (`def:session`), and their costs:
+
+- Buffers are per reader, not per stream, so an entry that two readers take is stored twice, once in each shape. In Q3, an old order goes to `O⁻` and to `J⁺`'s orders reader. Index reads and payload decodes are unchanged.
+- `J⁺` reads two streams. It is not one reader but `J`'s join re-evaluated per requested path, over two one-stream readers; its rows are the one copy left at the DBSP boundary.
 
 ## Current implementation against the write-up
 
@@ -300,11 +330,11 @@ This table refreshes `tab:prototype`.
 | --- | --- | --- |
 | Reads | `C⁺`, `O⁻`, `J⁺`, `L⁻`, versions as in the table above | Same |
 | `V`'s key | `(custkey, orderkey)`; `J` joins on `(custkey)` and keeps `(custkey, orderkey)` (step 4) | `(custkey, orderkey)` |
-| Delta delivery | Each join receives its whole driving delta once, at the transaction's flush; its partner reads come from the groups that one session buffered | Per touched group, from its buffers |
-| Base deltas | The driving deltas are the `Dlt` halves of the collected groups, pushed through typed input handles; `prepare` completes `Dlt` for general changes | The complete changes of the stored entries, `Dlt`, from index maintenance (A2) |
+| Delta delivery | Each join receives its whole driving delta once, at the transaction's flush; its partner reads are the batches of typed readers that one session filled | Per touched group, from its buffers |
+| Base deltas | The driving deltas are the readers' `Dlt` batches, which the circuit's sources emit at the flush; `prepare` completes `Dlt` for general changes | The complete changes of the stored entries, `Dlt`, from index maintenance (A2) |
 | Versions | `Old` for before reads; `Old` then `Dlt`, unconsolidated, for after reads | Same |
 | Owner-key change | `prepare` emits both folded keys of each moved line item, reading its lines from `Old` | Same |
-| Cursors and seeks | One session per transaction: one forward cursor over `Old`, each buffered old entry read once, untouched groups passed. The readers read the buffers and open no cursor | Same |
+| Cursors and seeks | One session per transaction: one forward cursor over `Old`, each buffered old entry read once, untouched groups passed. The partner reads are the readers' batches and open no cursor on the index | Same |
 | Key order | Folded byte keys compared as bytes; signed integers in value order, tested | Folded order |
 | Counters | `SessionCounts` and the run counters (`index_session_counts`, `index_run_reads.session`; measurement version 8) | Same |
 
@@ -312,10 +342,9 @@ This table refreshes `tab:prototype`.
 
 These are implementation questions, not algorithm questions:
 
-- **Feeding the view side from `Dlt`.** Done in step 4: the driving deltas are the `Dlt` halves of the collected groups. Two copies remain at the DBSP boundary until step 5: the driving deltas into the input handles, and each reader's partner vector into the snapshot-reader join.
+- **Feeding the view side from `Dlt`.** Done in step 4, and without a push since step 5: the driving deltas are the readers' `Dlt` batches. One copy remains at the DBSP boundary, `J⁺`'s partner rows.
 - **The cost model.** A logical seek costs one seek per run of the snapshot. Decoding has four levels: key, value, weight, and payload. [No extra decoding](#no-extra-decoding) sets the rules and the counters that check them.
-- **The join-plan type.** The operator interprets it: the joins with their keys and delta terms, each term's version and kind (path or range), and any selections and projections between them. The callback evaluates it over a group's buffers.
-- **Output.** Emit chunks of the size DBSP expects, and leave consolidation to DBSP's batcher.
+- **The join plan.** The DBSP circuit itself (decision of 2026-11-11); each join's partner read is a typed reader.
 - **Workers.** One worker, as decided on 2026-10-12. Sharding by `custkey` is deferred.
 
 ## Coding roadmap
@@ -455,7 +484,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
      - Eight old rows and five delta rows: the counts show the mechanism, not a scale.
      - The placement is whatever each arm's pressure produced (Critical in every sample, in 5 of 5 repeats), not a typical workload's. At Critical pressure every run, the delta batches included, is in a file, so the old state is not in files with the delta in memory as a long-running pipeline would have it. The user decided on 2026-11-10 not to imitate that placement.
-     - The session does not compute the view change itself: the view circuit's joins do, over copies of the buffered partner vectors, until step 5.
+     - The session does not compute the view change itself: the view circuit's joins do, over copies of the buffered partner vectors (since step 5, over the readers' batches).
      - Pressure is sampled. The tests print the level at three points and pin counts, never a level or a layout, except that a native run whose reads are all decodes pins the 6 + 1 split.
      - Real conclusions wait for a full realistic workload.
 
@@ -494,11 +523,20 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
      - `q3-trie-view-circuit`: `deltas_beyond_rf1_rf2_match_the_brute_force_join` and `single_stream_transactions_and_empty_ones_match`;
      - harness: `general_transcript`, `random_general_changes_match_the_reference_join`, and `native_deltas_match_full_join_across_updates`, which now runs in both builds (its orphan line included); `session_worked_transaction_tests` also runs the view circuit.
    - *Retired tests:* `rejects_missing_placement_and_incomplete_rf2`, `publication_and_batch_local_placement_are_required`, `candidate_locations_follow_each_snapshot_without_duplicating_rows`, `requested_orders_require_nonempty_candidate_locations`, `cancelled_and_missing_keys_have_no_values`, and `todays_readers_run_reads_on_the_worked_transaction` (its table under step 1 stays as history).
-5. **Buffered-execution session.**
-   - The join-plan type, plus one operator that drives the scan session. The operator supplies `Maintain`'s `on_group` callback, which evaluates `ΔJ` and `ΔV` over a group's buffers and emits rows; the session then releases the buffers. It replaces step 4's two joins, which now take turns per group inside the callback.
-   - It is exact for any plan with path or range reads.
-   - Collection decodes only buffered entries (step 2's rules).
-   - *Exit:* the counters show each buffered old entry read and decoded once, and none of Q3's invoices decoded beyond their keys. The transcript comparison passes.
+5. **Typed readers filled at collection.** *Done 2026-11-11* (decisions of 2026-11-11 in [decisions.md](decisions.md)). DBSP's joins stay; only their partner reads change.
+   - `crates/dbsp/src/trace/merged_index/reader.rs` ([Readers](#readers-step-5)): `Reader<D, K, V>`, `reader::collect`, `ReaderRuns`, and `TouchedGroups`.
+   - `merged-index-col/src/q3.rs`: four readers (customers by `custkey`, orders by `custkey`, orders by `(custkey, orderkey)`, and line items by `(custkey, orderkey)`). `C⁺`, `O⁻`, and `L⁻` check that each requested customer was collected and return the reader's batches. `J⁺` is `J`'s join on each requested path. `VirtualBuffer`, `Version`, `Node`, and the per-stream groups are gone. `customer_deltas`, `order_deltas`, and `line_deltas` replace `push_driving_deltas`.
+   - `q3-trie-view-circuit`: three `TransactionGenerator` sources replace the input handles; `build` returns the catalog only.
+   - Harness: the view phase is `collect`, the transaction, and `finish`. Measurement version 10.
+   - *Exit:*
+     - Both transcript comparisons pass (`verify.sh`).
+     - Each buffered old entry is read and decoded once: `session_run_reads_on_the_worked_transaction` and `collect_reads_the_index_once_and_the_readers_not_at_all` keep their pins, and a second reader of a stream costs no payload decode (`a_second_reader_of_a_stream_costs_no_payload_decode`).
+     - COL has no invoices. A position outside `inputs` costing a key decode only is pinned by the session's counter tests (step 2).
+   - *New tests:*
+     - `supplied_snapshot_join_sees_a_delta_emitted_at_the_flush` (`join.rs`);
+     - the `merged_index::reader` tests, among them the property test `readers_match_a_brute_force`;
+     - COL's `readers_match_a_brute_force`, renamed from `virtual_buffer_reads_match_a_brute_force`, whose before and after reads now cover the whole touched groups.
+   - *Not done:* reading the readers' rows without building batches (`J⁺`'s copy remains), and releasing each group before the next.
 6. **Measurement, new version.**
    - Add the counters to `measure.py`, and run the native and reconstructed (buffered) modes on Linux, with the session's `Pass` knob as an A/B.
    - *Exit:* raw artifacts under `target/`; [measurement.md](measurement.md) reports base and IVM side by side.
@@ -527,10 +565,16 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
 
 Step 4 (2026-11-10):
 
-- `Arc<OnceLock<TrieInputs>>` as the hand-off of the input handles from the circuit builder to the harness, as `view_worker_cache` does for the cache.
 - No `ERROR_VIEW` in the hand-written circuit; the generated circuit's error view is absent from the reconstructed build.
-- The IVM window (settled on 2026-11-11, measurement version 9): in reconstructed mode `q3_ms` and `ivm_ms` include the session's collection; the push of the driving deltas is booked in `forward_ms`, as native's feed is. Completing `Dlt` stays in `index_ms`.
+- The IVM window (settled on 2026-11-11, measurement version 9): in reconstructed mode `q3_ms` and `ivm_ms` include the session's collection. Completing `Dlt` stays in `index_ms`. Since step 5 (version 10) reconstructed mode has no push to book in `forward_ms`.
 - `on_group` takes the buffers by value, not by reference, so that `collect` can keep them until `finish`.
-- The reader shape: each reader is a `Version` and a `Node` description over a borrowing `VirtualBuffer`, as the seed of step 5's join-plan type.
 - The compiler hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused; removing it is a follow-up.
 - Owner lookup sources: for an order that is not in the delta, the driver passes the pre-transaction `BaseState` and tests pass `Reference`, both counted under `BaseRelation`.
+
+Step 5 (2026-11-11):
+
+- The readers' sources clone the `Dlt` batches into the circuit inside the view transaction, so that copy falls in `q3_ms`. The decision of 2026-11-11 put the boundary copy outside the IVM window. The clone is one batch copy per stream, with no decode or projection. Timing it apart is unconfirmed.
+- Each group's `GroupBuffers` are built and then dropped once routed, rather than the session writing into the readers directly. `ScanSession` is unchanged.
+- The contract check: a partner read walks its driving delta's keys and errors on a customer outside the touched groups, as step 4's readers did.
+- A projection is a function pointer, `fn(&Key, &Payload) -> Result<(K, V), String>`, which errors on an entry of another stream.
+- `TransactionGenerator` as the view circuit's input, one source per driving delta.
