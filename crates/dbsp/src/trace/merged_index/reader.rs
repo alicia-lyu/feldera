@@ -13,7 +13,8 @@
 //! A sealed reader, [`ReaderRuns`], holds two batches of the join's type:
 //!
 //! * `Old`'s rows, the read before the transaction ([`ReaderRuns::before`]);
-//! * `Dlt`'s rows, the transaction's driving delta ([`ReaderRuns::delta`]).
+//! * `Dlt`'s rows, the transaction's driving delta ([`ReaderRuns::delta`],
+//!   or [`ReaderRuns::take_delta`] to move it out).
 //!
 //! The read after the transaction is both batches in one snapshot, kept apart
 //! and unconsolidated, since a join is bilinear (`prop:overlay`).
@@ -139,10 +140,20 @@ impl<K: DBData, V: DBData> ReaderRuns<K, V> {
         Self::snapshot([self.old.clone(), self.dlt.clone()])
     }
 
-    /// The driving delta: `Dlt`'s rows. The batch is cloned, since the
-    /// after read may share it; nothing is decoded or projected again.
+    /// The driving delta: `Dlt`'s rows, cloned, for a reader whose after
+    /// read shares the batch. Nothing is decoded or projected again.
     pub fn delta(&self) -> OrdIndexedZSet<K, V> {
         TypedBatch::new((*self.dlt).clone())
+    }
+
+    /// Moves the driving delta out, for a reader whose after read is not
+    /// used: the reader keeps an empty `Dlt` batch, so its after read equals
+    /// its before read from then on. The batch is copied only if some
+    /// snapshot from [`Self::after`] still shares it.
+    pub fn take_delta(&mut self) -> OrdIndexedZSet<K, V> {
+        let empty = Arc::new(OrdIndexedZSet::<K, V>::empty().into_inner());
+        let dlt = std::mem::replace(&mut self.dlt, empty);
+        TypedBatch::new(Arc::try_unwrap(dlt).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     fn snapshot(

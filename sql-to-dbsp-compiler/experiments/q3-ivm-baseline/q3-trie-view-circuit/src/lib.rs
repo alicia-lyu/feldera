@@ -13,9 +13,9 @@
 //! `L` by `(custkey, orderkey, linenumber)`. A line item carries its customer, and
 //! `J` keeps `(custkey, orderkey)`.
 //!
-//! **(A2) Complete deltas.** The inputs are the transaction's `Dlt`: three sources
-//! emit the readers' `Dlt` batches at the commit's flush ([`Q3State::customer_deltas`]
-//! and its siblings), every row at its full trie path. The joins are the
+//! **(A2) Complete deltas.** The inputs are the transaction's `Dlt`: the driver sets the
+//! readers' `Dlt` batches ([`Q3State::take_driving_deltas`]) into three input handles of
+//! DBSP's `Input` operator, as native mode feeds its own, every row at its full trie path. The joins are the
 //! snapshot-reader joins of `merged_index_col::q3`, so the four partner reads are
 //! `C⁺`, `O⁻`, `J⁺`, and `L⁻`; only their keys differ from the generated circuit's.
 //!
@@ -23,43 +23,50 @@
 //! There is no `ERROR_VIEW`.
 
 use dbsp::{
-    circuit::{circuit_builder::Circuit, RootCircuit},
-    operator::TransactionGenerator,
+    circuit::RootCircuit,
     utils::{Tup2, Tup3, Tup9},
-    Error, OrdZSet, Stream,
+    Error, InputHandle, OrdZSet, Stream,
 };
 use dbsp_adapters::Catalog;
 use feldera_sqllib::{Date, SqlDecimal, SqlString, Variant};
 use feldera_types::{deserialize_table_record, serialize_table_record};
-use merged_index_col::q3::{join_lineitems_orders, join_orders_customers, Q3State};
+use merged_index_col::q3::{
+    join_lineitems_orders, join_orders_customers, CustomerByCustkeyVector, DrivingDeltas,
+    LineitemByCustkeyOrderkeyVector, OrdersByCustkeyVector, Q3State,
+};
 
 /// A row of `V`: `(c_custkey, c_mktsegment, o_orderkey, o_orderdate,
 /// o_shippriority, l_linenumber, l_extendedprice, l_discount, l_shipdate)`.
 pub type ViewTuple =
     Tup9<i64, SqlString, i64, Date, i32, i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>;
 
-/// A source that emits one driving delta, `delta(state)`, at each transaction's flush, and
-/// an empty batch on the other steps. The caller collects the readers before the transaction.
-fn driving_delta<B: Default + Clone + 'static>(
-    circuit: &mut RootCircuit,
-    state: Q3State,
-    delta: fn(&Q3State) -> Result<B, String>,
-) -> Stream<RootCircuit, B> {
-    circuit.add_source(TransactionGenerator::new(move |flush| {
-        if flush {
-            delta(&state).expect("Q3 driving delta: collect the readers before the transaction")
-        } else {
-            B::default()
-        }
-    }))
+/// The circuit's three input handles. Each takes one whole driving delta, already indexed by
+/// its join key, a prefix of its trie path.
+#[derive(Clone)]
+pub struct TrieInputs {
+    pub customers: InputHandle<CustomerByCustkeyVector>,
+    pub orders: InputHandle<OrdersByCustkeyVector>,
+    pub lines: InputHandle<LineitemByCustkeyOrderkeyVector>,
 }
 
-/// Builds the sources and joins in `circuit` and returns the stream of `V`.
-pub fn view(circuit: &mut RootCircuit, state: Q3State) -> Stream<RootCircuit, OrdZSet<ViewTuple>> {
-    // Each delta is already indexed by its join key, a prefix of its trie path.
-    let customers_by_custkey = driving_delta(circuit, state.clone(), Q3State::customer_deltas);
-    let orders_by_custkey = driving_delta(circuit, state.clone(), Q3State::order_deltas);
-    let lines_by_order = driving_delta(circuit, state.clone(), Q3State::line_deltas);
+impl TrieInputs {
+    /// Hands one transaction's driving deltas to the circuit's one worker. `Input` emits them
+    /// on the transaction's next step.
+    pub fn set(&self, deltas: DrivingDeltas) {
+        self.customers.set_for_worker(0, deltas.customers);
+        self.orders.set_for_worker(0, deltas.orders);
+        self.lines.set_for_worker(0, deltas.lines);
+    }
+}
+
+/// Builds the joins in `circuit` and returns the input handles and the stream of `V`.
+pub fn view(
+    circuit: &mut RootCircuit,
+    state: Q3State,
+) -> (TrieInputs, Stream<RootCircuit, OrdZSet<ViewTuple>>) {
+    let (customers_by_custkey, customers) = circuit.add_input_stream::<CustomerByCustkeyVector>();
+    let (orders_by_custkey, orders) = circuit.add_input_stream::<OrdersByCustkeyVector>();
+    let (lines_by_order, lines) = circuit.add_input_stream::<LineitemByCustkeyOrderkeyVector>();
 
     // `J` keeps `(custkey, orderkey)`: the node at which `V` reads it.
     let joined = join_orders_customers(
@@ -73,7 +80,7 @@ pub fn view(circuit: &mut RootCircuit, state: Q3State) -> Stream<RootCircuit, Or
             ))
         },
     );
-    join_lineitems_orders(
+    let view = join_lineitems_orders(
         &lines_by_order,
         &joined,
         state,
@@ -90,6 +97,14 @@ pub fn view(circuit: &mut RootCircuit, state: Q3State) -> Stream<RootCircuit, Or
                 line.3,
             )
         },
+    );
+    (
+        TrieInputs {
+            customers,
+            orders,
+            lines,
+        },
+        view,
     )
 }
 
@@ -158,16 +173,16 @@ serialize_table_record!(ViewRecord[9]{
 const VIEW_SCHEMA: &str = r#"{"name":"v","case_sensitive":false,"fields":[{"name":"c_custkey","case_sensitive":false,"columntype":{"nullable":false,"type":"BIGINT"},"unused":false},{"name":"c_mktsegment","case_sensitive":false,"columntype":{"nullable":false,"precision":-1,"type":"VARCHAR"},"unused":false},{"name":"o_orderkey","case_sensitive":false,"columntype":{"nullable":false,"type":"BIGINT"},"unused":false},{"name":"o_orderdate","case_sensitive":false,"columntype":{"nullable":false,"type":"DATE"},"unused":false},{"name":"o_shippriority","case_sensitive":false,"columntype":{"nullable":false,"type":"INTEGER"},"unused":false},{"name":"l_linenumber","case_sensitive":false,"columntype":{"nullable":false,"type":"INTEGER"},"unused":false},{"name":"l_extendedprice","case_sensitive":false,"columntype":{"nullable":false,"precision":15,"scale":2,"type":"DECIMAL"},"unused":false},{"name":"l_discount","case_sensitive":false,"columntype":{"nullable":false,"precision":4,"scale":2,"type":"DECIMAL"},"unused":false},{"name":"l_shipdate","case_sensitive":false,"columntype":{"nullable":false,"type":"DATE"},"unused":false}],"materialized":true}"#;
 
 /// Builds the circuit and registers `V` as a materialized output, as the generated circuit
-/// does. Returns the catalog, which holds `V` alone.
-pub fn build(circuit: &mut RootCircuit, state: Q3State) -> Result<Catalog, Error> {
+/// does. Returns the catalog, which holds `V` alone, and the input handles.
+pub fn build(circuit: &mut RootCircuit, state: Q3State) -> Result<(Catalog, TrieInputs), Error> {
     let mut catalog = Catalog::new();
-    let view = view(circuit, state);
+    let (inputs, view) = view(circuit, state);
     catalog.register_materialized_output_zset_persistent::<_, ViewRecord>(
         Some("q3-trie-view-circuit/v"),
         view,
         VIEW_SCHEMA,
     );
-    Ok(catalog)
+    Ok((catalog, inputs))
 }
 
 #[cfg(test)]

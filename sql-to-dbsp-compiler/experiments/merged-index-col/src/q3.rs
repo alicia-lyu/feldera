@@ -13,7 +13,7 @@
 //! re-evaluated on the path of each requested `(custkey, orderkey)`, from the
 //! customers' and the orders-by-order readers' after reads; its rows are the
 //! one copy left at the DBSP boundary. The driving deltas are the readers'
-//! `Dlt` batches ([`Q3State::customer_deltas`] and its siblings). A request outside the touched
+//! `Dlt` batches ([`Q3State::take_driving_deltas`]). A request outside the touched
 //! groups breaks the contract that every driving-delta key lies in a group
 //! that `Dlt` touches, and is an error.
 
@@ -82,6 +82,14 @@ impl AddAssign for SessionReads {
     }
 }
 
+/// The driving deltas of one transaction, `ΔC`, `ΔO`, and `ΔL`: the readers'
+/// `Dlt` batches, indexed by the joins' keys. Every row carries its trie keys.
+pub struct DrivingDeltas {
+    pub customers: CustomerByCustkeyVector,
+    pub orders: OrdersByCustkeyVector,
+    pub lines: LineitemByCustkeyOrderkeyVector,
+}
+
 /// The sealed readers of one transaction, and what collecting them read.
 struct CollectedReaders {
     customers: ReaderRuns<Tup1<i64>, Tup1<SqlString>>,
@@ -90,6 +98,8 @@ struct CollectedReaders {
     lines: ReaderRuns<Tup2<i64, i64>, Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>,
     touched: TouchedGroups,
     reads: SessionReads,
+    /// Until [`Q3State::take_driving_deltas`] hands them over.
+    driving: Mutex<Option<DrivingDeltas>>,
 }
 
 impl CollectedReaders {
@@ -118,7 +128,8 @@ struct ReadViews {
 /// Publish `Old`, the index snapshot before the transaction, and `Dlt`, the
 /// run of the transaction's signed index changes, after index maintenance and
 /// before the view transaction. [`Self::collect`] then fills the readers; the
-/// circuit's source takes the driving deltas and the joins the partner reads.
+/// driver takes the driving deltas for the circuit's input handles
+/// ([`Self::take_driving_deltas`]), and the joins take the partner reads.
 /// Keep the publication unchanged until `DBSPHandle::transaction` or the
 /// equivalent multi-step commit has completed, then call [`Self::finish`]: the
 /// readers are held until then, since `J` and `V` are separate operators and
@@ -174,13 +185,24 @@ impl Q3State {
             Ok::<_, String>((touched, session.counts()))
         })?;
         let run_reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
+        // `ΔO` and `ΔL` are moved out of readers that serve before reads only.
+        // `ΔC` is cloned: its batch is also half of `C⁺`, the customers' after read.
+        let customers = customers.seal();
+        let mut orders_by_customer = orders_by_customer.seal();
+        let mut lines = lines.seal();
+        let driving = DrivingDeltas {
+            customers: customers.delta(),
+            orders: orders_by_customer.take_delta(),
+            lines: lines.take_delta(),
+        };
         let collected = CollectedReaders {
-            customers: customers.seal(),
-            orders_by_customer: orders_by_customer.seal(),
+            customers,
+            orders_by_customer,
             orders_by_order: orders_by_order.seal(),
-            lines: lines.seal(),
+            lines,
             touched,
             reads: SessionReads { counts, run_reads },
+            driving: Mutex::new(Some(driving)),
         };
         views
             .collected
@@ -220,26 +242,18 @@ impl Q3State {
             .ok_or_else(|| "publish merged-index views before Q3 maintenance".into())
     }
 
-    // The transaction's driving deltas, `ΔC`, `ΔO`, and `ΔL`, are the readers'
-    // `Dlt` batches, indexed by the joins' keys. Every row carries its trie keys.
-
-    /// `ΔC`, by `custkey`.
-    pub fn customer_deltas(&self) -> Result<CustomerByCustkeyVector, String> {
-        Ok(self.views()?.collected_readers()?.customers.delta())
-    }
-
-    /// `ΔO`, by `custkey`.
-    pub fn order_deltas(&self) -> Result<OrdersByCustkeyVector, String> {
-        Ok(self
-            .views()?
+    /// Hands over the transaction's driving deltas, once, for the view
+    /// circuit's input handles.
+    pub fn take_driving_deltas(&self) -> Result<DrivingDeltas, String> {
+        let views = self.views()?;
+        let mut driving = views
             .collected_readers()?
-            .orders_by_customer
-            .delta())
-    }
-
-    /// `ΔL`, by `(custkey, orderkey)`.
-    pub fn line_deltas(&self) -> Result<LineitemByCustkeyOrderkeyVector, String> {
-        Ok(self.views()?.collected_readers()?.lines.delta())
+            .driving
+            .lock()
+            .map_err(|_| "Q3 driving deltas lock poisoned")?;
+        driving
+            .take()
+            .ok_or_else(|| "the driving deltas were already taken".to_owned())
     }
 
     /// `C⁺`: the customers after the transaction, driven by `ΔO`. A path read

@@ -262,6 +262,41 @@ fn the_after_read_keeps_old_and_dlt_apart() {
 }
 
 #[test]
+fn taking_the_delta_moves_it_and_leaves_the_before_read() {
+    let old = vec![vec![row(Key::B(1, 1), 20, 1)]];
+    let dlt = vec![row(Key::B(1, 2), 21, 1)];
+    let mut collected = collect_all(&old, &dlt).unwrap();
+
+    let delta = collected.b_by_a.take_delta();
+    assert_eq!(
+        rows::<u8, Tup2<u8, u8>>(delta.inner()),
+        vec![(1, Tup2(2, 21), 1)]
+    );
+    assert_eq!(
+        rows::<u8, Tup2<u8, u8>>(collected.b_by_a.before().inner()),
+        vec![(1, Tup2(1, 20), 1)]
+    );
+    // The reader's `Dlt` batch is now empty, so its after read is its before read.
+    assert!(rows::<u8, Tup2<u8, u8>>(collected.b_by_a.delta().inner()).is_empty());
+    assert_eq!(
+        summed(rows::<u8, Tup2<u8, u8>>(collected.b_by_a.after().inner())),
+        BTreeMap::from([((1, Tup2(1, 20)), 1)])
+    );
+
+    // An after snapshot that still shares the batch makes the take a copy.
+    let after = collected.b_by_ab.after();
+    let shared = collected.b_by_ab.take_delta();
+    assert_eq!(
+        rows::<Tup2<u8, u8>, u8>(shared.inner()),
+        vec![(Tup2(1, 2), 21, 1)]
+    );
+    assert_eq!(
+        summed(rows::<Tup2<u8, u8>, u8>(after.inner())),
+        BTreeMap::from([((Tup2(1, 1), 20), 1), ((Tup2(1, 2), 21), 1)])
+    );
+}
+
+#[test]
 fn a_second_reader_of_a_stream_costs_no_payload_decode() {
     let old = vec![vec![
         row(Key::A(1), 10, 1),

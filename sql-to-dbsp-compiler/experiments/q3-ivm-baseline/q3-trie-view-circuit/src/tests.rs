@@ -23,7 +23,7 @@ use merged_index_col::{
     OrdersByCustkeyOrderkeyKey, OrdersByCustkeyOrderkeyPayload, Payload, StoredPayload,
 };
 
-use super::{view, ViewTuple};
+use super::{view, TrieInputs, ViewTuple};
 
 type Row = (Key, Payload, i64);
 
@@ -159,9 +159,10 @@ fn rows_of(zset: &OrdZSet<ViewTuple>) -> BTreeMap<ViewTuple, i64> {
 fn check(transactions: Vec<Vec<Row>>) {
     let state = Q3State::default();
     let build_state = state.clone();
-    let (mut circuit, output): (_, OutputHandle<OrdZSet<ViewTuple>>) =
+    let (mut circuit, (inputs, output)): (_, (TrieInputs, OutputHandle<OrdZSet<ViewTuple>>)) =
         Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
-            Ok(view(circuit, build_state.clone()).output())
+            let (inputs, view) = view(circuit, build_state.clone());
+            Ok((inputs, view.output()))
         })
         .unwrap();
 
@@ -182,6 +183,7 @@ fn check(transactions: Vec<Vec<Row>>) {
         runs.push(dlt.clone());
         state.publish(old, dlt).unwrap();
         state.collect(Pass::Seek).unwrap();
+        inputs.set(state.take_driving_deltas().unwrap());
         circuit.transaction().unwrap();
         state.finish().unwrap();
 

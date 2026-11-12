@@ -412,11 +412,15 @@ fn driving_deltas_carry_trie_keys() {
             line(3, 20, 1, 100, 1),
         ],
     );
-    let (customers, orders, lines) = (
-        state.customer_deltas().unwrap(),
-        state.order_deltas().unwrap(),
-        state.line_deltas().unwrap(),
-    );
+    let DrivingDeltas {
+        customers,
+        orders,
+        lines,
+    } = state.take_driving_deltas().unwrap();
+    assert!(state
+        .take_driving_deltas()
+        .err()
+        .is_some_and(|error| error.contains("already taken")));
     state.finish().unwrap();
 
     assert_eq!(

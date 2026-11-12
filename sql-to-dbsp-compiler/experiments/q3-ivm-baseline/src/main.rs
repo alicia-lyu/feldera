@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
-#[cfg(all(test, feature = "merged-index"))]
+#[cfg(feature = "merged-index")]
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -344,6 +344,9 @@ struct Pipeline {
     orphans: OrphanLines,
     #[cfg(feature = "merged-index")]
     q3_state: Q3State,
+    /// The view circuit's input handles, which take each transaction's driving deltas.
+    #[cfg(feature = "merged-index")]
+    view_inputs: q3_trie_view_circuit::TrieInputs,
     /// The buffer cache that the view circuit's worker saw when it built the circuit, for the
     /// test that the index's thread shares it.
     #[cfg(all(test, feature = "merged-index"))]
@@ -364,15 +367,24 @@ impl Pipeline {
         let view_worker_cache = Arc::new(OnceLock::new());
         #[cfg(all(test, feature = "merged-index"))]
         let probe = view_worker_cache.clone();
-        // The constructor runs on the view circuit's worker. The view circuit's sources take the
-        // driving deltas from `view_state`, so it has no input handles.
+        // The constructor runs on the view circuit's worker, which hands its input handles to
+        // the driver. The reconstructed build runs one worker, so the circuit is built once.
+        #[cfg(feature = "merged-index")]
+        let view_input_slot = Arc::new(OnceLock::new());
+        #[cfg(feature = "merged-index")]
+        let view_input_probe = view_input_slot.clone();
         #[cfg(feature = "merged-index")]
         let view_constructor = CircuitConstructor::new(move |circuit: &mut RootCircuit| {
             #[cfg(test)]
             probe
                 .set(Runtime::buffer_cache().expect("the worker has a buffer cache"))
                 .expect("the view circuit is built once");
-            q3_trie_view_circuit::build(circuit, view_state.clone()).map_err(anyhow::Error::from)
+            let (catalog, inputs) = q3_trie_view_circuit::build(circuit, view_state.clone())
+                .map_err(anyhow::Error::from)?;
+            view_input_probe
+                .set(inputs)
+                .map_err(|_| anyhow::anyhow!("the view circuit is built once"))?;
+            Ok(catalog)
         });
         #[cfg(not(feature = "merged-index"))]
         let view_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
@@ -395,6 +407,11 @@ impl Pipeline {
         // the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
         let index = ManualIndex::new(base.circuit.runtime())?;
+        #[cfg(feature = "merged-index")]
+        let view_inputs = view_input_slot
+            .get()
+            .context("the view circuit did not hand over its input handles")?
+            .clone();
         Ok(Self {
             base,
             view,
@@ -405,6 +422,8 @@ impl Pipeline {
             orphans: OrphanLines::default(),
             #[cfg(feature = "merged-index")]
             q3_state,
+            #[cfg(feature = "merged-index")]
+            view_inputs,
             #[cfg(all(test, feature = "merged-index"))]
             view_worker_cache,
         })
@@ -438,6 +457,17 @@ impl Pipeline {
     fn collect_groups(&self) -> Result<()> {
         self.in_cache(|| self.q3_state.collect(Pass::Seek))
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Hands the readers' `Dlt` batches, the driving deltas, to the view circuit's input
+    /// handles: `ΔO` and `ΔL` are moved, and `ΔC` is a clone (see `Q3State::collect`).
+    fn feed_driving_deltas(&self) -> Result<()> {
+        let deltas = self
+            .q3_state
+            .take_driving_deltas()
+            .map_err(anyhow::Error::msg)?;
+        self.view_inputs.set(deltas);
+        Ok(())
     }
 }
 
@@ -684,19 +714,34 @@ fn transact_inner(
     let view_reads_before = pipeline.view.circuit.run_reads()?;
     let view_started = Instant::now();
     // The IVM window of the reconstructed build starts with the scan session, which reads the
-    // index once for the whole transaction and fills the readers. The view circuit's sources
-    // take the driving deltas from the readers inside the transaction: there is no push.
+    // index once for the whole transaction and fills the readers. Handing the readers' `Dlt`
+    // batches to the input handles is the counterpart of native's feed, so it is booked in
+    // `forward_ms` and the window resumes with the transaction.
     #[cfg(feature = "merged-index")]
-    let transaction_result = pipeline.collect_groups().and_then(|()| {
-        pipeline
-            .view
-            .circuit
-            .transaction()
-            .map_err(anyhow::Error::from)
-    });
+    let (transaction_result, latency) = {
+        let collection_result = pipeline.collect_groups();
+        let collection = view_started.elapsed();
+        let feed_started = Instant::now();
+        let feed_result = collection_result.and_then(|()| pipeline.feed_driving_deltas());
+        stats.forward += feed_started.elapsed();
+        let transaction_started = Instant::now();
+        let transaction_result = feed_result.and_then(|()| {
+            pipeline
+                .view
+                .circuit
+                .transaction()
+                .map_err(anyhow::Error::from)
+        });
+        (
+            transaction_result,
+            collection + transaction_started.elapsed(),
+        )
+    };
     #[cfg(not(feature = "merged-index"))]
-    let transaction_result = pipeline.view.circuit.transaction();
-    let latency = view_started.elapsed();
+    let (transaction_result, latency) = {
+        let transaction_result = pipeline.view.circuit.transaction();
+        (transaction_result, view_started.elapsed())
+    };
     let view_reads_after = pipeline.view.circuit.run_reads()?;
     if let (Some(before), Some(base_after)) = (cpu_before, base_cpu_after) {
         let view_after = profiled_cpu(&mut pipeline.view.circuit)?;
@@ -878,15 +923,17 @@ fn publish_net_delta(
 }
 
 /// Runs the view circuit's transaction, as one of three steps when `stepped`. In reconstructed
-/// mode the caller has published `Old` and `Dlt`: the session fills the readers, and the
-/// publication is finished here. The circuit's sources emit the driving deltas at the commit,
-/// and the joins read their partners there, so the steps share the one collection.
+/// mode the caller has published `Old` and `Dlt`: the session fills the readers, the driving
+/// deltas reach the input handles before the first step, and the publication is finished
+/// here. The joins' accumulators hold the deltas until the commit, where the joins read their
+/// partners, so the steps share the one collection.
 #[cfg(test)]
 fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result<()> {
     #[cfg(feature = "merged-index")]
     {
         drop(net_delta);
         pipeline.collect_groups()?;
+        pipeline.feed_driving_deltas()?;
         if stepped {
             pipeline.view.circuit.start_transaction()?;
             for _ in 0..3 {
@@ -1557,9 +1604,9 @@ fn finish_loading(
 /// upkeep. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `ivm_ms` is
 /// incremental view maintenance and equals `q3_ms`, the view circuit's transaction (in
 /// reconstructed mode, with the scan session's collection before it). `forward_ms` holds the
-/// net delta read, and in native mode its feed into the view circuit's input handles.
-/// Reconstructed mode has no such copy: the circuit's sources take the readers' `Dlt` batches
-/// inside the transaction (measurement version 10). The base circuit, `forward_ms`, the index append and `q3_ms` are
+/// net delta read and the feed of the driving deltas into the view circuit's input handles:
+/// native's rows, and in reconstructed mode the readers' `Dlt` batches (measurement version
+/// 10). The base circuit, `forward_ms`, the index append and `q3_ms` are
 /// disjoint intervals of the transaction; the base and IVM phases are always reported side by side.
 fn phase_json(stats: &Measurements) -> Value {
     json!({
@@ -1574,7 +1621,7 @@ fn phase_json(stats: &Measurements) -> Value {
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
         "ivm_ms": milliseconds(stats.ivm_phase()),
-        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it also includes the scan session's collection of the touched groups into the typed readers, and the circuit's sources take the driving deltas (the readers' Dlt batches) inside the transaction. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and in native mode its feed into the view circuit's input handles; reconstructed mode has no feed), discovery, preparation and publication/cleanup are in neither.",
+        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it also includes the scan session's collection of the touched groups into the typed readers. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and the feed of the driving deltas into the view circuit's input handles: native's rows, or reconstructed's hand-off of the readers' Dlt batches, moved for orders and line items and cloned for customers), discovery, preparation and publication/cleanup are in neither.",
         "verification_ms_excluded": milliseconds(stats.verification),
         "profiled_cpu_ms": stats.profiled_cpu.map(|cpu| json!({
             "base": milliseconds(cpu.base),
@@ -4002,6 +4049,7 @@ mod session_worked_transaction_tests {
 
                 // The view circuit takes the same readers' driving deltas, and `V` must be the
                 // independent join of the new state.
+                pipeline.feed_driving_deltas()?;
                 pipeline.view.circuit.transaction()?;
                 let session = pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
                 let output = pipeline
