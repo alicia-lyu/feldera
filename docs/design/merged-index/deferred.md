@@ -6,6 +6,8 @@ The designs and work items here are not implemented. None is a prerequisite for 
 - Shared scan sessions that let several readers share one range cursor.
 - Later work on the general merged-index definition, outside its roadmap.
 - Native packing of values.
+- Selective execution.
+- The whole-group over-read for narrow requests.
 
 ## What R3 does instead
 
@@ -273,6 +275,15 @@ Selective execution visited only the instance nodes that requests needed, and ke
 - **Result.** On the worked transaction, two forward logical seeks served all four reads, and `v2`, `v8`, and `c6` were never decoded.
 
 Buffered execution replaces it as the fallback and as the only target. Reviving selective execution means restoring the request queues and `Visit` over the same `RunMerge`, `Old`, and `Dlt`, and showing (A3) for the circuit.
+
+## Whole-group over-read for narrow requests
+
+Deferred on 2026-11-12. The scan session visits every position of each touched customer's group, while the joins' partner reads need only a slice of it: an inserted line item needs its order and customer, not the customer's other orders and their lines.
+
+- **Evidence.** In the version 10 smoke run (`target/r5-v10-smoke/`, [measurement.md](measurement.md)), the session buffered 34 to 94 `Old` entries per touched group per refresh, against native's 73 to 134 DBSP operator key reads for the whole refresh. Each refresh touched 8 to 10 groups.
+- **The workloads do not test clustering.** At scale factor 0.01, clustered RF1 puts its 10 Orders on 8 to 10 Customers, so almost every touched customer receives one order. Reading a group once pays off only when one group serves many requests. A fair test needs many Orders per Customer.
+- **First mitigation (2026-11-12).** Each reader keeps only the rows its driving delta requests, and only those entries are decoded ([decisions.md](decisions.md)). The joins and their counters no longer see the over-read. The key read per position remains.
+- **Next step.** The routing cursor seeks past a subtree that no reader requests, such as an order with no change and no changed customer, together with its lines. This is close to the `Skip` of [selective execution](#selective-execution), restricted to one group.
 
 ## General merged-index definition: later work
 
