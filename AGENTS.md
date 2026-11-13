@@ -71,7 +71,7 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 | --- | --- |
 | Folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
 | Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
-| Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit; unused since 2026-11-10, when the hand-written `q3-trie-view-circuit` replaced it | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
+| Hand-written reconstructed view circuit (replaced the compiler hook `--q3-merged-index` on 2026-11-10; the hook was removed on 2026-11-13) | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/q3-trie-view-circuit/` |
 | COL keys, payloads, Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 

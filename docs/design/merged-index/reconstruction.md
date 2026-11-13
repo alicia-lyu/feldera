@@ -21,9 +21,9 @@ The COL keys nest customer, order, and line prefixes, so the four reads (`C` aft
 
 The reader contract is in the function's doc comment: the left reader returns right state after the current update; the right reader returns left state before it. The caller keeps the state behind each snapshot valid through the flush.
 
-The reconstructed Q3 circuit uses two such joins, which together replace four traces (see [native-state-read-contracts.md](native-state-read-contracts.md)). Since 2026-11-10 the circuit is hand-written (`q3-ivm-baseline/q3-trie-view-circuit`): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, and `V` joins on `(custkey, orderkey)`, so each join's key is on the trie (A1). The compiler hook `--q3-merged-index` (`Q3MergedIndexBinding.java`, `ToRustVisitor.java`) that used to emit the circuit stays in Java, unused.
+The reconstructed Q3 circuit uses two such joins, which together replace four traces (see [native-state-read-contracts.md](native-state-read-contracts.md)). Since 2026-11-10 the circuit is hand-written (`q3-ivm-baseline/q3-trie-view-circuit`): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, and `V` joins on `(custkey, orderkey)`, so each join's key is on the trie (A1). The compiler hook `--q3-merged-index` that used to emit the circuit was removed on 2026-11-13.
 
-Q3 inserts nothing into the index. The readers in `merged-index-col/src/q3.rs` only read the buffers of the scan session, and the module comment says so. The sole writer is `ManualIndex::append` in the harness (`q3-ivm-baseline/src/reconstruction.rs`), outside the circuit.
+Q3 inserts nothing into the index. The readers in `merged-index-col/src/q3.rs` only keep the entries that the scan session routes to them, and the module comment says so. The sole writer is `ManualIndex::append` in the harness (`q3-ivm-baseline/src/reconstruction.rs`), outside the circuit.
 
 ## Transaction contract
 
@@ -53,7 +53,7 @@ The merged index is owned by `ManualIndex` on an auxiliary thread of the runtime
 
 ## General deltas
 
-Every delta row the view gets must carry its folded key (A2). A line item folds under its order's customer, so `reconstruction::prepare` gives every changed order a before owner `cb` and an after owner `ca`, each a customer or none. They come from the net delta's deletion and insertion of the order, or else from the base `Orders` state, which the transaction left unchanged (`BaseState` taken before the transaction in the driver, `Reference` in tests; the reads count under `BaseRelation`). The order's lines before are `L⁻`, read from `Old` at `(cb, order)` or, with no owner, from `OrphanLines`. The lines after are `L⁺ = L⁻ + ΔL`.
+Every delta row the view gets must carry its folded key (A2). A line item folds under its order's customer, so `reconstruction::prepare` gives every changed order a before owner `cb` and an after owner `ca`, each a customer or none. They come from the net delta's deletion and insertion of the order, or else from the base `Orders` state, which the transaction left unchanged (`BaseState` taken before the transaction in the driver, `Reference` in tests; the reads count under `BaseRelation`). The base state is needed when an order changes only through its line items, such as a new line on an existing order: the order is not in the net delta, but its lines still fold under its customer. `BaseState` (`workload.rs`) holds snapshots of the base circuit's tables taken before the transaction and finds the order by `seek_key_exact` on `Orders`; `Reference` (`main.rs`) is the tests' in-memory oracle, whose map lookups count nothing. `Old` cannot answer the lookup: it is keyed customer first, so an order cannot be found there by `orderkey` without already knowing its customer (user decision of 2026-11-13). The order's lines before are `L⁻`, read from `Old` at `(cb, order)` or, with no owner, from `OrphanLines`. The lines after are `L⁺ = L⁻ + ΔL`.
 
 | Case | `Dlt` line rows | Side store |
 | --- | --- | --- |
@@ -86,7 +86,6 @@ Other tests that bear on reconstruction:
 | --- | --- | --- |
 | `supplied_snapshot_join_matches_native_signed_updates` | `crates/dbsp/src/operator/dynamic/join.rs` | The supplied-snapshot join equals the native join on simultaneous and multi-step transactions |
 | `readers_match_a_brute_force` (and the other `merged_index::reader` tests) | `crates/dbsp/src/trace/merged_index/reader/tests.rs` | The driving deltas and requests of `capture`, the routing of kept entries by folded key, the `RowBuilder`, and one decode for an entry that two readers keep |
-| `Q3MergedIndexBindingTest` | `sql-to-dbsp-compiler/SQL-compiler` | The hook accepts the supported circuit and rejects others |
 | `rf1_rf2_match_full_join` | `q3-ivm-baseline/src/main.rs` | RF1 and RF2 against the full join (reconstructed mode) |
 | `native_deltas_match_full_join_across_updates` | same (both builds) | Customer-only and line-only changes, an order that moves, and an orphan line, against the full join |
 | `random_general_changes_match_the_reference_join` | same | Random general changes against the reference join |

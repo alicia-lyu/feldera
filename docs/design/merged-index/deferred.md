@@ -77,7 +77,7 @@ existing batches; they create no tuple copies, historical-version catalog, or ex
 ## Shared scan sessions
 
 > [!NOTE]
-> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward scan session per transaction that reads each touched group once and routes each requested entry to its reader (routing by requests, 2026-11-12; buffered execution until then). The material below remains background for full-query execution.
+> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward scan session per transaction that reads each touched group once and routes each requested entry to its reader (selective routing, 2026-11-12; buffered execution until then). The material below remains background for full-query execution.
 
 Shared scan sessions are a **deferred, optional abstraction** for either full-query execution or IVM.
 The current experiments use direct reconstruction. The design below applies only if later workloads
@@ -278,7 +278,7 @@ Buffered execution replaces it as the fallback and as the only target. Reviving 
 
 ### Status on 2026-11-12: requests apply at routing; skipping stays deferred
 
-The 2026-11-12 design (decisions.md) revives most of the request machinery inside one touched group, but not the skipping. The implementation, *routing by requests* (name unconfirmed), sits between buffered and selective execution. With the deferred skip, it would become selective execution restricted to one group at a time.
+The 2026-11-12 design (decisions.md) revives most of the request machinery inside one touched group, but not the skipping. The implementation, *selective routing*, sits between buffered and selective execution. With the deferred skip, it would become selective execution restricted to one group at a time.
 
 | Selective execution (above) | Status |
 | --- | --- |
@@ -309,7 +309,7 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 These items lie outside the roadmap in [general-definition.md](general-definition.md).
 
 - **Variable-width keys,** such as VARCHAR. They need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
-- **Generated readers and joins,** replacing the exact-shape matching in `Q3MergedIndexBinding`.
+- **Generated readers and joins,** replacing the hand-written readers, Q3's hook, and the hand-written circuit (the exact-shape matching of `Q3MergedIndexBinding` was removed on 2026-11-13; see the initial thought under the unconfirmed choices of [shared-traversal.md](shared-traversal.md)).
 - **Inferring the trie** from foreign-key and primary-key metadata.
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 - **Placements on views.** The validator rejects them because views have no primary key (decision of 2026-10-20). Allowing them needs a way to declare or infer a view's unique key, for example in the spec or from the view's query.

@@ -17,8 +17,8 @@ The experiment runs two generated circuits, each in its own DBSP runtime:
   This forwarding is harness overhead: a single DBSP circuit passes deltas between
   views as in-memory streams, so the JSON hop has no counterpart in a deployed
   pipeline. It is excluded from the base and IVM figures but inside the sequence totals.
-  `--q3-merged-index` applies to this circuit only. Everything below, from the
-  compiler-expanded graph to the generated joins, describes this circuit.
+  The reconstructed view circuit is hand-written (`q3-trie-view-circuit`). Everything below, from the
+  compiler-expanded graph to the generated joins, describes the generated (native) view circuit.
 
 The driver times the two circuits separately, so `q3_ms` is the view circuit's transaction
 (`ivm_ms` adds `delta_ms`, the preparation of its input delta) and `base_ms` is the base circuit plus, in reconstructed mode, the merged index's upkeep;

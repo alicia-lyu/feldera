@@ -437,7 +437,7 @@ The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting 
 
 ### 2026-11-10: The hand-written view circuit replaces the generated one
 
-The user decided on 2026-11-10 (roadmap step 4):
+The user decided on 2026-11-10 (roadmap step 4). The hook that this entry keeps was removed on 2026-11-13 (user decision; see that day's entry):
 
 - The hand-written circuit (`q3-ivm-baseline/q3-trie-view-circuit`) replaces the generated reconstructed circuit in the `merged-index` build. This amends 2026-10-29's "the compiler hook stays": the hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused. Its removal is an unconfirmed follow-up.
 - Both modes now build the view circuit from different sources: native from `q3.sql`, reconstructed from the committed crate. `generate.sh` takes no option, and `verify.sh` no longer regenerates for the reconstructed run.
@@ -543,6 +543,17 @@ The user confirmed on 2026-11-13 these choices from the unconfirmed list of [sha
 - **`ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself**, so the opening's key decode is inside the session's counted region.
 - **`RunMerge::exhaust`** for a skipped prefix with no successor (unused by the session since 2026-11-12).
 - **`take_driving_deltas` errors on a second call** in one transaction, rather than handing over empty deltas.
+
+Confirmed in the second pass the same day:
+
+- **Lazy values in the file cursor:** a landing reads the key only; a once-filled slot positions on the first value at the first read, with the previous value cursor as the hint for `first_with_hint`.
+- **The counting rules of `RunReads`:** an opening counts the key it lands on; a landing counts the key, and the first value or weight read at that position counts the value; a value seek counts no seek; a predicate seek counts each probe; each returned weight counts one weight decode; in-memory runs count the same events in their own `memory_*` fields. The user asked not to be asked about rules that only count work actually done.
+- **One enum names the components for reads and writes, with separate thread-locals for the current read and write owner.** The enum `WriteOwner` is renamed `Component`, in `storage/attribution.rs`; the functions keep "owner" for the role (`with_read_owner`, `with_write_owner`, `ReadOwnerCursor`).
+- **`ΔJ` is computed exactly:** `L⁻` is requested only where `ΔO ⋈ C⁺ + O⁻ ⋈ ΔC` has a row after consolidation.
+- **A join with a snapshot reader does not sample its partner:** the requested slice holds only requested rows, so the delta drives.
+- **Owner lookups read the base tables** (`BaseState` in the driver, `Reference` in tests, under `BaseRelation`), as [reconstruction.md](reconstruction.md#general-deltas) states.
+- **The compiler hook is removed.** `--q3-merged-index`, `Q3MergedIndexBinding.java`, and its test are deleted; the hand-written circuit replaced it on 2026-11-10.
+- **The current hybrid is named "selective routing"** (the scan reads each touched group once and routes only requested entries to the readers). It replaces "selective decoding with whole-group positioning" and the working name "routing by requests".
 
 ## Superseded and withdrawn
 
