@@ -16,7 +16,7 @@ This file defines what is measured and what remains pending. Commands (the runne
 - Measurement version 10 (2026-11-11) follows roadmap step 5: reconstructed mode's view circuit takes the driving deltas as whole batches from the typed readers, through DBSP's `Input` operator. Their hand-off to the input handles, before the transaction, is booked in `forward_ms` as native's feed is: `ΔO` and `ΔL` are moved and `ΔC` is cloned, so no row is pushed. The session's collection, in `q3_ms`, now also projects the entries into the readers' typed rows, and the joins' flush no longer projects per request. The fields are those of version 9. No version 10 run has been recorded.
 - Measurement version 11 (2026-11-12) follows the reader change of that day, in which each reader holds its driving delta's requests and keeps only the rows it requests ([Readers](shared-traversal.md#readers-step-5)). `view_run_reads` gains the owner `requested_slice`, the joins' reads of the readers' requested slices, which leave `query`: `query` is now the DBSP operators' own reads. The scan session no longer opens a cursor over `Dlt`, so `cursor_opens` is 1; the capture reads `Dlt` once and fills `payload_decodes_dlt`, and `payload_decodes_old` counts the entries that a reader keeps. The per-owner write arrays gain two owners, `requested_slice` and `partner_trace`, whose writes are zero. `partner_trace` is the native joins' reads of their partner traces (the counterpart of `requested_slice`), so native's `query` is the deltas' and the rest of the circuit's. `driver_run_reads` reports the reads that the driver's thread made while collecting, per owner: the index's, and the routing's reads of the driving deltas under `requested_slice`; the summarizer adds the latter to the `requested_slice` columns, and the raw report keeps the split. Timing fields are those of version 10. No version 11 run has been recorded; version 10's view-worker counters do not carry over.
 - The first version 10 run is the macOS smoke run of 2026-11-11, with the session pass as an A/B ([Version 10 smoke](#version-10-smoke-2026-11-11)).
-- Measurement version 11 (2026-11-12) books the preparation of the view circuit's transaction delta in a new sub-phase, `delta_ms`, inside the IVM window in both modes (user decision of 2026-11-12; it revises version 9's boundary-copy rule). `ivm_ms = delta_ms + q3_ms`. Native's `delta_ms` is the conversion of the net delta into the view circuit's input rows, which was in `forward_ms`; reconstructed mode's is phase A of the collection, which builds `ΔC`, `ΔO`, and `ΔL` from `Dlt` (timed inside `Q3State::collect`, which returns it), plus their hand-off to the input handles (`Pipeline::build_view_delta`), which was in `forward_ms`. `forward_ms` keeps only the net-delta read (`workload::net_delta`), the same operation in both modes. The report shows `delta_ms` beside `ivm_ms`, since the two modes' operations are not identical. `measure.py` requires the field, finite and non-negative, and `ivm_ms >= delta_ms`. No version 11 run has been recorded.
+- Measurement version 11 (2026-11-12) books the preparation of the view circuit's transaction delta in a new sub-phase, `delta_ms`, inside the IVM window in both modes (user decision of 2026-11-12; it revises version 9's boundary-copy rule). `ivm_ms = delta_ms + q3_ms`. Native's `delta_ms` is the conversion of the net delta into the view circuit's input rows, which was in `forward_ms`; reconstructed mode's is phase A of the collection, which builds `ΔC`, `ΔO`, and `ΔL` from `Dlt` (timed inside `Q3State::collect`, which returns it), plus their hand-off to the input handles (`Pipeline::build_view_delta`), which was in `forward_ms`. `forward_ms` keeps only the net-delta read (`workload::net_delta`), the same operation in both modes. The report shows `delta_ms` beside `ivm_ms`, since the two modes' operations are not identical. `measure.py` requires the field, finite and non-negative, and `ivm_ms >= delta_ms`. The macOS smoke at version 11 is in [Version 11 smoke](#version-11-smoke-2026-11-12).
 - Measurement version 6 (2026-11-05) runs the base and view circuits in one runtime, with one buffer cache, and adds the CPU profiler's per-circuit step CPU time; see [One runtime](#one-runtime-version-6-2026-11-05). Its timing definitions are those of version 4.
 - Measurement version 5 (2026-11-04) adds run reads: the merged index's per reader, the view worker's per owner in both modes, and the index snapshots' layout. Its timing and write fields are those of version 4. One macOS smoke run per workload and mode is in [Run reads](#run-reads-version-5-smoke-2026-11-04), with native joins reading through run cursors.
 - macOS runs are smoke tests only. Their highest RSS (47.0 MiB in the 2026-10-22 rerun) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
@@ -231,6 +231,44 @@ Per-phase timings, the median over three repetitions, with the minimum and maxim
 - **Step costs about 30 ms more `ivm_ms`** than Seek in both workloads, with about 400,000 more key reads; the profiled q3 time rises by 0.14 to 0.22 ms only, since the walk is in the collection, outside the circuit's steps. Which part of `ivm_ms` the collection takes is not timed apart, so no figure for it is given here.
 - **`forward_ms`** is smaller in reconstructed mode, which hands whole batches to the input handles, than in native mode, which feeds rows.
 - **No pressure, no disk.** These runs show nothing about file runs, the buffer cache, or beyond-memory behavior. The Linux campaign measures those.
+
+## Version 11 smoke (2026-11-12)
+
+The settings and inputs of the [version 10 smoke](#version-10-smoke-2026-11-11), at revision `fba8abbd9`: three repetitions per workload, mode, and session pass. `git_status_short` lists only the untracked agent worktrees under `.claude/`. Version 11 changes what is read and how it is attributed: readers keep only the requested rows and decode only those, and the partner reads have their own owners, `partner_trace` (native) and `requested_slice` (reconstructed), apart from the DBSP operator reads (`query`). It also adds `delta_ms`. As before, nothing reached disk, pressure stayed `low`, and every repetition gave identical counts.
+
+Artifacts: `q3-ivm-baseline/target/r5-v11-smoke/{seek,step}-{clustered,scattered}/manifest.json` and `summary/`, local-only.
+
+Counters, summed over the six refreshes. Reads are memory reads, key / value / weight; file decodes are 0 throughout. Requested-slice reads are the view worker's plus the driver thread's routing reads (`driver_run_reads.requested_slice`: 0 seeks, 56 / 60 / 60 clustered and 60 / 60 / 60 scattered).
+
+| Workload | Mode | Pass | DBSP operator seeks; reads | Partner reads: seeks; reads | Index seeks; reads | `Old` decodes | Upkeep seeks; reads |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clustered | native | either | 0; 470 / 622 / 622 | `partner_trace` 858; 178 / 457 / 457 | — | — | — |
+| clustered | reconstructed | seek | 0; 248 / 340 / 340 | `requested_slice` 176; 160 / 471 / 471 | 368; 5,118 / 498 / 498 | 203 | 210; 520 / 177 / 177 |
+| clustered | reconstructed | step | 0; 248 / 340 / 340 | `requested_slice` 176; 160 / 471 / 471 | 0; 411,205 / 498 / 498 | 203 | 210; 520 / 177 / 177 |
+| scattered | native | either | 0; 474 / 622 / 622 | `partner_trace` 870; 182 / 461 / 461 | — | — | — |
+| scattered | reconstructed | seek | 0; 252 / 340 / 340 | `requested_slice` 180; 168 / 475 / 475 | 394; 4,547 / 502 / 502 | 207 | 210; 518 / 177 / 177 |
+| scattered | reconstructed | step | 0; 252 / 340 / 340 | `requested_slice` 180; 168 / 475 / 475 | 0; 418,176 / 502 / 502 | 207 | 210; 518 / 177 / 177 |
+
+What the counts show:
+
+- **Native is unchanged.** Its two owners sum to version 10's view reads (858 seeks; 648 / 1,079 / 1,079 clustered). All its seeks are partner seeks.
+- **The index reads only what is kept.** Groups, positions, seeks, and key reads equal version 10's, since the session still visits every position of a touched group (the [deferred over-read](deferred.md#whole-group-over-read-for-narrow-requests)). `Old` payload decodes fall from 4,414 to 203 (clustered) and from 3,820 to 207 (scattered); the index's value reads, 498, are those 203 plus `Dlt`'s 295, read once in phase A.
+- **The partner reads match in kind.** Reconstructed mode's requested-slice value reads (471 and 475) are close to native's partner-trace value reads (457 and 461): both count one read per joined pair, since a join rereads a partner key's values for each delta value. Native seeks about five times as often (858 against 176), one seek per run of its traces.
+- **The DBSP operator reads are the shared work.** Reconstructed mode has no operator seeks, and its operator reads (248 / 340) are below native's (470 / 622). The two circuits differ in their operators, so the rows are not expected to be equal.
+- **Upkeep is unchanged** and does not depend on the pass.
+
+Per-phase timings, the median over three repetitions with the minimum and maximum, summed over the six refreshes, in milliseconds. From version 11, `ivm_ms = delta_ms + q3_ms`, so native's `ivm_ms` now includes its JSON conversion (`delta_ms`), which version 10 booked in `forward_ms`.
+
+| Workload | Mode | Pass | `base_ms` | `forward_ms` | `delta_ms` | `q3_ms` | `ivm_ms` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clustered | native | either | 0.55 (0.54–0.69) | 0.29 | 0.51 | 0.95 (0.95–1.11) | 1.47 (1.46–1.64) |
+| clustered | reconstructed | seek | 1.25 (1.10–1.42) | 0.32 | 0.11 | 1.81 (1.64–2.06) | 1.92 (1.74–2.17) |
+| clustered | reconstructed | step | 1.03 (1.01–1.07) | 0.30 | 0.10 | 31.74 (31.70–31.81) | 31.84 (31.79–31.91) |
+| scattered | native | either | 0.52 (0.50–0.54) | 0.28 | 0.51 | 0.90 (0.89–0.91) | 1.41 (1.40–1.42) |
+| scattered | reconstructed | seek | 0.94 (0.91–0.99) | 0.28 | 0.09 | 1.33 (1.32–1.42) | 1.41 (1.40–1.51) |
+| scattered | reconstructed | step | 1.09 (0.96–1.10) | 0.30 | 0.10 | 32.83 (32.42–32.95) | 32.93 (32.52–33.06) |
+
+Caveats: these are smoke figures at SF 0.01 with no memory pressure and no file runs, so they support no claim of cost or saving. Reconstructed `ivm_ms` with Seek fell from about 3.0 (version 10, clustered) to 1.9, with the drop in `Old` decodes, but version 10 and 11 differ in what `ivm_ms` covers, so the two are not directly comparable. Step's cost is its 410,000 key reads and is unchanged.
 
 ## Pending: Linux campaign
 
