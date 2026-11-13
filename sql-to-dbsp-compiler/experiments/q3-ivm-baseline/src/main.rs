@@ -472,6 +472,15 @@ impl Pipeline {
             .map_err(anyhow::Error::msg)
     }
 
+    /// Prepares the view circuit's transaction delta from the collected `Dlt`: the work that
+    /// `delta_ms` times in reconstructed mode. Today that is the hand-off of the driving deltas
+    /// (`feed_driving_deltas`); the collection's pass over `Dlt` that builds each reader's
+    /// driving delta still runs inside `collect_groups`, so it counts in `q3_ms`. When that pass
+    /// is callable apart from the scan, call it here and `delta_ms` will include it.
+    fn build_view_delta(&self) -> Result<()> {
+        self.feed_driving_deltas()
+    }
+
     /// Hands the readers' `Dlt` batches, the driving deltas, to the view circuit's input
     /// handles: `ΔO` and `ΔL` are moved, and `ΔC` is a clone (see `Q3State::collect`).
     fn feed_driving_deltas(&self) -> Result<()> {
@@ -574,15 +583,22 @@ struct Measurements {
     preparation: Duration,
     /// The base circuit's transaction alone. Reported inside `base_ms`; see `base_phase`.
     base_circuit: Duration,
-    /// Reading the base tables' net delta and feeding it to the view circuit's inputs.
+    /// Reading the base tables' net delta (`workload::net_delta`), the same operation in both
+    /// modes. Not part of `ivm_ms`; see `delta`.
     forward: Duration,
+    /// Preparing the view circuit's transaction delta, which is view work (measurement version
+    /// 11) and a part of `ivm_ms`. Native: converting the net delta into the input handles'
+    /// rows. Reconstructed: building the driving deltas from `Dlt` and handing them to the
+    /// input handles (`Pipeline::build_view_delta`). The two operations are not identical, so
+    /// the report shows `delta_ms` beside `ivm_ms`.
+    delta: Duration,
     /// Completing the net delta into the index's `Dlt` (reading `Old` for moved lines), appending
     /// it, and acquiring the snapshots (reconstructed mode). The index is base storage, so this
     /// is a part of `base_ms`.
     index: Duration,
     /// The view circuit's transaction: delta accumulation, joins and `V`. In reconstructed mode
-    /// it starts with the scan session's collection of the touched groups and the push of the
-    /// driving deltas into the circuit's input handles.
+    /// it starts with the scan session's collection of the touched groups. The transaction
+    /// delta's preparation (`delta`) is not in it.
     view_circuit: Duration,
     discovery: Duration,
     publication_cleanup: Duration,
@@ -628,10 +644,11 @@ impl Measurements {
         self.base_circuit + self.index
     }
 
-    /// Incremental view maintenance: the view circuit's transaction. The merged index's upkeep
-    /// is not part of it.
+    /// Incremental view maintenance: preparing the view circuit's transaction delta, then the
+    /// view circuit's transaction (with the scan session's collection in reconstructed mode).
+    /// The merged index's upkeep and the net-delta read are not part of it.
     fn ivm_phase(&self) -> Duration {
-        self.view_circuit
+        self.delta + self.view_circuit
     }
 }
 
@@ -715,30 +732,33 @@ fn transact_inner(
             .map_err(anyhow::Error::msg)?;
         stats.publication_cleanup += publish_started.elapsed();
     }
-    // The native view circuit takes the net delta as JSON rows, which is not view maintenance.
+    // The native view circuit takes the net delta as JSON rows; converting them into its input
+    // handles is view work (`delta_ms`).
     #[cfg(not(feature = "merged-index"))]
-    {
-        let feed_started = Instant::now();
+    let delta = {
+        let delta_started = Instant::now();
         net_delta.apply_optional(None, pipeline.view.inputs())?;
-        stats.forward += feed_started.elapsed();
-    }
+        delta_started.elapsed()
+    };
+    #[cfg(feature = "merged-index")]
+    let mut delta = Duration::ZERO;
 
     // The view worker counts its own run reads; they are read outside the transaction's timer.
     let view_reads_before = pipeline.view.circuit.run_reads()?;
     let view_started = Instant::now();
-    // The IVM window of the reconstructed build starts with the scan session, which reads the
-    // index once for the whole transaction and fills the readers. Handing the readers' `Dlt`
-    // batches to the input handles is the counterpart of native's feed, so it is booked in
-    // `forward_ms` and the window resumes with the transaction.
+    // The reconstructed view phase starts with the scan session, which reads the index once for
+    // the whole transaction and fills the readers (`q3_ms`). Preparing the transaction delta
+    // from `Dlt` is the counterpart of native's row conversion, so it is booked in `delta_ms`
+    // and the `q3_ms` window resumes with the transaction.
     #[cfg(feature = "merged-index")]
-    let (transaction_result, latency) = {
+    let (transaction_result, view_time) = {
         let collection_result = pipeline.collect_groups();
         let collection = view_started.elapsed();
-        let feed_started = Instant::now();
-        let feed_result = collection_result.and_then(|()| pipeline.feed_driving_deltas());
-        stats.forward += feed_started.elapsed();
+        let delta_started = Instant::now();
+        let delta_result = collection_result.and_then(|()| pipeline.build_view_delta());
+        delta += delta_started.elapsed();
         let transaction_started = Instant::now();
-        let transaction_result = feed_result.and_then(|()| {
+        let transaction_result = delta_result.and_then(|()| {
             pipeline
                 .view
                 .circuit
@@ -751,10 +771,12 @@ fn transact_inner(
         )
     };
     #[cfg(not(feature = "merged-index"))]
-    let (transaction_result, latency) = {
+    let (transaction_result, view_time) = {
         let transaction_result = pipeline.view.circuit.transaction();
         (transaction_result, view_started.elapsed())
     };
+    // The latency of a view transaction is its `ivm_ms`: the delta's preparation and the rest.
+    let latency = delta + view_time;
     let view_reads_after = pipeline.view.circuit.run_reads()?;
     if let (Some(before), Some(base_after)) = (cpu_before, base_cpu_after) {
         let view_after = profiled_cpu(&mut pipeline.view.circuit)?;
@@ -782,7 +804,8 @@ fn transact_inner(
     {
         stats.session_reads += finish_result?;
     }
-    stats.view_circuit += latency;
+    stats.delta += delta;
+    stats.view_circuit += view_time;
     stats.latencies.push(latency);
     stats.transactions += 1;
     stats.foreground += foreground_started.elapsed();
@@ -946,7 +969,7 @@ fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result
     {
         drop(net_delta);
         pipeline.collect_groups()?;
-        pipeline.feed_driving_deltas()?;
+        pipeline.build_view_delta()?;
         if stepped {
             pipeline.view.circuit.start_transaction()?;
             for _ in 0..3 {
@@ -1645,12 +1668,13 @@ fn finish_loading(
 ///
 /// `base_ms` is base maintenance: the base circuit's transaction plus the merged index's
 /// upkeep. `index_ms` is a sub-phase of `base_ms` and is never added to it again. `ivm_ms` is
-/// incremental view maintenance and equals `q3_ms`, the view circuit's transaction (in
-/// reconstructed mode, with the scan session's collection before it). `forward_ms` holds the
-/// net delta read and the feed of the driving deltas into the view circuit's input handles:
-/// native's rows, and in reconstructed mode the readers' `Dlt` batches (measurement version
-/// 10). The base circuit, `forward_ms`, the index append and `q3_ms` are
-/// disjoint intervals of the transaction; the base and IVM phases are always reported side by side.
+/// incremental view maintenance: `delta_ms + q3_ms`. `delta_ms` prepares the view circuit's
+/// transaction delta (native's conversion of the net delta into input rows; reconstructed's
+/// building and hand-off of the driving deltas from `Dlt`), and `q3_ms` is the view circuit's
+/// transaction (in reconstructed mode, with the scan session's collection before it).
+/// `forward_ms` holds only the net-delta read (measurement version 11). The base circuit,
+/// `forward_ms`, the index append, `delta_ms` and `q3_ms` are disjoint intervals of the
+/// transaction; the base and IVM phases are always reported side by side.
 fn phase_json(stats: &Measurements) -> Value {
     json!({
         "rows": stats.rows,
@@ -1660,11 +1684,12 @@ fn phase_json(stats: &Measurements) -> Value {
         "base_ms": milliseconds(stats.base_phase()),
         "forward_ms": milliseconds(stats.forward),
         "index_ms": milliseconds(stats.index),
+        "delta_ms": milliseconds(stats.delta),
         "q3_ms": milliseconds(stats.view_circuit),
         "publication_cleanup_ms": milliseconds(stats.publication_cleanup),
         "foreground_ms": milliseconds(stats.foreground),
         "ivm_ms": milliseconds(stats.ivm_phase()),
-        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = q3_ms, the view circuit's transaction; in reconstructed mode it also includes the scan session's collection of the touched groups into the typed readers. Report base_ms and ivm_ms side by side. forward_ms (the net delta read, and the feed of the driving deltas into the view circuit's input handles: native's rows, or reconstructed's hand-off of the readers' Dlt batches, moved for orders and line items and cloned for customers), discovery, preparation and publication/cleanup are in neither.",
+        "phase_note": "base_ms = the base circuit's transaction + index_ms (the merged index's upkeep, including the reads of Old for the lines of an order that changes owner; zero in native mode); index_ms is a sub-phase of base_ms and is not added again. ivm_ms = delta_ms + q3_ms. delta_ms prepares the view circuit's transaction delta: in native mode, the conversion of the net delta into the input handles' rows; in reconstructed mode, the hand-off of the readers' Dlt batches (the driving deltas, moved for orders and line items and cloned for customers) to the input handles. The two operations are not identical, so compare the modes with and without delta_ms. q3_ms = the view circuit's transaction; in reconstructed mode it also includes the scan session's collection of the touched groups into the typed readers, which builds the readers' driving deltas and so is not yet in delta_ms. forward_ms is only the net delta read (workload::net_delta), the same operation in both modes, and is in neither ivm_ms nor q3_ms. Report base_ms and ivm_ms side by side. Discovery, preparation and publication/cleanup are in none of them.",
         "verification_ms_excluded": milliseconds(stats.verification),
         "profiled_cpu_ms": stats.profiled_cpu.map(|cpu| json!({
             "base": milliseconds(cpu.base),
@@ -1871,9 +1896,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let load_peak_storage_bytes = sampler.map(measurement::StorageSampler::stop).transpose()?;
     let load_elapsed = started.elapsed();
     let load_rows = load.customer_rows + load.order_rows + load.line_rows;
-    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} base_ms={:.3} forward_ms={:.3} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
+    println!("run={run_number} phase=load rows={load_rows} transactions={} verified={} base_ms={:.3} forward_ms={:.3} delta_ms={:.3} q3_ms={:.3} prep_ms={:.3} background_merge_wait_ms={:.3} end_to_end_ms={:.3} driver_reference_bytes={} driver_max_load_retained_rows={} peak_process_rss_bytes={} {}",
         stats.transactions, config.verify, milliseconds(stats.base_phase()), milliseconds(stats.forward),
-        milliseconds(stats.view_circuit), milliseconds(stats.preparation),
+        milliseconds(stats.delta), milliseconds(stats.view_circuit), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
 
     // Parse every refresh file now, so that the window reads no input file. The loop consumes
@@ -3059,6 +3084,7 @@ mod measurement_tests {
             base_circuit: Duration::from_millis(4),
             index: Duration::from_millis(1),
             forward: Duration::from_millis(7),
+            delta: Duration::from_millis(3),
             view_circuit: Duration::from_millis(2),
             ..Measurements::default()
         };
@@ -3068,7 +3094,9 @@ mod measurement_tests {
         assert!((phase("base_ms") - 5.0).abs() < 1e-9);
         assert!((phase("index_ms") - 1.0).abs() < 1e-9);
         assert!((phase("q3_ms") - 2.0).abs() < 1e-9);
-        assert_eq!(phase("ivm_ms"), phase("q3_ms"));
+        // ivm_ms = delta_ms + q3_ms, and forward_ms is in neither.
+        assert!((phase("delta_ms") - 3.0).abs() < 1e-9);
+        assert!((phase("ivm_ms") - 5.0).abs() < 1e-9);
         assert!((phase("forward_ms") - 7.0).abs() < 1e-9);
         assert!(phases.get("combined_maintenance_ms").is_none());
     }
@@ -3173,14 +3201,21 @@ mod measurement_tests {
         assert_eq!(refreshes[2]["absent_orders"], 2);
         assert_eq!(refreshes[5]["rows"], 0);
         // Measurement version 4 books the merged index's upkeep in the base phase: `index_ms`
-        // is a part of `base_ms`, and the IVM figure is the view circuit alone.
+        // is a part of `base_ms`. Measurement version 11 books the transaction delta's
+        // preparation in `delta_ms`, inside the IVM figure: `ivm_ms = delta_ms + q3_ms`.
         for refresh in refreshes {
             let phase = |name: &str| refresh[name].as_f64().unwrap();
             assert!(phase("base_ms") > 0.0, "{refresh}");
             assert!(phase("q3_ms") > 0.0, "{refresh}");
             assert!(phase("forward_ms") >= 0.0, "{refresh}");
             assert!(phase("index_ms") <= phase("base_ms"), "{refresh}");
-            assert!((phase("ivm_ms") - phase("q3_ms")).abs() < 1e-6, "{refresh}");
+            // Both modes time the transaction delta's preparation inside the IVM window.
+            assert!(phase("delta_ms") >= 0.0, "{refresh}");
+            assert!(phase("ivm_ms") >= phase("delta_ms"), "{refresh}");
+            assert!(
+                (phase("ivm_ms") - phase("delta_ms") - phase("q3_ms")).abs() < 1e-6,
+                "{refresh}"
+            );
             assert!(
                 refresh.get("combined_maintenance_ms").is_none(),
                 "{refresh}"
@@ -4210,7 +4245,7 @@ mod session_worked_transaction_tests {
 
                 // The view circuit takes the same readers' driving deltas, and `V` must be the
                 // independent join of the new state.
-                pipeline.feed_driving_deltas()?;
+                pipeline.build_view_delta()?;
                 pipeline.view.circuit.transaction()?;
                 let session = pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
                 let output = pipeline

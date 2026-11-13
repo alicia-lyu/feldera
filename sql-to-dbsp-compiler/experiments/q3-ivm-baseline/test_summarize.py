@@ -77,7 +77,7 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
     native = mode == "native"
     refreshes = [{"refresh": number, "foreground_ms": 10.0 * scale * number,
                   "base_ms": 4.0 * scale * number, "forward_ms": 0.5 * scale * number,
-                  "index_ms": 1.0 * scale * number, "q3_ms": 2.0 * scale * number,
+                  "index_ms": 1.0 * scale * number, "delta_ms": 0.25 * scale * number, "q3_ms": 1.75 * scale * number,
                   "ivm_ms": 2.0 * scale * number,
                   "index_run_reads": None if native else index_reads(int(number * scale)),
                   "index_layout": None if native else LAYOUT,
@@ -157,6 +157,9 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(native["metrics"]["refresh_index_ms"]["median"], 6.0)
         self.assertEqual(native["metrics"]["refresh_base_ms"]["median"], 24.0)
         self.assertEqual(native["metrics"]["refresh_forward_ms"]["median"], 3.0)
+        # delta_ms (0.25 * scale * 3) is a part of ivm_ms (2 * scale * 3) and beside forward_ms.
+        self.assertEqual(native["metrics"]["refresh_delta_ms"]["median"], 1.5)
+        self.assertEqual(native["metrics"]["refresh_q3_ms"]["median"], 10.5)
         # The CPU profiler's times are summed per circuit in both modes: 3 and 1.5 * scale * 3.
         self.assertEqual(native["metrics"]["refresh_profiled_cpu_base_ms"]["median"], 18.0)
         self.assertEqual(native["metrics"]["refresh_profiled_cpu_q3_ms"]["max"], 13.5)
@@ -251,6 +254,13 @@ class SummarizeTest(unittest.TestCase):
         content = copy.deepcopy(base)
         del content["runs"][0]["driver"]["refreshes"][1]["q3_ms"]
         self.failing(content, "native run 1 refresh 2: missing field q3_ms")
+        content = copy.deepcopy(base)
+        del content["runs"][0]["driver"]["refreshes"][1]["delta_ms"]
+        self.failing(content, "native run 1: inconsistent counters: refresh 2: delta_ms is None")
+        content = copy.deepcopy(base)
+        content["runs"][3]["driver"]["refreshes"][0]["delta_ms"] = 5.0
+        self.failing(content, "merged-index run 2: inconsistent counters: refresh 1: "
+                              "ivm_ms 4.0 is below delta_ms 5.0")
         content = copy.deepcopy(base)
         content["runs"][0]["driver"]["sequence"]["end_to_end_ms"] = None
         self.failing(content, "end_to_end_ms is None")

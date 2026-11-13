@@ -31,8 +31,10 @@ transaction starts, and the CPU profiler's per-circuit step CPU time (`profiled_
 reported beside the phase timers as a cross-check. In reconstructed mode the merged index lives in
 the same runtime and writes through its buffer cache, because its upkeep is base maintenance. The phases are `base_ms` (the base
 circuit's transaction plus the index append), `index_ms` (the append alone, a sub-phase of
-`base_ms` and never added to it again), `forward_ms`, and `q3_ms`, the view circuit alone, which
-is also reported as `ivm_ms`. Base and IVM are always reported side by side.
+`base_ms` and never added to it again), `forward_ms` (the net-delta read), `delta_ms` (preparing
+the view circuit's transaction delta), and `q3_ms` (the view circuit's transaction, with the scan
+session's collection in reconstructed mode). `ivm_ms` is `delta_ms + q3_ms`. Base and IVM are always
+reported side by side.
 
 All commands live in [WORKFLOW.md](../../../docs/design/merged-index/WORKFLOW.md). The
 architecture and R1–R5 status are in the

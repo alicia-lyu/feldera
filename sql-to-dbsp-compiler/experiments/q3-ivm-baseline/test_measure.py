@@ -556,6 +556,23 @@ class MeasureTest(unittest.TestCase):
             self.assertIn("profiled_cpu_ms.base is None",
                           measure.profiled_cpu_problems(report)[0])
 
+    def test_delta_phase_is_required_and_within_ivm_in_both_modes(self) -> None:
+        for mode in ("native", "reconstructed"):
+            report = {"mode": mode, "refreshes": [
+                {"refresh": 1, "delta_ms": 0.5, "q3_ms": 1.0, "ivm_ms": 1.5}]}
+            self.assertEqual(measure.delta_phase_problems(report), [])
+            report["refreshes"][0]["delta_ms"] = 0
+            self.assertEqual(measure.delta_phase_problems(report), [])
+            for bad in (-1, float("nan"), None, True):
+                report["refreshes"][0]["delta_ms"] = bad
+                self.assertIn("delta_ms is", measure.delta_phase_problems(report)[0])
+            del report["refreshes"][0]["delta_ms"]
+            self.assertIn("delta_ms is None", measure.delta_phase_problems(report)[0])
+            report["refreshes"][0]["delta_ms"] = 2.0
+            self.assertIn("ivm_ms 1.5 is below delta_ms 2.0",
+                          measure.delta_phase_problems(report)[0])
+        self.assertEqual(measure.delta_phase_problems({"mode": "other", "refreshes": [{}]}), [])
+
     def test_reported_session_pass_must_be_the_requested_one(self) -> None:
         def report(mode: str, reported: object) -> dict:
             return {"mode": mode, "configuration": {"session_pass": reported}}
