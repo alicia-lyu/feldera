@@ -508,6 +508,13 @@ The user amended this on the same day:
 - **The contract check is test-only.** The partner-read check that each circuit delta key is one of its reader's requests runs only in tests, including `verify.sh`'s test runs, and in the harness's validation runs (`Q3State::enable_contract_check`), never in a measured run (R5, `measure.py`). It is a runtime setting, off by default, so tests reach it; no measured counter includes it. When on, its walk of the circuit's delta is under `query` on the view worker, like the join's own delta side, so `requested_slice` holds only slice reads and the routing's reads above.
 - **`RowBuilder`: one batch per slice, with a bounded local reorder** (option 1). The rows of one folded key (at most three: an `Old` row, and `Dlt`'s `-old` and `+new`) may be reordered and consolidated among themselves, with cancelling pairs dropped, because the packed payload bytes do not order like the typed values. Across different folded keys `(K, V)` must already arrive strictly ascending, and the builder errors otherwise. There is no general sort. One folded key yielding more than three rows is an error. A test checks a `-old/+new` pair in byte-reversed typed order, `Old c5` plus `-c5` plus `+c5'` consolidating to `+c5'`, and rows of different folded keys out of order.
 
+The user also decided the read owners and the IVM window on 2026-11-12:
+
+- **Read owners.** `requested_slice` counts the reconstructed joins' partner reads of the readers' slices and routing's reads of `ΔC` and `ΔO` rows (read by a forward merge with the scan, since both are sorted, because they build the slices). `partner_trace` counts the native joins' trace reads, partner sampling included. Delta-side reads stay under `query`, labeled "DBSP operator reads". Phase A's `Dlt` reads count under `merged_index`, so both modes' partner-read rows cover the same kind of work (native's traces are integrated, so they include this transaction's delta rows). The code has `requested_slice`; `partner_trace`, the forward merge, and phase A's owner are pending.
+- **`DrivingDelta`** (`Stream(id)` or `Join`) names how a reader's driving delta arises; the entry-to-row function is `unfold`.
+- **`delta_ms`.** Preparing the view's transaction delta is in the IVM window in both modes (native's JSON conversion; reconstructed mode's phase A and hand-off), and `forward_ms` keeps only the net-delta read. Measurement version 11. Pending in code.
+- **Relation to selective execution.** This design revives selective execution's requests, kept path, and ready pairs inside one touched group, but not `Visit` ([deferred.md](deferred.md#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred)).
+
 The whole-group over-read that remains, a key read per position of a touched group, is deferred ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
 
 ### 2026-11-10: Pipelining types take the suffix `Vector`
@@ -519,6 +526,7 @@ The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyV
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
+| 2026-11-09 | Selective execution's requests are withdrawn (deferred with `Visit`). | 2026-11-12, in part: requests, the kept path, and ready pairs apply at routing inside a touched group; `Visit` stays deferred. |
 | 2026-11-11 | The driving deltas are pushed row by row into the view circuit's `ZSetHandle`s (measurement version 9). | 2026-11-11: the readers' `Dlt` batches are handed whole to `add_input_stream` handles (measurement version 10). |
 | 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader holds its driving delta's requests and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
 | 2026-11-11 | Three `TransactionGenerator` sources emit the readers' `Dlt` batches at the commit flush, cloning all three. | 2026-11-11: DBSP's `Input` operator, as native mode uses; `ΔO` and `ΔL` moved, `ΔC` cloned. |
