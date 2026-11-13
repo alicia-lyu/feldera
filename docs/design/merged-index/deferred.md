@@ -77,7 +77,7 @@ existing batches; they create no tuple copies, historical-version catalog, or ex
 ## Shared scan sessions
 
 > [!NOTE]
-> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward scan session per transaction that collects each touched group once and hands its buffers to the execution (buffered execution, as amended on 2026-11-09). The material below remains background for full-query execution.
+> For IVM, [shared-traversal.md](shared-traversal.md) (2026-10-29) supersedes this section as the target design: one forward scan session per transaction that reads each touched group once and routes each requested entry to its reader (routing by requests, 2026-11-12; buffered execution until then). The material below remains background for full-query execution.
 
 Shared scan sessions are a **deferred, optional abstraction** for either full-query execution or IVM.
 The current experiments use direct reconstruction. The design below applies only if later workloads
@@ -278,7 +278,7 @@ Buffered execution replaces it as the fallback and as the only target. Reviving 
 
 ### Status on 2026-11-12: requests apply at routing; skipping stays deferred
 
-The 2026-11-12 design (decisions.md) revives most of the request machinery inside one touched group, but not the skipping. The implementation sits between buffered and selective execution: *selective decoding with whole-group positioning*. With the deferred skip, it would become selective execution restricted to one group at a time.
+The 2026-11-12 design (decisions.md) revives most of the request machinery inside one touched group, but not the skipping. The implementation, *routing by requests* (name unconfirmed), sits between buffered and selective execution. With the deferred skip, it would become selective execution restricted to one group at a time.
 
 | Selective execution (above) | Status |
 | --- | --- |

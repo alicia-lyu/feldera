@@ -530,7 +530,19 @@ This revises the 2026-11-11 rule that the boundary copy lies outside the IVM win
 
 ### 2026-11-10: Pipelining types take the suffix `Vector`
 
-The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers.
+The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers. (Since 2026-11-12 there are no buffers: the records live in the readers' requested slices.)
+
+### 2026-11-13: Minor implementation choices confirmed
+
+The user confirmed on 2026-11-13 these choices from the unconfirmed list of [shared-traversal.md](shared-traversal.md), and asked not to be asked again about choices that ordinary engineering practice settles.
+
+- **`prefix_successor` returns `Option`.** `None` means the range runs to the end of the index; there is no sentinel key.
+- **`RunMerge` finds the minimum key by linear scan** over its run cursors. A heap would keep the cursors ordered by their current key and cost O(log k) per step instead of O(k); a snapshot holds few runs, so the simpler scan was kept.
+- **A separate `weight_decodes` counter.** A file run stores a value and its weight apart, and `CursorList`'s zero-weight skip reads weights that no reader takes; folding them into value decodes would hide that cost.
+- **`cursor_opens` counts logical cursors**, not run cursors: one, over `Old`.
+- **`ScanSession::new` takes `Old` as a snapshot and opens its `RunMerge` itself**, so the opening's key decode is inside the session's counted region.
+- **`RunMerge::exhaust`** for a skipped prefix with no successor (unused by the session since 2026-11-12).
+- **`take_driving_deltas` errors on a second call** in one transaction, rather than handing over empty deltas.
 
 ## Superseded and withdrawn
 

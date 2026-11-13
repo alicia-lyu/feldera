@@ -71,20 +71,19 @@ This branch prototypes maintaining TPC-H Q3 as the predicate-free join `V = Cust
 | --- | --- |
 | Folded keys, merged-index batches (schema-independent) | `crates/dbsp/src/trace/merged_index/` |
 | Join that takes supplied snapshot readers instead of traces | `dyn_join_generic_with_snapshot_readers` in `crates/dbsp/src/operator/dynamic/join.rs`; typed wrapper in `mono.rs` |
-| Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
+| Compiler hook (`--q3-merged-index`) that pattern-matches the exact Q3 circuit; unused since 2026-11-10, when the hand-written `q3-trie-view-circuit` replaced it | `Q3MergedIndexBinding.java`, `ToRustVisitor.java`, `CompilerOptions.java` |
 | COL keys, payloads, Q3 readers, `Q3State` | `sql-to-dbsp-compiler/experiments/merged-index-col/` |
 | Harness: loading, RF1/RF2 refreshes, `ManualIndex`, R5 measurement | `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/` |
 
 ### Experiment commands
 
-Run these from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline` with JDK 21. `src/lib.rs` is generated and git-ignored.
+Run these from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline` with JDK 21. `generate.sh` writes the git-ignored native pair, `q3-base-circuit/src/lib.rs` and `q3-view-circuit/src/lib.rs`; the reconstructed view circuit is hand-written.
 
 ```bash
-./generate.sh                       # native circuit
+./generate.sh                       # generates the native pair; the reconstructed view circuit needs no generation
 cargo +1.96.1 test --offline --locked
-./generate.sh --q3-merged-index     # reconstructed circuit
 cargo +1.96.1 test --offline --locked --features merged-index
-./verify.sh                         # full gate: fmt, both modes, clippy, transcript cmp, COL suite, Python tests; restores native generation
+./verify.sh                         # full gate: fmt, both modes, clippy, two transcript cmps, COL suite, Python tests
 python3 measure.py --help           # R5 measurement runner
 ```
 

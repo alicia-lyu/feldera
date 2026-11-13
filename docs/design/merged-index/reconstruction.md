@@ -33,7 +33,7 @@ A DBSP transaction is `start_transaction`, any number of `step()` calls, then `c
 - Outputs appear at commit.
 - The logical clock advances once per transaction.
 
-The reconstructed joins call their readers once, at the commit flush, and the readers read groups that the session buffered before the transaction. In `JoinTrace` (`join.rs`), a step that is not a flush yields an empty output and returns before any reader runs.
+The reconstructed joins call their readers once, at the commit flush, and the readers hand over the requested slices that the session filled before the transaction. In `JoinTrace` (`join.rs`), a step that is not a flush yields an empty output and returns before any reader runs.
 
 Per transaction, the harness does the following in order (`q3-ivm-baseline/src/main.rs`):
 
