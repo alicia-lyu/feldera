@@ -467,16 +467,15 @@ impl Pipeline {
     /// Runs the transaction's scan session over the published `Old` and `Dlt`, which buffers the
     /// touched groups until the publication is finished. This is the transaction's only read of
     /// the index in the view phase.
-    fn collect_groups(&self) -> Result<()> {
+    /// Runs the scan session and returns the time it spent preparing the driving deltas from
+    /// `Dlt` (phase A), which belongs to `delta_ms`, not to the scan's `q3_ms`.
+    fn collect_groups(&self) -> Result<Duration> {
         self.in_cache(|| self.q3_state.collect(self.session_pass))
             .map_err(anyhow::Error::msg)
     }
 
-    /// Prepares the view circuit's transaction delta from the collected `Dlt`: the work that
-    /// `delta_ms` times in reconstructed mode. Today that is the hand-off of the driving deltas
-    /// (`feed_driving_deltas`); the collection's pass over `Dlt` that builds each reader's
-    /// driving delta still runs inside `collect_groups`, so it counts in `q3_ms`. When that pass
-    /// is callable apart from the scan, call it here and `delta_ms` will include it.
+    /// Hands the prepared transaction delta to the view circuit: the part of `delta_ms` after
+    /// the collection (phase A's part is returned by `collect_groups`).
     fn build_view_delta(&self) -> Result<()> {
         self.feed_driving_deltas()
     }
@@ -753,9 +752,13 @@ fn transact_inner(
     #[cfg(feature = "merged-index")]
     let (transaction_result, view_time) = {
         let collection_result = pipeline.collect_groups();
-        let collection = view_started.elapsed();
+        // Phase A (the driving deltas from `Dlt`) runs inside the collection; it moves from the
+        // scan's `q3_ms` to `delta_ms`.
+        let delta_preparation = collection_result.as_ref().copied().unwrap_or_default();
+        let collection = view_started.elapsed().saturating_sub(delta_preparation);
+        delta += delta_preparation;
         let delta_started = Instant::now();
-        let delta_result = collection_result.and_then(|()| pipeline.build_view_delta());
+        let delta_result = collection_result.and_then(|_| pipeline.build_view_delta());
         delta += delta_started.elapsed();
         let transaction_started = Instant::now();
         let transaction_result = delta_result.and_then(|()| {

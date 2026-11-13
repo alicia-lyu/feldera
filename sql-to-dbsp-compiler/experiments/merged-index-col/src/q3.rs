@@ -46,6 +46,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
     },
+    time::{Duration, Instant},
 };
 
 use dbsp::{
@@ -711,59 +712,74 @@ impl Q3State {
     /// until [`Self::finish`]. The index is read here, on the calling thread
     /// under the merged index's read owner, and nowhere else; the caller binds
     /// the runtime's buffer cache to this thread.
-    pub fn collect(&self, pass: Pass) -> Result<(), String> {
+    ///
+    /// Returns the time spent preparing the driving deltas (the capture of
+    /// `Dlt` and the sealing of `ΔC`, `ΔO`, and `ΔL`), which the harness books
+    /// as the preparation of the view's transaction delta, apart from the scan.
+    pub fn collect(&self, pass: Pass) -> Result<Duration, String> {
         let views = self.views()?;
         let before = WriteOwner::ALL.map(RunReads::current_for);
-        let (collected, driving, counts) = with_read_owner(WriteOwner::MergedIndex, || {
-            let mut customers = Reader::<CustomersAfter>::new()?;
-            let mut orders = Reader::<OrdersBefore>::new()?;
-            let mut joined = Reader::<JoinedAfter>::new()?;
-            let mut lines = Reader::<LineitemsBefore>::new()?;
+        let (collected, driving, counts, delta_preparation) =
+            with_read_owner(WriteOwner::MergedIndex, || {
+                let mut customers = Reader::<CustomersAfter>::new()?;
+                let mut orders = Reader::<OrdersBefore>::new()?;
+                let mut joined = Reader::<JoinedAfter>::new()?;
+                let mut lines = Reader::<LineitemsBefore>::new()?;
 
-            // The driving deltas: `ΔO` of `C⁺`, `ΔC` of `O⁻`, and `ΔL` of `J⁺`. `L⁻`'s is a
-            // join, so it has requests only. The readers keep the requests, not the deltas.
-            let mut delta_orders = Delta::<CustomersAfter>::new()?;
-            let mut delta_customers = Delta::<OrdersBefore>::new()?;
-            let mut delta_lines = Delta::<JoinedAfter>::new()?;
-            let drivers: &mut [&mut dyn DeltaReader<Definition>] = &mut [
-                &mut Capture::new(&mut customers, &mut delta_orders),
-                &mut Capture::new(&mut orders, &mut delta_customers),
-                &mut Capture::new(&mut joined, &mut delta_lines),
-            ];
-            let captured = capture::<Definition>(&views.dlt, drivers)?;
+                // The driving deltas: `ΔO` of `C⁺`, `ΔC` of `O⁻`, and `ΔL` of `J⁺`. `L⁻`'s is a
+                // join, so it has requests only. The readers keep the requests, not the deltas.
+                let mut delta_orders = Delta::<CustomersAfter>::new()?;
+                let mut delta_customers = Delta::<OrdersBefore>::new()?;
+                let mut delta_lines = Delta::<JoinedAfter>::new()?;
+                let drivers: &mut [&mut dyn DeltaReader<Definition>] = &mut [
+                    &mut Capture::new(&mut customers, &mut delta_orders),
+                    &mut Capture::new(&mut orders, &mut delta_customers),
+                    &mut Capture::new(&mut joined, &mut delta_lines),
+                ];
+                let capture_started = Instant::now();
+                let captured = capture::<Definition>(&views.dlt, drivers)?;
+                let mut delta_preparation = capture_started.elapsed();
 
-            let mut session = ScanSession::<Definition>::new(&views.old, &captured.touched, pass);
-            Routing {
-                delta_customers: delta_customers.cursor()?,
-                delta_orders: delta_orders.cursor()?,
-                customers: &mut customers,
-                orders: &mut orders,
-                joined: &mut joined,
-                lines: &mut lines,
-            }
-            .scan(&mut session)?;
-            let counts = SessionCounts {
-                payload_decodes_dlt: captured.payload_decodes_dlt,
-                ..session.counts()
-            };
-            drop(session);
+                let mut session =
+                    ScanSession::<Definition>::new(&views.old, &captured.touched, pass);
+                Routing {
+                    delta_customers: delta_customers.cursor()?,
+                    delta_orders: delta_orders.cursor()?,
+                    customers: &mut customers,
+                    orders: &mut orders,
+                    joined: &mut joined,
+                    lines: &mut lines,
+                }
+                .scan(&mut session)?;
+                let counts = SessionCounts {
+                    payload_decodes_dlt: captured.payload_decodes_dlt,
+                    ..session.counts()
+                };
+                drop(session);
 
-            for reader in [
-                customers.seal_partner(),
-                orders.seal_partner(),
-                joined.seal_partner(),
-                lines.seal_partner(),
-            ] {
-                reader?;
-            }
-            // The deltas are moved out, not cloned: no after read shares them.
-            let driving = DrivingDeltas {
-                customers: delta_customers.into_batch()?,
-                orders: delta_orders.into_batch()?,
-                lines: delta_lines.into_batch()?,
-            };
-            Ok::<_, String>(((customers, orders, joined, lines), driving, counts))
-        })?;
+                for reader in [
+                    customers.seal_partner(),
+                    orders.seal_partner(),
+                    joined.seal_partner(),
+                    lines.seal_partner(),
+                ] {
+                    reader?;
+                }
+                // The deltas are moved out, not cloned: no after read shares them.
+                let seal_started = Instant::now();
+                let driving = DrivingDeltas {
+                    customers: delta_customers.into_batch()?,
+                    orders: delta_orders.into_batch()?,
+                    lines: delta_lines.into_batch()?,
+                };
+                delta_preparation += seal_started.elapsed();
+                Ok::<_, String>((
+                    (customers, orders, joined, lines),
+                    driving,
+                    counts,
+                    delta_preparation,
+                ))
+            })?;
         let after = WriteOwner::ALL.map(RunReads::current_for);
         let driver_reads: OwnerReads = std::array::from_fn(|i| after[i].since(before[i]));
         let run_reads = driver_reads[WriteOwner::MergedIndex as usize];
@@ -783,7 +799,8 @@ impl Q3State {
                 },
                 driving: Some(driving),
             }))
-            .map_err(|_| "the published views were already collected".to_owned())
+            .map_err(|_| "the published views were already collected".to_owned())?;
+        Ok(delta_preparation)
     }
 
     /// Release the readers and published handles after all transaction

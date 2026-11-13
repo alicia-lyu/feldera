@@ -366,7 +366,7 @@ This table refreshes `tab:prototype`.
 | Owner-key change | `prepare` emits both folded keys of each moved line item, reading its lines from `Old` | Same |
 | Cursors and seeks | One session per transaction: one forward cursor over `Old`, a key read at every position of a touched group, each kept entry decoded once, untouched groups passed. The partner reads are the requested slices and open no cursor on the index | Same |
 | Key order | Folded byte keys compared as bytes; signed integers in value order, tested | Folded order |
-| Counters | `SessionCounts` and the run counters (`index_session_counts`, `index_run_reads.session`). Version 11: the read owner `requested_slice` counts the reconstructed joins' reads of the slices and, pending, routing's reads of `ΔC` and `ΔO` rows (now a cursor seek per key under `query`); `partner_trace` (pending) will count native's trace reads; delta-side reads stay under `query`, labeled "DBSP operator reads"; `delta_ms` (pending) books the preparation of the view's transaction delta in the IVM window in both modes, and `forward_ms` keeps only the net-delta read; phase A's `Dlt` reads count under `merged_index` (pending) | Same |
+| Counters | `SessionCounts` and the run counters (`index_session_counts`, `index_run_reads.session`). Version 11: the read owner `requested_slice` counts the reconstructed joins' reads of the slices and routing's reads of `ΔC` and `ΔO` rows (a forward merge, no seek); `partner_trace` counts native's trace reads, partner sampling included; delta-side reads stay under `query`, labeled "DBSP operator reads"; `delta_ms` books the preparation of the view's transaction delta in the IVM window in both modes, and `forward_ms` keeps only the net-delta read; phase A's `Dlt` reads count under `merged_index`; `collect` captures every owner on the driver's thread (`driver_run_reads`) | Same |
 
 ## Design work the write-up leaves to the implementation
 
@@ -434,7 +434,7 @@ The steps are ordered. Each has an exit check and updates its docs. They are not
    - `GroupBuffers`, `on_group`, `reject`, `Projection`, `ReaderRuns`, `TouchedGroups`, `values_at`, and `RequestedRows` are gone. `ΔJ` and `J⁺` are computed at routing.
    - No driving delta is cloned: `C⁺`'s batch holds `ΔC`'s rows of the customers of `ΔO`.
    - The `requested_slice` read owner counts the joins' reads of the slices.
-   - *Pending:* the `partner_trace` read owner (native's trace reads, partner sampling included); routing's reads of `ΔC` and `ΔO` rows by a forward merge with the scan, under `requested_slice`; phase A's `Dlt` reads under `merged_index`; `collect` capturing every owner on the driver's thread; `delta_ms`.
+   - Also done 2026-11-12: the `partner_trace` read owner (native's trace reads, partner sampling included); routing's reads of `ΔC` and `ΔO` rows by a forward merge with the scan, under `requested_slice`; phase A's `Dlt` reads under `merged_index`; `collect` capturing every owner on the driver's thread; `delta_ms`, with phase A in it.
    - *Exit:*
      - Both transcript comparisons pass (`verify.sh`) on the merged tree.
      - A test asserts that `collect` leaves zero reads under `query` on the driver's thread.

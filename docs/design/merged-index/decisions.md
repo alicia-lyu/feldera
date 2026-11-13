@@ -510,7 +510,7 @@ The user amended this on the same day:
 
 The user also decided the read owners and the IVM window on 2026-11-12:
 
-- **Read owners.** `requested_slice` counts the reconstructed joins' partner reads of the readers' slices and routing's reads of `ΔC` and `ΔO` rows (read by a forward merge with the scan, since both are sorted, because they build the slices). `partner_trace` counts the native joins' trace reads, partner sampling included. Delta-side reads stay under `query`, labeled "DBSP operator reads". Phase A's `Dlt` reads count under `merged_index`, so both modes' partner-read rows cover the same kind of work (native's traces are integrated, so they include this transaction's delta rows). The code has `requested_slice`; `partner_trace`, the forward merge, and phase A's owner are pending.
+- **Read owners.** `requested_slice` counts the reconstructed joins' partner reads of the readers' slices and routing's reads of `ΔC` and `ΔO` rows (read by a forward merge with the scan, since both are sorted, because they build the slices). `partner_trace` counts the native joins' trace reads, partner sampling included. Delta-side reads stay under `query`, labeled "DBSP operator reads". Phase A's `Dlt` reads count under `merged_index`, so both modes' partner-read rows cover the same kind of work (native's traces are integrated, so they include this transaction's delta rows).
 - **`DrivingDelta`** (`Stream(id)` or `Join`) names how a reader's driving delta arises; the entry-to-row function is `unfold`.
 - **`delta_ms`.** Preparing the view's transaction delta is in the IVM window in both modes (native's JSON conversion; reconstructed mode's phase A and hand-off), and `forward_ms` keeps only the net-delta read. Measurement version 11. Pending in code.
 - **Relation to selective execution.** This design revives selective execution's requests, kept path, and ready pairs inside one touched group, but not `Visit` ([deferred.md](deferred.md#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred)).
@@ -522,7 +522,7 @@ The whole-group over-read that remains, a key read per position of a touched gro
 The user decided on 2026-11-12 that preparing the view circuit's transaction delta is view maintenance in both modes, timed inside the IVM window as a new sub-phase, `delta_ms` (measurement version 11, shared with the reader redesign).
 
 - **Native:** the conversion of the net delta into the view circuit's input rows (`net_delta.apply_optional` into the input handles).
-- **Reconstructed:** building the driving deltas from `Dlt` and handing them to the input handles (`Pipeline::build_view_delta`, which today calls `feed_driving_deltas`). The collection's pass over `Dlt` that builds each reader's driving delta joins `delta_ms` once it is callable apart from the scan; until then it counts in `q3_ms`.
+- **Reconstructed:** building the driving deltas from `Dlt` and handing them to the input handles (phase A, timed inside `Q3State::collect`, which returns it, then `Pipeline::build_view_delta`). The scan of `Old` (phase B) stays in `q3_ms`.
 - **`forward_ms`** keeps only the net-delta read (`workload::net_delta`), the same operation in both modes.
 - **`ivm_ms = delta_ms + q3_ms`.** `q3_ms` stays the view circuit's transaction, plus the scan session's collection in reconstructed mode. The report shows `delta_ms` beside `ivm_ms`, so a reader can compare the modes with and without it: the two operations are not identical.
 

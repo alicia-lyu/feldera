@@ -1131,7 +1131,7 @@ fn an_inserted_order_is_stepped_between_the_orders_of_old() {
 /// The run reads that `collect` makes on this thread for the merged index, and
 /// for every other owner together.
 fn collect_reads_of(state: &Q3State, pass: Pass) -> (RunReads, RunReads) {
-    let ((), index, other) = run_reads_of(|| state.collect(pass).unwrap());
+    let (_, index, other) = run_reads_of(|| state.collect(pass).unwrap());
     (index, other)
 }
 
