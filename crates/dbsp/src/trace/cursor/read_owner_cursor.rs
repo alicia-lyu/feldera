@@ -1,6 +1,6 @@
 use crate::{
     dynamic::Factory,
-    storage::write_attribution::WriteOwner,
+    storage::attribution::Component,
     trace::{Cursor, cursor::Position, with_read_owner},
 };
 
@@ -12,13 +12,13 @@ use crate::{
 /// with another one, such as the partner cursor of a join, which steps in
 /// between the delta cursor's own reads. This adapter charges each call alone.
 pub struct ReadOwnerCursor<C> {
-    owner: WriteOwner,
+    owner: Component,
     cursor: C,
 }
 
 impl<C> ReadOwnerCursor<C> {
     /// Wraps `cursor`; its calls are counted for `owner`.
-    pub fn new(owner: WriteOwner, cursor: C) -> Self {
+    pub fn new(owner: Component, cursor: C) -> Self {
         Self { owner, cursor }
     }
 }
@@ -154,7 +154,7 @@ mod tests {
     use crate::{
         ZWeight,
         dynamic::{DowncastTrait, Erase},
-        storage::write_attribution::WriteOwner,
+        storage::attribution::Component,
         trace::{
             BatchReader as DynamicBatchReader, Cursor, RunReads, current_read_owner,
             with_read_owner,
@@ -170,7 +170,7 @@ mod tests {
     }
 
     /// The reads of `f` for `owner` and for the thread's other owners together.
-    fn reads_of(owner: WriteOwner, f: impl FnOnce()) -> (RunReads, RunReads) {
+    fn reads_of(owner: Component, f: impl FnOnce()) -> (RunReads, RunReads) {
         let (before, before_owner) = (RunReads::current(), RunReads::current_for(owner));
         f();
         let for_owner = RunReads::current_for(owner).since(before_owner);
@@ -183,9 +183,9 @@ mod tests {
         let wrapped = batch(&[(1, 10), (2, 20), (3, 30)]);
         let other = batch(&[(1, 10), (2, 20), (3, 30)]);
         let mut other_cursor = other.inner().cursor();
-        let mut cursor = ReadOwnerCursor::new(WriteOwner::RequestedSlice, wrapped.inner().cursor());
+        let mut cursor = ReadOwnerCursor::new(Component::RequestedSlice, wrapped.inner().cursor());
 
-        let (slice, all) = reads_of(WriteOwner::RequestedSlice, || {
+        let (slice, all) = reads_of(Component::RequestedSlice, || {
             // The two cursors interleave, as a join's delta and partner cursors
             // do; only the wrapped cursor's calls are charged to the owner.
             assert!(cursor.seek_key_exact(2i64.erase(), None));
@@ -202,7 +202,7 @@ mod tests {
         assert!(all.memory_key_reads > slice.memory_key_reads);
 
         // Without the adapter the same reads count for the current owner.
-        let (slice_plain, _) = reads_of(WriteOwner::RequestedSlice, || {
+        let (slice_plain, _) = reads_of(Component::RequestedSlice, || {
             let mut plain = wrapped.inner().cursor();
             assert!(plain.seek_key_exact(2i64.erase(), None));
         });
@@ -212,20 +212,20 @@ mod tests {
     #[test]
     fn the_adapter_overrides_the_current_owner_and_restores_it() {
         let wrapped = batch(&[(1, 10)]);
-        let mut cursor = ReadOwnerCursor::new(WriteOwner::RequestedSlice, wrapped.inner().cursor());
+        let mut cursor = ReadOwnerCursor::new(Component::RequestedSlice, wrapped.inner().cursor());
         let (slice, index) = {
             let before = (
-                RunReads::current_for(WriteOwner::RequestedSlice),
-                RunReads::current_for(WriteOwner::MergedIndex),
+                RunReads::current_for(Component::RequestedSlice),
+                RunReads::current_for(Component::MergedIndex),
             );
-            with_read_owner(WriteOwner::MergedIndex, || {
+            with_read_owner(Component::MergedIndex, || {
                 cursor.step_key();
                 cursor.rewind_keys();
-                assert_eq!(current_read_owner(), WriteOwner::MergedIndex);
+                assert_eq!(current_read_owner(), Component::MergedIndex);
             });
             (
-                RunReads::current_for(WriteOwner::RequestedSlice).since(before.0),
-                RunReads::current_for(WriteOwner::MergedIndex).since(before.1),
+                RunReads::current_for(Component::RequestedSlice).since(before.0),
+                RunReads::current_for(Component::MergedIndex).since(before.1),
             )
         };
         assert!(slice.memory_key_reads > 0);

@@ -44,7 +44,7 @@
 //!
 //! Each read is also counted for the thread's current *read owner*, the
 //! component on whose behalf the run is read. The owners are the components of
-//! [`WriteOwner`]; the default is [`WriteOwner::Query`], and
+//! [`Component`]; the default is [`Component::Query`], and
 //! [`with_read_owner`] changes it for the duration of a closure.
 //! [`RunReads::current_for`] gives one owner's totals, and the owners add up
 //! to [`RunReads::current`].
@@ -59,7 +59,7 @@ use std::thread::LocalKey;
 
 use serde::Serialize;
 
-use crate::storage::write_attribution::WriteOwner;
+use crate::storage::attribution::Component;
 
 /// The reads of single runs on one thread; see the [module docs](self).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -74,32 +74,32 @@ pub struct RunReads {
     pub memory_weight_reads: u64,
 }
 
-/// One running total per owner, indexed like [`WriteOwner::ALL`].
-type PerOwner = [Cell<u64>; WriteOwner::ALL.len()];
+/// One running total per owner, indexed like [`Component::ALL`].
+type PerOwner = [Cell<u64>; Component::ALL.len()];
 
 thread_local! {
-    static CURRENT_READ_OWNER: Cell<WriteOwner> = const { Cell::new(WriteOwner::Query) };
-    static SEEKS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static FILTER_REJECTIONS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static KEY_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static VALUE_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static WEIGHT_DECODES: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static MEMORY_KEY_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static MEMORY_VALUE_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
-    static MEMORY_WEIGHT_READS: PerOwner = const { [const { Cell::new(0) }; WriteOwner::ALL.len()] };
+    static CURRENT_READ_OWNER: Cell<Component> = const { Cell::new(Component::Query) };
+    static SEEKS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static FILTER_REJECTIONS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static KEY_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static VALUE_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static WEIGHT_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static MEMORY_KEY_READS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static MEMORY_VALUE_READS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static MEMORY_WEIGHT_READS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
 }
 
 impl RunReads {
     /// This thread's running totals, over all owners.
     pub fn current() -> Self {
-        WriteOwner::ALL
+        Component::ALL
             .into_iter()
             .map(Self::current_for)
             .fold(Self::default(), Self::plus)
     }
 
     /// This thread's running totals for the reads made on behalf of `owner`.
-    pub fn current_for(owner: WriteOwner) -> Self {
+    pub fn current_for(owner: Component) -> Self {
         let total = |counter: &'static LocalKey<PerOwner>| {
             counter.with(|counts| counts[owner.index()].get())
         };
@@ -151,14 +151,14 @@ impl AddAssign for RunReads {
 }
 
 /// The owner that this thread's run reads are now counted for.
-pub fn current_read_owner() -> WriteOwner {
+pub fn current_read_owner() -> Component {
     CURRENT_READ_OWNER.get()
 }
 
 /// Runs `f` with `owner` as this thread's read owner, then restores the
 /// previous owner, even if `f` panics.
-pub fn with_read_owner<R>(owner: WriteOwner, f: impl FnOnce() -> R) -> R {
-    struct Restore(WriteOwner);
+pub fn with_read_owner<R>(owner: Component, f: impl FnOnce() -> R) -> R {
+    struct Restore(Component);
     impl Drop for Restore {
         fn drop(&mut self) {
             CURRENT_READ_OWNER.set(self.0);
@@ -305,11 +305,11 @@ mod tests {
     };
 
     /// The reads that `f` makes, in total and for each owner.
-    fn reads_by_owner(f: impl FnOnce()) -> (RunReads, [RunReads; WriteOwner::ALL.len()]) {
+    fn reads_by_owner(f: impl FnOnce()) -> (RunReads, [RunReads; Component::ALL.len()]) {
         let earlier_total = RunReads::current();
-        let earlier = WriteOwner::ALL.map(RunReads::current_for);
+        let earlier = Component::ALL.map(RunReads::current_for);
         f();
-        let later = WriteOwner::ALL.map(RunReads::current_for);
+        let later = Component::ALL.map(RunReads::current_for);
         let by_owner = std::array::from_fn(|i| later[i].since(earlier[i]));
         (RunReads::current().since(earlier_total), by_owner)
     }
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn a_read_scope_attributes_its_reads() {
         let (total, [query, _, index, ..]) = reads_by_owner(|| {
-            with_read_owner(WriteOwner::MergedIndex, count_seek);
+            with_read_owner(Component::MergedIndex, count_seek);
             count_seek();
         });
         assert_eq!(total.seeks, 2);
@@ -337,13 +337,13 @@ mod tests {
     #[test]
     fn nested_scopes_restore_the_outer_owner() {
         let (_, [query, base, index, ..]) = reads_by_owner(|| {
-            with_read_owner(WriteOwner::MergedIndex, || {
-                with_read_owner(WriteOwner::BaseRelation, count_seek);
-                assert_eq!(current_read_owner(), WriteOwner::MergedIndex);
+            with_read_owner(Component::MergedIndex, || {
+                with_read_owner(Component::BaseRelation, count_seek);
+                assert_eq!(current_read_owner(), Component::MergedIndex);
                 count_seek();
             });
         });
-        assert_eq!(current_read_owner(), WriteOwner::Query);
+        assert_eq!(current_read_owner(), Component::Query);
         assert_eq!(base, ONE_SEEK);
         assert_eq!(index, ONE_SEEK);
         assert_eq!(query, RunReads::default());
@@ -353,7 +353,7 @@ mod tests {
     fn a_panic_restores_the_owner() {
         let (_, [query, _, index, ..]) = reads_by_owner(|| {
             let result = std::panic::catch_unwind(|| {
-                with_read_owner(WriteOwner::MergedIndex, || panic!("inside the scope"))
+                with_read_owner(Component::MergedIndex, || panic!("inside the scope"))
             });
             assert!(result.is_err());
             count_seek();

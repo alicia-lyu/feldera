@@ -7,10 +7,10 @@ use super::{
 use crate::Runtime;
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED, FILES_SYNCED};
 use crate::profile::{BlockingFor, ParkReason};
-use crate::storage::diagnostics::{self, FlushRecord};
-use crate::storage::write_attribution::{
-    WriteOwner, current_write_owner, record_write_bytes, record_write_operation,
+use crate::storage::attribution::{
+    Component, current_write_owner, record_write_bytes, record_write_operation,
 };
+use crate::storage::diagnostics::{self, FlushRecord};
 use crate::storage::{buffer_cache::FBuf, init};
 use feldera_storage::metrics::{
     READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS,
@@ -674,7 +674,7 @@ struct PosixWriter {
     /// Who the bytes of this file are counted for, fixed when the writer is
     /// created. A flush may happen on any thread and long after the writer's
     /// creator has moved on, so the owner is not looked up at flush time.
-    owner: WriteOwner,
+    owner: Component,
 
     async_threads: bool,
     ioop_delay: Duration,

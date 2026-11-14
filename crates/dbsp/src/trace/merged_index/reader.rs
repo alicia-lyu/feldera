@@ -54,7 +54,7 @@ use std::sync::Arc;
 use crate::{
     DBData, ZWeight,
     dynamic::{DowncastTrait, Erase},
-    storage::write_attribution::WriteOwner,
+    storage::attribution::Component,
     trace::{
         Batch as DynBatch, BatchReader as DynBatchReader, Builder, Cursor,
         SpineSnapshot as DynamicSnapshot, with_read_owner,
@@ -513,7 +513,7 @@ impl<R: ReaderDefinition> Delta<R> {
         match &self.rows {
             // Opening the cursor lands on the first key, which is a read.
             DeltaRows::Sealed(batch) => Ok(DeltaCursor {
-                cursor: with_read_owner(WriteOwner::RequestedSlice, || batch.inner().cursor()),
+                cursor: with_read_owner(Component::RequestedSlice, || batch.inner().cursor()),
             }),
             DeltaRows::Building(_) => Err("the driving delta is not sealed yet".into()),
         }
@@ -534,7 +534,7 @@ impl<R: ReaderDefinition> Delta<R> {
 /// so each key stepped over is one the scan visits anyway.
 ///
 /// These are reads the routing makes to build the readers' slices, so they are counted under
-/// [`WriteOwner::RequestedSlice`], not the merged index's or the DBSP operators'.
+/// [`Component::RequestedSlice`], not the merged index's or the DBSP operators'.
 pub struct DeltaCursor<'a, R: ReaderDefinition> {
     cursor: <Inner<R::DeltaKey, R::DeltaVal> as DynBatchReader>::Cursor<'a>,
 }
@@ -544,7 +544,7 @@ impl<R: ReaderDefinition> DeltaCursor<'_, R> {
     /// must be asked for in strictly ascending order: a key's values are read once, from the
     /// position that stepping onto the key gives, with no rewind.
     pub fn rows_at(&mut self, key: &R::DeltaKey) -> Vec<(R::DeltaVal, ZWeight)> {
-        with_read_owner(WriteOwner::RequestedSlice, || {
+        with_read_owner(Component::RequestedSlice, || {
             while self.cursor.key_valid()
                 && self.cursor.key().downcast_checked::<R::DeltaKey>() < key
             {

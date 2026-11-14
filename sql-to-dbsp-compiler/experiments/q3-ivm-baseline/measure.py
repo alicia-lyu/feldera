@@ -19,7 +19,7 @@ from typing import Any
 
 EXPERIMENT = Path(__file__).resolve().parent
 MODES = ("native", "merged-index")
-# The owners of `WriteOwner::ALL` (measurement version 11): the components that write storage and
+# The owners of `Component::ALL` (measurement version 11): the components that write storage and
 # whose reads are counted. `requested_slice` (the joins' reads of the readers' requested slices of
 # the index, reconstructed mode) and `partner_trace` (the joins' reads of their traces, native
 # mode) are read owners only, so no write is ever counted under them.

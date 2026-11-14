@@ -29,12 +29,12 @@ use crate::{
     dynamic::{DynVec, Factory},
     profile::{ParkReason, ParkingFor},
     storage::{
+        attribution::{Component, current_write_owner, scope_write_owner, with_write_owner},
         buffer_cache::{BufferCache, CacheStats},
         diagnostics::{
             self, CompactionRecord, RunContents, RunWriteKind, SpineContents, now_micros,
         },
         file::{FilterKind, FilterStats},
-        write_attribution::{WriteOwner, current_write_owner, scope_write_owner, with_write_owner},
     },
     time::Timestamp,
     trace::{
@@ -134,7 +134,7 @@ pub(crate) const MIN_LEVEL0_MERGE_BATCHES: usize = 8;
 /// writes belongs to the spine's owner.
 fn scope_tokio_merger_locals<F>(
     worker_index: usize,
-    write_owner: WriteOwner,
+    write_owner: Component,
     buffer_cache: Arc<BufferCache>,
     slab_allocator: Arc<FBufSlabs>,
     future: F,
@@ -883,7 +883,7 @@ where
     }
 
     /// Who the files of this spine are counted for.
-    fn write_owner(&self) -> WriteOwner {
+    fn write_owner(&self) -> Component {
         self.merge_workers.write_owner
     }
 
@@ -1386,7 +1386,7 @@ where
 
     /// The owner of the spine, fixed when the spine is created. Mergers run
     /// under it, so a compaction's files belong to the spine's owner.
-    write_owner: WriteOwner,
+    write_owner: Component,
 }
 
 impl<B> MergeWorkers<B>
@@ -1400,7 +1400,7 @@ where
         runtime: Runtime,
         max_level0_batch_size_records: usize,
         worker_index: usize,
-        write_owner: WriteOwner,
+        write_owner: Component,
     ) -> Self {
         Self {
             workers_started: AtomicU32::new(0),
@@ -1773,7 +1773,7 @@ where
 }
 
 /// Lists the runs of the spine behind `state`, for [diagnostics::spine_contents].
-fn spine_contents<B: Batch>(state: &Mutex<SharedState<B>>, owner: WriteOwner) -> SpineContents {
+fn spine_contents<B: Batch>(state: &Mutex<SharedState<B>>, owner: Component) -> SpineContents {
     // Copy what is needed and release the lock: reading files can be slow, and
     // the mergers need the lock.
     let (name, role, factories, batches) = {
@@ -1828,7 +1828,7 @@ fn spine_contents<B: Batch>(state: &Mutex<SharedState<B>>, owner: WriteOwner) ->
 impl MergeLogInfo {
     /// Describes this merge, now finished with `output`, for the compaction
     /// log.
-    fn record<B: Batch>(&self, owner: WriteOwner, spine: String, output: &B) -> CompactionRecord {
+    fn record<B: Batch>(&self, owner: Component, spine: String, output: &B) -> CompactionRecord {
         let (output_file, output_file_bytes) = file_of(output);
         CompactionRecord {
             kind: if self.requested {

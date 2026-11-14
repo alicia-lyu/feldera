@@ -19,7 +19,7 @@ use crate::{
             trace::{DelayedTraceId, TraceBounds, TraceId, UntimedTraceAppend, Z1Trace},
         },
     },
-    storage::write_attribution::{WriteOwner, with_write_owner},
+    storage::attribution::{Component, with_write_owner},
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Rkyv, Spine,
         cursor::Cursor,
@@ -290,7 +290,7 @@ where
 
             // The trace holds the base relation's state, so its files are
             // counted for the base relation, not for the query.
-            let z1 = with_write_owner(WriteOwner::BaseRelation, || {
+            let z1 = with_write_owner(Component::BaseRelation, || {
                 Z1Trace::new(
                     &factories.batch_factories,
                     &factories.batch_factories,
@@ -398,7 +398,7 @@ where
 
             // The trace holds the base relation's state, so its files are
             // counted for the base relation, not for the query.
-            let z1 = with_write_owner(WriteOwner::BaseRelation, || {
+            let z1 = with_write_owner(Component::BaseRelation, || {
                 Z1Trace::new(
                     &factories.batch_factories,
                     &factories.batch_factories,

@@ -5,7 +5,7 @@ use dbsp::circuit::Layout;
 use dbsp::circuit::circuit_builder::CircuitBase;
 use dbsp::dynamic::DynData;
 use dbsp::operator::dynamic::accumulator::EnableCount;
-use dbsp::storage::write_attribution::{WriteOwner, with_write_owner};
+use dbsp::storage::attribution::{Component, with_write_owner};
 use dbsp::trace::spine_async::WithSnapshot;
 use dbsp::typed_batch::{Spine, TypedBatch};
 use dbsp::utils::Tup1;
@@ -190,7 +190,7 @@ impl Catalog {
             move || {
                 // The relation's own state and its delta accumulators belong to the
                 // base relation, not to the queries that read it.
-                with_write_owner(WriteOwner::BaseRelation, || {
+                with_write_owner(Component::BaseRelation, || {
                     // Inputs are also outputs.
                     self.register_output_zset_persistent_inner(
                         Self::output_persistent_id(&stream).as_deref(),
@@ -237,7 +237,7 @@ impl Catalog {
             move || {
                 // The relation's own state and its delta accumulators belong to the
                 // base relation, not to the queries that read it.
-                with_write_owner(WriteOwner::BaseRelation, || {
+                with_write_owner(Component::BaseRelation, || {
                     // Inputs are also outputs.
                     self.register_materialized_output_zset_persistent_inner(
                         Self::output_persistent_id(&stream).as_deref(),
@@ -328,7 +328,7 @@ impl Catalog {
             move || {
                 // The relation's own state and its delta accumulators belong to the
                 // base relation, not to the queries that read it.
-                with_write_owner(WriteOwner::BaseRelation, || {
+                with_write_owner(Component::BaseRelation, || {
                     // Inputs are also outputs.
                     let handles = self
                         .register_output_map_persistent_inner(
@@ -414,7 +414,7 @@ impl Catalog {
             move || {
                 // The relation's own state and its delta accumulators belong to the
                 // base relation, not to the queries that read it.
-                with_write_owner(WriteOwner::BaseRelation, || {
+                with_write_owner(Component::BaseRelation, || {
                     // Inputs are also outputs.
                     let handles = self
                         .register_output_map_persistent_inner(

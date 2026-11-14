@@ -9,7 +9,7 @@ use crate::{
 use dbsp::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DowncastTrait, DynData, Erase},
-    storage::write_attribution::WriteOwner,
+    storage::attribution::Component,
     trace::{
         merged_index::{Pass, ScanSession, SessionCounts},
         Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
@@ -196,7 +196,7 @@ fn in_storage_runtime(f: impl FnOnce() + Clone + Send + 'static) {
 /// The run reads that `f` makes on this thread for the merged index, and for
 /// every other owner together.
 fn run_reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads, RunReads) {
-    let index = || RunReads::current_for(WriteOwner::MergedIndex);
+    let index = || RunReads::current_for(Component::MergedIndex);
     let (total_before, index_before) = (RunReads::current(), index());
     let result = f();
     let index_reads = index().since(index_before);
@@ -860,9 +860,9 @@ fn check_readers(
     // requested slice's.
     let reads = state.finish().unwrap();
     for silent in [
-        WriteOwner::Query,
-        WriteOwner::BaseRelation,
-        WriteOwner::PartnerTrace,
+        Component::Query,
+        Component::BaseRelation,
+        Component::PartnerTrace,
     ] {
         prop_assert_eq!(reads.driver_reads[silent as usize], RunReads::default());
     }
@@ -1240,13 +1240,13 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
         assert_eq!(report.run_reads, collecting);
         // The collecting thread's reads, per owner: the index's, the routing's under the
         // requested slice, and none under `query` (nor any other owner).
-        let owner = |owner: WriteOwner| report.driver_reads[owner as usize];
-        assert_eq!(owner(WriteOwner::MergedIndex), collecting);
-        assert_eq!(owner(WriteOwner::RequestedSlice), collecting_other);
+        let owner = |owner: Component| report.driver_reads[owner as usize];
+        assert_eq!(owner(Component::MergedIndex), collecting);
+        assert_eq!(owner(Component::RequestedSlice), collecting_other);
         for silent in [
-            WriteOwner::Query,
-            WriteOwner::BaseRelation,
-            WriteOwner::PartnerTrace,
+            Component::Query,
+            Component::BaseRelation,
+            Component::PartnerTrace,
         ] {
             assert_eq!(owner(silent), RunReads::default(), "{silent:?}");
         }
@@ -1330,12 +1330,12 @@ fn collect_leaves_zero_query_reads_on_the_collecting_thread() {
     );
     let reads = state.finish().unwrap();
     assert_eq!(
-        reads.driver_reads[WriteOwner::Query as usize],
+        reads.driver_reads[Component::Query as usize],
         RunReads::default()
     );
-    assert!(reads.driver_reads[WriteOwner::MergedIndex as usize].memory_key_reads > 0);
+    assert!(reads.driver_reads[Component::MergedIndex as usize].memory_key_reads > 0);
     // The routing merged `ΔC` and `ΔO` forward: reads, and no seek.
-    let slice = reads.driver_reads[WriteOwner::RequestedSlice as usize];
+    let slice = reads.driver_reads[Component::RequestedSlice as usize];
     assert!(slice.memory_key_reads > 0);
     assert_eq!(slice.seeks, 0);
 }
@@ -1352,7 +1352,7 @@ fn scan_col(
     pass: Pass,
 ) -> ((Scanned, SessionCounts), RunReads, RunReads) {
     run_reads_of(|| {
-        with_read_owner(WriteOwner::MergedIndex, || {
+        with_read_owner(Component::MergedIndex, || {
             let mut session =
                 ScanSession::<CustomerOrdersLineitemDefinition>::new(old, touched, pass);
             let mut scanned = Vec::new();

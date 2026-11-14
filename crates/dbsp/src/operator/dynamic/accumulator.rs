@@ -23,7 +23,7 @@ use crate::{
         operator_traits::{Operator, OperatorName, UnaryOperator},
     },
     circuit_cache_key,
-    storage::write_attribution::{WriteOwner, current_write_owner, with_write_owner},
+    storage::attribution::{Component, current_write_owner, with_write_owner},
     trace::{Batch, BatchReader, Spine, Trace, TraceRole},
 };
 
@@ -182,7 +182,7 @@ where
     /// The owner that is current where this accumulator is created. Each
     /// transaction accumulates into a fresh spine, so the owner is kept to
     /// give every one of them the same owner.
-    write_owner: WriteOwner,
+    write_owner: Component,
 
     /// Used to enable/disable an accumulator during a transaction.
     enable_count: EnableCount,

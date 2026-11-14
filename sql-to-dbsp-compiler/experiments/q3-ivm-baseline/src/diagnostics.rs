@@ -23,9 +23,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
+use dbsp::storage::attribution::{write_snapshot, Component};
 use dbsp::storage::diagnostics::{self as dbsp_diagnostics, FlushRecord};
 use dbsp::storage::file::block_stats::{layer_file_block_bytes, LevelBlockBytes};
-use dbsp::storage::write_attribution::{write_snapshot, WriteOwner};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -211,7 +211,7 @@ impl Diagnostics {
 /// total.
 fn flush_split(flushes: &[FlushRecord], keep: impl Fn(&FlushRecord) -> bool) -> Value {
     let mut by_owner = BTreeMap::<&'static str, (u64, u64)>::new();
-    for owner in WriteOwner::ALL {
+    for owner in Component::ALL {
         by_owner.insert(owner.name(), (0, 0));
     }
     for flush in flushes.iter().filter(|flush| keep(flush)) {
@@ -236,7 +236,7 @@ fn flush_split(flushes: &[FlushRecord], keep: impl Fn(&FlushRecord) -> bool) -> 
 mod tests {
     use super::*;
 
-    fn flush(owner: WriteOwner, bytes: u64, finished_micros: u64) -> FlushRecord {
+    fn flush(owner: Component, bytes: u64, finished_micros: u64) -> FlushRecord {
         FlushRecord {
             file: "file".to_owned(),
             bytes,
@@ -251,10 +251,10 @@ mod tests {
     #[test]
     fn a_flush_split_counts_each_owner_and_sums_to_its_total() {
         let flushes = [
-            flush(WriteOwner::Query, 10, 1),
-            flush(WriteOwner::MergedIndex, 20, 2),
-            flush(WriteOwner::MergedIndex, 40, 3),
-            flush(WriteOwner::BaseRelation, 80, 4),
+            flush(Component::Query, 10, 1),
+            flush(Component::MergedIndex, 20, 2),
+            flush(Component::MergedIndex, 40, 3),
+            flush(Component::BaseRelation, 80, 4),
         ];
         let split = flush_split(&flushes, |f| f.finished_micros >= 2);
         assert_eq!(split["operations"], 3);

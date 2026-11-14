@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use dbsp::storage::write_attribution::{write_snapshot, WriteOwner, WriteSnapshot};
+use dbsp::storage::attribution::{write_snapshot, Component, WriteSnapshot};
 use feldera_storage::histogram::ExponentialHistogram;
 use feldera_storage::metrics::{READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS};
 use serde_json::{json, Map, Value};
@@ -94,7 +94,7 @@ impl ResourceSnapshot {
     /// Per-owner increments of the write counters, keyed by owner name.
     fn write_delta_by_owner(&self, after: &Self) -> Value {
         let mut owners = Map::new();
-        for owner in WriteOwner::ALL {
+        for owner in Component::ALL {
             let before = self.writes.owner(owner);
             let after = after.writes.owner(owner);
             owners.insert(
@@ -240,7 +240,7 @@ pub fn drain_until(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbsp::storage::write_attribution::WriteCounts;
+    use dbsp::storage::attribution::WriteCounts;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -255,9 +255,9 @@ mod tests {
         root
     }
 
-    /// A write snapshot whose owners, in `WriteOwner::ALL` order, wrote the
+    /// A write snapshot whose owners, in `Component::ALL` order, wrote the
     /// given (operations, bytes), and whose totals are their sums.
-    fn snapshot_of(by_owner: [(u64, u64); WriteOwner::ALL.len()]) -> WriteSnapshot {
+    fn snapshot_of(by_owner: [(u64, u64); Component::ALL.len()]) -> WriteSnapshot {
         let by_owner = by_owner.map(|(operations, bytes)| WriteCounts { operations, bytes });
         WriteSnapshot {
             total: WriteCounts {
@@ -302,7 +302,7 @@ mod tests {
             ("operations", "backend_write_operations"),
             ("bytes", "backend_write_bytes"),
         ] {
-            let by_owner: u64 = WriteOwner::ALL
+            let by_owner: u64 = Component::ALL
                 .iter()
                 .map(|owner| owners[owner.name()][field].as_u64().unwrap())
                 .sum();

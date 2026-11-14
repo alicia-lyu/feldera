@@ -5,8 +5,8 @@ use crate::circuit::metrics::{DBSP_STEP, DBSP_STEP_LATENCY_MICROSECONDS};
 use crate::circuit::schedule::CommitProgress;
 use crate::monitor::visual_graph::Graph;
 use crate::operator::dynamic::balance::{BalancerHint, PartitioningPolicy};
+use crate::storage::attribution::Component;
 use crate::storage::backend::StorageError;
-use crate::storage::write_attribution::WriteOwner;
 use crate::trace::RunReads;
 use crate::trace::spine_async::MAX_LEVEL0_BATCH_SIZE_RECORDS;
 use crate::{
@@ -1056,7 +1056,7 @@ impl Runtime {
                         }
                     }
                     Ok(Command::RunReads) => {
-                        let reads = WriteOwner::ALL.map(RunReads::current_for);
+                        let reads = Component::ALL.map(RunReads::current_for);
                         if status_sender
                             .send(Ok(Response::RunReads(Box::new(reads))))
                             .is_err()
@@ -1528,7 +1528,7 @@ enum Response {
     BootstrapComplete(bool),
     IsCompactionComplete(bool),
     IsBackgroundMergeIdle(bool),
-    RunReads(Box<[RunReads; WriteOwner::ALL.len()]>),
+    RunReads(Box<[RunReads; Component::ALL.len()]>),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2796,14 +2796,14 @@ impl DBSPHandle {
     }
 
     /// The run reads of the worker threads so far, per read owner, indexed
-    /// like [`WriteOwner::ALL`] and summed over the workers.
+    /// like [`Component::ALL`] and summed over the workers.
     ///
     /// These are running totals; take them before and after a transaction
     /// and subtract with [`RunReads::since`]. They cover what the circuit's
     /// operators read on the workers. Background compaction and auxiliary
     /// threads run elsewhere and are not included.
-    pub fn run_reads(&mut self) -> Result<[RunReads; WriteOwner::ALL.len()], DbspError> {
-        let mut reads = [RunReads::default(); WriteOwner::ALL.len()];
+    pub fn run_reads(&mut self) -> Result<[RunReads; Component::ALL.len()], DbspError> {
+        let mut reads = [RunReads::default(); Component::ALL.len()];
         self.broadcast_command(Command::RunReads, |_, response| {
             if let Response::RunReads(worker_reads) = response {
                 for (total, worker) in reads.iter_mut().zip(*worker_reads) {
@@ -3062,7 +3062,7 @@ impl CheckpointPublisher {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::storage::write_attribution::WriteOwner;
+    use crate::storage::attribution::Component;
     use crate::trace::RunReads;
     use std::fs::{File, create_dir_all};
     use std::io;
@@ -3677,12 +3677,12 @@ pub(crate) mod tests {
         left_input.append(&mut vec![Tup2(7, Tup2(0, 1))]);
         circuit.transaction().unwrap();
         let after = circuit.run_reads().unwrap();
-        let read = |owner: WriteOwner| after[owner.index()].since(before[owner.index()]);
+        let read = |owner: Component| after[owner.index()].since(before[owner.index()]);
         // The join's probes of its trace are the partner trace's reads.
-        assert!(read(WriteOwner::PartnerTrace).seeks > 0);
-        assert!(read(WriteOwner::PartnerTrace).key_decodes > 0);
-        assert_eq!(read(WriteOwner::MergedIndex), RunReads::default());
-        assert_eq!(read(WriteOwner::BaseRelation), RunReads::default());
+        assert!(read(Component::PartnerTrace).seeks > 0);
+        assert!(read(Component::PartnerTrace).key_decodes > 0);
+        assert_eq!(read(Component::MergedIndex), RunReads::default());
+        assert_eq!(read(Component::BaseRelation), RunReads::default());
 
         circuit.kill().unwrap();
     }

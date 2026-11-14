@@ -52,7 +52,7 @@ use std::{
 use dbsp::{
     circuit::RootCircuit,
     dynamic::DowncastTrait,
-    storage::write_attribution::WriteOwner,
+    storage::attribution::Component,
     trace::{
         merged_index::{
             capture, route, Capture, Delta, DeltaCursor, DeltaReader, DrivingDelta,
@@ -95,8 +95,8 @@ pub type SourceSnapshot = DynamicSnapshot<MergedIndexBatch>;
 
 type Definition = CustomerOrdersLineitemDefinition;
 
-/// Run reads per read owner, indexed like [`WriteOwner::ALL`].
-pub type OwnerReads = [RunReads; WriteOwner::ALL.len()];
+/// Run reads per read owner, indexed like [`Component::ALL`].
+pub type OwnerReads = [RunReads; Component::ALL.len()];
 
 /// What one transaction's view maintenance read from the index: the scan
 /// session's moves, and the run reads they cost on the thread that collected.
@@ -718,9 +718,9 @@ impl Q3State {
     /// as the preparation of the view's transaction delta, apart from the scan.
     pub fn collect(&self, pass: Pass) -> Result<Duration, String> {
         let views = self.views()?;
-        let before = WriteOwner::ALL.map(RunReads::current_for);
+        let before = Component::ALL.map(RunReads::current_for);
         let (collected, driving, counts, delta_preparation) =
-            with_read_owner(WriteOwner::MergedIndex, || {
+            with_read_owner(Component::MergedIndex, || {
                 let mut customers = Reader::<CustomersAfter>::new()?;
                 let mut orders = Reader::<OrdersBefore>::new()?;
                 let mut joined = Reader::<JoinedAfter>::new()?;
@@ -780,9 +780,9 @@ impl Q3State {
                     delta_preparation,
                 ))
             })?;
-        let after = WriteOwner::ALL.map(RunReads::current_for);
+        let after = Component::ALL.map(RunReads::current_for);
         let driver_reads: OwnerReads = std::array::from_fn(|i| after[i].since(before[i]));
-        let run_reads = driver_reads[WriteOwner::MergedIndex as usize];
+        let run_reads = driver_reads[Component::MergedIndex as usize];
 
         let (customers, orders, joined, lines) = collected;
         views
@@ -943,7 +943,7 @@ impl ReadViews {
 /// own delta side, so its reads are the operators' (`query`), not the requested slice's, though
 /// the join runs the reader callback under that owner.
 fn requested_keys<K: DBData, V: DBData>(delta: &SpineSnapshot<OrdIndexedZSet<K, V>>) -> Vec<K> {
-    with_read_owner(WriteOwner::Query, || {
+    with_read_owner(Component::Query, || {
         let mut cursor = delta.inner().cursor();
         let mut keys = Vec::new();
         while cursor.key_valid() {

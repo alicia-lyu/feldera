@@ -26,11 +26,11 @@ use dbsp::circuit::{
     StorageConfig, StorageOptions,
 };
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
+use dbsp::storage::attribution::Component;
 use dbsp::storage::file::writer::{
     ELIDED_VALUE_HEADER_BLOCKS, FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS,
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
 };
-use dbsp::storage::write_attribution::WriteOwner;
 use dbsp::trace::merged_index::Pass;
 #[cfg(feature = "merged-index")]
 use dbsp::trace::with_read_owner;
@@ -507,11 +507,11 @@ fn complete_net_delta(
 ) -> Result<(Vec<reconstruction::SourceRow>, RunReads)> {
     let runtime = pipeline.runtime().clone();
     runtime.with_buffer_cache(0, || {
-        let reads_before = RunReads::current_for(WriteOwner::MergedIndex);
+        let reads_before = RunReads::current_for(Component::MergedIndex);
         let old = pipeline.index.snapshot()?;
         let mut base_owner = |order: i64| -> Result<Option<i64>> {
             if let Some(base) = base {
-                let found = with_read_owner(WriteOwner::BaseRelation, || base.order(order))?;
+                let found = with_read_owner(Component::BaseRelation, || base.order(order))?;
                 return Ok(found.map(|order| order.customer_key));
             }
             let reference = reference.context(
@@ -520,10 +520,10 @@ fn complete_net_delta(
             )?;
             Ok(reference.orders.get(&order).map(|order| order.customer_key))
         };
-        let rows = with_read_owner(WriteOwner::MergedIndex, || {
+        let rows = with_read_owner(Component::MergedIndex, || {
             reconstruction::prepare(net_delta, &old, &mut pipeline.orphans, &mut base_owner)
         })?;
-        let reads = RunReads::current_for(WriteOwner::MergedIndex).since(reads_before);
+        let reads = RunReads::current_for(Component::MergedIndex).since(reads_before);
         Ok((rows, reads))
     })
 }
@@ -621,8 +621,8 @@ struct Measurements {
     /// mode).
     index_layout: Option<Value>,
     /// The view worker's run reads in the view transactions, per read owner, indexed like
-    /// `WriteOwner::ALL` (both modes).
-    view_reads: [RunReads; WriteOwner::ALL.len()],
+    /// `Component::ALL` (both modes).
+    view_reads: [RunReads; Component::ALL.len()],
     /// The CPU profiler's step CPU time of each circuit in the measured transactions, a
     /// cross-check of the phase timers. `None` while the pipeline is not profiling.
     profiled_cpu: Option<ProfiledCpu>,
@@ -1708,8 +1708,8 @@ fn phase_json(stats: &Measurements) -> Value {
 /// of the readers' batches are under `requested_slice`. Nothing the worker runs reads under
 /// `merged_index`: the scan session reads the index on the driver's thread. The fields are those
 /// of `RunReads`: file runs' decodes and in-memory runs' reads count apart.
-fn view_reads_json(reads: &[RunReads; WriteOwner::ALL.len()]) -> Result<Value> {
-    WriteOwner::ALL
+fn view_reads_json(reads: &[RunReads; Component::ALL.len()]) -> Result<Value> {
+    Component::ALL
         .into_iter()
         .map(|owner| {
             Ok((
@@ -1960,7 +1960,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut sequence_session_reads = SessionReads::default();
     #[cfg(feature = "merged-index")]
     let mut sequence_upkeep_reads = RunReads::default();
-    let mut sequence_view_reads = [RunReads::default(); WriteOwner::ALL.len()];
+    let mut sequence_view_reads = [RunReads::default(); Component::ALL.len()];
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
@@ -4240,10 +4240,10 @@ mod session_worked_transaction_tests {
                     .collect();
                 let dlt_shape = (dlt.location(), dlt.len());
 
-                let index_before = RunReads::current_for(WriteOwner::MergedIndex);
+                let index_before = RunReads::current_for(Component::MergedIndex);
                 let total_before = RunReads::current();
                 pipeline.collect_groups()?;
-                let reads = RunReads::current_for(WriteOwner::MergedIndex).since(index_before);
+                let reads = RunReads::current_for(Component::MergedIndex).since(index_before);
                 let other_reads = RunReads::current().since(total_before).since(reads);
 
                 // The view circuit takes the same readers' driving deltas, and `V` must be the

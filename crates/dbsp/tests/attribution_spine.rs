@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use dbsp::algebra::OrdZSet;
 use dbsp::circuit::{CircuitConfig, CircuitStorageConfig};
 use dbsp::dynamic::DynData;
+use dbsp::storage::attribution::{Component, with_write_owner, write_snapshot};
 use dbsp::storage::diagnostics::{self, RunWriteKind};
-use dbsp::storage::write_attribution::{WriteOwner, with_write_owner, write_snapshot};
 use dbsp::trace::{BatchReaderFactories, Spine, Trace, TraceRole};
 use dbsp::utils::Tup2;
 use dbsp::{OrdZSet as TypedOrdZSet, Runtime, ZWeight};
@@ -24,7 +24,7 @@ const RUNS: i32 = 12;
 
 /// Inserts `RUNS` runs into a new spine created under `owner`, waits for the
 /// compaction that this triggers, and returns the spine's name.
-fn fill_and_compact(owner: WriteOwner, name: &str) {
+fn fill_and_compact(owner: Component, name: &str) {
     let factories = BatchReaderFactories::new::<i32, (), ZWeight>();
     let mut spine = with_write_owner(owner, || {
         Spine::<OrdZSet<DynData>>::new(&factories, Arc::new(name.to_owned()), TraceRole::Integral)
@@ -68,9 +68,9 @@ fn compaction_inherits_the_spines_owner() {
     let (handle, ()) = Runtime::init_circuit(config, move |_circuit| {
         // Two spines with different owners run at once, so the test fails if
         // an owner leaks from one spine's tasks to the other's.
-        fill_and_compact(WriteOwner::MergedIndex, "merged_index_spine");
-        fill_and_compact(WriteOwner::BaseRelation, "base_relation_spine");
-        fill_and_compact(WriteOwner::Query, "query_spine");
+        fill_and_compact(Component::MergedIndex, "merged_index_spine");
+        fill_and_compact(Component::BaseRelation, "base_relation_spine");
+        fill_and_compact(Component::Query, "query_spine");
         *report.lock().unwrap() = true;
         Ok(())
     })
@@ -81,9 +81,9 @@ fn compaction_inherits_the_spines_owner() {
     let compactions = diagnostics::compaction_log();
     let flushes = diagnostics::flush_log();
     for (spine, owner) in [
-        ("merged_index_spine", WriteOwner::MergedIndex),
-        ("base_relation_spine", WriteOwner::BaseRelation),
-        ("query_spine", WriteOwner::Query),
+        ("merged_index_spine", Component::MergedIndex),
+        ("base_relation_spine", Component::BaseRelation),
+        ("query_spine", Component::Query),
     ] {
         let records: Vec<_> = compactions
             .iter()
@@ -119,8 +119,8 @@ fn compaction_inherits_the_spines_owner() {
     // Counted per owner, and the owners add up to the totals.
     let snapshot = write_snapshot();
     assert_eq!(snapshot.owners_sum(), snapshot.total);
-    for owner in WriteOwner::ALL {
-        if matches!(owner, WriteOwner::RequestedSlice | WriteOwner::PartnerTrace) {
+    for owner in Component::ALL {
+        if matches!(owner, Component::RequestedSlice | Component::PartnerTrace) {
             // A read owner: nothing is written under it.
             assert_eq!(snapshot.owner(owner).bytes, 0);
             continue;

@@ -229,7 +229,7 @@ pub(crate) mod tests {
     use crate::{
         DBData, DynZWeight,
         dynamic::DynData,
-        storage::write_attribution::WriteOwner,
+        storage::attribution::Component,
         trace::{
             Batch, BatchLocation, BatchReaderFactories, Builder, RunReads,
             merged_index::{FoldedKey, batch::build_batch},
@@ -679,12 +679,12 @@ pub(crate) mod tests {
     fn reads_count_for_the_current_read_owner() {
         run_in_circuit_with_storage(|| {
             let snapshot = snapshot(&[(vec![row(b"a", 1, 1)], true)]);
-            let before = RunReads::current_for(WriteOwner::MergedIndex);
-            with_read_owner(WriteOwner::MergedIndex, || {
+            let before = RunReads::current_for(Component::MergedIndex);
+            with_read_owner(Component::MergedIndex, || {
                 let mut merge = RunMerge::new(&snapshot);
                 take_all(&mut merge);
             });
-            let reads = RunReads::current_for(WriteOwner::MergedIndex).since(before);
+            let reads = RunReads::current_for(Component::MergedIndex).since(before);
             assert_eq!((reads.key_decodes, reads.value_decodes), (1, 1));
         });
     }

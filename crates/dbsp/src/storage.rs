@@ -3,13 +3,13 @@
 //! The API consists of a lower layer, [backend], that provides block-based
 //! access to storage, a middle layer, [buffer_cache], that implements
 //! buffering, and an upper layer, [mod@file], that implements data access.
+pub mod attribution;
 pub mod backend;
 pub mod buffer_cache;
 pub mod diagnostics;
 pub mod dirlock;
 pub mod file;
 pub mod tracking_bloom_filter;
-pub mod write_attribution;
 
 use fdlimit::{Outcome::LimitRaised, raise_fd_limit};
 use tracing::warn;

@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use super::write_attribution::WriteOwner;
+use super::attribution::Component;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -62,7 +62,7 @@ pub struct FlushRecord {
     /// When the flush ended, in [`now_micros`].
     pub finished_micros: u64,
     /// The owner that the file writer captured when it was created.
-    pub owner: WriteOwner,
+    pub owner: Component,
     /// False if the flush failed after writing `bytes`.
     pub succeeded: bool,
 }
@@ -85,7 +85,7 @@ pub struct CompactionRecord {
     /// Why the run was written.
     pub kind: RunWriteKind,
     /// The owner of the spine.
-    pub owner: WriteOwner,
+    pub owner: Component,
     /// The spine's name at the time.
     pub spine: String,
     /// The spine level that was compacted (0 for a spill).
@@ -154,7 +154,7 @@ pub struct RunContents {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SpineContents {
     /// The owner the spine captured when it was created.
-    pub owner: WriteOwner,
+    pub owner: Component,
     /// The spine's name.
     pub name: String,
     /// `"accumulator"` or `"integral"`.

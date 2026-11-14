@@ -1,14 +1,14 @@
-//! Attribution of storage writes to the component that causes them.
+//! Attribution of storage reads and writes to the [`Component`] that causes them.
 //!
 //! The storage backend counts every write in two process-wide metrics: the
 //! number of flushes (`WRITE_LATENCY_MICROSECONDS`) and the bytes written
 //! (`WRITE_BLOCKS_BYTES`). This module keeps the same two counts per
-//! [`WriteOwner`], updated at the same two places, so the owners always add up
+//! [`Component`], updated at the same two places, so the owners always add up
 //! to the totals.
 //!
 //! # How an owner reaches a file
 //!
-//! * A thread has a *current owner*, [`WriteOwner::Query`] by default.
+//! * A thread has a *current owner*, [`Component::Query`] by default.
 //!   [`with_write_owner`] changes it for the duration of a closure.
 //! * A `Spine` captures the current owner when it is created and keeps it for
 //!   life. Its inserts run under that owner, and its background compaction
@@ -25,7 +25,7 @@
 //! A batch that an operator builds in storage before it reaches a `Spine`
 //! (the spill that a builder performs under memory pressure or when
 //! `min_step_storage_bytes` is set) is written under the owner that is current
-//! on the thread that runs the operator, which is [`WriteOwner::Query`]
+//! on the thread that runs the operator, which is [`Component::Query`]
 //! unless an enclosing scope says otherwise.
 
 use std::cell::Cell;
@@ -39,10 +39,10 @@ use feldera_storage::metrics::{WRITE_BLOCKS_BYTES, WRITE_LATENCY_MICROSECONDS};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 
-/// The component on whose behalf storage is written.
+/// The component that a storage read or write is attributed to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WriteOwner {
+pub enum Component {
     /// Join traces, materialized views, and query execution. The default.
     #[default]
     Query,
@@ -57,28 +57,28 @@ pub enum WriteOwner {
     /// write counts stay zero.
     RequestedSlice,
     /// The joins' reads of their partner traces in native mode, the counterpart
-    /// of [`WriteOwner::RequestedSlice`]. A read owner only.
+    /// of [`Component::RequestedSlice`]. A read owner only.
     PartnerTrace,
 }
 
-impl WriteOwner {
+impl Component {
     /// Every owner, in the order of [`WriteSnapshot::by_owner`].
-    pub const ALL: [WriteOwner; 5] = [
-        WriteOwner::Query,
-        WriteOwner::BaseRelation,
-        WriteOwner::MergedIndex,
-        WriteOwner::RequestedSlice,
-        WriteOwner::PartnerTrace,
+    pub const ALL: [Component; 5] = [
+        Component::Query,
+        Component::BaseRelation,
+        Component::MergedIndex,
+        Component::RequestedSlice,
+        Component::PartnerTrace,
     ];
 
     /// A stable lower-case name, used as a key in reports.
     pub fn name(self) -> &'static str {
         match self {
-            WriteOwner::Query => "query",
-            WriteOwner::BaseRelation => "base_relation",
-            WriteOwner::MergedIndex => "merged_index",
-            WriteOwner::RequestedSlice => "requested_slice",
-            WriteOwner::PartnerTrace => "partner_trace",
+            Component::Query => "query",
+            Component::BaseRelation => "base_relation",
+            Component::MergedIndex => "merged_index",
+            Component::RequestedSlice => "requested_slice",
+            Component::PartnerTrace => "partner_trace",
         }
     }
 
@@ -88,18 +88,18 @@ impl WriteOwner {
 }
 
 thread_local! {
-    static CURRENT_OWNER: Cell<WriteOwner> = const { Cell::new(WriteOwner::Query) };
+    static CURRENT_OWNER: Cell<Component> = const { Cell::new(Component::Query) };
 }
 
 /// The owner that files and spines created on this thread now belong to.
-pub fn current_write_owner() -> WriteOwner {
+pub fn current_write_owner() -> Component {
     CURRENT_OWNER.get()
 }
 
 /// Runs `f` with `owner` as the current owner of this thread, then restores the
 /// previous owner, even if `f` panics.
-pub fn with_write_owner<R>(owner: WriteOwner, f: impl FnOnce() -> R) -> R {
-    struct Restore(WriteOwner);
+pub fn with_write_owner<R>(owner: Component, f: impl FnOnce() -> R) -> R {
+    struct Restore(Component);
     impl Drop for Restore {
         fn drop(&mut self) {
             CURRENT_OWNER.set(self.0);
@@ -110,9 +110,9 @@ pub fn with_write_owner<R>(owner: WriteOwner, f: impl FnOnce() -> R) -> R {
 }
 
 pin_project! {
-    /// A future that runs each of its polls under a fixed [`WriteOwner`].
+    /// A future that runs each of its polls under a fixed [`Component`].
     pub struct WithWriteOwner<F> {
-        owner: WriteOwner,
+        owner: Component,
         #[pin]
         future: F,
     }
@@ -131,7 +131,7 @@ impl<F: Future> Future for WithWriteOwner<F> {
 ///
 /// A poll may run on any thread of a tokio runtime, so the owner is set per
 /// poll rather than per thread.
-pub fn scope_write_owner<F: Future>(owner: WriteOwner, future: F) -> WithWriteOwner<F> {
+pub fn scope_write_owner<F: Future>(owner: Component, future: F) -> WithWriteOwner<F> {
     WithWriteOwner { owner, future }
 }
 
@@ -150,13 +150,13 @@ pub struct WriteSnapshot {
     /// The backend's own totals. These are the numbers that existed before
     /// attribution did.
     pub total: WriteCounts,
-    /// The same writes split by owner, indexed like [`WriteOwner::ALL`].
-    pub by_owner: [WriteCounts; WriteOwner::ALL.len()],
+    /// The same writes split by owner, indexed like [`Component::ALL`].
+    pub by_owner: [WriteCounts; Component::ALL.len()],
 }
 
 impl WriteSnapshot {
     /// The counts for `owner`.
-    pub fn owner(&self, owner: WriteOwner) -> WriteCounts {
+    pub fn owner(&self, owner: Component) -> WriteCounts {
         self.by_owner[owner.index()]
     }
 
@@ -170,10 +170,10 @@ impl WriteSnapshot {
     }
 }
 
-static OPERATIONS_BY_OWNER: [AtomicU64; WriteOwner::ALL.len()] =
-    [const { AtomicU64::new(0) }; WriteOwner::ALL.len()];
-static BYTES_BY_OWNER: [AtomicU64; WriteOwner::ALL.len()] =
-    [const { AtomicU64::new(0) }; WriteOwner::ALL.len()];
+static OPERATIONS_BY_OWNER: [AtomicU64; Component::ALL.len()] =
+    [const { AtomicU64::new(0) }; Component::ALL.len()];
+static BYTES_BY_OWNER: [AtomicU64; Component::ALL.len()] =
+    [const { AtomicU64::new(0) }; Component::ALL.len()];
 
 /// Number of counter updates that have started but not finished.
 static UPDATES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
@@ -190,7 +190,7 @@ fn grouped_update(update: impl FnOnce()) {
 }
 
 /// Counts `bytes` written by one vectored write on behalf of `owner`.
-pub(crate) fn record_write_bytes(owner: WriteOwner, bytes: usize) {
+pub(crate) fn record_write_bytes(owner: Component, bytes: usize) {
     grouped_update(|| {
         WRITE_BLOCKS_BYTES.record(bytes);
         BYTES_BY_OWNER[owner.index()].fetch_add(bytes as u64, Ordering::Relaxed);
@@ -199,7 +199,7 @@ pub(crate) fn record_write_bytes(owner: WriteOwner, bytes: usize) {
 
 /// Counts one backend flush on behalf of `owner`. `started` is when the flush
 /// began; its duration goes to the backend's latency histogram, as before.
-pub(crate) fn record_write_operation(owner: WriteOwner, started: Instant) {
+pub(crate) fn record_write_operation(owner: Component, started: Instant) {
     grouped_update(|| {
         WRITE_LATENCY_MICROSECONDS.record_elapsed(started);
         OPERATIONS_BY_OWNER[owner.index()].fetch_add(1, Ordering::Relaxed);
@@ -230,7 +230,7 @@ pub fn write_snapshot() -> WriteSnapshot {
                 operations: histogram_count(&WRITE_LATENCY_MICROSECONDS),
                 bytes: WRITE_BLOCKS_BYTES.sum(),
             },
-            by_owner: WriteOwner::ALL.map(|owner| WriteCounts {
+            by_owner: Component::ALL.map(|owner| WriteCounts {
                 operations: OPERATIONS_BY_OWNER[owner.index()].load(Ordering::Relaxed),
                 bytes: BYTES_BY_OWNER[owner.index()].load(Ordering::Relaxed),
             }),
@@ -249,28 +249,28 @@ mod tests {
 
     #[test]
     fn the_default_owner_is_query() {
-        assert_eq!(current_write_owner(), WriteOwner::Query);
+        assert_eq!(current_write_owner(), Component::Query);
     }
 
     #[test]
     fn scopes_nest_and_restore() {
-        with_write_owner(WriteOwner::BaseRelation, || {
-            assert_eq!(current_write_owner(), WriteOwner::BaseRelation);
-            with_write_owner(WriteOwner::MergedIndex, || {
-                assert_eq!(current_write_owner(), WriteOwner::MergedIndex);
+        with_write_owner(Component::BaseRelation, || {
+            assert_eq!(current_write_owner(), Component::BaseRelation);
+            with_write_owner(Component::MergedIndex, || {
+                assert_eq!(current_write_owner(), Component::MergedIndex);
             });
-            assert_eq!(current_write_owner(), WriteOwner::BaseRelation);
+            assert_eq!(current_write_owner(), Component::BaseRelation);
         });
-        assert_eq!(current_write_owner(), WriteOwner::Query);
+        assert_eq!(current_write_owner(), Component::Query);
     }
 
     #[test]
     fn a_panic_restores_the_owner() {
         let result = std::panic::catch_unwind(|| {
-            with_write_owner(WriteOwner::MergedIndex, || panic!("boom"));
+            with_write_owner(Component::MergedIndex, || panic!("boom"));
         });
         assert!(result.is_err());
-        assert_eq!(current_write_owner(), WriteOwner::Query);
+        assert_eq!(current_write_owner(), Component::Query);
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
             .unwrap();
         let observed = runtime
             .block_on(async {
-                tokio::spawn(scope_write_owner(WriteOwner::MergedIndex, async {
+                tokio::spawn(scope_write_owner(Component::MergedIndex, async {
                     let first = current_write_owner();
                     // Yielding lets the task resume on another thread.
                     tokio::task::yield_now().await;
@@ -291,14 +291,14 @@ mod tests {
                 .await
             })
             .unwrap();
-        assert_eq!(observed, (WriteOwner::MergedIndex, WriteOwner::MergedIndex));
-        assert_eq!(current_write_owner(), WriteOwner::Query);
+        assert_eq!(observed, (Component::MergedIndex, Component::MergedIndex));
+        assert_eq!(current_write_owner(), Component::Query);
     }
 
     #[test]
     fn owner_names_are_distinct() {
         let names: std::collections::BTreeSet<_> =
-            WriteOwner::ALL.iter().map(|owner| owner.name()).collect();
-        assert_eq!(names.len(), WriteOwner::ALL.len());
+            Component::ALL.iter().map(|owner| owner.name()).collect();
+        assert_eq!(names.len(), Component::ALL.len());
     }
 }

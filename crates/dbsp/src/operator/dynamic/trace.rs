@@ -5,7 +5,7 @@ use crate::circuit::{NodeId, splitter_output_chunk_size};
 use crate::dynamic::Factory;
 use crate::operator::dynamic::replay::ReplayState;
 use crate::operator::require_persistent_id;
-use crate::storage::write_attribution::{WriteOwner, current_write_owner, with_write_owner};
+use crate::storage::attribution::{Component, current_write_owner, with_write_owner};
 use crate::trace::GroupFilter;
 use crate::trace::spine_async::WithSnapshot;
 use crate::{
@@ -946,7 +946,7 @@ where
 }
 
 /// Creates an empty trace that belongs to `owner`.
-fn new_trace<T: Trace>(owner: WriteOwner, factories: &T::Factories, name: Arc<String>) -> T {
+fn new_trace<T: Trace>(owner: Component, factories: &T::Factories, name: Arc<String>) -> T {
     with_write_owner(owner, || T::new(factories, name, TraceRole::Integral))
 }
 
@@ -969,7 +969,7 @@ pub struct Z1Trace<C: Circuit, B: Batch, T: Trace> {
     /// The owner that is current where this operator is created. The trace is
     /// created later, on whichever thread starts the clock, so the owner is
     /// captured here and re-established when the trace is created.
-    write_owner: WriteOwner,
+    write_owner: Component,
 
     // Metrics maintained by the trace.
     batch_factories: B::Factories,

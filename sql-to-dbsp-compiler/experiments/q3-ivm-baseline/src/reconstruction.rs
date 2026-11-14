@@ -7,9 +7,9 @@ use std::sync::{mpsc, Arc};
 use anyhow::{bail, ensure, Context, Result};
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::dynamic::{DowncastTrait, DynData, Erase};
+use dbsp::storage::attribution::{with_write_owner, Component};
 #[cfg(test)]
 use dbsp::storage::buffer_cache::BufferCache;
-use dbsp::storage::write_attribution::{with_write_owner, WriteOwner};
 use dbsp::trace::merged_index::MergedIndexDefinition;
 use dbsp::trace::{
     BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSetFactories, Spine,
@@ -88,7 +88,7 @@ impl ManualIndex {
         runtime.spawn_aux_thread("q3-manual-merged-index", parker, move |parker| {
             // Every file this thread creates, and every spine it owns and that
             // spine's background compaction, belongs to the merged index.
-            with_write_owner(WriteOwner::MergedIndex, || {
+            with_write_owner(Component::MergedIndex, || {
                 bound_to_cache(cache_owner.as_ref(), || {
                     // Before the thread builds anything, so that nothing is written elsewhere.
                     let on_runtime_cache = check_on_runtime_cache(&expected_cache_owner);
