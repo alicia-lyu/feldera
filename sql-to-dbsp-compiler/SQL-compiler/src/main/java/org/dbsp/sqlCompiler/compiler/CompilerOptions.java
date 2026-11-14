@@ -218,9 +218,6 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Parameter(names = "--handles",
                 description = "Use handles (true) or Catalog (false) in the emitted Rust code")
         public boolean emitHandles = false;
-        @Parameter(names = "--q3-merged-index",
-                description = "Experimental Q3 joins reconstructed from an external merged index")
-        public boolean q3MergedIndex = false;
         @Parameter(names = "--trimInputs", description = "Do not ingest unused fields of input tables")
         public boolean trimInputs = false;
         @Parameter(names = "--crates", description = "Followed by a program name. Generates code using multiple crates; " +
@@ -261,8 +258,7 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         /** Only compare fields that matter. */
         public boolean same(IO other) {
             return this.emitHandles == other.emitHandles &&
-                    this.trimInputs == other.trimInputs &&
-                    this.q3MergedIndex == other.q3MergedIndex;
+                    this.trimInputs == other.trimInputs;
         }
 
         public boolean multiCrates() {
@@ -290,12 +286,6 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                         "Options -png/-jpg/-svg cannot be used at the same time");
                 return false;
             }
-            if (this.q3MergedIndex && (this.emitHandles || this.multiCrates() ||
-                    this.emitCircuitIr() || this.noRust)) {
-                reporter.reportError(SourcePositionRange.INVALID, "Invalid options",
-                        "--q3-merged-index requires single-crate Rust Catalog output");
-                return false;
-            }
             if ((this.mergedIndexSpec == null) != (this.mergedIndexOutput == null)) {
                 reporter.reportError(SourcePositionRange.INVALID, "Invalid options",
                         "--merged-index and --merged-index-output must be used together");
@@ -311,7 +301,6 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                     ",\n\tcorrelatedColumns=" + this.correlatedColumns +
                     ",\n\tcrates=" + this.crates +
                     ",\n\temitHandles=" + this.emitHandles +
-                    ",\n\tq3MergedIndex=" + this.q3MergedIndex +
                     ",\n\temitJpeg=" + this.emitJpeg +
                     ",\n\temitSvg=" + this.emitSvg +
                     ",\n\tdumpExpandedCircuit=" + this.dumpExpandedCircuit +
@@ -342,8 +331,6 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
             return "IO{" +
                     (this.emitHandles != other.emitHandles ? ".emitHandles=" +
                             this.emitHandles + "!=" + other.emitHandles: "")
-                    + (this.q3MergedIndex != other.q3MergedIndex ? ".q3MergedIndex=" +
-                            this.q3MergedIndex + "!=" + other.q3MergedIndex: "")
                     + (this.trimInputs != other.trimInputs ? ".trimInputs=" +
                             this.trimInputs + "!=" + other.trimInputs: "") +
                     "}";

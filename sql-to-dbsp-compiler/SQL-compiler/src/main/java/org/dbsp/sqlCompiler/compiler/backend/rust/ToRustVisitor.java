@@ -120,8 +120,6 @@ public class ToRustVisitor extends CircuitVisitor {
     final Set<String> perCircuitDeclarations;
     final SourcePositionResource sourcePositionResource;
     final CircuitPostfix postfix;
-    @Nullable
-    Q3MergedIndexBinding q3MergedIndexBinding;
 
     /* Example output generated when 'useHandles' is false:
      * pub fn circuit0(workers: usize) -> (DBSPHandle, Catalog) {
@@ -319,12 +317,6 @@ public class ToRustVisitor extends CircuitVisitor {
     @Override
     public VisitDecision preorder(DBSPCircuit circuit) {
         this.circuitVariable = CIRCUIT_VARIABLE;
-        if (this.options.ioOptions.q3MergedIndex) {
-            if (!this.options.languageOptions.incrementalize || this.useHandles ||
-                    this.options.ioOptions.multiCrates())
-                throw new InternalCompilerError("--q3-merged-index requires incremental single-crate Catalog output");
-            this.q3MergedIndexBinding = Q3MergedIndexBinding.bind(circuit);
-        }
         IndentStream signature = new IndentStreamBuilder();
         ToRustInnerVisitor inner = this.createInnerVisitor(signature);
 
@@ -362,8 +354,6 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append("impl " + CIRCUIT_TYPE_NAME + " {")
                 .increase();
         this.builder.append("pub fn build(" + this.circuitVariable + ": &mut RootCircuit");
-        if (this.q3MergedIndexBinding != null)
-            this.builder.append(", q3_state: merged_index_col::q3::Q3State");
         this.builder.append(") -> Result<");
         if (!this.useHandles) {
             signature.append("Catalog");
@@ -445,11 +435,7 @@ public class ToRustVisitor extends CircuitVisitor {
         // The entry point for a caller that wants a circuit in a runtime of its own.
         this.builder.append("pub fn ")
                 .append(circuit.getName())
-                .append("(cconf: CircuitConfig");
-        if (this.q3MergedIndexBinding != null)
-            this.builder.append(", q3_state: merged_index_col::q3::Q3State");
-        this.builder
-                .append(") -> Result<(DBSPHandle, ")
+                .append("(cconf: CircuitConfig) -> Result<(DBSPHandle, ")
                 .append(signature.toString())
                 .append("), Error> {")
                 .increase();
@@ -459,14 +445,9 @@ public class ToRustVisitor extends CircuitVisitor {
                         .newline();
         }
         this.builder
-                .append(this.q3MergedIndexBinding == null ?
-                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, |circuit| {" :
-                        "let (mut circuit, streams) = Runtime::init_circuit(cconf, move |circuit| {")
+                .append("let (mut circuit, streams) = Runtime::init_circuit(cconf, |circuit| {")
                 .increase()
-                .append(this.q3MergedIndexBinding == null ?
-                        circuit.getName() + "::" + CIRCUIT_TYPE_NAME + "::build(circuit).map_err(Into::into)" :
-                        circuit.getName() + "::" + CIRCUIT_TYPE_NAME +
-                                "::build(circuit, q3_state).map_err(Into::into)")
+                .append(circuit.getName() + "::" + CIRCUIT_TYPE_NAME + "::build(circuit).map_err(Into::into)")
                 .newline()
                 .decrease()
                 .append("})?;")
@@ -1647,24 +1628,6 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(operator.getNodeName(this.preferHash))
                 .append(": ");
         streamType.accept(this.innerVisitor);
-        if (this.q3MergedIndexBinding != null &&
-                operator == this.q3MergedIndexBinding.ordersCustomers) {
-            this.builder.append(" = merged_index_col::q3::join_orders_customers(&")
-                    .append(this.getInputName(operator, 0))
-                    .append(", &")
-                    .append(this.getInputName(operator, 1))
-                    .append(", q3_state.clone(), ");
-            DBSPClosureExpression closure = operator.getClosureFunction();
-            closure.body.some().closure(closure.parameters).accept(this.innerVisitor);
-            this.builder.append(")")
-                    .append(this.markDistinct(operator))
-                    .append(";");
-            this.tagStream(operator);
-            this.builder.newline();
-            this.emitBalancerHints(operator);
-            this.innerVisitor.setOperatorContext(null);
-            return VisitDecision.STOP;
-        }
         this.builder.append(" = ")
                 .append(this.getInputName(operator, 0))
                 .append(".")
@@ -2020,26 +1983,6 @@ public class ToRustVisitor extends CircuitVisitor {
                 .append(": ");
         streamType.accept(this.innerVisitor);
         this.builder.append(" = ");
-        if (this.q3MergedIndexBinding != null &&
-                (operator == this.q3MergedIndexBinding.ordersCustomers ||
-                        operator == this.q3MergedIndexBinding.lineitemsOrders)) {
-            this.builder.append(operator == this.q3MergedIndexBinding.ordersCustomers ?
-                    "merged_index_col::q3::join_orders_customers(&" :
-                    "merged_index_col::q3::join_lineitems_orders(&")
-                    .append(this.getInputName(operator, 0))
-                    .append(", &")
-                    .append(this.getInputName(operator, 1))
-                    .append(", q3_state.clone(), ");
-            operator.getFunction().accept(this.innerVisitor);
-            this.builder.append(")")
-                    .append(this.markDistinct(operator))
-                    .append(";");
-            this.tagStream(operator);
-            this.builder.newline();
-            this.emitBalancerHints(operator);
-            this.innerVisitor.setOperatorContext(null);
-            return VisitDecision.STOP;
-        }
         if (!operator.inputs.isEmpty())
             this.builder.append(this.getInputName(operator, 0))
                     .append(".");
