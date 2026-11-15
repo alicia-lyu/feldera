@@ -21,7 +21,7 @@ The merged index is secondary storage, maintained beside Feldera's own base-tabl
 
 ### 2026-10-12: The compiler hook is the current approach
 
-The `--q3-merged-index` compiler option is endorsed for now. It pattern-matches the exact Q3 circuit and emits the reconstructed joins. This supersedes the 2026-09-28 preference for hand-composed circuits (see [Superseded](#superseded-and-withdrawn)).
+The `--q3-merged-index` compiler option is endorsed for now. It pattern-matches the exact Q3 circuit and emits the reconstructed joins. This supersedes the 2026-09-28 preference for hand-composed circuits (see [Superseded](#superseded-and-withdrawn)). *The hand-written circuit replaced the hook on 2026-11-10, and the hook was removed on 2026-11-13.*
 
 An open question remains; see [Open questions](#open-questions).
 
@@ -439,7 +439,7 @@ The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting 
 
 The user decided on 2026-11-10 (roadmap step 4). The hook that this entry keeps was removed on 2026-11-13 (user decision; see that day's entry):
 
-- The hand-written circuit (`q3-ivm-baseline/q3-trie-view-circuit`) replaces the generated reconstructed circuit in the `merged-index` build. This amends 2026-10-29's "the compiler hook stays": the hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stays in Java, unused. Its removal is an unconfirmed follow-up.
+- The hand-written circuit (`q3-ivm-baseline/q3-trie-view-circuit`) replaces the generated reconstructed circuit in the `merged-index` build. This amends 2026-10-29's "the compiler hook stays": the hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stayed in Java, unused, until its removal on 2026-11-13.
 - Both modes now build the view circuit from different sources: native from `q3.sql`, reconstructed from the committed crate. `generate.sh` takes no option, and `verify.sh` no longer regenerates for the reconstructed run.
 - The circuit meets (A1) and (A2): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, `V` joins on `(custkey, orderkey)`, and the inputs are keyed by their full trie paths.
 

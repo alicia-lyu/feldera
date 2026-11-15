@@ -182,7 +182,7 @@ For one spec, `MergedIndexRustEmitter` (in the compiler's `backend/rust` package
 
 The emitter rejects a spec whose derived Rust names collide or are not Rust identifiers. A Rust keyword such as `type` becomes a raw identifier, `r#type`.
 
-The compiler flags `--merged-index <spec>` and `--merged-index-output <file.rs>` select the output; each requires the other. Spec errors are reported as compiler errors that name `spec:line:column`. The circuit and `--q3-merged-index` are untouched.
+The compiler flags `--merged-index <spec>` and `--merged-index-output <file.rs>` select the output; each requires the other. Spec errors are reported as compiler errors that name `spec:line:column`. The circuit is untouched.
 
 For COL, `merged-index-col/generate.sh` runs the compiler on `q3-ivm-baseline/query.sql` and `merged-index-col/col.mi`, formats the result with rustfmt 1.96.1, and writes the committed `src/generated.rs`, which COL's `lib.rs` re-exports. The compiler wrapper always exits 0, so the script treats a missing output as the failure.
 

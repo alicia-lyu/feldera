@@ -360,7 +360,7 @@ maintenance measurements.
 
 ### R3 RF1/RF2 binding
 
-*Updated 2026-11-10: the hand-written view circuit replaced the compiler's emitter, the placement map is gone, and general deltas are supported (see [reconstruction.md](reconstruction.md)). The text below describes the original RF1/RF2 binding, which the readers' keys have since replaced: the readers take their customer from the delta key and read the groups that one scan session buffered.*
+*Updated 2026-11-10: the hand-written view circuit replaced the compiler's emitter, the placement map is gone, and general deltas are supported (see [reconstruction.md](reconstruction.md)). The text below describes the original RF1/RF2 binding, which the readers' keys have since replaced: the readers take their customer from the delta key and read the touched groups in one scan session.*
 
 The opt-in compiler (`--q3-merged-index`) emitted calls to the COL library's
 [Q3 readers](../../../sql-to-dbsp-compiler/experiments/merged-index-col/src/q3.rs).
