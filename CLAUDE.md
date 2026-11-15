@@ -46,7 +46,8 @@ cargo clippy --workspace -- -D warnings
 # SQL compiler: full build (also builds Calcite), or the compiler alone
 cd sql-to-dbsp-compiler && ./build.sh
 cd sql-to-dbsp-compiler/SQL-compiler && mvn package -DskipTests
-# One JUnit test (generated Rust lands in sql-to-dbsp-compiler/temp/)
+# One JUnit test (generated Rust lands in sql-to-dbsp-compiler/temp/); tests that cargo-check
+# the generated crate call plain `cargo`, so also export RUSTUP_TOOLCHAIN=1.96.1
 mvn test -pl SQL-compiler -Dtest=<TestClass> -Dsurefire.failIfNoSpecifiedTests=false
 
 # Pipeline manager (needs the compiler built first)
