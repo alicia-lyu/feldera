@@ -22,7 +22,7 @@ pub use ordered::OrderedKey;
 pub use packed::{PackedField, PayloadDecoder, PayloadEncoder};
 pub use reader::{
     Capture, Captured, Delta, DeltaCursor, DeltaReader, DrivingDelta, Position, Reader,
-    ReaderDefinition, Requests, RowBuilder, StoredReader, capture, route,
+    ReaderDefinition, Requests, RowBuilder, SealedReader, StoredReader, capture, route,
 };
 pub use run_merge::RunMerge;
 pub use session::{Pass, ScanSession, SessionCounts};

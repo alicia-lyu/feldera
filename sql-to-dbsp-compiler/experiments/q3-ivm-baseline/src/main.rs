@@ -39,7 +39,7 @@ use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
-use merged_index_col::q3::{Q3State, SessionReads};
+use merged_index_col::q3::{Collection, DrivingDeltas, Q3State, SessionReads};
 #[cfg(feature = "merged-index")]
 use reconstruction::{ManualIndex, OrphanLines};
 use serde_json::{json, Value};
@@ -464,30 +464,26 @@ impl Pipeline {
 /// with the runtime's buffer cache bound.
 #[cfg(feature = "merged-index")]
 impl Pipeline {
-    /// Runs the transaction's scan session over the published `Old` and `Dlt`, which buffers the
-    /// touched groups until the publication is finished. This is the transaction's only read of
-    /// the index in the view phase.
-    /// Runs the scan session and returns the time it spent preparing the driving deltas from
-    /// `Dlt` (phase A), which belongs to `delta_ms`, not to the scan's `q3_ms`.
-    fn collect_groups(&self) -> Result<Duration> {
+    /// Runs the transaction's scan session over the published `Old` and `Dlt`, which seals the
+    /// readers of the touched groups until the publication is finished. This is the
+    /// transaction's only read of the index in the view phase. Returns the driving deltas, and
+    /// the time the collection spent preparing them from `Dlt` (phase A), which belongs to
+    /// `delta_ms`, not to the scan's `q3_ms`.
+    fn collect_groups(&self) -> Result<Collection> {
         self.in_cache(|| self.q3_state.collect(self.session_pass))
             .map_err(anyhow::Error::msg)
     }
 
     /// Hands the prepared transaction delta to the view circuit: the part of `delta_ms` after
-    /// the collection (phase A's part is returned by `collect_groups`).
-    fn build_view_delta(&self) -> Result<()> {
-        self.feed_driving_deltas()
+    /// the collection (phase A's part is in the `Collection` that `collect_groups` returned).
+    fn build_view_delta(&self, driving: DrivingDeltas) -> Result<()> {
+        self.feed_driving_deltas(driving)
     }
 
-    /// Hands the readers' `Dlt` batches, the driving deltas, to the view circuit's input
-    /// handles: `ΔO` and `ΔL` are moved, and `ΔC` is a clone (see `Q3State::collect`).
-    fn feed_driving_deltas(&self) -> Result<()> {
-        let deltas = self
-            .q3_state
-            .take_driving_deltas()
-            .map_err(anyhow::Error::msg)?;
-        self.view_inputs.set(deltas);
+    /// Hands the driving deltas, which the collection moved out of `Q3State`, to the view
+    /// circuit's input handles.
+    fn feed_driving_deltas(&self, driving: DrivingDeltas) -> Result<()> {
+        self.view_inputs.set(driving);
         Ok(())
     }
 }
@@ -754,11 +750,13 @@ fn transact_inner(
         let collection_result = pipeline.collect_groups();
         // Phase A (the driving deltas from `Dlt`) runs inside the collection; it moves from the
         // scan's `q3_ms` to `delta_ms`.
-        let delta_preparation = collection_result.as_ref().copied().unwrap_or_default();
+        let delta_preparation = collection_result
+            .as_ref()
+            .map_or(Duration::ZERO, |collection| collection.delta_preparation);
         let collection = view_started.elapsed().saturating_sub(delta_preparation);
         delta += delta_preparation;
         let delta_started = Instant::now();
-        let delta_result = collection_result.and_then(|_| pipeline.build_view_delta());
+        let delta_result = collection_result.and_then(|collection| pipeline.build_view_delta(collection.driving));
         delta += delta_started.elapsed();
         let transaction_started = Instant::now();
         let transaction_result = delta_result.and_then(|()| {
@@ -971,8 +969,8 @@ fn run_view(pipeline: &mut Pipeline, net_delta: Change, stepped: bool) -> Result
     #[cfg(feature = "merged-index")]
     {
         drop(net_delta);
-        pipeline.collect_groups()?;
-        pipeline.build_view_delta()?;
+        let collection = pipeline.collect_groups()?;
+        pipeline.build_view_delta(collection.driving)?;
         if stepped {
             pipeline.view.circuit.start_transaction()?;
             for _ in 0..3 {
@@ -4244,13 +4242,13 @@ mod session_worked_transaction_tests {
 
                 let index_before = RunReads::current_for(Component::MergedIndex);
                 let total_before = RunReads::current();
-                pipeline.collect_groups()?;
+                let collection = pipeline.collect_groups()?;
                 let reads = RunReads::current_for(Component::MergedIndex).since(index_before);
                 let other_reads = RunReads::current().since(total_before).since(reads);
 
                 // The view circuit takes the same readers' driving deltas, and `V` must be the
                 // independent join of the new state.
-                pipeline.build_view_delta()?;
+                pipeline.build_view_delta(collection.driving)?;
                 pipeline.view.circuit.transaction()?;
                 let session = pipeline.q3_state.finish().map_err(anyhow::Error::msg)?;
                 let output = pipeline

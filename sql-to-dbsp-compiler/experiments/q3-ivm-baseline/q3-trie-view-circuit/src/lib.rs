@@ -14,7 +14,7 @@
 //! `J` keeps `(custkey, orderkey)`.
 //!
 //! **(A2) Complete deltas.** The inputs are the transaction's `Dlt`: the driver sets the
-//! readers' `Dlt` batches ([`Q3State::take_driving_deltas`]) into three input handles of
+//! readers' `Dlt` batches (the `driving` field that [`Q3State::collect`] returns) into three input handles of
 //! DBSP's `Input` operator, as native mode feeds its own, every row at its full trie path. The joins are the
 //! snapshot-reader joins of `merged_index_col::q3`, so the four partner reads are
 //! `C⁺`, `O⁻`, `J⁺`, and `L⁻`; only their keys differ from the generated circuit's.

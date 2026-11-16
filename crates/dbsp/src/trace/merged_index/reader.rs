@@ -476,13 +476,54 @@ impl<R: ReaderDefinition> Reader<R> {
         let PartnerRows::Sealed(batch) = &self.partner else {
             return Err("the partner batch is not sealed yet".into());
         };
-        let mut snapshot = TypedBatch::new(DynamicSnapshot::new(
-            OrdIndexedZSet::<R::Key, R::Val>::factories(),
-        ));
-        snapshot
-            .inner_mut()
-            .extend_with_batches([Arc::clone(batch)]);
-        Ok(snapshot)
+        Ok(snapshot_of(batch))
+    }
+
+    /// Ends the routing: seals the partner batch if it is still open, and
+    /// keeps the requests with it as a [`SealedReader`], which no one can
+    /// change and which threads can share. The row builder, which is not
+    /// `Sync`, is gone.
+    pub fn into_sealed(self) -> Result<SealedReader<R>, String> {
+        let partner = match self.partner {
+            PartnerRows::Building(builder) => Arc::new((*builder).finish()?.into_inner()),
+            PartnerRows::Sealed(batch) => batch,
+        };
+        Ok(SealedReader {
+            requests: self.requests,
+            partner,
+        })
+    }
+}
+
+/// The one-batch snapshot of a sealed partner batch.
+fn snapshot_of<K: DBData, V: DBData>(
+    batch: &Arc<Inner<K, V>>,
+) -> SpineSnapshot<OrdIndexedZSet<K, V>> {
+    let mut snapshot = TypedBatch::new(DynamicSnapshot::new(OrdIndexedZSet::<K, V>::factories()));
+    snapshot
+        .inner_mut()
+        .extend_with_batches([Arc::clone(batch)]);
+    snapshot
+}
+
+/// A [`Reader`] after its routing: the requests of its driving delta and its
+/// finished partner batch. Both are immutable, so the reader is `Sync`, and
+/// the threads that run a join's partner reads share it without a lock.
+pub struct SealedReader<R: ReaderDefinition> {
+    requests: Requests,
+    partner: Arc<Inner<R::Key, R::Val>>,
+}
+
+impl<R: ReaderDefinition> SealedReader<R> {
+    /// The requests of the driving delta, which a partner read checks the
+    /// delta's keys against.
+    pub fn requests(&self) -> &Requests {
+        &self.requests
+    }
+
+    /// The partner batch, as the one-batch snapshot that a join reads.
+    pub fn partner(&self) -> SpineSnapshot<OrdIndexedZSet<R::Key, R::Val>> {
+        snapshot_of(&self.partner)
     }
 }
 

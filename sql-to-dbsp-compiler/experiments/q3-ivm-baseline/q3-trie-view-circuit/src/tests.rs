@@ -182,8 +182,7 @@ fn check(transactions: Vec<Vec<Row>>) {
         let dlt = Arc::new(build_batch(rows).unwrap());
         runs.push(dlt.clone());
         state.publish(old, dlt).unwrap();
-        state.collect(Pass::Seek).unwrap();
-        inputs.set(state.take_driving_deltas().unwrap());
+        inputs.set(state.collect(Pass::Seek).unwrap().driving);
         circuit.transaction().unwrap();
         state.finish().unwrap();
 

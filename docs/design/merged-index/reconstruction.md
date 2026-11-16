@@ -40,7 +40,7 @@ Per transaction, the harness does the following in order (`q3-ivm-baseline/src/m
 1. Run the base transaction, then `prepare` its net delta into the complete rows of `Dlt` (`reconstruction::prepare`; see [General deltas](#general-deltas)). The CLI drivers' inputs are first checked by `BaseState::validate` (`workload.rs`).
 2. `ManualIndex::append` the rows. It yields `Old`, the snapshot before the append, and `Dlt`, the appended run. `prepare` and the append are timed as `index_ms`, inside `base_ms`.
 3. `Q3State::publish(old, dlt)`, then `Q3State::collect(pass)`: one scan session fills the typed readers. Before reads take `Old`'s batch; after reads take `Old`'s and `Dlt`'s, unconsolidated (`prop:overlay`).
-4. `Q3State::take_driving_deltas` hands the readers' `Dlt` batches to the view circuit's `add_input_stream` handles, timed in `forward_ms`. Then run the view transaction; at its commit, the joins read the readers' batches.
+4. The driving deltas that `Q3State::collect` returned go to the view circuit's `add_input_stream` handles (`Pipeline::build_view_delta`), timed in `delta_ms`. Then run the view transaction; at its commit, the joins read the readers' batches.
 5. `Q3State::finish()` releases the readers and returns the session's reads.
 
 `publish` returns an error if a previous publication has not been finished; `finish` returns an error if nothing was published (`merged-index-col/src/q3.rs`). Consequently several transactions cannot share one publication: each has its own `Old` and `Dlt`.

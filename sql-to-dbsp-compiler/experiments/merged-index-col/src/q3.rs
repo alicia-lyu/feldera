@@ -35,16 +35,18 @@
 //! join).
 //!
 //! The circuit's driving deltas are the batches that `capture` built, moved out
-//! ([`Q3State::take_driving_deltas`]); no after read shares them. A partner
-//! read errors on a delta key outside its reader's requests: every delta key
-//! lies in a request, and a request outside the touched groups breaks that
-//! contract.
+//! to the caller of [`Q3State::collect`] ([`Collection`]); no after read shares
+//! them. When `collect` ends, each reader is sealed ([`SealedReader`]): its
+//! requests and its finished partner batch are immutable, so the joins on the
+//! worker thread read them through `&self` with no lock. A partner read errors
+//! on a delta key outside its reader's requests: every delta key lies in a
+//! request, and a request outside the touched groups breaks that contract.
 
 use std::{
     ops::AddAssign,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -57,7 +59,7 @@ use dbsp::{
         merged_index::{
             capture, route, Capture, Delta, DeltaCursor, DeltaReader, DrivingDelta,
             MergedIndexBatch, OrderedKey, Pass, Position, Reader, ReaderDefinition, ScanSession,
-            SessionCounts, StoredReader,
+            SealedReader, SessionCounts, StoredReader,
         },
         with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
         SpineSnapshot as DynamicSnapshot,
@@ -129,6 +131,17 @@ pub struct DrivingDeltas {
     pub customers: CustomerByCustkeyVector,
     pub orders: OrdersByCustkeyVector,
     pub lines: LineitemByCustkeyOrderkeyVector,
+}
+
+/// What [`Q3State::collect`] hands the driver.
+pub struct Collection {
+    /// The driving deltas, for the view circuit's input handles. They leave
+    /// `Q3State` here, once per transaction: collecting again errors.
+    pub driving: DrivingDeltas,
+    /// The time spent preparing the driving deltas (the capture of `Dlt` and
+    /// the sealing of `ΔC`, `ΔO`, and `ΔL`), which the harness books as the
+    /// preparation of the view's transaction delta, apart from the scan.
+    pub delta_preparation: Duration,
 }
 
 // ---- The four reader definitions: the static part of each partner read ----
@@ -606,21 +619,20 @@ fn take_delta_orders(group: &mut Group, order: i64) -> Result<Weighted<Tup2<Date
 
 // ---- The state of one transaction ----
 
-/// The readers of one transaction, after collection, and what collecting
-/// them read.
+/// The readers of one transaction, sealed by [`Q3State::collect`], and what
+/// collecting them read. Nothing in it changes after `collect`, so it is
+/// `Sync` and the joins' callbacks share it without a lock.
 struct CollectedReaders {
-    customers: Reader<CustomersAfter>,
-    orders: Reader<OrdersBefore>,
-    joined: Reader<JoinedAfter>,
-    lines: Reader<LineitemsBefore>,
+    customers: SealedReader<CustomersAfter>,
+    orders: SealedReader<OrdersBefore>,
+    joined: SealedReader<JoinedAfter>,
+    lines: SealedReader<LineitemsBefore>,
     reads: SessionReads,
-    /// Until [`Q3State::take_driving_deltas`] hands them over.
-    driving: Option<DrivingDeltas>,
 }
 
 /// Checks that a delta key's request prefix is one of `reader`'s requests.
 fn require_requested<R: ReaderDefinition>(
-    reader: &Reader<R>,
+    reader: &SealedReader<R>,
     prefix: &[u8],
     what: &str,
     reader_name: &str,
@@ -638,9 +650,10 @@ fn require_requested<R: ReaderDefinition>(
 struct ReadViews {
     old: SourceSnapshot,
     dlt: Arc<MergedIndexBatch>,
-    /// Set once by [`Q3State::collect`]. The readers' builders are not `Sync`,
-    /// so the readers sit behind a lock that the joins' callbacks take.
-    collected: OnceLock<Mutex<CollectedReaders>>,
+    /// Set once by [`Q3State::collect`], and read-only after that: the driver
+    /// thread sets it, and the worker thread's partner reads and the driver's
+    /// `finish` read it.
+    collected: OnceLock<CollectedReaders>,
 }
 
 /// One externally prepared transaction's index views and readers, shared by
@@ -648,9 +661,9 @@ struct ReadViews {
 ///
 /// Publish `Old`, the index snapshot before the transaction, and `Dlt`, the
 /// run of the transaction's signed index changes, after index maintenance and
-/// before the view transaction. [`Self::collect`] then fills the readers; the
-/// driver takes the driving deltas for the circuit's input handles
-/// ([`Self::take_driving_deltas`]), and the joins take the partner reads.
+/// before the view transaction. [`Self::collect`] then fills and seals the
+/// readers and hands the driver the driving deltas for the circuit's input
+/// handles ([`Collection`]), and the joins take the partner reads.
 /// Keep the publication unchanged until `DBSPHandle::transaction` or the
 /// equivalent multi-step commit has completed, then call [`Self::finish`]: the
 /// readers are held until then, since `J` and `V` are separate operators and
@@ -680,7 +693,7 @@ impl Q3State {
     /// Checks `keys` (the keys of a circuit delta, read only if the check is on) against `reader`.
     fn check_requested<R: ReaderDefinition, K: DBData, V: DBData>(
         &self,
-        reader: &Reader<R>,
+        reader: &SealedReader<R>,
         delta: &SpineSnapshot<OrdIndexedZSet<K, V>>,
         prefix: impl Fn(&K) -> (Vec<u8>, String),
         reader_name: &str,
@@ -708,18 +721,17 @@ impl Q3State {
         Ok(())
     }
 
-    /// Reads `Dlt` and `Old` once each and fills the readers, which are kept
-    /// until [`Self::finish`]. The index is read here, on the calling thread
-    /// under the merged index's read owner, and nowhere else; the caller binds
-    /// the runtime's buffer cache to this thread.
+    /// Reads `Dlt` and `Old` once each and fills the readers, which are sealed
+    /// and kept until [`Self::finish`]. The index is read here, on the calling
+    /// thread under the merged index's read owner, and nowhere else; the
+    /// caller binds the runtime's buffer cache to this thread.
     ///
-    /// Returns the time spent preparing the driving deltas (the capture of
-    /// `Dlt` and the sealing of `ΔC`, `ΔO`, and `ΔL`), which the harness books
-    /// as the preparation of the view's transaction delta, apart from the scan.
-    pub fn collect(&self, pass: Pass) -> Result<Duration, String> {
+    /// Returns the driving deltas, which leave `Q3State` here, and the time
+    /// spent preparing them. A second `collect` of one publication errors.
+    pub fn collect(&self, pass: Pass) -> Result<Collection, String> {
         let views = self.views()?;
         let before = Component::ALL.map(RunReads::current_for);
-        let (collected, driving, counts, delta_preparation) =
+        let (sealed, driving, counts, delta_preparation) =
             with_read_owner(Component::MergedIndex, || {
                 let mut customers = Reader::<CustomersAfter>::new()?;
                 let mut orders = Reader::<OrdersBefore>::new()?;
@@ -757,14 +769,13 @@ impl Q3State {
                 };
                 drop(session);
 
-                for reader in [
-                    customers.seal_partner(),
-                    orders.seal_partner(),
-                    joined.seal_partner(),
-                    lines.seal_partner(),
-                ] {
-                    reader?;
-                }
+                // The readers are sealed here, so that the worker thread can share them.
+                let sealed = (
+                    customers.into_sealed()?,
+                    orders.into_sealed()?,
+                    joined.into_sealed()?,
+                    lines.into_sealed()?,
+                );
                 // The deltas are moved out, not cloned: no after read shares them.
                 let seal_started = Instant::now();
                 let driving = DrivingDeltas {
@@ -773,21 +784,16 @@ impl Q3State {
                     lines: delta_lines.into_batch()?,
                 };
                 delta_preparation += seal_started.elapsed();
-                Ok::<_, String>((
-                    (customers, orders, joined, lines),
-                    driving,
-                    counts,
-                    delta_preparation,
-                ))
+                Ok::<_, String>((sealed, driving, counts, delta_preparation))
             })?;
         let after = Component::ALL.map(RunReads::current_for);
         let driver_reads: OwnerReads = std::array::from_fn(|i| after[i].since(before[i]));
         let run_reads = driver_reads[Component::MergedIndex as usize];
 
-        let (customers, orders, joined, lines) = collected;
+        let (customers, orders, joined, lines) = sealed;
         views
             .collected
-            .set(Mutex::new(CollectedReaders {
+            .set(CollectedReaders {
                 customers,
                 orders,
                 joined,
@@ -797,10 +803,12 @@ impl Q3State {
                     run_reads,
                     driver_reads,
                 },
-                driving: Some(driving),
-            }))
+            })
             .map_err(|_| "the published views were already collected".to_owned())?;
-        Ok(delta_preparation)
+        Ok(Collection {
+            driving,
+            delta_preparation,
+        })
     }
 
     /// Release the readers and published handles after all transaction
@@ -811,13 +819,10 @@ impl Q3State {
         let views = views
             .take()
             .ok_or("no Q3 transaction views were published")?;
-        match views.collected.get() {
-            Some(collected) => Ok(collected
-                .lock()
-                .map_err(|_| "Q3 readers lock poisoned")?
-                .reads),
-            None => Ok(SessionReads::default()),
-        }
+        Ok(views
+            .collected
+            .get()
+            .map_or_else(SessionReads::default, |collected| collected.reads))
     }
 
     /// The published `Old` snapshot.
@@ -838,17 +843,6 @@ impl Q3State {
             .ok_or_else(|| "publish merged-index views before Q3 maintenance".into())
     }
 
-    /// Hands over the transaction's driving deltas, once, for the view
-    /// circuit's input handles.
-    pub fn take_driving_deltas(&self) -> Result<DrivingDeltas, String> {
-        let views = self.views()?;
-        let mut collected = views.collected_readers()?;
-        collected
-            .driving
-            .take()
-            .ok_or_else(|| "the driving deltas were already taken".to_owned())
-    }
-
     /// `C⁺`: the customers after the transaction, driven by `ΔO`: for each
     /// customer of `ΔO`, `Old`'s row and `ΔC`'s rows, consolidated.
     pub fn customers_after(
@@ -863,7 +857,7 @@ impl Q3State {
             |Tup1(customer)| (prefix_custkey(*customer), format!("customer {customer}")),
             "C⁺",
         )?;
-        collected.customers.partner()
+        Ok(collected.customers.partner())
     }
 
     /// `O⁻`: the orders before the transaction, driven by `ΔC`: every order
@@ -880,7 +874,7 @@ impl Q3State {
             |Tup1(customer)| (prefix_custkey(*customer), format!("customer {customer}")),
             "O⁻",
         )?;
-        collected.orders.partner()
+        Ok(collected.orders.partner())
     }
 
     /// `J⁺`: the joined orders at the requested `(custkey, orderkey)` nodes
@@ -903,7 +897,7 @@ impl Q3State {
             },
             "J⁺",
         )?;
-        collected.joined.partner()
+        Ok(collected.joined.partner())
     }
 
     /// `L⁻`: the line items before the transaction, driven by `ΔJ`: every
@@ -925,17 +919,15 @@ impl Q3State {
             },
             "L⁻",
         )?;
-        collected.lines.partner()
+        Ok(collected.lines.partner())
     }
 }
 
 impl ReadViews {
-    fn collected_readers(&self) -> Result<MutexGuard<'_, CollectedReaders>, String> {
+    fn collected_readers(&self) -> Result<&CollectedReaders, String> {
         self.collected
             .get()
-            .ok_or_else(|| "collect the touched groups before reading them".to_owned())?
-            .lock()
-            .map_err(|_| "Q3 readers lock poisoned".to_owned())
+            .ok_or_else(|| "collect the touched groups before reading them".to_owned())
     }
 }
 

@@ -138,11 +138,17 @@ fn checked_state() -> Q3State {
 }
 
 /// Publishes `old` and `dlt` and collects their groups with the `Seek` pass.
-fn published(old: Vec<Vec<SourceRow>>, dlt: Vec<SourceRow>) -> Q3State {
+/// Returns the state and the driving deltas that the collection handed over.
+fn published(old: Vec<Vec<SourceRow>>, dlt: Vec<SourceRow>) -> (Q3State, DrivingDeltas) {
     let state = checked_state();
     state.publish(source(old), run(dlt)).unwrap();
-    state.collect(Pass::Seek).unwrap();
-    state
+    let driving = state.collect(Pass::Seek).unwrap().driving;
+    (state, driving)
+}
+
+/// [`published`], for a test that does not use the driving deltas.
+fn published_state(old: Vec<Vec<SourceRow>>, dlt: Vec<SourceRow>) -> Q3State {
+    published(old, dlt).0
 }
 
 /// Copies `run` into a batch in a file.
@@ -279,7 +285,7 @@ fn with_readers<T>(state: &Q3State, f: impl FnOnce(&CollectedReaders) -> T) -> T
     f(&readers)
 }
 
-fn requests_of<R: ReaderDefinition>(reader: &Reader<R>) -> Vec<Vec<u8>> {
+fn requests_of<R: ReaderDefinition>(reader: &SealedReader<R>) -> Vec<Vec<u8>> {
     reader.requests().iter().map(<[u8]>::to_vec).collect()
 }
 
@@ -302,12 +308,12 @@ fn four_readers_preserve_weighted_before_after_relations() {
         line(2, 20, 1, 100, -4),
         line(2, 20, 1, 200, 1),
     ];
-    let state = published(vec![initial], changes);
+    let (state, driving) = published(vec![initial], changes);
     let DrivingDeltas {
         customers: customers_delta,
         orders: orders_delta,
         lines: lines_delta,
-    } = state.take_driving_deltas().unwrap();
+    } = driving;
     let joined_delta = delta(vec![(
         Tup2(2, 20),
         Tup3(SqlString::from("new"), Date::from_days(11), 7),
@@ -354,7 +360,7 @@ fn four_readers_preserve_weighted_before_after_relations() {
 /// the same order key at another customer is another node.
 #[test]
 fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
-    let state = published(
+    let (state, driving) = published(
         vec![vec![customer(2, "old", 1), customer(3, "new", 1)]],
         vec![
             order(2, 20, 10, -1),
@@ -365,7 +371,7 @@ fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
             line(3, 21, 1, 100, 1),
         ],
     );
-    let lines = state.take_driving_deltas().unwrap().lines;
+    let lines = driving.lines;
     assert_eq!(
         tuples(&state.joined_orders_after(&snap(lines)).unwrap()),
         vec![
@@ -391,7 +397,7 @@ fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
     // `ΔC` changes both customers, so `ΔJ` has a row at each of their orders:
     // `L⁻` keeps those orders' line items before the transaction. It keeps
     // no line item of the order `(2, 21)`, which no one asks for.
-    let state_with_lines = published(
+    let state_with_lines = published_state(
         vec![vec![
             order(2, 20, 10, 1),
             order(3, 20, 10, 1),
@@ -444,7 +450,7 @@ fn joined_orders_are_read_at_the_customer_and_order_of_the_request() {
 
 #[test]
 fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() {
-    let state = published(
+    let (state, driving) = published(
         vec![],
         vec![
             customer(2, "A", -2),
@@ -455,7 +461,7 @@ fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() 
             order(9, 90, 10, 100),
         ],
     );
-    let lines = state.take_driving_deltas().unwrap().lines;
+    let lines = driving.lines;
     assert_eq!(
         tuples(&state.joined_orders_after(&snap(lines)).unwrap()),
         vec![(
@@ -469,7 +475,7 @@ fn joined_projection_multiplies_signed_weights_and_ignores_unrequested_ranges() 
 #[test]
 fn cancelled_keys_have_no_values_and_unrequested_keys_are_refused() {
     // Customer 2's row cancels against `ΔC`, and its order is inserted.
-    let state = published(
+    let state = published_state(
         vec![vec![customer(2, "A", 1), customer(3, "B", 1)]],
         vec![customer(2, "A", -1), order(2, 20, 0, 1)],
     );
@@ -528,8 +534,7 @@ fn the_after_read_is_the_requested_slice_of_old_and_dlt() {
         &state.old().unwrap().batches()[0],
         &old.batches()[0]
     ));
-    state.collect(Pass::Seek).unwrap();
-    let driving = state.take_driving_deltas().unwrap();
+    let driving = state.collect(Pass::Seek).unwrap().driving;
     // `ΔC` holds all three customers' changes, and goes whole to the circuit.
     assert_eq!(tuples(&driving.customers).len(), 5);
     // `C⁺` holds the customers that `ΔO` requests (2 and 4), not customer 3
@@ -569,7 +574,7 @@ fn publication_collection_and_release_follow_one_order() {
         .lineitems_before(&joined)
         .unwrap_err()
         .contains("publish"));
-    assert!(state.collect(Pass::Seek).unwrap_err().contains("publish"));
+    assert!(state.collect(Pass::Seek).err().unwrap().contains("publish"));
     state
         .publish(source(vec![]), run(vec![order(2, 20, 10, 1)]))
         .unwrap();
@@ -585,19 +590,57 @@ fn publication_collection_and_release_follow_one_order() {
     state.collect(Pass::Seek).unwrap();
     assert!(state
         .collect(Pass::Seek)
-        .unwrap_err()
+        .err()
+        .unwrap()
         .contains("already collected"));
     assert!(tuples(&state.lineitems_before(&delta(Vec::new())).unwrap()).is_empty());
     state.finish().unwrap();
     assert!(state.finish().is_err());
 }
 
+/// Fails to compile unless `T` can be shared between threads.
+fn assert_sync<T: Sync>() {}
+
+/// The readers are sealed when `collect` ends, so the worker thread's joins read them while the
+/// driver's `Arc` is shared, with no lock around the readers.
+#[test]
+fn collected_readers_are_shared_with_the_worker_thread() {
+    assert_sync::<ReadViews>();
+    assert_sync::<CollectedReaders>();
+
+    let (state, driving) = published(
+        vec![vec![
+            customer(2, "old", 1),
+            order(2, 20, 10, 1),
+            line(2, 20, 1, 100, 1),
+        ]],
+        vec![order(2, 21, 11, 1)],
+    );
+    let request = snap(driving.orders);
+    let from_worker = std::thread::scope(|scope| {
+        scope
+            .spawn(|| tuples(&state.customers_after(&request).unwrap()))
+            .join()
+            .unwrap()
+    });
+    // The worker thread reads what the driver thread reads.
+    assert_eq!(
+        from_worker,
+        tuples(&state.customers_after(&request).unwrap())
+    );
+    assert_eq!(
+        from_worker,
+        vec![(Tup1(2), Tup1(SqlString::from("old")), 1)]
+    );
+    state.finish().unwrap();
+}
+
 /// The driving deltas are their owners' batches: each row carries its trie
-/// keys, and a moved line item appears under both customers. They are moved
-/// out, once.
+/// keys, and a moved line item appears under both customers. `collect` moves
+/// them out, so they can be taken only once.
 #[test]
 fn driving_deltas_carry_trie_keys() {
-    let state = published(
+    let (state, driving) = published(
         vec![vec![
             customer(2, "old", 1),
             order(2, 20, 10, 1),
@@ -615,11 +658,7 @@ fn driving_deltas_carry_trie_keys() {
         customers,
         orders,
         lines,
-    } = state.take_driving_deltas().unwrap();
-    assert!(state
-        .take_driving_deltas()
-        .err()
-        .is_some_and(|error| error.contains("already taken")));
+    } = driving;
     state.finish().unwrap();
 
     assert_eq!(
@@ -801,10 +840,7 @@ fn check_readers(
                 _ => None,
             })
             .collect();
-        prop_assert_eq!(
-            tuples(&readers.customers.partner().unwrap()),
-            wanted(customers)
-        );
+        prop_assert_eq!(tuples(&readers.customers.partner()), wanted(customers));
 
         // `O⁻`: the orders before, at the customers of `ΔC`.
         let orders: Vec<_> = before
@@ -822,7 +858,7 @@ fn check_readers(
                 _ => None,
             })
             .collect();
-        prop_assert_eq!(tuples(&readers.orders.partner().unwrap()), wanted(orders));
+        prop_assert_eq!(tuples(&readers.orders.partner()), wanted(orders));
 
         // `J⁺`: `J` after, at the nodes of `ΔL`.
         let joined: Vec<_> = joined_rows(&after)
@@ -838,7 +874,7 @@ fn check_readers(
                 )
             })
             .collect();
-        prop_assert_eq!(tuples(&readers.joined.partner().unwrap()), wanted(joined));
+        prop_assert_eq!(tuples(&readers.joined.partner()), wanted(joined));
 
         // `L⁻`: the line items before, at the nodes where `ΔJ` has a row.
         let lines: Vec<_> = before
@@ -855,7 +891,7 @@ fn check_readers(
                 _ => None,
             })
             .collect();
-        prop_assert_eq!(tuples(&readers.lines.partner().unwrap()), wanted(lines));
+        prop_assert_eq!(tuples(&readers.lines.partner()), wanted(lines));
         Ok(())
     })?;
     // Whatever the delta, the collecting thread reads under no owner but the index's and the
@@ -949,7 +985,7 @@ proptest! {
 /// the driving delta and the `C⁺` slice are built in typed order all the same.
 #[test]
 fn a_replaced_segment_is_built_in_typed_order_though_it_arrives_in_packed_order() {
-    let state = published(
+    let (state, driving) = published(
         vec![vec![customer(5, "C", 1), order(5, 50, 10, 1)]],
         vec![
             customer(5, "C", -1),
@@ -959,7 +995,7 @@ fn a_replaced_segment_is_built_in_typed_order_though_it_arrives_in_packed_order(
     );
     let DrivingDeltas {
         customers, orders, ..
-    } = state.take_driving_deltas().unwrap();
+    } = driving;
     assert_eq!(
         tuples(&customers),
         vec![
@@ -1028,7 +1064,7 @@ fn delta_joined_requests_follow_customer_changes_and_moved_orders() {
     }
 
     // The segment change's `L⁻` requests, spelled out.
-    let state = published(
+    let state = published_state(
         vec![vec![
             customer(2, "A", 1),
             order(2, 20, 10, 1),
@@ -1081,13 +1117,13 @@ fn the_contract_check_is_off_unless_enabled() {
 /// order, which `Old` held without one, leaves.
 #[test]
 fn a_node_where_the_delta_terms_cancel_is_not_requested() {
-    let state = published(
+    let state = published_state(
         vec![vec![order(5, 50, 10, 1), line(5, 50, 1, 100, 1)]],
         vec![customer(5, "A", 1), order(5, 50, 10, -1)],
     );
     with_readers(&state, |readers| {
         assert!(requests_of(&readers.lines).is_empty());
-        assert!(tuples(&readers.lines.partner().unwrap()).is_empty());
+        assert!(tuples(&readers.lines.partner()).is_empty());
     });
 }
 
@@ -1095,7 +1131,7 @@ fn a_node_where_the_delta_terms_cancel_is_not_requested() {
 /// inserts between two orders of `Old` is stepped between them.
 #[test]
 fn an_inserted_order_is_stepped_between_the_orders_of_old() {
-    let state = published(
+    let state = published_state(
         vec![vec![
             customer(2, "A", 1),
             order(2, 10, 1, 1),
@@ -1119,7 +1155,7 @@ fn an_inserted_order_is_stepped_between_the_orders_of_old() {
             ]
         );
         assert_eq!(
-            tuples(&readers.joined.partner().unwrap())
+            tuples(&readers.joined.partner())
                 .into_iter()
                 .map(|(Tup2(_, order), _, weight)| (order, weight))
                 .collect::<Vec<_>>(),
@@ -1132,9 +1168,9 @@ fn an_inserted_order_is_stepped_between_the_orders_of_old() {
 
 /// The run reads that `collect` makes on this thread for the merged index, and
 /// for every other owner together.
-fn collect_reads_of(state: &Q3State, pass: Pass) -> (RunReads, RunReads) {
-    let (_, index, other) = run_reads_of(|| state.collect(pass).unwrap());
-    (index, other)
+fn collect_reads_of(state: &Q3State, pass: Pass) -> (DrivingDeltas, RunReads, RunReads) {
+    let (collection, index, other) = run_reads_of(|| state.collect(pass).unwrap());
+    (collection.driving, index, other)
 }
 
 /// `collect` is one pass over `Dlt` and one scan session over the worked
@@ -1157,7 +1193,7 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
         let state = checked_state();
         state.publish(old, Arc::new(dlt)).unwrap();
 
-        let (collecting, collecting_other) = collect_reads_of(&state, Pass::Seek);
+        let (driving, collecting, collecting_other) = collect_reads_of(&state, Pass::Seek);
         // The routing's reads of the driving deltas `ΔC` and `ΔO`, which it merges forward
         // alongside the scan, are the requested-slice owner's: each cursor lands on its first
         // key (2 key reads), and customer 5's rows are read (`ΔC`'s two and `ΔO`'s one, 3 value
@@ -1176,7 +1212,7 @@ fn collect_reads_the_index_once_and_the_readers_not_at_all() {
             customers: customers_delta,
             orders: orders_delta,
             lines: lines_delta,
-        } = state.take_driving_deltas().unwrap();
+        } = driving;
         let joined_delta = delta(
             [3, 4, 5]
                 .map(|order| {
@@ -1312,7 +1348,7 @@ fn finish_returns_each_transactions_session_reads() {
 /// `Dlt` is the index's, and the routing's merge of the driving deltas is the requested slice's.
 #[test]
 fn collect_leaves_zero_query_reads_on_the_collecting_thread() {
-    let state = published(
+    let state = published_state(
         vec![vec![
             customer(2, "A", 1),
             customer(3, "B", 1),

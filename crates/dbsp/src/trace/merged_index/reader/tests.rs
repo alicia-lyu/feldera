@@ -658,6 +658,45 @@ fn a_derived_reader_takes_the_rows_the_routing_builds() {
     assert!(derived.push_row(Tup2(3, 0), 1, 1).is_err());
 }
 
+fn sealed_rows<R: ReaderDefinition>(reader: &SealedReader<R>) -> Vec<(R::Key, R::Val, ZWeight)> {
+    rows(reader.partner().inner())
+}
+
+/// Fails to compile unless `T` can be shared between threads.
+fn assert_sync<T: Sync>() {}
+
+#[test]
+fn a_sealed_reader_keeps_its_requests_and_partner_and_is_sync() {
+    assert_sync::<SealedReader<DerivedAtPath>>();
+
+    let mut derived = Reader::<DerivedAtPath>::new().unwrap();
+    derived.request(&[1, 2]).unwrap();
+    derived.request(&[1, 3]).unwrap();
+    derived.push_ordered_row(Tup2(1, 2), 5, 3).unwrap();
+    derived.push_ordered_row(Tup2(2, 0), 1, 1).unwrap();
+    // The partner batch is still open, and `into_sealed` seals it.
+    let sealed = derived.into_sealed().unwrap();
+    assert_eq!(
+        sealed.requests().iter().collect::<Vec<_>>(),
+        vec![&[1u8, 2][..], &[1, 3][..]]
+    );
+    assert!(sealed.requests().contains(&[1, 3]));
+    assert!(!sealed.requests().contains(&[9]));
+    assert_eq!(
+        sealed_rows(&sealed),
+        vec![(Tup2(1, 2), 5, 3), (Tup2(2, 0), 1, 1)]
+    );
+
+    // A reader that was already sealed passes through unchanged.
+    let mut already = Reader::<DerivedAtPath>::new().unwrap();
+    already.push_ordered_row(Tup2(1, 2), 5, 3).unwrap();
+    already.seal_partner().unwrap();
+    assert_eq!(
+        sealed_rows(&already.into_sealed().unwrap()),
+        vec![(Tup2(1, 2), 5, 3)]
+    );
+}
+
 // ---- Against a brute force ----
 
 /// The summed weight of each `(key, payload)` over `runs`, zero sums dropped.
