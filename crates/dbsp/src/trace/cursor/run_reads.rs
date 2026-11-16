@@ -15,7 +15,8 @@
 //!   key row (two for a reverse key seek, below) and one for each key a
 //!   predicate seek probes.
 //! * `value_decodes`: values a file run deserializes, one for each landing on a
-//!   new value row and one for each value a predicate seek probes. Landing on
+//!   new value row (two for a reverse value seek, below) and one for each
+//!   value a predicate seek probes. Landing on
 //!   a key reads no value. The first read of a value, weight, or value move
 //!   after a landing positions on the key's first value, and counts it once.
 //! * `weight_decodes`: weights a file run deserializes, one for each weight
@@ -33,15 +34,15 @@
 //! `FileIndexedWSet`) count. Runs of other batch types, such as Z-sets, are
 //! not counted.
 //!
-//! A reverse key seek (`seek_key_reverse`, `seek_key_with_reverse`) on a file
-//! run counts two key decodes when it ends on a row, whether or not the cursor
-//! moved, because the reader deserializes that key twice: once when it finds
+//! A reverse seek (`seek_key_reverse`, `seek_key_with_reverse`,
+//! `seek_val_reverse`, `seek_val_with_reverse`) on a file run counts two
+//! decodes of the key or value when it ends on a row, whether or not the
+//! cursor moved, because the reader deserializes it twice: once when it finds
 //! the row, and again when it settles the position. It counts none when it
 //! ends on no row. It misses one decode: a cursor before its first row stays
 //! there, and the cursor cannot tell a seek that found a key from one that
-//! found nothing. An in-memory run counts one key read for a landing. Nothing
-//! that reads merged indexes seeks backward. The reverse seeks over values
-//! are not adjusted: they still count one decode for a landing.
+//! found nothing. An in-memory run counts one read for a landing. Nothing
+//! that reads merged indexes seeks backward.
 //!
 //! The totals are kept per thread and never reset. To count a region, take
 //! [`RunReads::current`] before and after it on the same thread and subtract

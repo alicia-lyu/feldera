@@ -749,7 +749,7 @@ where
     {
         let start = row(&self.key_cursor);
         op(&mut self.key_cursor).unwrap_storage();
-        for _ in 0..landing.key_decodes(start, row(&self.key_cursor)) {
+        for _ in 0..landing.decodes(start, row(&self.key_cursor)) {
             count_key_decode();
         }
         // Keep the old value cursor as the hint for the next first value. If
@@ -795,7 +795,7 @@ where
         let val_cursor = self.value_cursor_mut();
         let start = row(val_cursor);
         op(val_cursor).unwrap_storage();
-        if landing.reads(start, row(val_cursor)) {
+        for _ in 0..landing.decodes(start, row(val_cursor)) {
             count_value_decode();
         }
     }
@@ -822,10 +822,10 @@ enum Landing {
     Always,
     /// Forward seeks read a key only when they leave the current row.
     IfMoved,
-    /// Reverse seeks that end on a row deserialize its key twice, moved or
-    /// not. `Position::rewind_to_last_le` in the file reader has `best_match`
-    /// deserialize the key that it finds, then deserializes the row's key
-    /// again once the position is settled.
+    /// Reverse seeks that end on a row deserialize its key or value twice,
+    /// moved or not. `Position::rewind_to_last_le` in the file reader has
+    /// `best_match` deserialize the key or value that it finds, then
+    /// deserializes the row's again once the position is settled.
     ///
     /// A reverse seek that ends off a row counts none. This misses one real
     /// deserialization: a cursor before its first row stays there, even
@@ -844,9 +844,9 @@ impl Landing {
         }
     }
 
-    /// How many times a move from `start` to `end` deserializes the key it
-    /// lands on.
-    fn key_decodes(self, start: Option<u64>, end: Option<u64>) -> u64 {
+    /// How many times a move from `start` to `end` deserializes the key or
+    /// value it lands on.
+    fn decodes(self, start: Option<u64>, end: Option<u64>) -> u64 {
         let landed = u64::from(self.reads(start, end));
         match self {
             Landing::TwiceOnRow => 2 * landed,
@@ -1027,7 +1027,7 @@ where
     }
 
     fn seek_val_reverse(&mut self, val: &V) {
-        self.move_val(Landing::Always, |val_cursor| unsafe {
+        self.move_val(Landing::TwiceOnRow, |val_cursor| unsafe {
             val_cursor.rewind_to_value_or_smaller(val)
         });
     }
@@ -1037,7 +1037,7 @@ where
             count_value_decode();
             predicate(val)
         };
-        self.move_val(Landing::Always, |val_cursor| unsafe {
+        self.move_val(Landing::TwiceOnRow, |val_cursor| unsafe {
             val_cursor.seek_backward_until(predicate)
         });
     }

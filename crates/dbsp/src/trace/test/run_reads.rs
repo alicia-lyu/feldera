@@ -264,6 +264,37 @@ fn a_reverse_predicate_seek_counts_each_probe_and_the_landed_key_twice() {
 }
 
 #[test]
+fn a_reverse_value_seek_that_lands_decodes_the_value_twice() {
+    run_in_circuit_with_storage(|| {
+        let run = file_run();
+        let mut cursor = run.cursor();
+        cursor.fast_forward_vals();
+        assert_eq!(*cursor.val().downcast_checked::<i32>(), 11);
+
+        // As for keys: `best_match` deserializes the value it finds, and the
+        // cursor deserializes the settled row's value again.
+        let ((), moved) = reads_of(|| cursor.seek_val_reverse(10_i32.erase()));
+        assert_eq!(*cursor.val().downcast_checked::<i32>(), 10);
+        assert_eq!(moved, reads(0, 0, 2, 0));
+
+        let ((), stayed) = reads_of(|| cursor.seek_val_reverse(10_i32.erase()));
+        assert_eq!(stayed, reads(0, 0, 2, 0));
+
+        let probes = Cell::new(0_u64);
+        let predicate = |val: &DynI32| {
+            probes.set(probes.get() + 1);
+            *val.downcast_checked::<i32>() <= 10
+        };
+        cursor.fast_forward_vals();
+        let ((), sought) = reads_of(|| cursor.seek_val_with_reverse(&predicate));
+        assert_eq!(*cursor.val().downcast_checked::<i32>(), 10);
+        assert!(probes.get() > 0);
+        // Every probe, then the landed value twice.
+        assert_eq!(sought, reads(0, 0, probes.get() + 2, 0));
+    });
+}
+
+#[test]
 fn the_first_value_read_counts_once() {
     run_in_circuit_with_storage(|| {
         let run = file_run();
