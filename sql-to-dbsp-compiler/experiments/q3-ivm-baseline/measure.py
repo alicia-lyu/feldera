@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,26 @@ SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_step
                         "payload_decodes_old", "payload_decodes_dlt", "cancelled")
 # How the reconstructed build's scan session passes untouched groups (`--session-pass`).
 SESSION_PASSES = ("seek", "step")
+# The version of the driver report that this runner and `summarize.py` understand. Version 12
+# adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses).
+MEASUREMENT_VERSION = 12
+# The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
+# `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
+# `--elide-value-headers`.
+PREFIX_TRUNCATED_EXPANSION_FIELDS = ("prefix_truncated_blocks", "prefix_truncated_encoded_bytes",
+                                     "prefix_truncated_expanded_bytes")
+ELIDED_EXPANSION_FIELDS = ("elided_blocks", "elided_encoded_bytes", "elided_expanded_bytes")
+BLOCK_EXPANSION_FIELDS = PREFIX_TRUNCATED_EXPANSION_FIELDS + ELIDED_EXPANSION_FIELDS
+# The threads whose expansions a report gives: the view worker per owner, the driver's thread
+# per owner (reconstructed mode), and base maintenance's reads of the index (one count,
+# reconstructed mode).
+EXPANSION_THREADS = ("view_worker", "driver", "index_upkeep")
+# The values of `--device-label`.
+DEVICE_LABELS = ("ssd", "hdd")
+# The storage device block of the manifest (`storage_device`); every field is `null` when the
+# device is not resolved.
+STORAGE_DEVICE_FIELDS = ("path", "device", "filesystem", "logical_sector_bytes", "rotational",
+                         "model", "label")
 
 
 def sha256(path: Path) -> str:
@@ -216,9 +237,132 @@ def session_pass_problems(report: dict[str, Any], session_pass: str) -> list[str
     return []
 
 
+def measurement_version_problems(report: dict[str, Any]) -> list[str]:
+    """List a driver report of another measurement version than this runner understands."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    version = report.get("measurement_version")
+    if version != MEASUREMENT_VERSION:
+        return [f"measurement_version is {version!r}, expected {MEASUREMENT_VERSION}"]
+    return []
+
+
+def layout_fallback_problems(report: dict[str, Any]) -> list[str]:
+    """List the disk encodings that were switched on and wrote a block as it was because the
+    block's layout did not match what the encoder understands.
+
+    That is a bug or an unexpected archive layout, and the run would then measure a mix of
+    formats. When `configuration.front_code_byte_keys` is true,
+    `front_coding.layout_fallbacks` must be 0, and when `configuration.elide_value_headers` is
+    true, `value_header_elision.layout_fallbacks` must be 0. Each `size_fallbacks` is not
+    checked: a block that an encoding would not shrink is left as it is on purpose.
+    """
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    configuration = report.get("configuration") or {}
+    problems: list[str] = []
+    for flag, section in (("front_code_byte_keys", "front_coding"),
+                          ("elide_value_headers", "value_header_elision")):
+        if not configuration.get(flag):
+            continue
+        fallbacks = (report.get(section) or {}).get("layout_fallbacks")
+        if isinstance(fallbacks, bool) or not isinstance(fallbacks, int) or fallbacks < 0:
+            problems.append(f"{section}.layout_fallbacks is {fallbacks!r}")
+        elif fallbacks:
+            problems.append(f"{section}.layout_fallbacks is {fallbacks}, expected 0 with "
+                            f"configuration.{flag}: those blocks were written in the plain layout")
+    return problems
+
+
+def block_expansion_problems(report: dict[str, Any]) -> list[str]:
+    """List where a driver report's `block_expansions` (measurement version 12) are malformed.
+
+    Each refresh and the sequence give `block_expansions` with three entries: `view_worker`
+    and `driver`, each with every owner of `WRITE_OWNERS`, and `index_upkeep`, one count. A
+    count has every `BLOCK_EXPANSION_FIELDS` as a non-negative integer, and a block count of 0
+    means 0 bytes, and an expanded block is no smaller than its encoded form. A native run has
+    no merged index, so its `driver` and `index_upkeep` are `null`. The sequence's counts are the
+    sums of the refreshes'. The `prefix_truncated_*` fields are 0 unless
+    `configuration.front_code_byte_keys` is true, and the `elided_*` fields are 0 unless
+    `configuration.elide_value_headers` is true: a file written in neither encoding has no block
+    to expand. A report that names neither mode is not checked here.
+    """
+    mode = report.get("mode")
+    if mode not in ("native", "reconstructed"):
+        return []
+    configuration = report.get("configuration") or {}
+    must_be_zero = ((() if configuration.get("front_code_byte_keys")
+                     else PREFIX_TRUNCATED_EXPANSION_FIELDS)
+                    + (() if configuration.get("elide_value_headers")
+                       else ELIDED_EXPANSION_FIELDS))
+    problems: list[str] = []
+
+    def counts(place: str, name: str, found: Any) -> dict[str, int] | None:
+        values = {}
+        for field in BLOCK_EXPANSION_FIELDS:
+            value = found.get(field) if isinstance(found, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                problems.append(f"{place}: block_expansions.{name}.{field} is {value!r}")
+                return None
+            values[field] = value
+        for field in must_be_zero:
+            if values[field]:
+                problems.append(f"{place}: block_expansions.{name}.{field} is {values[field]}, "
+                                "expected 0 with the encoding off")
+        for blocks, encoded, expanded in (
+                ("prefix_truncated_blocks", "prefix_truncated_encoded_bytes",
+                 "prefix_truncated_expanded_bytes"),
+                ("elided_blocks", "elided_encoded_bytes", "elided_expanded_bytes")):
+            if not values[blocks] and (values[encoded] or values[expanded]):
+                problems.append(f"{place}: block_expansions.{name} counts bytes of no {blocks}")
+            if values[expanded] < values[encoded]:
+                problems.append(f"{place}: block_expansions.{name}.{expanded} is below "
+                                f"{encoded}")
+        return values
+
+    def place_counts(place: str, found: Any) -> dict[tuple[str, str | None], dict[str, int]] | None:
+        if not isinstance(found, dict):
+            problems.append(f"{place}: block_expansions is {found!r}")
+            return None
+        values: dict[tuple[str, str | None], dict[str, int]] = {}
+        for thread in EXPANSION_THREADS:
+            part = found.get(thread)
+            if thread != "view_worker" and mode == "native":
+                if part is not None:
+                    problems.append(f"{place}: a native run reports block_expansions.{thread}")
+                continue
+            if thread == "index_upkeep":
+                one = counts(place, thread, part)
+                if one is None:
+                    return None
+                values[(thread, None)] = one
+                continue
+            for owner in WRITE_OWNERS:
+                one = counts(place, f"{thread}.{owner}",
+                             part.get(owner) if isinstance(part, dict) else None)
+                if one is None:
+                    return None
+                values[(thread, owner)] = one
+        return values
+
+    totals: dict[tuple[str, str | None], dict[str, int]] = {}
+    for item in report.get("refreshes", []):
+        found = place_counts(f"refresh {item.get('refresh')}", item.get("block_expansions"))
+        for key, one in (found or {}).items():
+            total = totals.setdefault(key, {field: 0 for field in BLOCK_EXPANSION_FIELDS})
+            for field, value in one.items():
+                total[field] += value
+    summed = place_counts("sequence", report.get("sequence", {}).get("block_expansions"))
+    if summed is not None and not problems and summed != totals:
+        problems.append("sequence: block_expansions are not the sums of the refreshes'")
+    return problems
+
+
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """Every consistency check of one driver report."""
-    return (owner_write_problems(report) + index_read_problems(report)
+    return (measurement_version_problems(report) + layout_fallback_problems(report)
+            + block_expansion_problems(report)
+            + owner_write_problems(report) + index_read_problems(report)
             + view_read_problems(report) + driver_read_problems(report)
             + counter_problems(report, "index_session_counts", SESSION_COUNT_FIELDS)
             + counter_problems(report, "index_upkeep_run_reads", RUN_READ_FIELDS)
@@ -359,6 +503,109 @@ def owner_write_problems(report: dict[str, Any]) -> list[str]:
         if report.get("mode") == "native" and any(owners["merged_index"].values()):
             problems.append(f"{place}: a native run reports merged-index writes")
     return problems
+
+
+def unescape_mountinfo(field: str) -> str:
+    """Undo the octal escapes (`\\040` for a space) in a `mountinfo` path."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
+
+
+def mount_of(path: Path, mountinfo: str) -> tuple[str, str] | None:
+    """The file system type and the source of the mount that holds `path`, from the text of
+    `/proc/self/mountinfo`: the mount with the longest mount point that contains `path`, the
+    later line when two mounts share it. `None` if no mount contains it."""
+    found: tuple[int, str, str] | None = None
+    for line in mountinfo.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, rest = before.split(), after.split()
+        if not separator or len(fields) < 5 or len(rest) < 2:
+            continue
+        mount_point = unescape_mountinfo(fields[4])
+        inside = (mount_point == "/" or str(path) == mount_point
+                  or str(path).startswith(mount_point.rstrip("/") + "/"))
+        if inside and (found is None or len(mount_point) >= found[0]):
+            found = (len(mount_point), rest[0], unescape_mountinfo(rest[1]))
+    return None if found is None else (found[1], found[2])
+
+
+def read_sysfs(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def block_disk_name(source: str, sys_root: Path) -> str | None:
+    """The sysfs name of the whole disk behind the mount source `source`, or `None`.
+
+    A partition resolves to its parent disk. A device-mapper device, an md array and a loop
+    device have no disk of their own in this sense, so they are not resolved, and neither is a
+    source outside `/dev` (a network or memory file system).
+    """
+    if not source.startswith("/dev/") or source.startswith("/dev/mapper/"):
+        return None
+    name = source.removeprefix("/dev/")
+    if "/" in name or re.match(r"(dm-|md|loop|zram|ram)\d+$", name):
+        return None
+    block = sys_root / "block"
+    if (block / name / "dm").exists():
+        return None
+    if (block / name / "queue").is_dir():
+        return name
+    if block.is_dir():
+        for disk in sorted(block.iterdir()):
+            if (disk / name).is_dir() and (disk / "queue").is_dir():
+                return disk.name
+    return None
+
+
+def storage_device(path: Path, label: str | None = None, system: str | None = None,
+                   proc_root: Path = Path("/proc"), sys_root: Path = Path("/sys")) -> dict[str, Any]:
+    """Describe the block device behind `path` for the manifest (`storage_device`).
+
+    On Linux it reads the mount of `path` from `<proc_root>/self/mountinfo`, then the disk's
+    `queue/rotational`, `queue/logical_block_size` and `device/model` under
+    `<sys_root>/block/<disk>`; a partition is described by its parent disk. Every field is `None`
+    elsewhere, and when the device is not resolved (an unreadable file, a device-mapper device or
+    another virtual device, a network file system): the fields are never guessed. `label` is the
+    operator's `--device-label` and is kept as given; `device` is the disk's `/dev` path.
+    """
+    unresolved: dict[str, Any] = {field: None for field in STORAGE_DEVICE_FIELDS}
+    unresolved["label"] = label
+    if (system or platform.system()) != "Linux":
+        return unresolved
+    try:
+        mountinfo = (proc_root / "self" / "mountinfo").read_text()
+    except OSError:
+        return unresolved
+    mount = mount_of(path, mountinfo)
+    disk = block_disk_name(mount[1], sys_root) if mount else None
+    if mount is None or disk is None:
+        return unresolved
+    queue = sys_root / "block" / disk / "queue"
+    rotational = read_sysfs(queue / "rotational")
+    sector = read_sysfs(queue / "logical_block_size")
+    return {
+        "path": str(path),
+        "device": f"/dev/{disk}",
+        "filesystem": mount[0],
+        "logical_sector_bytes": int(sector) if sector and sector.isdigit() else None,
+        "rotational": {"0": False, "1": True}.get(rotational or ""),
+        "model": read_sysfs(sys_root / "block" / disk / "device" / "model"),
+        "label": label,
+    }
+
+
+def device_label_problem(device: dict[str, Any]) -> str | None:
+    """Describe how the operator's label contradicts the device's `rotational` flag, if it does.
+    Nothing is checked when either is unknown."""
+    label, rotational = device.get("label"), device.get("rotational")
+    if label is None or rotational is None:
+        return None
+    if (label == "ssd") == rotational:
+        return (f"--device-label {label} contradicts {device.get('device')}, which reports "
+                f"rotational={int(rotational)}")
+    return None
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -590,6 +837,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=10000)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--storage-path", type=Path)
+    parser.add_argument("--device-label", choices=DEVICE_LABELS,
+                        help="the kind of device that holds the storage path, recorded in the "
+                             "manifest; on Linux it must agree with the device's rotational flag")
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--diagnostics", action="store_true",
                         help="record the flush log, the compaction log and the run contents "
@@ -631,9 +881,15 @@ def run(argv: list[str]) -> int:
     campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     root = (args.storage_path or EXPERIMENT / "target" / "r5-measurements" /
             campaign_id).resolve()
+    device = storage_device(root, args.device_label)
+    problem = device_label_problem(device)
+    if problem:
+        print(f"measure: {problem}", file=sys.stderr)
+        return 2
     manifest: dict[str, Any] = {
         "status": "failed", "revision": None, "git_status_short": None,
         "platform": platform.platform(),
+        "storage_device": device,
         "configuration": {"runs": args.runs, "cache_bytes": args.cache_bytes,
                           "batch": args.batch,
                           "memory_target_bytes": args.memory_target_bytes,

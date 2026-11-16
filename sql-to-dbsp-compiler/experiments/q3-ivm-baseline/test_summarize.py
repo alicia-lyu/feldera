@@ -67,6 +67,39 @@ def upkeep_reads(seeks: int) -> dict[str, int]:
     return {field: seeks for field in summarize.RUN_READ_FIELDS}
 
 
+def expansion(prefix_truncated: int = 0, elided: int = 0) -> dict[str, int]:
+    """A block-expansion count: each prefix-truncated block is 100 bytes encoded and 400
+    expanded, each elided block 50 and 200."""
+    return {"prefix_truncated_blocks": prefix_truncated,
+            "prefix_truncated_encoded_bytes": 100 * prefix_truncated,
+            "prefix_truncated_expanded_bytes": 400 * prefix_truncated,
+            "elided_blocks": elided, "elided_encoded_bytes": 50 * elided,
+            "elided_expanded_bytes": 200 * elided}
+
+
+def owner_expansions(**by_owner: dict[str, int]) -> dict[str, dict[str, int]]:
+    """A per-owner block-expansion report: the owners named, the others zero."""
+    return {owner: by_owner.get(owner, expansion()) for owner in summarize.WRITE_OWNERS}
+
+
+def block_expansions(mode: str, number: int) -> dict:
+    """The block expansions of refresh `number` (or, passed the sum, the sequence). A native run
+    has no byte-string columns, so it expands nothing. A reconstructed run expands `number`
+    prefix-truncated and `2 * number` elided blocks on the view worker's requested slices,
+    `number` of each kind in the driver's scan, and `number` prefix-truncated blocks in base
+    maintenance."""
+    if mode == "native":
+        return {"view_worker": owner_expansions(), "driver": None, "index_upkeep": None}
+    return {"view_worker": owner_expansions(
+                requested_slice=expansion(number, 2 * number)),
+            "driver": owner_expansions(merged_index=expansion(number, number)),
+            "index_upkeep": expansion(number, 0)}
+
+
+STORAGE_DEVICE = {"path": "/mnt/ssd/campaign", "device": "/dev/nvme0n1", "filesystem": "ext4",
+                  "logical_sector_bytes": 512, "rotational": False, "model": "Samsung SSD 990",
+                  "label": "ssd"}
+
 LAYOUT = {snapshot: {"file": {"runs": 1, "bytes": 10}, "memory": {"runs": 1, "bytes": 5}}
           for snapshot in ("before", "after")}
 
@@ -92,11 +125,16 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
             10 * refresh["refresh"], 0 if native else 3 * refresh["refresh"],
             4 * refresh["refresh"] if native else 0)
         refresh["driver_run_reads"] = None if native else driver_reads(refresh["refresh"])
+        refresh["block_expansions"] = block_expansions(mode, refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 11, "os": "linux",
+        "measurement_version": 12, "os": "linux",
+        "configuration": {"front_code_byte_keys": True, "elide_value_headers": True},
+        "front_coding": {"blocks": 5, "layout_fallbacks": 0, "size_fallbacks": 1},
+        "value_header_elision": {"blocks": 6, "layout_fallbacks": 0, "size_fallbacks": 0},
         "refreshes": refreshes,
         "sequence": {
+            "block_expansions": block_expansions(mode, 3),
             "index_run_reads": None if native else index_reads(int(3 * scale)),
             "index_session_counts": None if native else session_counts(3),
             "index_upkeep_run_reads": None if native else upkeep_reads(3),
@@ -119,7 +157,7 @@ def manifest(scales: dict[str, list[float]]) -> dict:
             runs.append({"mode": mode, "repetition": repetition, "status": "complete",
                          "returncode": 0, "driver": driver_report(mode, scale)})
     return {"status": "complete", "errors": [], "platform": "test", "revision": "abc",
-            "configuration": {"runs": 3}, "runs": runs}
+            "configuration": {"runs": 3}, "storage_device": STORAGE_DEVICE, "runs": runs}
 
 
 class SummarizeTest(unittest.TestCase):
@@ -175,6 +213,21 @@ class SummarizeTest(unittest.TestCase):
         markdown = (out / "summary.md").read_text()
         self.assertIn("## clustered", markdown)
         self.assertIn("Runs per mode: native 3, merged-index 3. Session pass: `seek`.", markdown)
+        # The storage device and its label stand beside the campaign.
+        self.assertIn("Storage device: ssd (/dev/nvme0n1, Samsung SSD 990, ext4, non-rotational, "
+                      "512-byte sectors).", markdown)
+        self.assertEqual(summary["workloads"]["clustered"]["storage_device"], STORAGE_DEVICE)
+        # Block expansions are summed over the threads and owners: a reconstructed run expands
+        # 3 + 3 + 3 prefix-truncated and 6 + 3 elided blocks over its two refreshes, and a native
+        # run none. The bytes follow the blocks.
+        self.assertEqual(native["metrics"]["expansion_prefix_truncated_blocks"]["max"], 0)
+        merged_metrics = summary["workloads"]["clustered"]["modes"]["merged-index"]["metrics"]
+        self.assertEqual(merged_metrics["expansion_prefix_truncated_blocks"]["median"], 9)
+        self.assertEqual(merged_metrics["expansion_prefix_truncated_expanded_bytes"]["median"],
+                         3600)
+        self.assertEqual(merged_metrics["expansion_elided_blocks"]["median"], 9)
+        self.assertEqual(merged_metrics["expansion_elided_encoded_bytes"]["median"], 450)
+        self.assertIn("`expansion_*` are the blocks", markdown)
         self.assertIn("| `sequence_wall_ms` | 200 | 100 | 300 | 600 | 500 | 700 |", markdown)
         # The index's run reads exist for the merged-index mode alone. Its sequence makes
         # 3 * scale seeks for the one reader, the scan session.
@@ -351,17 +404,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 11")
+        self.failing(content, "native run 1: measurement_version is 2, not 12")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 11")
+        self.failing(content, "native run 1: measurement_version is 3, not 12")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 11")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 12")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 11")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 12")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")
@@ -407,6 +460,40 @@ class SummarizeTest(unittest.TestCase):
         refresh = content["runs"][1]["driver"]["refreshes"][0]
         refresh["driver_run_reads"]["query"]["seeks"] = 1
         self.failing(content, "driver_run_reads.query.seeks")
+
+    def test_a_manifest_without_a_device_is_summarized_as_not_recorded(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        del content["storage_device"]
+        path = self.write_manifest("old", content)
+        out = self.root / "out"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(summarize.main([str(path), "--out", str(out)]), 0)
+        self.assertIn("Storage device: not recorded.", (out / "summary.md").read_text())
+
+    def test_the_device_description_shows_the_label_first(self) -> None:
+        self.assertEqual(summarize.describe_device(STORAGE_DEVICE),
+                         "ssd (/dev/nvme0n1, Samsung SSD 990, ext4, non-rotational, "
+                         "512-byte sectors)")
+        unresolved = {field: None for field in STORAGE_DEVICE}
+        self.assertEqual(summarize.describe_device(unresolved), "unlabelled (device not resolved)")
+        self.assertEqual(summarize.describe_device({**unresolved, "label": "hdd"}),
+                         "hdd (device not resolved)")
+        self.assertEqual(summarize.describe_device({**STORAGE_DEVICE, "label": "hdd",
+                                                    "rotational": True}).split(",")[3],
+                         " rotational")
+
+    def test_a_layout_fallback_or_a_malformed_expansion_is_an_error(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][1]["driver"]["front_coding"]["layout_fallbacks"] = 2
+        self.failing(content, "front_coding.layout_fallbacks is 2")
+
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][0]["driver"]["sequence"]["block_expansions"] = None
+        self.failing(content, "sequence: block_expansions is None")
+
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][1]["driver"]["configuration"]["elide_value_headers"] = False
+        self.failing(content, "expected 0 with the encoding off")
 
     def test_repetition_count_mismatch_is_an_error(self) -> None:
         self.failing(manifest({"native": [1.0, 2.0, 3.0], "merged-index": [1.0, 2.0]}),
