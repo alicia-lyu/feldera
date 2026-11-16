@@ -282,7 +282,7 @@ fn snap<K: DBData, V: DBData>(batch: OrdIndexedZSet<K, V>) -> SpineSnapshot<OrdI
 fn with_readers<T>(state: &Q3State, f: impl FnOnce(&CollectedReaders) -> T) -> T {
     let views = state.views().unwrap();
     let readers = views.collected_readers().unwrap();
-    f(&readers)
+    f(readers)
 }
 
 fn requests_of<R: ReaderDefinition>(reader: &SealedReader<R>) -> Vec<Vec<u8>> {
