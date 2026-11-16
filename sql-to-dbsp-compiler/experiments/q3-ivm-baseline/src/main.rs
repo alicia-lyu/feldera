@@ -34,7 +34,7 @@ use dbsp::storage::file::writer::{
 use dbsp::trace::merged_index::Pass;
 #[cfg(feature = "merged-index")]
 use dbsp::trace::with_read_owner;
-use dbsp::trace::RunReads;
+use dbsp::trace::{BlockExpansions, RunReads};
 use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::program_schema::SqlIdentifier;
@@ -492,18 +492,19 @@ impl Pipeline {
 /// The reads of `Old` are base maintenance, counted under the merged index's read owner; the
 /// base state's reads of an order's customer are counted under the base relations'. `base`
 /// names the customer of an order that the delta mentions only through its lines, or else
-/// `reference` does; one of them must be given then. Returns the rows and the run reads of the
-/// index.
+/// `reference` does; one of them must be given then. Returns the rows, and the run reads and block
+/// expansions of the index.
 #[cfg(feature = "merged-index")]
 fn complete_net_delta(
     pipeline: &mut Pipeline,
     net_delta: &Change,
     base: Option<&workload::BaseState>,
     reference: Option<&Reference>,
-) -> Result<(Vec<reconstruction::SourceRow>, RunReads)> {
+) -> Result<(Vec<reconstruction::SourceRow>, RunReads, BlockExpansions)> {
     let runtime = pipeline.runtime().clone();
     runtime.with_buffer_cache(0, || {
         let reads_before = RunReads::current_for(Component::MergedIndex);
+        let expansions_before = BlockExpansions::current_for(Component::MergedIndex);
         let old = pipeline.index.snapshot()?;
         let mut base_owner = |order: i64| -> Result<Option<i64>> {
             if let Some(base) = base {
@@ -520,7 +521,9 @@ fn complete_net_delta(
             reconstruction::prepare(net_delta, &old, &mut pipeline.orphans, &mut base_owner)
         })?;
         let reads = RunReads::current_for(Component::MergedIndex).since(reads_before);
-        Ok((rows, reads))
+        let expansions =
+            BlockExpansions::current_for(Component::MergedIndex).since(expansions_before);
+        Ok((rows, reads, expansions))
     })
 }
 
@@ -613,12 +616,20 @@ struct Measurements {
     /// lines of an order whose owner changes (reconstructed mode).
     #[cfg(feature = "merged-index")]
     upkeep_reads: RunReads,
+    /// The blocks that `prepare`'s reads of `Old` expanded from their disk encoding, on the
+    /// merged index's owner (reconstructed mode; measurement version 12).
+    #[cfg(feature = "merged-index")]
+    upkeep_expansions: BlockExpansions,
     /// Where the last transaction's published index snapshots kept their runs (reconstructed
     /// mode).
     index_layout: Option<Value>,
     /// The view worker's run reads in the view transactions, per read owner, indexed like
     /// `Component::ALL` (both modes).
     view_reads: [RunReads; Component::ALL.len()],
+    /// The blocks the view worker expanded from their disk encoding on cache misses in the view
+    /// transactions, per read owner (both modes; measurement version 12). A storage-level step,
+    /// apart from `view_reads`' item decodes.
+    view_expansions: [BlockExpansions; Component::ALL.len()],
     /// The CPU profiler's step CPU time of each circuit in the measured transactions, a
     /// cross-check of the phase timers. `None` while the pipeline is not profiling.
     profiled_cpu: Option<ProfiledCpu>,
@@ -706,7 +717,7 @@ fn transact_inner(
     #[cfg(feature = "merged-index")]
     {
         let index_started = Instant::now();
-        let (index_rows, upkeep_reads) = complete_net_delta(
+        let (index_rows, upkeep_reads, upkeep_expansions) = complete_net_delta(
             pipeline,
             &net_delta,
             check.map(|(base, _)| base),
@@ -715,6 +726,7 @@ fn transact_inner(
         let (old, dlt) = pipeline.index.append(index_rows)?;
         stats.index += index_started.elapsed();
         stats.upkeep_reads += upkeep_reads;
+        stats.upkeep_expansions += upkeep_expansions;
         let publish_started = Instant::now();
         // The after reads see `Old`'s runs and `Dlt`, which is placed like an operator's output.
         stats.index_layout = Some(json!({
@@ -740,6 +752,7 @@ fn transact_inner(
 
     // The view worker counts its own run reads; they are read outside the transaction's timer.
     let view_reads_before = pipeline.view.circuit.run_reads()?;
+    let view_expansions_before = pipeline.view.circuit.block_expansions()?;
     let view_started = Instant::now();
     // The reconstructed view phase starts with the scan session, which reads the index once for
     // the whole transaction and fills the readers (`q3_ms`). Preparing the transaction delta
@@ -780,6 +793,7 @@ fn transact_inner(
     // The latency of a view transaction is its `ivm_ms`: the delta's preparation and the rest.
     let latency = delta + view_time;
     let view_reads_after = pipeline.view.circuit.run_reads()?;
+    let view_expansions_after = pipeline.view.circuit.block_expansions()?;
     if let (Some(before), Some(base_after)) = (cpu_before, base_cpu_after) {
         let view_after = profiled_cpu(&mut pipeline.view.circuit)?;
         let spent = stats.profiled_cpu.get_or_insert_with(ProfiledCpu::default);
@@ -791,6 +805,14 @@ fn transact_inner(
         .iter_mut()
         .zip(view_reads_after)
         .zip(view_reads_before)
+    {
+        *total += after.since(before);
+    }
+    for ((total, after), before) in stats
+        .view_expansions
+        .iter_mut()
+        .zip(view_expansions_after)
+        .zip(view_expansions_before)
     {
         *total += after.since(before);
     }
@@ -952,7 +974,7 @@ fn publish_net_delta(
     net_delta: &Change,
     reference: &Reference,
 ) -> Result<()> {
-    let (index_rows, _) = complete_net_delta(pipeline, net_delta, None, Some(reference))?;
+    let (index_rows, _, _) = complete_net_delta(pipeline, net_delta, None, Some(reference))?;
     let (old, dlt) = pipeline.index.append(index_rows)?;
     pipeline
         .q3_state
@@ -1708,16 +1730,45 @@ fn phase_json(stats: &Measurements) -> Value {
 /// `merged_index`: the scan session reads the index on the driver's thread. The fields are those
 /// of `RunReads`: file runs' decodes and in-memory runs' reads count apart.
 fn view_reads_json(reads: &[RunReads; Component::ALL.len()]) -> Result<Value> {
+    per_owner_json(reads)
+}
+
+/// An object with one entry per read owner, keyed by the owner's name.
+fn per_owner_json<T: serde::Serialize>(values: &[T; Component::ALL.len()]) -> Result<Value> {
     Component::ALL
         .into_iter()
         .map(|owner| {
             Ok((
                 owner.name().to_owned(),
-                serde_json::to_value(reads[owner as usize])?,
+                serde_json::to_value(&values[owner as usize])?,
             ))
         })
         .collect::<Result<serde_json::Map<_, _>>>()
         .map(Value::Object)
+}
+
+/// The blocks expanded from their disk encoding on cache misses (measurement version 12), per
+/// thread that read and, for the view worker and the driver, per read owner:
+///
+/// - `view_worker`: the view circuit's worker, per owner, in both modes. In native mode its
+///   `query` entry holds the join traces' expansions along with the operators' own.
+/// - `driver`: the thread that collects the readers (reconstructed mode), per owner; `null` in
+///   native mode. Its `merged_index` entry is the scan session's expansions of `Old` and `Dlt`.
+/// - `index_upkeep`: base maintenance's `prepare` reads of `Old` (reconstructed mode); `null` in
+///   native mode.
+///
+/// A block expansion rebuilds a prefix-truncated or an elided data block; the fields are
+/// those of `BlockExpansions`. Other threads, such as the index's own, are not counted.
+fn block_expansions_json(
+    view_worker: &[BlockExpansions; Component::ALL.len()],
+    driver: Option<&[BlockExpansions; Component::ALL.len()]>,
+    index_upkeep: Option<&BlockExpansions>,
+) -> Result<Value> {
+    Ok(json!({
+        "view_worker": per_owner_json(view_worker)?,
+        "driver": driver.map(per_owner_json).transpose()?,
+        "index_upkeep": index_upkeep.map(serde_json::to_value).transpose()?,
+    }))
 }
 
 /// The merged index's run reads in the view phase (measurement version 8): the scan session's,
@@ -1960,6 +2011,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     #[cfg(feature = "merged-index")]
     let mut sequence_upkeep_reads = RunReads::default();
     let mut sequence_view_reads = [RunReads::default(); Component::ALL.len()];
+    let mut sequence_view_expansions = [BlockExpansions::default(); Component::ALL.len()];
+    #[cfg(feature = "merged-index")]
+    let mut sequence_driver_expansions = [BlockExpansions::default(); Component::ALL.len()];
+    #[cfg(feature = "merged-index")]
+    let mut sequence_upkeep_expansions = BlockExpansions::default();
     for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
@@ -2073,6 +2129,30 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             *total += reads;
         }
         report["view_run_reads"] = view_reads_json(&measurement.view_reads)?;
+        for (total, expansions) in sequence_view_expansions
+            .iter_mut()
+            .zip(measurement.view_expansions)
+        {
+            *total += expansions;
+        }
+        #[cfg(feature = "merged-index")]
+        {
+            sequence_driver_expansions
+                .iter_mut()
+                .zip(measurement.session_reads.driver_expansions)
+                .for_each(|(total, expansions)| *total += expansions);
+            sequence_upkeep_expansions += measurement.upkeep_expansions;
+            report["block_expansions"] = block_expansions_json(
+                &measurement.view_expansions,
+                Some(&measurement.session_reads.driver_expansions),
+                Some(&measurement.upkeep_expansions),
+            )?;
+        }
+        #[cfg(not(feature = "merged-index"))]
+        {
+            report["block_expansions"] =
+                block_expansions_json(&measurement.view_expansions, None, None)?;
+        }
         println!(
             "run={run_number} refresh={} phase={phase} {}",
             number + 1,
@@ -2095,6 +2175,14 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     #[cfg(not(feature = "merged-index"))]
     let (sequence_index_run_reads, sequence_index_session_counts, sequence_index_upkeep_run_reads) =
         (Value::Null, Value::Null, Value::Null);
+    #[cfg(feature = "merged-index")]
+    let sequence_block_expansions = block_expansions_json(
+        &sequence_view_expansions,
+        Some(&sequence_driver_expansions),
+        Some(&sequence_upkeep_expansions),
+    )?;
+    #[cfg(not(feature = "merged-index"))]
+    let sequence_block_expansions = block_expansions_json(&sequence_view_expansions, None, None)?;
     let sequence_elapsed = sequence_finished
         .duration_since(sequence_started)
         .saturating_sub(verification_time);
@@ -2140,7 +2228,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 11,
+        "measurement_version": 12,
         "os": std::env::consts::OS,
         "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2208,6 +2296,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "driver_run_reads": sequence_driver_run_reads,
             "index_upkeep_run_reads": sequence_index_upkeep_run_reads,
             "view_run_reads": view_reads_json(&sequence_view_reads)?,
+            "block_expansions": sequence_block_expansions,
             "manual_index_storage": manual_storage,
             "completion_boundary": "last_refresh_complete",
             "catalog_storage": storage_evidence,
@@ -2928,7 +3017,7 @@ mod reconstructed_tests {
         };
         let mut reference = Reference::default();
         let net_delta = run_base(&mut pipeline, &mut reference, refresh, false)?;
-        let (index_rows, _) =
+        let (index_rows, _, _) =
             complete_net_delta(&mut pipeline, &net_delta, None, Some(&reference))?;
         let (old, dlt) = pipeline.index.append(index_rows)?;
         let rows = |snapshot: &reconstruction::Snapshot| -> usize {
@@ -2999,7 +3088,7 @@ mod reconstructed_tests {
         };
         let mut reference = Reference::default();
         let net_delta = run_base(&mut pipeline, &mut reference, refresh, false)?;
-        let (index_rows, _) =
+        let (index_rows, _, _) =
             complete_net_delta(&mut pipeline, &net_delta, None, Some(&reference))?;
         pipeline.index.append(index_rows)?;
         let runs: Vec<_> = pipeline
@@ -3245,7 +3334,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 11);
+        assert_eq!(output["measurement_version"], 12);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -3386,6 +3475,48 @@ mod measurement_tests {
         if !cfg!(feature = "merged-index") {
             // The native joins probe their traces on the view worker.
             assert!(view_seeks > 0);
+        }
+        // Block expansions (version 12): the view worker's per owner in both modes, the driver
+        // thread's and base maintenance's in the reconstructed mode only. The smoke run is
+        // written in no disk encoding, so it expands nothing; the sequence sums the refreshes.
+        let expansion_fields = [
+            "prefix_truncated_blocks",
+            "prefix_truncated_encoded_bytes",
+            "prefix_truncated_expanded_bytes",
+            "elided_blocks",
+            "elided_encoded_bytes",
+            "elided_expanded_bytes",
+        ];
+        let owners = [
+            "query",
+            "base_relation",
+            "merged_index",
+            "requested_slice",
+            "partner_trace",
+        ];
+        for place in refreshes
+            .iter()
+            .map(|refresh| &refresh["block_expansions"])
+            .chain([&output["sequence"]["block_expansions"]])
+        {
+            for owner in owners {
+                for field in expansion_fields {
+                    assert!(place["view_worker"][owner][field].is_u64(), "{place}");
+                }
+            }
+            if cfg!(feature = "merged-index") {
+                for owner in owners {
+                    for field in expansion_fields {
+                        assert!(place["driver"][owner][field].is_u64(), "{place}");
+                    }
+                }
+                for field in expansion_fields {
+                    assert_eq!(place["index_upkeep"][field], 0, "{place}");
+                }
+            } else {
+                assert!(place["driver"].is_null(), "{place}");
+                assert!(place["index_upkeep"].is_null(), "{place}");
+            }
         }
         assert_eq!(
             output["sequence"]["completion_boundary"],
