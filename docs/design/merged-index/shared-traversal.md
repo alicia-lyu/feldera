@@ -301,7 +301,7 @@ DBSP's run cursors count the storage costs: per-run seeks, filtered probes (`fil
 Seeks count what the file reader does:
 
 - **Forward.** A `seek_key` that moves counts one seek and one key decode, for the row it lands on. The reader's search (`advance_to_value_or_larger`) compares the target with each probed key where it lies in the block, without deserializing it. A seek whose target is at or below the current key does not move and counts nothing. A predicate seek deserializes each probed key for its predicate, and counts each.
-- **Reverse.** On a file run, a reverse seek that lands on a row counts two key decodes. `rewind_to_last_le` deserializes the key it finds (`best_match`), and the cursor then deserializes it again (decision of 2026-11-16). A memory run counts one.
+- **Reverse.** On a file run, a reverse seek that lands on a row counts two decodes of its key, or of its value for a value seek. `rewind_to_last_le` deserializes what it finds (`best_match`), and the cursor then deserializes it again (decision of 2026-11-16). A memory run counts one.
 - **What a probe compares.** A probe and a decode see the same bytes. A merged-index key is a `FoldedKey`, the tagged bytes `[tag value]* 0 id` in one `Vec<u8>`. A file run stores every key serialized by rkyv, and rkyv's serialized ("archived") form of a `FoldedKey` is a length followed by those bytes. A probe compares them in place; a decode copies them into an owned `Vec`, which is what `key_decodes` counts. A native run's typed tuple keys are compared field by field in their archived form, in the same way.
 
 ### Ownership
@@ -465,3 +465,9 @@ Each choice says what it is, why, and the alternative it rejects. The user's con
 - **The counter of probes that a filter answers is named `filtered_probes`.** The user asked for a new name for `filter_rejections` on 2026-11-16; this one is mine.
   - *Why:* it names what is counted, a probe, and how the probe ended: a filter answered it. It sits beside `seeks`, which counts the probes that were sought.
   - *Rejected:* `filter_negatives`, Bloom-filter vocabulary that the key-range filter does not fit; `filter_skips`, since a skip is another move in this design (`Skip`).
+- **`collect` hands the driving deltas back in a `Collection`.** The sealed readers need no mutation after `collect`, so the one value that still moves, the driving deltas, leaves by return value, in a struct named `Collection` with the delta preparation time; `take_driving_deltas` is gone. `SealedReader` and `Reader::into_sealed` live in DBSP's `merged_index::reader`, beside `Reader`.
+  - *Why:* a value returned once cannot be taken twice, so the second-take error becomes a type rule, and no lock remains around the readers.
+  - *Rejected:* a take-once `Mutex<Option<DrivingDeltas>>` beside the readers, which brings a lock back; a `(Duration, DrivingDeltas)` tuple, whose fields have no names.
+- **One reverse-seek decode stays uncounted.** A cursor before its first row stays there after a reverse seek, even when `best_match` found and deserialized a key, and the cursor cannot tell that from a seek that found nothing. The count misses that one decode (pinned by `a_reverse_key_seek_from_before_the_first_row_counts_no_key`).
+  - *Why:* no merged-index or Q3 path seeks backward, so the miss never reaches a report.
+  - *Rejected:* having the file reader report whether `best_match` found a row, which changes a storage-layer signature for an uncounted case no measurement reaches.
