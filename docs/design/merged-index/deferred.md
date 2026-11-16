@@ -307,7 +307,7 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 
 ## Search a prefix-truncated block without expanding it
 
-**Current cost.** A block written with prefix truncation (`--front-code-byte-keys`) or with elided value headers is rebuilt in full when a read of it misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The cache holds the expanded bytes, so prefix truncation saves disk space and I/O but not cache capacity. The user accepted this on 2026-11-16 because every variant pays it ([decisions.md](decisions.md#2026-11-16-one-full-block-expansion-per-cache-miss-is-accepted-for-now)).
+**Current cost.** A block written with prefix truncation (`--front-code-byte-keys`) or with elided value headers is rebuilt in full when a read of it misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The cache holds the expanded bytes, so prefix truncation saves disk space and I/O but not cache capacity. The user accepted this on 2026-11-16; only reconstructed mode pays it, since native's typed rows never qualify for either encoding ([decisions.md](decisions.md#2026-11-16-one-full-block-expansion-per-cache-miss-is-accepted-for-now)).
 
 **Alternatives.** These are recalled from the literature and were not checked against the sources or against DBSP's code:
 
