@@ -12,12 +12,13 @@ use crate::{
     circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DataTrait, DowncastTrait, DynWeight, Factory, LeanVec, Vector, WithFactory},
     storage::{
+        attribution::Component,
         backend::{BlockLocation, StorageBackend},
         buffer_cache::BufferCache,
         file::{
             TouchedWindowCount,
             format::{
-                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression,
+                BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, DATA_BLOCK_MAGIC,
                 ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC, FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer,
                 INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
                 INCOMPATIBLE_FEATURE_MODULAR_FILTERS, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
@@ -27,9 +28,10 @@ use crate::{
         },
     },
     trace::{
-        BatchReaderFactories, Builder, VecIndexedWSetFactories, VecWSetFactories,
+        BatchReaderFactories, BlockExpansions, Builder, VecIndexedWSetFactories, VecWSetFactories,
         filter::BatchFilters,
         ord::vec::{indexed_wset_batch::VecIndexedWSetBuilder, wset_batch::VecWSetBuilder},
+        with_read_owner,
     },
     utils::{Tup1, test::init_test_logger},
 };
@@ -960,6 +962,19 @@ fn test_two_columns<T>(parameters: Parameters)
 where
     T: TwoColumns,
 {
+    test_two_columns_with_cache::<T>(parameters, test_buffer_cache, || ());
+}
+
+/// Runs the two-column tests with a writer and reader on `cache`. `after_write`
+/// runs once the file is written, so that a test can drop the blocks that the
+/// writer left in the cache and make the first read of each block a miss.
+fn test_two_columns_with_cache<T>(
+    parameters: Parameters,
+    cache: fn() -> Option<Arc<BufferCache>>,
+    after_write: impl FnOnce(),
+) where
+    T: TwoColumns,
+{
     let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
     let factories1 = Factories::<DynData, DynData>::new::<T::K1, T::A1>();
 
@@ -975,7 +990,7 @@ where
     let mut layer_file = Writer2::new(
         &factories0,
         &factories1,
-        test_buffer_cache,
+        cache,
         &*storage_backend,
         parameters,
         FilterPlan::<DynData>::decide_filter(None, T::n0()),
@@ -993,6 +1008,7 @@ where
 
     let (reader, filters) = layer_file.into_reader(BatchMetadata::default()).unwrap();
     reader.evict();
+    after_write();
     let rows0 = reader.rows();
     let expected0 = |row0| {
         let key0 = T::key0(row0);
@@ -1026,6 +1042,17 @@ fn test_two_columns_multifetch<T>(parameters: Parameters)
 where
     T: TwoColumns,
 {
+    test_two_columns_multifetch_with_cache::<T>(parameters, test_buffer_cache, || ());
+}
+
+/// The multifetch counterpart of [`test_two_columns_with_cache`].
+fn test_two_columns_multifetch_with_cache<T>(
+    parameters: Parameters,
+    cache: fn() -> Option<Arc<BufferCache>>,
+    after_write: impl FnOnce(),
+) where
+    T: TwoColumns,
+{
     let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
     let factories1 = Factories::<DynData, DynWeight>::new::<T::K1, T::A1>();
 
@@ -1041,7 +1068,7 @@ where
     let mut layer_file = Writer2::new(
         &factories0,
         &factories1,
-        test_buffer_cache,
+        cache,
         &*storage_backend,
         parameters,
         FilterPlan::<DynData>::decide_filter(None, T::n0()),
@@ -1059,6 +1086,7 @@ where
 
     let (reader, _filters) = layer_file.into_reader(BatchMetadata::default()).unwrap();
     reader.evict();
+    after_write();
     test_multifetch_two_columns::<T>(&reader);
 }
 
@@ -2727,6 +2755,14 @@ type TwoColumnReader = Reader<(
 fn write_two_columns<T: TwoColumns>(
     parameters: Parameters,
 ) -> (TwoColumnReader, tempfile::TempDir) {
+    write_two_columns_with_cache::<T>(parameters, test_buffer_cache)
+}
+
+/// [`write_two_columns`] with the writer and the reader on `cache`.
+fn write_two_columns_with_cache<T: TwoColumns>(
+    parameters: Parameters,
+    cache: fn() -> Option<Arc<BufferCache>>,
+) -> (TwoColumnReader, tempfile::TempDir) {
     let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
     let factories1 = Factories::<DynData, DynData>::new::<T::K1, T::A1>();
     let tempdir = tempdir().unwrap();
@@ -2741,7 +2777,7 @@ fn write_two_columns<T: TwoColumns>(
     let mut writer = Writer2::new(
         &factories0,
         &factories1,
-        test_buffer_cache,
+        cache,
         &*storage_backend,
         parameters,
         None,
@@ -2931,4 +2967,268 @@ fn check_elided_byte_values(strings: Vec<Vec<u8>>, compression: Option<Compressi
         unsafe { cursor.move_next() }.unwrap();
     }
     assert!(!cursor.has_value());
+}
+
+/// Both disk encodings at once, as the merged index's files are written:
+/// folded byte-string keys, then byte-string values with an `i64` weight.
+/// `ROWS` is the number of keys, so that a test can pick where the last
+/// blocks end.
+struct FoldedKeysAndByteValues<const ROWS: usize>;
+
+/// Enough rows for many blocks in each column.
+type BothEncodingsRows = FoldedKeysAndByteValues<3000>;
+
+impl<const ROWS: usize> TwoColumns for FoldedKeysAndByteValues<ROWS> {
+    type K0 = Vec<u8>;
+    type A0 = ();
+    type K1 = Vec<u8>;
+    type A1 = i64;
+
+    fn n0() -> usize {
+        ROWS
+    }
+    fn key0(row0: usize) -> Self::K0 {
+        FoldedKeys::key0(row0)
+    }
+    fn near0(row0: usize) -> (Self::K0, Self::K0) {
+        FoldedKeys::near0(row0)
+    }
+    fn aux0(_row0: usize) -> Self::A0 {}
+
+    fn n1(row0: usize) -> usize {
+        ByteValues::n1(row0)
+    }
+    fn key1(row0: usize, row1: usize) -> Self::K1 {
+        ByteValues::key1(row0, row1)
+    }
+    fn near1(row0: usize, row1: usize) -> (Self::K1, Self::K1) {
+        ByteValues::near1(row0, row1)
+    }
+    fn aux1(row0: usize, row1: usize) -> Self::A1 {
+        ByteValues::aux1(row0, row1)
+    }
+}
+
+thread_local! {
+    static SWAPPABLE_CACHE: std::cell::RefCell<Arc<BufferCache>> =
+        std::cell::RefCell::new(Arc::new(BufferCache::new(64 * 1024 * 1024)));
+}
+
+/// A buffer cache large enough to hold every block of a test file, which
+/// [`drop_swappable_cache`] empties. `Reader::evict` does nothing outside a
+/// runtime with eager eviction, and the writer leaves its blocks in the cache,
+/// so a test that counts misses needs this.
+fn swappable_cache() -> Option<Arc<BufferCache>> {
+    Some(SWAPPABLE_CACHE.with(|cache| cache.borrow().clone()))
+}
+
+/// Empties [`swappable_cache`]: the next read of every block is a miss.
+fn drop_swappable_cache() {
+    SWAPPABLE_CACHE
+        .with(|cache| *cache.borrow_mut() = Arc::new(BufferCache::new(64 * 1024 * 1024)));
+}
+
+/// Arm A's disk format: prefix-truncated keys and elided value headers.
+fn both_encodings(parameters: Parameters) -> Parameters {
+    elided(front_coded(parameters))
+}
+
+/// Writes the both-encodings file of `ROWS` keys, with the buffer cache empty
+/// afterwards.
+fn write_cold_both_encodings<const ROWS: usize>(
+    compression: Option<Compression>,
+) -> (TwoColumnReader, tempfile::TempDir) {
+    let parameters = both_encodings(Parameters::default().with_compression(compression));
+    let written =
+        write_two_columns_with_cache::<FoldedKeysAndByteValues<ROWS>>(parameters, swappable_cache);
+    drop_swappable_cache();
+    written
+}
+
+/// Reads every block of both columns of `reader`, through the buffer cache.
+fn read_both_columns_in_bulk<const ROWS: usize>(reader: &TwoColumnReader) {
+    test_bulk_rows(
+        reader.bulk_rows().unwrap(),
+        Column0::<FoldedKeysAndByteValues<ROWS>>::new(),
+    );
+    test_bulk_rows(
+        reader.bulk_rows().unwrap().next_column().unwrap(),
+        Column1::<FoldedKeysAndByteValues<ROWS>>::new(),
+    );
+}
+
+/// The block expansions that `f` makes on this thread, in total.
+fn expansions_during(f: impl FnOnce()) -> BlockExpansions {
+    let earlier = BlockExpansions::current();
+    f();
+    BlockExpansions::current().since(earlier)
+}
+
+/// Every cursor, filter, and multifetch test, with both encodings on, under
+/// each compression the single-encoding tests use, reading a file whose
+/// blocks are all misses. The key column must expand prefix-truncated blocks
+/// and the value column elided ones.
+#[test]
+fn both_encodings_two_columns() {
+    init_test_logger();
+    for compression in [None, Some(Compression::Snappy), Some(Compression::Zstd)] {
+        let parameters = both_encodings(Parameters::default().with_compression(compression));
+
+        // The cursor tests cover forward, reverse, and exact seeks, and they
+        // run the Bloom and key-range probes.
+        let expanded = expansions_during(|| {
+            test_two_columns_with_cache::<BothEncodingsRows>(
+                parameters.clone(),
+                swappable_cache,
+                drop_swappable_cache,
+            );
+        });
+        assert!(expanded.prefix_truncated_blocks > 0, "{compression:?}");
+        assert!(expanded.elided_blocks > 0, "{compression:?}");
+
+        let expanded = expansions_during(|| {
+            test_two_columns_multifetch_with_cache::<BothEncodingsRows>(
+                parameters.clone(),
+                swappable_cache,
+                drop_swappable_cache,
+            );
+        });
+        assert!(expanded.prefix_truncated_blocks > 0, "{compression:?}");
+        assert!(expanded.elided_blocks > 0, "{compression:?}");
+
+        let (reader, _dir) = write_cold_both_encodings::<3000>(compression);
+        assert_eq!(
+            incompatible_features(&reader)
+                & (INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS
+                    | INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS),
+            INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS | INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS,
+            "{compression:?}"
+        );
+        // Each column holds its own encoding: reading one row of a column
+        // expands one block of that column's encoding and none of the other.
+        let rows0 = reader.rows();
+        let keys = expansions_during(|| {
+            rows0.nth(5).unwrap();
+        });
+        assert_eq!(keys.prefix_truncated_blocks, 1, "{compression:?}");
+        assert_eq!(keys.elided_blocks, 0, "{compression:?}");
+        let values = expansions_during(|| {
+            let rows1 = rows0.nth(5).unwrap().next_column().unwrap();
+            // SAFETY: the file was written with `Vec<u8>` values and `i64` weights.
+            unsafe { rows1.first() }.unwrap();
+        });
+        assert_eq!(values.prefix_truncated_blocks, 0, "{compression:?}");
+        assert_eq!(values.elided_blocks, 1, "{compression:?}");
+    }
+}
+
+/// With no compression the blocks sit on disk as written, so their magics
+/// show that the file holds both kinds.
+#[test]
+fn both_encodings_put_both_magics_on_disk() {
+    init_test_logger();
+    let (reader, _dir) = write_cold_both_encodings::<3000>(None);
+    assert!(!front_coded_blocks(&reader).is_empty());
+    assert!(!blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).is_empty());
+}
+
+/// A miss expands the block, in full, once; a hit expands nothing; a block
+/// written in no encoding expands nothing.
+#[test]
+fn a_cache_miss_expands_one_block_and_a_hit_none() {
+    init_test_logger();
+    for compression in [None, Some(Compression::Snappy), Some(Compression::Zstd)] {
+        let (reader, _dir) = write_cold_both_encodings::<3000>(compression);
+        let rows0 = reader.rows();
+
+        let miss = expansions_during(|| {
+            rows0.nth(5).unwrap();
+        });
+        assert_eq!(miss.prefix_truncated_blocks, 1, "{compression:?}");
+        assert!(
+            miss.prefix_truncated_expanded_bytes > miss.prefix_truncated_encoded_bytes,
+            "{compression:?}: {miss:?}"
+        );
+        assert_eq!(miss.elided_blocks, 0);
+
+        let hit = expansions_during(|| {
+            rows0.nth(5).unwrap();
+        });
+        assert_eq!(hit, BlockExpansions::default(), "{compression:?}");
+
+        // Once the file's blocks are all cached, a whole read expands nothing.
+        read_both_columns_in_bulk::<3000>(&reader);
+        let warm = expansions_during(|| read_both_columns_in_bulk::<3000>(&reader));
+        assert_eq!(warm, BlockExpansions::default(), "{compression:?}");
+
+        // Emptying the cache makes the next read a miss again.
+        drop_swappable_cache();
+        let again = expansions_during(|| {
+            rows0.nth(5).unwrap();
+        });
+        assert_eq!(again.prefix_truncated_blocks, 1, "{compression:?}");
+    }
+
+    let (plain, _dir) = write_two_columns_with_cache::<BothEncodingsRows>(
+        Parameters::default().with_compression(None),
+        swappable_cache,
+    );
+    drop_swappable_cache();
+    let unencoded = expansions_during(|| read_both_columns_in_bulk::<3000>(&plain));
+    assert_eq!(unencoded, BlockExpansions::default());
+}
+
+/// A block's expansion is charged to the read owner that misses, and to that
+/// owner alone.
+#[test]
+fn a_block_expansion_is_charged_to_the_read_owner() {
+    init_test_logger();
+    let (reader, _dir) = write_cold_both_encodings::<3000>(None);
+    let rows0 = reader.rows();
+    let query = BlockExpansions::current_for(Component::Query);
+    let index = BlockExpansions::current_for(Component::MergedIndex);
+    with_read_owner(Component::MergedIndex, || {
+        rows0.nth(5).unwrap();
+    });
+    assert_eq!(BlockExpansions::current_for(Component::Query), query);
+    let charged = BlockExpansions::current_for(Component::MergedIndex).since(index);
+    assert_eq!(charged.prefix_truncated_blocks, 1);
+}
+
+/// The number of keys at which the last block of a column is too small to save
+/// a sector when encoded, so that, with no compression, the file holds encoded
+/// blocks and blocks that fell back to the plain layout. It depends on the
+/// block sizing of the writer and on `FoldedKeys` and `ByteValues`; the test
+/// below fails if it drifts.
+const MIXED_ROWS: usize = 250;
+
+/// A file whose last block saves no whole sector when encoded keeps that
+/// block as it is, next to the encoded ones, and reads back whole. A cold
+/// read expands each encoded block once and no other.
+#[test]
+fn a_file_mixing_encoded_and_fallback_blocks_reads_back() {
+    init_test_logger();
+    let (reader, _dir) = write_cold_both_encodings::<MIXED_ROWS>(None);
+    let key_blocks = front_coded_blocks(&reader).len();
+    let value_blocks = blocks_with_magic(&reader, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC).len();
+    let plain_blocks = blocks_with_magic(&reader, DATA_BLOCK_MAGIC).len();
+    assert!(key_blocks > 0 && value_blocks > 0);
+    assert!(plain_blocks > 0, "no block fell back to the plain layout");
+
+    let expanded = expansions_during(|| read_both_columns_in_bulk::<MIXED_ROWS>(&reader));
+    assert_eq!(expanded.prefix_truncated_blocks, key_blocks as u64);
+    assert_eq!(expanded.elided_blocks, value_blocks as u64);
+
+    // The cursor, filter, and multifetch tests read the same layout.
+    let parameters = both_encodings(Parameters::default().with_compression(None));
+    test_two_columns_with_cache::<FoldedKeysAndByteValues<MIXED_ROWS>>(
+        parameters.clone(),
+        swappable_cache,
+        drop_swappable_cache,
+    );
+    test_two_columns_multifetch_with_cache::<FoldedKeysAndByteValues<MIXED_ROWS>>(
+        parameters,
+        swappable_cache,
+        drop_swappable_cache,
+    );
 }

@@ -7,8 +7,8 @@ use crate::monitor::visual_graph::Graph;
 use crate::operator::dynamic::balance::{BalancerHint, PartitioningPolicy};
 use crate::storage::attribution::Component;
 use crate::storage::backend::StorageError;
-use crate::trace::RunReads;
 use crate::trace::spine_async::MAX_LEVEL0_BATCH_SIZE_RECORDS;
+use crate::trace::{BlockExpansions, RunReads};
 use crate::{
     Error as DbspError, RootCircuit, Runtime, RuntimeError, circuit::runtime::RuntimeHandle,
     profile::Profiler,
@@ -1064,6 +1064,15 @@ impl Runtime {
                             return;
                         }
                     }
+                    Ok(Command::BlockExpansions) => {
+                        let expansions = Component::ALL.map(BlockExpansions::current_for);
+                        if status_sender
+                            .send(Ok(Response::BlockExpansions(Box::new(expansions))))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Ok(Command::IsBackgroundMergeIdle) => {
                         let idle = circuit.is_background_merge_idle();
                         if status_sender
@@ -1437,6 +1446,8 @@ enum Command {
     IsBackgroundMergeIdle,
     /// Report the worker thread's run reads, per read owner.
     RunReads,
+    /// Report the worker thread's block expansions, per read owner.
+    BlockExpansions,
     /// Build the bootstrap circuit: a second copy of the circuit, built from
     /// the same constructor as the main one (see
     /// [`DBSPHandle::create_bootstrap_circuit`]).  When a checkpoint path is
@@ -1503,6 +1514,7 @@ impl Debug for Command {
             Command::IsCompactionComplete => write!(f, "IsCompactionComplete"),
             Command::IsBackgroundMergeIdle => write!(f, "IsBackgroundMergeIdle"),
             Command::RunReads => write!(f, "RunReads"),
+            Command::BlockExpansions => write!(f, "BlockExpansions"),
             Command::CreateBootstrapCircuit(checkpoint) => f
                 .debug_tuple("CreateBootstrapCircuit")
                 .field(checkpoint)
@@ -1529,6 +1541,7 @@ enum Response {
     IsCompactionComplete(bool),
     IsBackgroundMergeIdle(bool),
     RunReads(Box<[RunReads; Component::ALL.len()]>),
+    BlockExpansions(Box<[BlockExpansions; Component::ALL.len()]>),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -2814,6 +2827,24 @@ impl DBSPHandle {
         Ok(reads)
     }
 
+    /// The block expansions of the worker threads so far, per read owner,
+    /// indexed like [`Component::ALL`] and summed over the workers. The
+    /// contract is that of [`DBSPHandle::run_reads`]; subtract with
+    /// [`BlockExpansions::since`].
+    pub fn block_expansions(
+        &mut self,
+    ) -> Result<[BlockExpansions; Component::ALL.len()], DbspError> {
+        let mut expansions = [BlockExpansions::default(); Component::ALL.len()];
+        self.broadcast_command(Command::BlockExpansions, |_, response| {
+            if let Response::BlockExpansions(worker_expansions) = response {
+                for (total, worker) in expansions.iter_mut().zip(*worker_expansions) {
+                    *total += worker;
+                }
+            }
+        })?;
+        Ok(expansions)
+    }
+
     /// Block until background compaction has fully converged on every worker,
     /// or until `timeout` elapses.
     ///
@@ -3063,7 +3094,7 @@ impl CheckpointPublisher {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::storage::attribution::Component;
-    use crate::trace::RunReads;
+    use crate::trace::{BlockExpansions, RunReads};
     use std::fs::{File, create_dir_all};
     use std::io;
     use std::path::Path;
@@ -3683,6 +3714,12 @@ pub(crate) mod tests {
         assert!(read(Component::PartnerTrace).key_decodes > 0);
         assert_eq!(read(Component::MergedIndex), RunReads::default());
         assert_eq!(read(Component::BaseRelation), RunReads::default());
+
+        // The worker's files are written in no disk encoding, so it expanded no block.
+        assert_eq!(
+            circuit.block_expansions().unwrap(),
+            [BlockExpansions::default(); Component::ALL.len()]
+        );
 
         circuit.kill().unwrap();
     }
