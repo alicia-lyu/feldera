@@ -24,7 +24,7 @@ use crate::{
         cursor::{
             CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor,
             run_reads::{
-                count_filter_rejection, count_key_decode, count_seek, count_value_decode,
+                count_filtered_probe, count_key_decode, count_seek, count_value_decode,
                 count_weight_decode,
             },
         },
@@ -942,7 +942,8 @@ where
 
     fn seek_key_exact(&mut self, key: &K, hash: Option<u64>) -> bool {
         if !self.wset.filters.maybe_contains_key(key, hash) {
-            count_filter_rejection();
+            // The run's key range, then its Roaring or Bloom filter, said no.
+            count_filtered_probe();
             return false;
         }
         self.seek_key(key);

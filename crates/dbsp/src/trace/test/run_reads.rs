@@ -55,7 +55,8 @@ fn reads_of<T>(f: impl FnOnce() -> T) -> (T, RunReads) {
     (result, RunReads::current().since(before))
 }
 
-/// Reads of a file run, with no filter rejection and no memory access.
+/// Reads of a file run, with no filtered probe (an exact probe that the run's
+/// key-range, Roaring, or Bloom filter answers) and no memory access.
 fn reads(seeks: u64, key_decodes: u64, value_decodes: u64, weight_decodes: u64) -> RunReads {
     RunReads {
         seeks,
@@ -121,7 +122,7 @@ fn file_run_counts_each_deserialization() {
 }
 
 #[test]
-fn file_run_filter_rejection_counts_no_seek() {
+fn file_run_filtered_probe_counts_no_seek() {
     run_in_circuit_with_storage(|| {
         let run = file_run();
         let mut cursor = run.cursor();
@@ -131,7 +132,7 @@ fn file_run_filter_rejection_counts_no_seek() {
         assert_eq!(
             rejected,
             RunReads {
-                filter_rejections: 1,
+                filtered_probes: 1,
                 ..RunReads::default()
             }
         );
@@ -140,7 +141,7 @@ fn file_run_filter_rejection_counts_no_seek() {
         let (found, admitted) = reads_of(|| cursor.seek_key_exact(3_i32.erase(), None));
         assert!(found);
         assert_eq!(admitted.seeks, 1);
-        assert_eq!(admitted.filter_rejections, 0);
+        assert_eq!(admitted.filtered_probes, 0);
     });
 }
 

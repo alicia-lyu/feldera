@@ -3323,9 +3323,11 @@ mod measurement_tests {
         // `merged_index`: the scan session reads the index on the driver's thread. The joins'
         // reads of the readers' batches are under `requested_slice` in reconstructed mode, and
         // none are in native mode.
+        // `filtered_probes` counts exact probes that a file run's filters (key range, then
+        // Roaring bitmap or Bloom filter) answer with no seek.
         let reads_fields = [
             "seeks",
-            "filter_rejections",
+            "filtered_probes",
             "key_decodes",
             "value_decodes",
             "weight_decodes",
@@ -3980,8 +3982,8 @@ mod worked_transaction {
     impl Totals {
         pub(super) fn of(reads: &RunReads) -> Self {
             Self {
-                // A probe that a run's filter rejects is a probe all the same.
-                probes: reads.seeks + reads.filter_rejections,
+                // A probe that a run's filters answer is a probe all the same.
+                probes: reads.seeks + reads.filtered_probes,
                 keys: reads.memory_key_reads + reads.key_decodes,
                 values: reads.memory_value_reads + reads.value_decodes,
                 weights: reads.memory_weight_reads + reads.weight_decodes,
@@ -4004,7 +4006,7 @@ mod native_worked_transaction_tests {
     use super::*;
 
     /// What one operator of the view circuit reads, derived per operator by a scout with no code
-    /// run, and confirmed by the pins below. `probes` are seeks, or filter rejections when a
+    /// run, and confirmed by the pins below. `probes` are seeks, or filtered probes when a
     /// file run's filter answers the probe.
     struct OperatorReads {
         probes: u64,
@@ -4154,15 +4156,15 @@ mod native_worked_transaction_tests {
     /// default arm, because the cursors make the same probes and passes. What differs is where
     /// the reads go, which the test prints and does not force: the runtime's pressure puts the
     /// runs wherever it does. When every run is in a file, the reads are decodes, and one of the
-    /// seven probes is answered by a run's filter, which counts a filter rejection and no seek
-    /// (6 seeks and 1 rejection); the test pins that split only then. The rejected probe is
+    /// seven probes is answered by a run's filter, which counts a filtered probe and no seek
+    /// (6 seeks and 1 filtered probe); the test pins that split only then. The filtered probe is
     /// ΔL's o5 into J's old run, which has no entry of o5.
     #[test]
     fn worked_transaction_pressured_arm() -> Result<()> {
         let (reads, pressures, _files) = run_arm(Arm::Pressured)?;
         assert!(pressures.at_start >= feldera_types::memory_pressure::MemoryPressure::High);
         // The runs landed in files in every run observed (Critical pressure throughout). Then
-        // the totals are all decodes, and the one rejected probe is not a seek. A mixed layout
+        // the totals are all decodes, and the one filtered probe is not a seek. A mixed layout
         // would split the reads differently, and is reported, not forced.
         let memory_reads =
             reads.memory_key_reads + reads.memory_value_reads + reads.memory_weight_reads;
@@ -4171,7 +4173,7 @@ mod native_worked_transaction_tests {
                 reads,
                 RunReads {
                     seeks: 6,
-                    filter_rejections: 1,
+                    filtered_probes: 1,
                     key_decodes: 16,
                     value_decodes: 41,
                     weight_decodes: 38,
@@ -4319,7 +4321,7 @@ mod session_worked_transaction_tests {
     ///   reads (the step past l11 lands on nothing), 5 value, and 5 weight reads. A run in a
     ///   file counts them as decodes, and a run in memory as memory reads. In all: 11 key, 11
     ///   value, and 11 weight reads.
-    /// - No seek reaches a run, so no seek or filter rejection is counted.
+    /// - No seek reaches a run, so no seek or filtered probe is counted.
     /// - The routing's reads of the driving deltas it merges forward alongside the scan (`dC` and
     ///   `dO` at c5: no seek, 2 key reads for the two cursors' first keys, and 3 value and 3
     ///   weight memory reads) are the `requested_slice` owner's, and nothing is read under

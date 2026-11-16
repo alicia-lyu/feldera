@@ -33,7 +33,8 @@ reports, over the repetitions:
   and the pressure stall totals) and the cgroup's window peak (`cgroup_window_peak_bytes` if the
   reset worked) and the maximum sampled `memory.current`;
 - `sequence.view_run_reads`, the view worker's run reads, in three groups (measurement version 11),
-  each with the eight `RunReads` fields (`seeks`, `filter_rejections`, `key_decodes`,
+  each with the eight `RunReads` fields (`seeks`, `filtered_probes` (exact probes answered by a
+  file run's filters, key range then Roaring bitmap or Bloom filter, with no seek), `key_decodes`,
   `value_decodes`, `weight_decodes`, `memory_key_reads`, `memory_value_reads`,
   `memory_weight_reads`):
   `dbsp_operator_<field>`, the DBSP operators' own reads (every owner but `requested_slice` and
@@ -44,7 +45,7 @@ reports, over the repetitions:
   (`sequence.driver_run_reads.requested_slice`), which the raw report keeps apart;
 - for the merged-index mode only, under the mode's `index_run_reads`: the scan session's run
   reads of the index in the view phase (`sequence.index_run_reads.session`: `index_seeks`,
-  `index_filter_rejections`, `index_key_decodes`, `index_value_decodes`,
+  `index_filtered_probes`, `index_key_decodes`, `index_value_decodes`,
   `index_weight_decodes`, `index_memory_key_reads`, `index_memory_value_reads`,
   `index_memory_weight_reads`), the session's moves (`sequence.index_session_counts`, as
   `index_session_<field>`), and base maintenance's reads of the index

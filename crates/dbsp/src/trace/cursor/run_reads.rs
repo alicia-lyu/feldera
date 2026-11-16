@@ -5,11 +5,12 @@
 //!
 //! * `seeks`: key seeks that reach the run (`seek_key`, `seek_key_with`, and
 //!   their reverse forms), in both in-memory and file runs. A
-//!   `seek_key_exact` that a file run's filter rejects reaches no run and
+//!   `seek_key_exact` that a file run's filters answer reaches no run and
 //!   counts no seek. Seeks over a [`CursorList`](super::CursorList) count once
 //!   per run.
-//! * `filter_rejections`: `seek_key_exact` calls that a file run's filter
-//!   answers without seeking. They cost no decode, but they are probes.
+//! * `filtered_probes`: `seek_key_exact` calls that a file run's filters
+//!   answer without seeking (see [`RunReads::filtered_probes`]). They cost no
+//!   decode, but they are probes.
 //! * `key_decodes`: keys a file run deserializes, one for each landing on a new
 //!   key row (two for a reverse key seek, below) and one for each key a
 //!   predicate seek probes.
@@ -72,7 +73,15 @@ use crate::storage::attribution::Component;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct RunReads {
     pub seeks: u64,
-    pub filter_rejections: u64,
+    /// Exact probes (`seek_key_exact`) that a file run's filters answer with
+    /// "absent", so that no seek happens. The filters run in order through
+    /// `BatchFilters::maybe_contains_key`. First comes the run's key range
+    /// (its minimum and maximum key). Then comes one membership filter: a
+    /// Roaring bitmap, which is exact, when the key type is
+    /// roaring-compatible (an integer) and the run's key span fits in a `u32`
+    /// offset; otherwise a Bloom filter, which has no false negatives but some
+    /// false positives. In-memory runs have no filters, so they count none.
+    pub filtered_probes: u64,
     pub key_decodes: u64,
     pub value_decodes: u64,
     pub weight_decodes: u64,
@@ -87,7 +96,7 @@ type PerOwner = [Cell<u64>; Component::ALL.len()];
 thread_local! {
     static CURRENT_READ_OWNER: Cell<Component> = const { Cell::new(Component::Query) };
     static SEEKS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
-    static FILTER_REJECTIONS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static FILTERED_PROBES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static KEY_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static VALUE_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static WEIGHT_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
@@ -112,7 +121,7 @@ impl RunReads {
         };
         Self {
             seeks: total(&SEEKS),
-            filter_rejections: total(&FILTER_REJECTIONS),
+            filtered_probes: total(&FILTERED_PROBES),
             key_decodes: total(&KEY_DECODES),
             value_decodes: total(&VALUE_DECODES),
             weight_decodes: total(&WEIGHT_DECODES),
@@ -128,7 +137,7 @@ impl RunReads {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             seeks: self.seeks - earlier.seeks,
-            filter_rejections: self.filter_rejections - earlier.filter_rejections,
+            filtered_probes: self.filtered_probes - earlier.filtered_probes,
             key_decodes: self.key_decodes - earlier.key_decodes,
             value_decodes: self.value_decodes - earlier.value_decodes,
             weight_decodes: self.weight_decodes - earlier.weight_decodes,
@@ -147,7 +156,7 @@ impl RunReads {
 impl AddAssign for RunReads {
     fn add_assign(&mut self, other: Self) {
         self.seeks += other.seeks;
-        self.filter_rejections += other.filter_rejections;
+        self.filtered_probes += other.filtered_probes;
         self.key_decodes += other.key_decodes;
         self.value_decodes += other.value_decodes;
         self.weight_decodes += other.weight_decodes;
@@ -187,8 +196,8 @@ pub(crate) fn count_seek() {
     increment(&SEEKS);
 }
 
-pub(crate) fn count_filter_rejection() {
-    increment(&FILTER_REJECTIONS);
+pub(crate) fn count_filtered_probe() {
+    increment(&FILTERED_PROBES);
 }
 
 pub(crate) fn count_key_decode() {
@@ -223,10 +232,10 @@ mod tests {
     fn since_subtracts_each_count() {
         let earlier = RunReads::current();
         count_seek();
-        count_filter_rejection();
-        count_filter_rejection();
-        count_filter_rejection();
-        count_filter_rejection();
+        count_filtered_probe();
+        count_filtered_probe();
+        count_filtered_probe();
+        count_filtered_probe();
         count_key_decode();
         count_key_decode();
         count_value_decode();
@@ -245,7 +254,7 @@ mod tests {
             RunReads::current().since(earlier),
             RunReads {
                 seeks: 1,
-                filter_rejections: 4,
+                filtered_probes: 4,
                 key_decodes: 2,
                 value_decodes: 1,
                 weight_decodes: 3,
@@ -260,7 +269,7 @@ mod tests {
     fn add_assign_adds_each_count() {
         let mut sum = RunReads {
             seeks: 1,
-            filter_rejections: 5,
+            filtered_probes: 5,
             key_decodes: 2,
             value_decodes: 3,
             weight_decodes: 4,
@@ -270,7 +279,7 @@ mod tests {
         };
         sum += RunReads {
             seeks: 10,
-            filter_rejections: 50,
+            filtered_probes: 50,
             key_decodes: 20,
             value_decodes: 30,
             weight_decodes: 40,
@@ -282,7 +291,7 @@ mod tests {
             sum,
             RunReads {
                 seeks: 11,
-                filter_rejections: 55,
+                filtered_probes: 55,
                 key_decodes: 22,
                 value_decodes: 33,
                 weight_decodes: 44,
@@ -302,7 +311,7 @@ mod tests {
 
     const ONE_SEEK: RunReads = RunReads {
         seeks: 1,
-        filter_rejections: 0,
+        filtered_probes: 0,
         key_decodes: 0,
         value_decodes: 0,
         weight_decodes: 0,

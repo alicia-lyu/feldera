@@ -29,7 +29,9 @@ READ_ONLY_OWNERS = ("requested_slice", "partner_trace")
 # view phase reads the index only through its scan session, so there is one reader. The decodes
 # are file runs'; the memory reads are in-memory runs', kept apart from them.
 INDEX_READERS = ("session",)
-RUN_READ_FIELDS = ("seeks", "filter_rejections", "key_decodes", "value_decodes", "weight_decodes",
+# `filtered_probes`: exact probes that a file run's filters (key range, then Roaring bitmap or
+# Bloom filter) answer with no seek.
+RUN_READ_FIELDS = ("seeks", "filtered_probes", "key_decodes", "value_decodes", "weight_decodes",
                    "memory_key_reads", "memory_value_reads", "memory_weight_reads")
 # The scan session's moves per transaction (`SessionCounts`, measurement version 8).
 SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_steps", "positions",

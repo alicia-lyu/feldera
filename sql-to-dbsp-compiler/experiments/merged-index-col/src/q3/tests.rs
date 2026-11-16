@@ -250,14 +250,16 @@ fn with_memory(file: RunReads, keys: u64, values: u64, weights: u64) -> RunReads
 
 fn reads(
     seeks: u64,
-    filter_rejections: u64,
+    // Exact probes that a file run's filters (key range, then Roaring bitmap or Bloom filter)
+    // answer with no seek.
+    filtered_probes: u64,
     key_decodes: u64,
     value_decodes: u64,
     weight_decodes: u64,
 ) -> RunReads {
     RunReads {
         seeks,
-        filter_rejections,
+        filtered_probes,
         key_decodes,
         value_decodes,
         weight_decodes,

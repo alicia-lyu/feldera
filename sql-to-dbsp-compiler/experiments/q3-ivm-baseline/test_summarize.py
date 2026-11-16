@@ -25,8 +25,9 @@ def owners(query: int, base: int, index: int) -> dict[str, dict[str, int]]:
 
 def index_reads(seeks: int) -> dict[str, dict[str, int]]:
     """The scan session with `seeks` seeks and twice as many key, value and weight decodes, and
-    as many memory reads."""
-    return {reader: {"seeks": seeks, "filter_rejections": 0, "key_decodes": 2 * seeks,
+    as many memory reads. `filtered_probes` counts exact probes that a file run's filters (key
+    range, then Roaring bitmap or Bloom filter) answer with no seek."""
+    return {reader: {"seeks": seeks, "filtered_probes": 0, "key_decodes": 2 * seeks,
                      "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks,
                      "memory_key_reads": seeks, "memory_value_reads": seeks,
                      "memory_weight_reads": seeks}
