@@ -124,6 +124,14 @@ The value level has a separate disk-only transform. Every `Vec<u8>` value carrie
 
 A seek goes down each column's tree (the key column, then the value column with its weights) one block at a time. Each block is read on demand through the buffer cache (`IndexBlock::new` and `DataBlock::new` in `crates/dbsp/src/storage/file/reader.rs`). Index blocks, min/max bounds, and filters are written from full keys, so the descent and the probes never see an encoded block. Only the data block that the seek lands on, if it was written encoded, is expanded in full, on a cache miss (`front_code::decode` in `decompress`). A hit costs nothing, and the cache holds the expanded bytes. So a seek expands at most one block per column, an unencoded (fallback) block is never expanded, and prefix truncation saves disk space and I/O, not cache capacity.
 
+A data block holds consecutive items of one column: keys, each pointing to its group of rows in the value column, or values with their weights, after a header and an array of item offsets. The writer fills it before it encodes it (`try_add_item` in `crates/dbsp/src/storage/file/writer.rs`). Once 32 items are in (`min_branch`), the block's size target becomes the larger of 8 KiB (`min_data_block`) and those items' size rounded up to 512 bytes. The block then closes before the item that would pass the target. The harness keeps these defaults. A block is left partly empty by three things:
+
+- the gap left by the item that did not fit, at most one item's size;
+- without compression, padding to a whole number of 512-byte sectors;
+- the end of the column, where the last block holds what remains.
+
+Prefix truncation therefore packs no more items into a block. It shrinks each block on disk; for example, an 8 KiB block encoded to 3.5 KiB takes 4 KiB with its padding. The number of blocks, the index blocks, and the reads per seek stay the same; the bytes per read and the disk space shrink. Uncompressed, a block is written encoded only when the encoding frees at least one sector; otherwise it is a size fallback (`size_fallbacks`). Packing more items into each truncated block would cut the number of blocks and could make the tree shallower. That is a different design, not the current one.
+
 This is suboptimal, and the user accepted it for now (decision of 2026-11-16). Only reconstructed mode pays it: native's typed rows never qualify for either encoding, so native saves no disk and expands no block. `RunReads` does not count the expansions; measurement version 12 counts them as `block_expansions`, apart from item decodes ([measurement.md](measurement.md#report-fields)). Searching the encoded block without expanding it is deferred ([deferred.md](deferred.md#search-a-prefix-truncated-block-without-expanding-it)).
 
 ## Uniqueness of folded keys
