@@ -8,6 +8,7 @@ The designs and work items here are not implemented. None is a prerequisite for 
 - Native packing of values.
 - Selective execution.
 - The whole-group over-read for narrow requests.
+- Searching a prefix-truncated block without expanding it.
 
 ## What R3 does instead
 
@@ -303,6 +304,19 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 - **The workloads do not test clustering.** At scale factor 0.01, clustered RF1 puts its 10 Orders on 8 to 10 Customers, so almost every touched customer receives one order. Reading a group once pays off only when one group serves many requests. A fair test needs many Orders per Customer.
 - **First mitigation (2026-11-12).** Each reader keeps only the rows its driving delta requests, and only those entries are decoded ([decisions.md](decisions.md)). The joins and their counters no longer see the over-read. The key read per position remains.
 - **Next step.** The routing cursor seeks past a subtree that no reader requests, such as an order with no change and no changed customer, together with its lines. This is the `Visit` of [selective execution](#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred), restricted to one group; the requests it needs already exist at routing.
+
+## Search a prefix-truncated block without expanding it
+
+**Current cost.** A block written with prefix truncation (`--front-code-byte-keys`) or with elided value headers is rebuilt in full when a read of it misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The cache holds the expanded bytes, so prefix truncation saves disk space and I/O but not cache capacity. The user accepted this on 2026-11-16 because every variant pays it ([decisions.md](decisions.md#2026-11-16-one-full-block-expansion-per-cache-miss-is-accepted-for-now)).
+
+**Alternatives.** These are recalled from the literature and were not checked against the sources or against DBSP's code:
+
+- **Restart points with an incremental scan.** The block format of LevelDB and RocksDB stores a full key every `k` entries (default 16) and prefix-truncates the entries between. A seek binary-searches the restart points, then scans one interval. RocksDB also offers an optional hash index inside the block. The user's scan-to-match is the case of one interval per block: it costs a linear pass per seek and keeps compact bytes in the cache.
+- **One shared prefix per block.** Head compression with suffix-truncated separators (Bayer and Unterauer 1977, "Prefix B-trees"; Graefe, *Modern B-Tree Techniques*, 2011) stores the common prefix once, so a comparison needs no rebuilt key.
+- **Offset-value coding** (Conner 1977; Graefe and Do) lets the scan decide most comparisons from a small code, without touching key bytes.
+- **On-demand key rebuilding inside the cache** (WiredTiger) keeps the block compact and rebuilds only the keys that a search touches.
+
+**DBSP obstacle.** Cursors read archived (rkyv) keys in place. A rebuilt key therefore needs a cursor-owned buffer, which touches every key-reading path. Any alternative must also keep `RunReads`' decode counts meaningful, apart from the `block_expansions` of measurement version 12.
 
 ## General merged-index definition: later work
 

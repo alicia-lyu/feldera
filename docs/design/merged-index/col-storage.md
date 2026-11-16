@@ -120,6 +120,12 @@ Because every K is unique, the key level stores one entry per row and shares not
 
 The value level has a separate disk-only transform. Every `Vec<u8>` value carries a 16-byte `ArchivedVec` root whose pointer and length follow from the item's position and bounds. With `--elide-value-headers` the layer file stores each value-level `(Vec<u8>, weight)` item as a LEB128 length, the bytes, and the weight, and reading rebuilds the roots (`encode_values` in `crates/dbsp/src/storage/file/front_code.rs`). It has its own block magic, incompatible-feature bit, and writer option, and does not depend on key prefix truncation or on what the bytes encode. On 2026-10-20, with packed values and prefix-truncated keys, the value level took 107,008 bytes; with elision it took 67,072 bytes (`target/r5-packed-values/` and `target/r5-packed-elided/`, local; see [measurement.md](measurement.md)).
 
+### Prefix truncation on the read path
+
+A seek goes down each column's tree (the key column, then the value column with its weights) one block at a time. Each block is read on demand through the buffer cache (`IndexBlock::new` and `DataBlock::new` in `crates/dbsp/src/storage/file/reader.rs`). Index blocks, min/max bounds, and filters are written from full keys, so the descent and the probes never see an encoded block. Only the data block that the seek lands on, if it was written encoded, is expanded in full, on a cache miss (`front_code::decode` in `decompress`). A hit costs nothing, and the cache holds the expanded bytes. So a seek expands at most one block per column, an unencoded (fallback) block is never expanded, and prefix truncation saves disk space and I/O, not cache capacity.
+
+This is suboptimal, and the user accepted it for now because every variant pays it (decision of 2026-11-16). `RunReads` does not count the expansions; measurement version 12 counts them as `block_expansions`, apart from item decodes ([measurement.md](measurement.md#report-fields)). Searching the encoded block without expanding it is deferred ([deferred.md](deferred.md#search-a-prefix-truncated-block-without-expanding-it)).
+
 ## Uniqueness of folded keys
 
 At a completed transaction boundary each folded K has at most one active payload. The argument ([decisions.md](decisions.md#2026-10-12-no-folded-key-uniqueness-validator)):

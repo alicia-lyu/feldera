@@ -38,7 +38,8 @@ Run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`. `generate.sh` write
 `plan.json` from `q3.sql` (Catalog mode, default optimization level 2). The two circuits are the
 base tables and the view; `query.sql` stays the logical definition. The driver builds both in one
 DBSP runtime, with one storage directory and one buffer cache (`--cache-bytes`). Run it before
-building or testing a fresh checkout.
+building or testing a fresh checkout. It generates only the native pair: the reconstructed build's
+view circuit, `q3-trie-view-circuit/`, is hand-written and tracked.
 
 `generate.sh` stops with a message if `src/lib.rs` or `src/stubs.rs` exists in the experiment.
 Those are stale files from before the base/view split. They are untracked and no longer
@@ -110,7 +111,7 @@ when the compiler writes no file; the compiler's errors name `col.mi:line:column
 committed `generated.rs` differs (`col-generated-fresh`). It then runs formatting checks, strict
 Clippy, the COL suite, the Python runner tests, a syntax check of each shell script, and a
 whitespace check, all with `--offline --locked`. It compares the native and reconstructed transaction transcripts with `cmp`.
-It restores native generation on exit, even after a failure. Logs and transcripts go to a fresh
+It starts by generating the native pair. Logs and transcripts go to a fresh
 `target/r4-verification/` directory; `CARGO_TARGET_DIR` can point at an existing build cache.
 What the tests cover is in [reconstruction.md](reconstruction.md).
 
@@ -135,12 +136,15 @@ Defaults: one worker, 10,000 input records per load transaction (`--batch`), thr
 runs (`--runs`), full verification, and memory-backed state. `--storage-path DIR` selects
 file-backed state in a distinct `run-N` subdirectory per run. `--no-verify` skips the
 independent full-join checks and leaves `delta_plus`, `delta_minus`, and `view_rows` unavailable
-(`verified=false`). `--dump-runtime-circuit DIR` writes each run's per-worker runtime graphs
+(`verified=false`). It also keeps the partner-read contract check off, which the driver enables only
+when verifying (`enable_contract_check` in `src/main.rs`). `--dump-runtime-circuit DIR` writes each run's per-worker runtime graphs
 after its final refresh, outside the phase timers; the directory must not already hold a run.
 
 Loading takes complete Order and Lineitem groups in ascending Order key and reports any other
-order as unsupported. The supported workload is RF1 insertion and RF2 deletion under referential
-integrity.
+order as unsupported. The CLI accepts RF1 insertion and RF2 deletion under referential integrity
+only. Reconstructed mode itself accepts general deltas of the base tables
+([decisions.md](decisions.md#2026-11-10-general-deltas-with-an-orphan-side-store)); only the tests
+exercise them.
 
 ## Measure R5
 
@@ -184,7 +188,8 @@ all of those. `--cache-bytes` must be a whole number of MiB.
 
 `python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`,
 `--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`,
-`--elide-value-headers`, `--session-pass`, `--cgroup-root`, `--total-memory-bytes`). `--session-pass seek|step`
+`--elide-value-headers`, `--session-pass`, `--cgroup-root`, `--total-memory-bytes`,
+`--device-label`). `--session-pass seek|step`
 (default `seek`, also a driver flag) selects how reconstructed mode's scan session passes the
 untouched groups; native ignores it and reports `configuration.session_pass` as `null`.
 
@@ -224,15 +229,30 @@ per process) with four files:
 - `summary.json`: the window, the flush log split before, in and after the window, and whether the
   flush log matches the backend's counters.
 
-The scans run outside the timed window. The runner also rejects any driver report whose per-owner
-writes do not add up to its totals.
+The scans run outside the timed window. The runner rejects any driver report that fails
+`report_problems` in `measure.py`:
+
+- per-owner writes sum to the totals;
+- `delta_ms` is present, finite, and non-negative, and `ivm_ms >= delta_ms`;
+- `view_run_reads` of `requested_slice` and `partner_trace` follow the mode: a native run has no
+  `requested_slice` reads and some `partner_trace` reads, a reconstructed run the reverse, and
+  nothing is read under `merged_index` on the view worker;
+- `driver_run_reads` is well formed (`null` in native mode), and no writes are charged to
+  `requested_slice`;
+- the scan session's counts, `index_upkeep_run_reads`, and `profiled_cpu_ms` are well formed and
+  their sequence totals are the sums of the refreshes;
+- `configuration.session_pass` is the pass that the runner asked for;
+- `front_coding.layout_fallbacks` is 0 when prefix truncation is on, and
+  `value_header_elision.layout_fallbacks` is 0 when elision is on (decision of 2026-11-16);
+- `block_expansions` are well formed and are 0 for an encoding that is off (measurement version 12,
+  pending).
 
 The refresh list is a JSON array in execution order. Each item is
 `{"rf1_orders": "orders.tbl.u1", "rf1_lines": "lineitem.tbl.u1"}` or `{"rf2": "delete.1"}`;
 relative paths resolve against the list file. `--cache-bytes` must be a whole number of MiB.
 
-The runner builds and preserves separate native and reconstructed release executables, restores
-native generation, and starts a fresh process and storage directory for each mode and repetition
+The runner builds and preserves separate native and reconstructed release executables,
+regenerates the native circuits at the end, and starts a fresh process and storage directory for each mode and repetition
 (three by default). Definitions of the reported intervals, the compaction policy, and the pending
 Linux qualification are in [measurement.md](measurement.md).
 
@@ -241,6 +261,37 @@ Linux qualification are in [measurement.md](measurement.md).
 This section is for a fresh agent on a fresh Linux machine that will run the R5 pilot. It is the
 only place for these commands; [measurement.md](measurement.md) defines what is measured and why.
 Anything marked "unverified" could not be checked from the repository.
+
+### Machine and OS
+
+Every figure here that the repository cannot check is unverified; none was checked on the campaign
+machine.
+
+- **Architecture:** x86_64. The dbgen `MACHINE=LINUX` build and the JDK path example below assume
+  it; aarch64 is untested.
+- **OS:** an Ubuntu LTS whose kernel is 6.12 or later (`uname -r`), for example Ubuntu 24.04 with
+  its hardware-enablement kernel, or a later LTS. Kernel 5.19 is the floor for `memory.peak`
+  itself, and 6.12 for resetting it by writing to it (unverified). Use bare metal or a full virtual
+  machine with root, not a container (unverified).
+- **CPU:** at least 8 cores, for the worker, the index thread, background compaction, and the build
+  (unverified). More cores are fine: they speed the build and do not change the runs, which use one
+  DBSP worker. Record the CPU model, and keep frequency scaling fixed if possible.
+- **RAM:** at least 32 GiB, for the Rust release builds (unverified). Runs are capped at 1 GiB by
+  the cgroup, so host RAM does not change them.
+- **Disks:** one SSD and, for the probe, one hard disk. Both need 512-byte logical sectors
+  (`O_DIRECT`, `FBuf::ALIGNMENT`; a 4Kn drive may fail) and ext4 or xfs. The SSD holds the inputs,
+  the build, and the campaign's storage. The hard disk holds only the probe's 16 runs
+  ("Hard-disk probe" below). `measure.py` records the device of `--storage-path` in the manifest
+  (`storage_device`: `path`, `device`, `filesystem`, `logical_sector_bytes`, `rotational`, `model`,
+  `label`). Every field is `null` on macOS or when it cannot be resolved; a device-mapper device is
+  reported unresolved, not guessed. `--device-label ssd|hdd` names the device, and the runner fails
+  if the label contradicts the device's `rotational` flag. The manifest block and the label arrive
+  with measurement version 12 (pending).
+
+Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
+inputs once (about 10 GB at SF 10, unchecked), 64 runs' storage (16 pilot runs and 48 campaign runs),
+and the build; the hard disk takes 16 runs' storage. Take the per-run figure from the pilot's
+`load.observed_storage_bytes`, which the pilot aims at about 4 GiB.
 
 ### Pre-flight checks
 
@@ -260,11 +311,13 @@ rather than corrupting results. Run them before building anything.
 
 ### State a clone needs
 
-- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. On 2026-11-11 the
-  local branch was ahead of `origin`: the user must push the verified commit, or supply it (for
-  example as a `git bundle`), before the Linux clone.
+- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. Before the Linux
+  clone, check that `origin` has the commit: `git rev-list --count
+  origin/docs/merged-index-tidy-up..HEAD` must print 0. Otherwise the user must push the verified
+  commit, or supply it (for example as a `git bundle`).
 - `q3-ivm-baseline/q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and
-  `plan.json` are generated and git-ignored. `measure.py` runs `generate.sh` itself.
+  `plan.json` are generated and git-ignored. `measure.py` runs `generate.sh` itself, which
+  generates only the native pair. `q3-trie-view-circuit/` is hand-written and tracked.
 - Raw artifacts (reports, run directories) are git-ignored and local to the machine.
 
 ### Toolchain
@@ -395,9 +448,11 @@ Also:
   size and modification time against the campaign's hash record and fails if one changed.
 - Each run keeps its maintained storage (`<run dir>/storage`), and nothing deletes it. One campaign
   of `--runs N` makes `2N` runs (native and reconstructed), so one pilot command (`--runs 1`) makes
-  two, the eight pilots make 16, and the eight campaigns make 48. Budget the inputs once plus 64
-  runs' storage, or 48 if the pilot's run directories are moved off the disk before the campaign.
-  The pilot's `load.observed_storage_bytes` gives the per-run figure.
+  two, the eight pilots make 16, and the eight campaigns make 48. On the SSD, budget the inputs once
+  plus 64 runs' storage (16 pilot runs and 48 campaign runs), or 48 if the pilot's run directories
+  are moved off the disk before the campaign. The hard-disk probe repeats the eight pilots on the
+  hard disk: 16 more runs there, and none on the SSD. The pilot's `load.observed_storage_bytes`
+  gives the per-run figure.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
 
@@ -424,7 +479,8 @@ python3 measure.py \
   --no-verify \
   --front-code-byte-keys \
   --elide-value-headers \
-  --session-pass seek
+  --session-pass seek \
+  --device-label ssd
 ```
 
 This is arm `A-seek` for clustered. The four arms differ in two flags ("Campaign and four arms"
@@ -445,6 +501,8 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
   without them.
 - `--session-pass`: how reconstructed mode's scan session passes the untouched groups. Native has
   no scan session; its report records `configuration.session_pass` as `null`.
+- `--device-label`: names the device of `--storage-path` in the manifest and fails the run if it
+  contradicts the device (measurement version 12, pending). Optional.
 
 **Pilot pass criterion.** For each of the eight pilots, and for both runs in its report (`runs[].qualification`), `status` must be
 `qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
@@ -468,11 +526,46 @@ pressure:
   pre-read's fixed overhead, equal in both modes.
 - `refreshes[].memory_pressure` shows what DBSP's level was; `cgroup.delta` (`pgscan`, `pgsteal`,
   `workingset_refault_*`, `memory_events.max`) shows what the kernel did. Report the two apart.
+- `measurement_version` (11 now, 12 once expansion counts land) and the fallback counters:
+  `front_coding.layout_fallbacks` and `value_header_elision.layout_fallbacks` must be 0; the runner
+  gates on them.
+- `delta_ms`, `q3_ms`, and `ivm_ms` per refresh, with `ivm_ms = delta_ms + q3_ms`.
+- The run reads per owner: `dbsp_operator_*`, `partner_trace_*`, and `requested_slice_*` in the
+  summary, and `driver_run_reads` and the `filtered_probes` counter in the report. (`filtered_probes`
+  was `filter_rejections` before 2026-11-16, so older manifests use that name.)
+- `block_expansions` per refresh and owner (measurement version 12, pending): the storage-level
+  rebuilds of encoded data blocks on buffer-cache misses, as `prefix_truncated_blocks`,
+  `prefix_truncated_encoded_bytes`, `prefix_truncated_expanded_bytes`, `elided_blocks`,
+  `elided_encoded_bytes`, and `elided_expanded_bytes`. They are not item decodes.
+- `storage_device`: the device, filesystem, sector size, and `rotational` flag of `--storage-path`.
+
+### Hard-disk probe
+
+The user decided on 2026-11-16 that the hard disk gets only the eight pilots, as a probe of 16 runs
+([decisions.md](decisions.md#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)).
+Run it after the SSD pilots pass. Repeat each pilot command with `--storage-path` on a directory of
+the hard disk and `--device-label hdd`, and keep every other flag. The inputs (`$DBGEN_OUT`,
+`$R5_INPUTS`) and the build stay on the SSD. The runs read the inputs only while loading and
+pre-reading, before the measured window, and evict them from the page cache first. Keeping them
+fixed makes the probe change one thing, where the maintained state lives. Name the directories by device, arm, and workload:
+
+```bash
+--report "$R5_OUT/pilot-hdd-<arm>-<workload>/manifest.json" \
+--storage-path "$HDD_MOUNT/r5/pilot-hdd-<arm>-<workload>/runs" \
+--device-label hdd
+```
+
+The pilot pass criterion applies unchanged, and each manifest's `storage_device.rotational` should
+say rotational (the field's exact format is unverified until measurement version 12 lands). Report
+the probe as evidence only: no HDD campaign exists, and nothing here supports a comparison between
+devices until the user decides one. Do not summarize `pilot-hdd-*` manifests together with the SSD
+campaign's.
 
 ### Campaign and four arms
 
-Run the campaign only after all eight pilots pass and the pressure instrumentation exists
-([measurement.md](measurement.md#pending-linux-campaign)). It has four arms, prefix truncation
+Run the campaign on the SSD, only after all eight SSD pilots pass and the pressure instrumentation
+exists ([measurement.md](measurement.md#pending-linux-campaign)); the hard-disk probe does not
+gate it. It has four arms, prefix truncation
 crossed with the session pass (decision of 2026-11-11), each the pilot command with `--runs 3` and
 fresh `--report` and `--storage-path` values:
 
@@ -502,9 +595,9 @@ python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
 
 `summarize.py` labels each manifest by its parent directory, which is why each needs its own, and
 its Markdown names each workload's session pass. The four arms quadruple both stages: the pilot is
-4 arms × 2 workloads × 1 repetition × 2 modes = 16 runs, and the campaign 4 × 2 × 3 × 2 = 48. The
-inputs are shared, so the disk holds them once, plus each run's storage (see "Storage path and disk
-budget").
+4 arms × 2 workloads × 1 repetition × 2 modes = 16 runs per device (the SSD, then the hard-disk
+probe), and the campaign 4 × 2 × 3 × 2 = 48 on the SSD. The inputs are shared, so the disk holds
+them once, plus each run's storage (see "Storage path and disk budget").
 
 ### Report back
 
@@ -516,6 +609,11 @@ When the pilots, or the campaign, are done, report:
 - whether the `clear_refs` and `memory.peak` resets worked (`sequence.window_peak_rss_error` and
   `sequence.cgroup.peak.window_peak_supported`), and `cgroup.proof.inputs_evicted` per run;
 - the revision (`manifest.revision`) and `git_status_short`, which must be empty;
+- each manifest's `measurement_version`, `storage_device`, and fallback counters (`front_coding`,
+  `value_header_elision`), and, from version 12, `block_expansions`;
+- the timing split per refresh (`delta_ms`, `q3_ms`, `ivm_ms = delta_ms + q3_ms`, `base_ms`) and the
+  run reads per owner, as `summarize.py` prints them (`dbsp_operator_*`, `partner_trace_*`,
+  `requested_slice_*`, `driver_run_reads`, `filtered_probes`);
 - the paths of the manifests and of `summary.md`. Raw artifacts stay on the machine.
 
 ### Known limits
@@ -534,11 +632,16 @@ When the pilots, or the campaign, are done, report:
   the cgroup can near its limit while DBSP reports Low pressure
   ([measurement.md](measurement.md#two-pressure-signals)). Input-cache eviction and refresh-file
   pre-reading narrow the gap and do not close it.
-- The jemalloc global allocator moved from the generated circuits into the driver's `main.rs`
-  in step D (the base/view split), because a binary can link one allocator. Its `malloc_conf`
-  (`prof:true,prof_active:true,lg_prof_sample:19`) is the symbol the compiler emitted before. Whether
-  the symbol takes effect from the driver on Linux (it changes allocator behavior and RSS) is
-  unverified.
+- The jemalloc global allocator and its `malloc_conf` (`prof:true,prof_active:true,lg_prof_sample:19`)
+  are defined once, in the driver's `src/main.rs`, because a binary can link one allocator;
+  `generate.sh` strips them from the generated circuits. Whether the symbol takes effect from the
+  driver on Linux (it changes allocator behavior and RSS) is unverified.
+- The campaign runs with Q3's routing hook (`Routing::hook` in `merged-index-col/src/q3.rs`). The
+  generic-reader work on the Mac ([deferred.md](deferred.md#generic-readers-before-and-after-state-and-declared-join-readers))
+  must not land on the campaign's revision while the campaign runs.
+- A seek expands at most one prefix-truncated or elided block, in full, on a buffer-cache miss, and
+  the cache holds the expanded bytes. The campaign pays this in every arm that encodes; it is
+  documented as suboptimal ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)).
 - Make none of these claims without raw artifacts: runtime memory pressure, reclaim or refault
   behavior, beyond-memory behavior, equal-memory performance, a disk saving at SF 10, or a
   maintenance-only I/O figure. The window fields are evidence, not proof. No SF 10 run has been
