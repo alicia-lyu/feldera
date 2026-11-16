@@ -756,7 +756,8 @@ fn transact_inner(
         let collection = view_started.elapsed().saturating_sub(delta_preparation);
         delta += delta_preparation;
         let delta_started = Instant::now();
-        let delta_result = collection_result.and_then(|collection| pipeline.build_view_delta(collection.driving));
+        let delta_result =
+            collection_result.and_then(|collection| pipeline.build_view_delta(collection.driving));
         delta += delta_started.elapsed();
         let transaction_started = Instant::now();
         let transaction_result = delta_result.and_then(|()| {
