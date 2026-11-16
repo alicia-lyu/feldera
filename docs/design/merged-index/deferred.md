@@ -309,12 +309,32 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 These items lie outside the roadmap in [general-definition.md](general-definition.md).
 
 - **Variable-width keys,** such as VARCHAR. They need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
-- **Generated readers and joins,** replacing the hand-written readers, Q3's hook, and the hand-written circuit (the exact-shape matching of `Q3MergedIndexBinding` was removed on 2026-11-13; see the initial thought under the unconfirmed choices of [shared-traversal.md](shared-traversal.md)).
+- **Generated readers and joins,** replacing the hand-written readers, Q3's hook, and the hand-written circuit (the exact-shape matching of `Q3MergedIndexBinding` was removed on 2026-11-13). The first step is [Generic readers](#generic-readers-before-and-after-state-and-declared-join-readers).
 - **Inferring the trie** from foreign-key and primary-key metadata.
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 - **Placements on views.** The validator rejects them because views have no primary key (decision of 2026-10-20). Allowing them needs a way to declare or infer a view's unique key, for example in the spec or from the view's query.
 - **Nullable and other payload types.** A payload column must be NOT NULL and have a packed encoding: an integer, BOOLEAN, DATE, TIME, TIMESTAMP, DECIMAL, or VARCHAR. Nullable columns need a packed `Option` encoding; floats, binary strings, and the other SQL types need their own.
 - **Quoted identifiers in specs.** Relation and column names are unquoted SQL identifiers, matched in the compiler's canonical casing. A table whose name needs quotes cannot be named yet.
+
+## Generic readers: before and after state, and declared join readers
+
+Next work, on Mac, in parallel with the Linux campaign (user, 2026-11-16). The campaign runs with Q3's hook.
+
+- **Today.** `reader::route` offers each `Old` position to the stored readers, which keep it when its stream is their `PARTNER_STREAM` and its prefix is among their requests. It copies entries; it cannot combine them, and it has no notion of a state before or after the transaction. Q3's hook (`Routing::hook` in `merged-index-col/src/q3.rs`) adds the rest, reader by reader:
+  - `O⁻` needs nothing.
+  - `C⁺` gets `ΔC`'s rows, because an after read is `Old` plus `Dlt`.
+  - `J⁺` gets all its rows: the customer after times the order after, where `ΔL` has lines (`PARTNER_STREAM = None`).
+  - `L⁻` gets all its requests, from `ΔJ`.
+  - The hook also steps the orders that only `ΔO` has, which have no `Old` position.
+- **Initial thought.** The partner's state (before or after) belongs in `ReaderDefinition`, since DBSP's join fixes which input it reads before and which after. Join readers (`J⁺`, `ΔJ`) could then be declared rather than hand-written, and `q3.rs` would hold only definitions. With two compiler passes (joins rekeyed on the trie, partners bound to snapshot readers), the reader definitions and the view circuit could be generated from the `.mi` spec and the circuit, for circuits that meet (A1)–(A3).
+
+## `ERROR_VIEW` in the hand-written circuit (open)
+
+Deferred and left open on 2026-11-16. The compiler adds `ERROR_VIEW` to every program (`DBSPCompiler.start`); it reads `FELDERA_ERROR_TABLE`, whose rows name a table or view and carry a message and metadata. Rows reach it when the runtime drops or rejects a record, for example a row that arrives too late.
+
+- **`LATENESS`.** A column annotation (`LATENESS INTERVAL 1 HOUR`, for example) that bounds how far out of order a column's values may arrive. It lets Feldera discard state older than the bound, and a row that arrives later than the bound is dropped and reported in `ERROR_VIEW`.
+- **Why it is absent.** Q3 declares no `LATENESS`, so native's `ERROR_VIEW` is always empty, and the hand-written circuit leaves it out. It would not help debug the harness, which compares `V` and the counters.
+- **When to revisit.** If a reconstructed query declares `LATENESS`, or the circuit runs as a Feldera pipeline, which exposes `ERROR_VIEW` among its outputs.
 
 ## Single circuit with merged indexes (open question, 2026-10-26)
 

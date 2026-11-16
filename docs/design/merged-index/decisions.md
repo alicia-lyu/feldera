@@ -555,6 +555,14 @@ Confirmed in the second pass the same day:
 - **The compiler hook is removed.** `--q3-merged-index`, `Q3MergedIndexBinding.java`, and its test are deleted; the hand-written circuit replaced it on 2026-11-10.
 - **The current hybrid is named "selective routing"** (the scan reads each touched group once and routes only requested entries to the readers). It replaces "selective decoding with whole-group positioning" and the working name "routing by requests".
 
+### 2026-11-16: Third pass over the unconfirmed choices
+
+- **A reverse key seek on a file run counts two key decodes,** because the file reader deserializes the landed key twice (`best_match`, then the cursor's key). A memory run counts one. No Q3 path seeks backward (only `lag.rs` does), so the version 11 counts are unchanged.
+- **The counter `filter_rejections` is renamed** (to `filtered_probes`; the name is listed as unconfirmed in [shared-traversal.md](shared-traversal.md#unconfirmed-choices)).
+- **Q3's hook stays for the Linux campaign.** The generic before and after state and declared join readers are the next work, on Mac, in parallel ([deferred.md](deferred.md#generic-readers-before-and-after-state-and-declared-join-readers)).
+- **The readers sit behind no lock.** `collect` seals each reader's partner into an immutable batch, which the joins read without a `Mutex`; the driver and the worker take turns and never share the readers at once.
+- **`ERROR_VIEW` is deferred and left open** ([deferred.md](deferred.md#error_view-in-the-hand-written-circuit-open)).
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |
