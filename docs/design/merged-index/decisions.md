@@ -558,9 +558,10 @@ Confirmed in the second pass the same day:
 ### 2026-11-16: Third pass over the unconfirmed choices
 
 - **A reverse seek on a file run counts two decodes** of the key or value it lands on, because the file reader deserializes it twice (`best_match`, then the cursor's settled row). A memory run counts one. No Q3 path seeks backward (the callers are `lag.rs`, as-of joins, rank, row number, and time series), so the version 11 counts are unchanged.
-- **The counter `filter_rejections` is renamed** (to `filtered_probes`, the exact probes that a file run's filters answer with no seek: the key-range filter, then a Roaring bitmap for integer keys whose span fits in 32 bits or else a Bloom filter; the name is listed as unconfirmed in [shared-traversal.md](shared-traversal.md#unconfirmed-choices)).
+- **The counter `filter_rejections` is renamed** (to `filtered_probes`, the exact probes that a file run's filters answer with no seek: the key-range filter, then a Roaring bitmap for integer keys whose span fits in 32 bits or else a Bloom filter).
 - **Q3's hook stays for the Linux campaign.** The generic before and after state and declared join readers are the next work, on Mac, in parallel ([deferred.md](deferred.md#generic-readers-before-and-after-state-and-declared-join-readers)).
-- **The readers sit behind no lock.** `collect` seals each reader's partner into an immutable batch, which the joins read without a `Mutex`; the driver and the worker take turns and never share the readers at once.
+- **The readers sit behind no lock.** `collect` seals each reader into a read-only `SealedReader` (its requests and its finished partner batch), which the joins read without a `Mutex`; the driver and the worker take turns and never share the readers at once. The driving deltas are not read but moved into the view circuit's input handles, so they leave by `collect`'s return value (`Collection`), not through the read-only struct; `take_driving_deltas` is gone.
+- **An item the user comments on with a minor adjustment is confirmed** as a whole: the adjustment is applied, and how I apply it (here the name `filtered_probes` and the `Collection` hand-off) needs no further confirmation.
 - **`ERROR_VIEW` is deferred and left open** ([deferred.md](deferred.md#error_view-in-the-hand-written-circuit-open)).
 
 ## Superseded and withdrawn
