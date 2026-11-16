@@ -309,7 +309,7 @@ Deferred on 2026-11-12. The scan session visits every position of each touched c
 These items lie outside the roadmap in [general-definition.md](general-definition.md).
 
 - **Variable-width keys,** such as VARCHAR. They need an escaped, terminated encoding, and the unique-parsing argument has to change to match.
-- **Generated readers and joins,** replacing the hand-written readers, Q3's hook, and the hand-written circuit (the exact-shape matching of `Q3MergedIndexBinding` was removed on 2026-11-13). The first step is [Generic readers](#generic-readers-before-and-after-state-and-declared-join-readers).
+- **Declared readers and joins,** replacing Q3's hook with definitions; the circuits stay hand-written (user, 2026-11-16; the exact-shape matching of `Q3MergedIndexBinding` was removed on 2026-11-13). See [Generic readers](#generic-readers-before-and-after-state-and-declared-join-readers).
 - **Inferring the trie** from foreign-key and primary-key metadata.
 - **Nullable key columns.** There are two candidate encodings: a marker byte before the value (one extra byte per field), or two consecutive tags per nullable domain, the lower meaning NULL (no extra bytes).
 - **Placements on views.** The validator rejects them because views have no primary key (decision of 2026-10-20). Allowing them needs a way to declare or infer a view's unique key, for example in the spec or from the view's query.
@@ -326,7 +326,7 @@ Next work, on Mac, in parallel with the Linux campaign (user, 2026-11-16). The c
   - `J⁺` gets all its rows: the customer after times the order after, where `ΔL` has lines (`PARTNER_STREAM = None`).
   - `L⁻` gets all its requests, from `ΔJ`.
   - The hook also steps the orders that only `ΔO` has, which have no `Old` position.
-- **Initial thought.** The partner's state (before or after) belongs in `ReaderDefinition`, since DBSP's join fixes which input it reads before and which after. Join readers (`J⁺`, `ΔJ`) could then be declared rather than hand-written, and `q3.rs` would hold only definitions. With two compiler passes (joins rekeyed on the trie, partners bound to snapshot readers), the reader definitions and the view circuit could be generated from the `.mi` spec and the circuit, for circuits that meet (A1)–(A3).
+- **Initial thought.** The partner's state (before or after) belongs in `ReaderDefinition`, since DBSP's join fixes which input it reads before and which after. Join readers (`J⁺`, `ΔJ`) could then be declared rather than hand-written, and `q3.rs` would hold only definitions. The view circuit stays hand-written, and so do the definitions: they state which partner each join reads and in which state, which the `.mi` spec does not hold. A test pairs each definition with its join, so a definition whose state disagrees with the circuit fails directly.
 
 ## `ERROR_VIEW` in the hand-written circuit (open)
 
