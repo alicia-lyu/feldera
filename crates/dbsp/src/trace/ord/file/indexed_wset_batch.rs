@@ -749,7 +749,7 @@ where
     {
         let start = row(&self.key_cursor);
         op(&mut self.key_cursor).unwrap_storage();
-        if landing.reads(start, row(&self.key_cursor)) {
+        for _ in 0..landing.key_decodes(start, row(&self.key_cursor)) {
             count_key_decode();
         }
         // Keep the old value cursor as the hint for the next first value. If
@@ -818,17 +818,39 @@ where
 /// When a move of a file cursor deserializes the key it lands on.
 #[derive(Clone, Copy)]
 enum Landing {
-    /// Steps, rewinds, and reverse seeks read the key of any row they end on.
+    /// Steps and rewinds read the key of any row they end on.
     Always,
     /// Forward seeks read a key only when they leave the current row.
     IfMoved,
+    /// Reverse seeks that end on a row deserialize its key twice, moved or
+    /// not. `Position::rewind_to_last_le` in the file reader has `best_match`
+    /// deserialize the key that it finds, then deserializes the row's key
+    /// again once the position is settled.
+    ///
+    /// A reverse seek that ends off a row counts none. This misses one real
+    /// deserialization: a cursor before its first row stays there, even
+    /// though `best_match` found a key that the seek deserialized. The
+    /// cursor cannot tell that case from a seek that found nothing.
+    TwiceOnRow,
 }
 
 impl Landing {
+    /// Whether a move from `start` to `end` deserializes the key or value it
+    /// lands on.
     fn reads(self, start: Option<u64>, end: Option<u64>) -> bool {
         match self {
-            Landing::Always => end.is_some(),
+            Landing::Always | Landing::TwiceOnRow => end.is_some(),
             Landing::IfMoved => end.is_some() && end != start,
+        }
+    }
+
+    /// How many times a move from `start` to `end` deserializes the key it
+    /// lands on.
+    fn key_decodes(self, start: Option<u64>, end: Option<u64>) -> u64 {
+        let landed = u64::from(self.reads(start, end));
+        match self {
+            Landing::TwiceOnRow => 2 * landed,
+            Landing::Always | Landing::IfMoved => landed,
         }
     }
 }
@@ -945,14 +967,14 @@ where
             count_key_decode();
             predicate(key)
         };
-        self.move_key(Landing::Always, |key_cursor| unsafe {
+        self.move_key(Landing::TwiceOnRow, |key_cursor| unsafe {
             key_cursor.seek_backward_until(predicate)
         });
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
         count_seek();
-        self.move_key(Landing::Always, |key_cursor| unsafe {
+        self.move_key(Landing::TwiceOnRow, |key_cursor| unsafe {
             key_cursor.rewind_to_value_or_smaller(key)
         });
     }

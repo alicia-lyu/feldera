@@ -193,8 +193,72 @@ fn a_landing_reads_no_value() {
             assert!(cursor.key_valid());
         });
         // Only the keys: the opening, the step, the seek, the rewind, the
-        // fast-forward, the reverse step, and the reverse seek.
-        assert_eq!(landed, reads(2, 7, 0, 0));
+        // fast-forward, and the reverse step each read one, and the reverse
+        // seek reads two.
+        assert_eq!(landed, reads(2, 8, 0, 0));
+    });
+}
+
+#[test]
+fn a_reverse_key_seek_that_lands_decodes_the_key_twice() {
+    run_in_circuit_with_storage(|| {
+        let run = file_run();
+        let mut cursor = run.cursor();
+        cursor.fast_forward_keys();
+        assert_eq!(key_of(&cursor), 3);
+
+        // `best_match` deserializes the key it finds, and the cursor
+        // deserializes the settled row's key again.
+        let ((), moved) = reads_of(|| cursor.seek_key_reverse(2_i32.erase()));
+        assert_eq!(key_of(&cursor), 2);
+        assert_eq!(moved, reads(1, 2, 0, 0));
+
+        // The same two when the cursor stays on its row.
+        let ((), stayed) = reads_of(|| cursor.seek_key_reverse(2_i32.erase()));
+        assert_eq!(key_of(&cursor), 2);
+        assert_eq!(stayed, reads(1, 2, 0, 0));
+
+        // No key is at or below 0, so `best_match` finds nothing to
+        // deserialize and the cursor ends before the first row.
+        let ((), passed) = reads_of(|| cursor.seek_key_reverse(0_i32.erase()));
+        assert!(!cursor.key_valid());
+        assert_eq!(passed, reads(1, 0, 0, 0));
+    });
+}
+
+#[test]
+fn a_reverse_key_seek_from_before_the_first_row_counts_no_key() {
+    run_in_circuit_with_storage(|| {
+        let run = file_run();
+        let mut cursor = run.cursor();
+        cursor.step_key_reverse();
+        assert!(!cursor.key_valid());
+
+        // The cursor stays before the first row, although `best_match` finds
+        // and deserializes key 3. The count misses that one decode, because
+        // the cursor cannot tell this seek from one that finds nothing.
+        let ((), stayed) = reads_of(|| cursor.seek_key_reverse(3_i32.erase()));
+        assert!(!cursor.key_valid());
+        assert_eq!(stayed, reads(1, 0, 0, 0));
+    });
+}
+
+#[test]
+fn a_reverse_predicate_seek_counts_each_probe_and_the_landed_key_twice() {
+    run_in_circuit_with_storage(|| {
+        let run = file_run();
+        let mut cursor = run.cursor();
+        cursor.fast_forward_keys();
+        let probes = Cell::new(0_u64);
+        let predicate = |key: &DynI32| {
+            probes.set(probes.get() + 1);
+            *key.downcast_checked::<i32>() <= 2
+        };
+        let ((), sought) = reads_of(|| cursor.seek_key_with_reverse(&predicate));
+        assert_eq!(key_of(&cursor), 2);
+        assert!(probes.get() > 0);
+        // Every probe, then the landed key twice; no value.
+        assert_eq!(sought, reads(1, probes.get() + 2, 0, 0));
     });
 }
 
@@ -372,8 +436,9 @@ fn a_memory_landing_reads_no_value() {
         cursor.seek_key_reverse(1_i32.erase());
         assert!(cursor.key_valid());
     });
-    // Only the keys: the opening, the step, the seek, the rewind, the
-    // fast-forward, the reverse step, and the reverse seek.
+    // Only the keys, one read each: the opening, the step, the seek, the
+    // rewind, the fast-forward, the reverse step, and the reverse seek. A
+    // memory run has no second deserialization of the reverse seek's key.
     assert_eq!(landed, memory_reads(2, 7, 0, 0));
 }
 
