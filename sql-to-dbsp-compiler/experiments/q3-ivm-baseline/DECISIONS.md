@@ -53,29 +53,9 @@ The user decided how `prepare_inputs.py` chooses refreshes:
 
 The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded (`cache_occupancy_at_window_start_bytes` in the `main.rs` report). Before 2026-11-05 it was recorded per runtime, under both the base and the view runtime; there is now one runtime and one cache. Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
 
-### 2026-11-03: Counters measure Feldera's costs as well as the write-up's
-
-The counters count per-run seeks, key reads, and value reads in storage, besides the write-up's logical seeks and payload decodes. In Feldera a logical seek costs one seek per run, and a key move on a file batch reads a value, so the write-up's units alone do not show the cost.
-
-### 2026-11-03: Counters live at two levels
-
-The scan session counts the write-up's units: cursor opens, logical seeks, and payload decodes. DBSP's run cursors count the storage costs. Both the in-memory cursor (`VecIndexedWSetCursor`) and the file cursor (`FileIndexedWSetCursor`) count per-run seeks. Only the file cursor counts key reads and value reads, since only file runs deserialize. The generic `Cursor` trait gains no counters. (Amended on 2026-11-03: per-run seeks were first counted in the file cursor only, and the logical counters were first placed in an instance-node cursor. Amended on 2026-11-09: in-memory runs also count key, value, and weight accesses, in fields apart from file decodes; see "2026-11-09: In-memory runs count their accesses".)
-
-### 2026-11-04: Run reads are attributed by a read scope
-
-Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
-
-### 2026-11-04: Native joins read through run cursors
-
-R5 runs the native join with DBSP's default read path, `fetch_join` off. With it on, as R5 had it since the driver was written, the native join batch-fetched each delta's keys from every file run into in-memory copies: an access style unlike the reconstructed readers' per-key cursor seeks, and one that the run counters do not see. With it off, both modes read their partner state through the counted run cursors. The fetch path stays uncounted. Reconstructed mode's counts do not depend on the setting.
-
 ### 2026-11-04: RF2 deletes the oldest Orders
 
 In both workloads, RF2 deletes the lowest base Order keys, as an analytical database ages out its oldest history. Pair K takes the next block, as large as its RF1. The two workloads then share their RF2 sets and differ only in RF1 (Zipf against uniform Customers). This replaces the RF2 rules of 2026-10-23; the RF1 rules stand.
-
-### 2026-11-04: Run counters count decodes
-
-`RunReads`' `key_reads`, `value_reads`, and `weight_reads` are renamed `key_decodes`, `value_decodes`, and `weight_decodes`. They count entries deserialized from file runs, which usually come from the buffer cache, not disk reads. Storage traffic is reported by the backend read counters beside them.
 
 ### 2026-11-09: No setup compaction is the default workload
 
@@ -86,23 +66,6 @@ Results so far (versions 4 to 6) ran with the flag, and each recorded result kee
 ### 2026-11-09: The Linux campaign runs without setup compaction
 
 The Linux pilot and campaign drop `--setup-full-compaction` in both front-coding arms, as the default workload of 2026-11-09 does. The arms still differ in the key encoding alone: both keep `--elide-value-headers`, and arm B drops only `--front-code-byte-keys`. This amends 2026-10-22, which kept the flag in both arms.
-
-### 2026-11-09: In-memory runs count their accesses
-
-In-memory runs count key, value, and weight accesses in fields of their own, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads`, apart from the file decodes. A memory access is never counted as a deserialization. This amends "2026-11-03: Counters live at two levels", which let memory runs count only seeks because they deserialize nothing.
-
-Why: seeks alone hide the key, value, and weight accesses of native traces, of the index's memory runs, and of `Dlt`, so a comparison across layouts would favor whichever mode keeps more state in memory.
-
-### 2026-11-10: Choices of the memory-run counters and the native comparison
-
-The user confirmed on 2026-11-10:
-
-- The field names `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see "2026-11-09: In-memory runs count their accesses").
-- A memory run's value counts once per position, mirroring the file cursor's laziness: a `Cell<bool>` that every key move clears and every value move sets.
-- The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads. *Amended on 2026-11-10 (see the entry below):* the arm is now the pressured arm of both sides, and no test asserts that files exist or where a run is; each reports its layout.
-- `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB) is a public constant, so that the harness can report the resolved default (see "2026-11-09: DBSP's default placement in both modes").
-- The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
-- The native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
 
 ### 2026-11-10: The step-3 publication of `(Old, Dlt)`
 
@@ -169,10 +132,6 @@ The probe comes first so that an HDD campaign is decided on evidence. This adds 
 ### 2026-11-16: `measure.py` gates on layout fallbacks
 
 A run is rejected when `front_coding.layout_fallbacks` is not 0 with prefix truncation on, or `value_header_elision.layout_fallbacks` is not 0 with elision on. A layout fallback is an eligible block that the encoder did not understand, so it was written unencoded and the arm would not measure the encoding it names. `size_fallbacks` (blocks that the encoding would not have shrunk by a sector) stay unchecked, since they are legitimate.
-
-### 2026-11-16: One full block expansion per cache miss is accepted for now
-
-A block written with prefix truncation (or with elided value headers) is rebuilt in full when its read misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](../../../docs/design/merged-index/storage-layout.md#prefix-truncation-on-the-read-path)). The user accepts this cost for now and requires it to be documented as suboptimal. Only reconstructed mode pays it: native runs with the same flags, but its typed rows never qualify for either encoding (`front_codable_key`, `elidable_value_headers` in the storage file writer), so it saves no disk and expands no block. The encodings are part of the merged index's design, since only its byte-string keys and values qualify (user decision of 2026-11-16). The session-pass arms pay it equally; arm A expands key and value blocks, arm B value blocks only. Alternatives that search the encoded block are deferred ([deferred.md](../../../docs/design/merged-index/deferred.md#search-a-prefix-truncated-block-without-expanding-it)). The rebuild is called a block expansion and is counted apart from item decodes, from measurement version 12.
 
 ### 2026-11-17: Load once into an image; each refresh run is a new process from a copy of it
 
