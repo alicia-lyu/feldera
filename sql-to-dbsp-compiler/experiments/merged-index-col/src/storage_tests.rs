@@ -36,6 +36,8 @@ type Row = (Vec<u8>, StoredPayload, ZWeight);
 
 const BATCHES: usize = 16;
 const CUSTOMERS_PER_BATCH: usize = 10_000;
+/// How long the compaction test waits for the background merge to write a file batch.
+const MERGE_DEADLINE: Duration = Duration::from_secs(300);
 type SourceRow = (Key, Payload, ZWeight);
 
 fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
@@ -206,7 +208,9 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
         );
 
         let first_snapshot = first_snapshot.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // The merge runs in the test's build profile. On a 2.2 GHz Xeon Silver 4114 the whole
+        // test took 198 s unoptimized and 24 s in release, so a 30 s deadline failed there.
+        let deadline = Instant::now() + MERGE_DEADLINE;
         let file_batch = loop {
             let snapshot = trace.ro_snapshot();
             if let Some(batch) = snapshot
@@ -223,7 +227,7 @@ fn native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots() {
                     .map(|batch| (batch.location(), batch.len(), batch.approximate_byte_size()))
                     .collect();
                 panic!(
-                    "no file batch after 30s: batches={batches:?}, first_eight_bytes={first_eight_bytes}, threshold={threshold}"
+                    "no file batch after {MERGE_DEADLINE:?}: batches={batches:?}, first_eight_bytes={first_eight_bytes}, threshold={threshold}"
                 );
             }
             thread::sleep(Duration::from_millis(100));

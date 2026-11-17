@@ -115,6 +115,20 @@ It starts by generating the native pair. Logs and transcripts go to a fresh
 `target/r4-verification/` directory; `CARGO_TARGET_DIR` can point at an existing build cache.
 What the tests cover is in [reconstruction.md](reconstruction.md).
 
+`verify.sh` exits nonzero on the first failing stage and names its log in
+`target/r4-verification/<run>/`. Wrapping it as `./verify.sh > log; echo $?` shows the real exit
+code; a background task's own exit status may report only that of the wrapper. Code under
+`#[cfg(target_os = "linux")]` is first compiled, linted, and tested on Linux, so a gate that passes
+on macOS can fail there. On the first Linux host, two such failures were fixed (2026-11-17):
+
+- Strict Clippy rejected `evict_inputs(&[path.clone()])` in a Linux-only test of
+  `src/window_memory.rs` (`cloned_ref_to_slice_refs`).
+- `native_spine_compacts_full_col_runs_to_file_and_preserves_snapshots` in the COL suite timed out:
+  "no file batch after 30s". The background merger was running, but the suite's unoptimized build
+  on a 2.2 GHz Xeon took 198 s for the whole test (24 s in release). `MERGE_DEADLINE` in
+  `merged-index-col/src/storage_tests.rs` is now 300 s. A timeout there means a slow debug build,
+  not a stuck merger, if `merger-0` shows state `R` in `/proc/<pid>/task/*/stat`.
+
 ## Run the driver
 
 The driver takes complete dbgen base files and one refresh batch. Build the release binary
@@ -264,18 +278,29 @@ Anything marked "unverified" could not be checked from the repository.
 
 ### Machine and OS
 
-Every figure here that the repository cannot check is unverified; none was checked on the campaign
-machine.
+Every figure here that the repository cannot check is unverified unless marked "verified on the
+first Linux host". That host (2026-11-17) was an Emulab/CloudLab-style bare-metal node: Ubuntu
+24.04.5 with the GA kernel 6.8.0, two Intel Xeon Silver 4114 (40 logical cores), 187 GiB RAM, an
+Intel SSDSC2BB48 SSD (480 GB, 512-byte logical sectors), and a Seagate ST1200MM0088 hard disk (1.2
+TB, 512-byte logical sectors).
 
 - **Architecture:** x86_64. The dbgen `MACHINE=LINUX` build and the JDK path example below assume
   it; aarch64 is untested.
 - **OS:** an Ubuntu LTS whose kernel is 6.12 or later (`uname -r`), for example Ubuntu 24.04 with
   its hardware-enablement kernel, or a later LTS. Kernel 5.19 is the floor for `memory.peak`
-  itself, and 6.12 for resetting it by writing to it (unverified). Use bare metal or a full virtual
-  machine with root, not a container (unverified).
+  itself, and 6.12 for resetting it by writing to it (unverified). The 24.04 GA kernel 6.8 also
+  works (verified on the first Linux host). There `memory.peak` exists but is read-only (mode
+  0444, so even its owner gets "Permission denied" on open for writing), so the window peak falls
+  back as the pre-flight table says. Use bare metal or a full virtual machine with root, not a
+  container (unverified).
 - **CPU:** at least 8 cores, for the worker, the index thread, background compaction, and the build
   (unverified). More cores are fine: they speed the build and do not change the runs, which use one
-  DBSP worker. Record the CPU model, and keep frequency scaling fixed if possible.
+  DBSP worker. Record the CPU model, and keep frequency scaling fixed if possible. With the
+  `intel_pstate` driver (check `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver`), set
+  the governor with `echo performance | sudo tee
+  /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor` and turn turbo off with `echo 1 | sudo
+  tee /sys/devices/system/cpu/intel_pstate/no_turbo`, after the build. Neither survives a reboot.
+  Testbed images often default to `powersave` (verified on the first Linux host).
 - **RAM:** at least 32 GiB, for the Rust release builds (unverified). Runs are capped at 1 GiB by
   the cgroup, so host RAM does not change them.
 - **Disks:** one SSD and, for the probe, one hard disk. Both need 512-byte logical sectors
@@ -286,6 +311,9 @@ machine.
   `label`). Every field is `null` on macOS or when it cannot be resolved; a device-mapper device is
   reported unresolved, not guessed. `--device-label ssd|hdd` names the device, and the runner fails
   if the label contradicts the device's `rotational` flag. Both arrived with measurement version 12.
+  List the disks with `lsblk -d -o NAME,ROTA,MODEL,SIZE,LOG-SEC,PHY-SEC` (`ROTA` 0 is the SSD).
+  The root filesystem of a testbed image may be ext3 and small (64 GB on the first Linux host),
+  with the rest of the SSD unpartitioned and the hard disk blank. See "Prepare the disks" below.
 
 Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
 inputs once (about 10 GB at SF 10, unchecked), 64 runs' storage (16 pilot runs and 48 campaign runs),
@@ -304,13 +332,15 @@ rather than corrupting results. Run them before building anything.
 | Swap accounting on | After the recipe below, `ls /sys/fs/cgroup/r5/driver/memory.swap.max` | `configure_cgroup` fails on the first run. Enable swap accounting or report. |
 | Delegation works | The recipe below, then `cat /proc/self/cgroup` prints `0::/r5/driver` | Adapt the recipe; do not run without `--cgroup-root`. |
 | Storage path accepts 512-byte `O_DIRECT` | `df -T <storage dir>` shows ext4 or xfs; `sudo blockdev --getss <device>` prints 512 | Use another filesystem or disk. A 4 KiB logical sector, tmpfs, or overlay may fail with "Invalid argument" on the first state write (untested). |
-| `clear_refs` resets the peak (Linux 4.0 or later) | `grep VmHWM /proc/self/status; echo 5 > /proc/self/clear_refs; grep VmHWM /proc/self/status` | `sequence.window_peak_rss_bytes` is `null` with `window_peak_rss_error` set. Report the kernel. (Unverified on the host.) |
-| `memory.peak` resets by writing to it (kernel 6.12 or later; unverified) | In the cgroup: `exec 3<>/sys/fs/cgroup/r5/driver/memory.peak; echo reset >&3; cat /proc/self/fd/3` | `peak.window_peak_supported` is false and the report falls back to the sampled `memory.current` maximum. Not a failure. |
+| `clear_refs` resets the peak (Linux 4.0 or later) | `grep VmHWM /proc/self/status; echo 5 > /proc/self/clear_refs; grep VmHWM /proc/self/status` | `sequence.window_peak_rss_bytes` is `null` with `window_peak_rss_error` set. Report the kernel. (Worked on 6.8, verified on the first Linux host. The second `VmHWM` is the current RSS, so on an idle shell it barely drops.) |
+| `memory.peak` resets by writing to it (kernel 6.12 or later; unverified) | In the cgroup: `exec 3<>/sys/fs/cgroup/r5/driver/memory.peak; echo reset >&3; cat /proc/self/fd/3` | `peak.window_peak_supported` is false and the report falls back to the sampled `memory.current` maximum. Not a failure. On 6.8 the `exec` fails with "Permission denied", because the file is read-only (verified on the first Linux host). |
 | Disk room | `df -h <storage dir>` against the budget below | Free space or lower `--runs`. |
 
 ### State a clone needs
 
-- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. Before the Linux
+- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. A plain `git
+  clone` checks out `main`, which lacks most of this work (it was 114 commits behind on
+  2026-11-17). Run `git checkout docs/merged-index-tidy-up` right after cloning. Before the Linux
   clone, check that `origin` has the commit: `git rev-list --count
   origin/docs/merged-index-tidy-up..HEAD` must print 0. Otherwise the user must push the verified
   commit, or supply it (for example as a `git bundle`).
@@ -321,24 +351,60 @@ rather than corrupting results. Run them before building anything.
 
 ### Toolchain
 
-- Rust: install rustup, then `rustup toolchain install 1.96.1 --component rustfmt clippy`. Every
-  cargo command passes `+1.96.1`.
-- Fetch dependencies online once. The runner builds with `--offline --locked`, which fails without
-  a populated registry cache. `q3-ivm-baseline` and `merged-index-col` are separate workspaces with
-  their own `Cargo.lock`, so fetch in each directory you will build in. Fetch at the repository root
-  too if you will run the DBSP tests.
+On Ubuntu 24.04 the system packages are (verified on the first Linux host, which had only Python,
+gcc, make, and git):
 
-  ```bash
-  # From sql-to-dbsp-compiler/experiments/q3-ivm-baseline, then from merged-index-col
-  cargo +1.96.1 fetch --locked
-  ```
+```bash
+sudo apt-get update
+sudo apt-get install -y openjdk-21-jdk-headless maven graphviz build-essential pkg-config \
+  libssl-dev cmake clang
+curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+. "$HOME/.cargo/env"
+rustup toolchain install 1.96.1 --profile minimal -c rustfmt -c clippy
+```
 
-- Java: JDK 21 (19 to 21 work, per the repository CLAUDE.md) and Maven. Set `JAVA_HOME` to the
-  Linux JDK path (for example `/usr/lib/jvm/java-21-openjdk-amd64` on Debian-family systems;
-  unverified) and put its `bin` first on `PATH`.
+- Rust: install rustup, then the 1.96.1 toolchain with rustfmt and clippy as above. Write each
+  component as its own `-c` (or `--component rustfmt,clippy`). rustup 1.29 rejects
+  `--component rustfmt clippy`, printing only "For more information, try '--help'" (verified on the
+  first Linux host). Every cargo command passes `+1.96.1`. Export `RUSTUP_TOOLCHAIN=1.96.1` too,
+  because the compiler's tests and some scripts call plain `cargo`.
+- Java: JDK 21 (19 to 21 work, per the repository CLAUDE.md) and Maven. Set
+  `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64` (the Ubuntu path, verified on the first Linux
+  host) and put its `bin` first on `PATH`.
 - SQL compiler: from `sql-to-dbsp-compiler`, run `./build.sh`. It needs network access, because
   it fetches or builds Calcite (`calcite-build`, pinned by `calcite_version.env`) and Maven
   dependencies, and then runs `mvn package -DskipTests`. It uses GNU `sed -i`, which Linux has.
+  It took about two minutes on the first Linux host and ends with "Parser generated successfully";
+  check that `SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar` exists.
+- Fetch dependencies online once, **after** the compiler is built. The runner builds with
+  `--offline --locked`, which fails without a populated registry cache. `q3-ivm-baseline` and
+  `merged-index-col` are separate workspaces with their own `Cargo.lock`, so fetch in each
+  directory you will build in. Fetch at the repository root too if you will run the DBSP tests. In
+  `q3-ivm-baseline`, run `./generate.sh` first. Its workspace members `q3-base-circuit` and
+  `q3-view-circuit` have no `src/lib.rs` until it does, and on a fresh clone `cargo fetch` fails with
+  "no targets specified in the manifest" (verified on the first Linux host).
+
+  ```bash
+  # From sql-to-dbsp-compiler/experiments/q3-ivm-baseline (compiler built)
+  ./generate.sh
+  cargo +1.96.1 fetch --locked
+  # From sql-to-dbsp-compiler/experiments/merged-index-col, and from the repository root
+  cargo +1.96.1 fetch --locked
+  ```
+
+A shell setup file saves retyping in every new shell (agent harnesses start a fresh shell for each
+command):
+
+```bash
+cat > ~/r5-env.sh <<'EOF'
+. "$HOME/.cargo/env"
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+export RUSTUP_TOOLCHAIN=1.96.1
+export DBGEN_OUT=/mnt/ssd/dbgen-sf10 R5_INPUTS=/mnt/ssd/r5-inputs R5_OUT=/mnt/ssd/r5-out
+export HDD_MOUNT=/mnt/hdd
+EOF
+```
 - Python: 3.9 or later. `measure.py` calls `Path.is_relative_to`, added in Python 3.9. It has no
   third-party imports.
 - `git`, `make`, and `gcc` to build dbgen.
@@ -371,10 +437,13 @@ These were run on macOS at `-s 0.01`, which produced exactly the files named abo
 - Keep `DSS_PATH` short. Update file paths are formatted into a 128-byte buffer (`upath` in
   `print.c`), and a long `DSS_PATH` crashed dbgen on macOS. Hence `DSS_PATH=.` from inside the
   output directory.
-- Each update set has `0.1%` of the base Orders by the dbgen formula: 15,000 at SF 10 (unchecked).
-  At SF 1 a run gave 1,500 Orders and 5,822 Lines; at SF 0.01 it gave 10 Orders per set.
-- Base sizes are dbgen's scale-factor figures (about 1.5 million Customers, 15 million Orders, 60
-  million Lines) and are unchecked here. `prepare-manifest.json` records the real counts.
+- Each update set has `0.1%` of the base Orders by the dbgen formula: 15,000 Orders and 15,000
+  deletes per set at SF 10, with 60,092, 59,617, and 60,274 Lines in sets 1 to 3. At SF 1 a run gave
+  1,500 Orders and 5,822 Lines; at SF 0.01 it gave 10 Orders per set.
+- Base sizes at SF 10: 1,500,000 Customers, 15,000,000 Orders, and 59,986,052 Lines, about 9.7 GB in
+  all (7.7 GB of it `lineitem.tbl`). The three calls took about ten minutes, single-threaded
+  (verified on the first Linux host with tpch-kit commit `852ad0a`). `prepare-manifest.json`
+  records the counts.
 
 ### Prepare the workloads
 
@@ -392,7 +461,9 @@ RF2 1, RF1 2, and so on. `$R5_INPUTS/prepare-manifest.json` records the seed, th
 counts, each pair's distinct Customers and the Order counts of its top 1, 10, and 100 Customers, and the SHA-256 of every input and output. The script refuses
 an `--out` that already holds either workload. Clustered RF1 draws Customers from a Zipf distribution (`--zipf-exponent`, default 1.0) independent of the RF2 sets. The selection rules are in its module docstring and
 summarized in [measurement.md](measurement.md#pending-linux-campaign). The whole path (dbgen,
-`prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01.
+`prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01. At SF 10 the
+command above took about 100 seconds and wrote 15,000 RF1 Orders and 15,000 RF2 deletes per pair in
+both workloads (verified on the first Linux host).
 
 ### cgroup v2 root
 
@@ -413,12 +484,12 @@ checks the following (`cgroup_available`, `configure_cgroup`, `enter_cgroup`, `v
   next to the run cgroups, because the kernel's no-internal-processes rule forbids a process in
   the root once `memory` is enabled for its children (kernel rule, unverified here).
 
-A recipe that satisfies these (unverified on any machine; adapt as needed, and see the
+A recipe that satisfies these (verified on the first Linux host, Ubuntu 24.04, kernel 6.8; see the
 [kernel's cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)):
 
 ```bash
 sudo mkdir -p /sys/fs/cgroup/r5/driver
-echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control   # harmless if already enabled
 echo +memory | sudo tee /sys/fs/cgroup/r5/cgroup.subtree_control
 sudo chown -R "$USER" /sys/fs/cgroup/r5
 echo $$ | sudo tee /sys/fs/cgroup/r5/driver/cgroup.procs   # this shell now lives in r5/driver
@@ -427,7 +498,23 @@ echo $$ | sudo tee /sys/fs/cgroup/r5/driver/cgroup.procs   # this shell now live
 Then pass `--cgroup-root /sys/fs/cgroup/r5`. The first move needs `sudo` because the source and
 destination share only the real root. Later moves, from `r5/driver` to `r5/r5-<id>-run-<n>-<mode>`,
 share `r5`, which the user owns. `r5` itself holds no process, as the "no internal processes" rule
-requires. An alternative is `systemd-run` with `-p Delegate=yes`; it is untested here.
+requires. An alternative is `systemd-run` with `-p Delegate=yes`; it is untested here. On Ubuntu
+24.04 the root's `cgroup.subtree_control` already lists `memory`, and systemd leaves a top-level
+`r5` alone. The tree does not survive a reboot, so rerun the recipe after one.
+
+**The move applies to one shell only.** `echo $$` moves the shell that runs it, and only its
+descendants inherit the cgroup. An interactive user can run the recipe once and then type the
+pilot commands in that shell. An agent's tool usually starts a fresh shell for each command, so it
+must move the shell and start `measure.py` in **one** command:
+
+```bash
+bash -c 'echo $$ | sudo tee /sys/fs/cgroup/r5/driver/cgroup.procs >/dev/null &&
+  grep -qx "0::/r5/driver" /proc/self/cgroup && exec python3 measure.py ...'
+```
+
+If `measure.py` instead starts in the login session's cgroup (`0::/user.slice/...`), the move of
+each run into `r5/r5-*` needs write access to the root's `cgroup.procs`, and the run fails in
+`enter_cgroup`.
 
 Also:
 
@@ -435,6 +522,44 @@ Also:
   older kernel `cgroup_evidence` records it as `null`, and the run still completes.
 - The runner never removes the child cgroups. After the runs have exited, remove them by hand:
   `find /sys/fs/cgroup/r5 -mindepth 1 -maxdepth 1 -name 'r5-*' -type d -exec rmdir {} +`.
+
+### Prepare the disks
+
+Skip this if an ext4 or xfs filesystem with enough room already sits on each device. On the first
+Linux host the root (`/dev/sda3`) was 64 GB of ext3, about 375 GB of the SSD was unallocated, and
+the hard disk had no partition table. The user approved partitioning both. Inspect the disks and
+**get the user's approval before writing any partition table**:
+
+```bash
+lsblk -d -o NAME,ROTA,MODEL,SIZE,LOG-SEC,PHY-SEC
+sudo parted -s /dev/sda unit GB print free   # look for the unallocated block
+sudo parted -s /dev/sdb print                # "unrecognised disk label" means blank
+```
+
+Then, with the device names checked against that output:
+
+```bash
+sudo sgdisk -n 4:0:0 -t 4:8300 -c 4:r5-ssd /dev/sda   # new partition in the largest free block
+sudo sgdisk -o -n 1:0:0 -t 1:8300 -c 1:r5-hdd /dev/sdb  # -o: new GPT, whole disk
+sudo partprobe /dev/sda /dev/sdb
+sudo mkfs.ext4 -q -L r5-ssd /dev/sda4
+sudo mkfs.ext4 -q -L r5-hdd /dev/sdb1
+sudo mkdir -p /mnt/ssd /mnt/hdd
+for p in sda4:/mnt/ssd sdb1:/mnt/hdd; do
+  echo "UUID=$(sudo blkid -s UUID -o value /dev/${p%%:*}) ${p#*:} ext4 defaults,noatime,nofail 0 2" |
+    sudo tee -a /etc/fstab
+done
+sudo systemctl daemon-reload && sudo mount -a
+sudo chown "$USER": /mnt/ssd /mnt/hdd
+sudo blockdev --getss /dev/sda4 /dev/sdb1   # both must print 512
+```
+
+`sgdisk` and `parted` warn that "not all of the space available ... appears to be used" when the
+GPT backup header leaves a few sectors unused. The warning is harmless. Put `$DBGEN_OUT`,
+`$R5_INPUTS`, and `$R5_OUT` on `/mnt/ssd`. The build stays in the clone, which may stay on the
+root if it has room. After `verify.sh`, the first Linux host's build used about 18 GB: 11 GB in
+`q3-ivm-baseline/target`, 4.4 GB in `merged-index-col/target`, 2 GB in `~/.cargo`, and 0.6 GB for
+Maven and Calcite.
 
 ### Storage path and disk budget
 

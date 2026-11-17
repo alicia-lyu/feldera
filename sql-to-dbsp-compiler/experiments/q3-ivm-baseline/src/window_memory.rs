@@ -723,7 +723,7 @@ mod tests {
     fn eviction_of_a_real_file_succeeds_on_linux() {
         let path = std::env::temp_dir().join(format!("evict-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
-        let report = evict_inputs(&[path.clone()]);
+        let report = evict_inputs(std::slice::from_ref(&path));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(report["evicted"], true, "{report}");
     }
