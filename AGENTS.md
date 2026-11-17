@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to Codex when working with code in this repository.
 
 - To gather more context beyond README.md:
   - Look at the outstanding changes in the tree
@@ -20,7 +20,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
   - Adhere to rules in "Bugs in Writing: A Guide to Debugging Your Prose" by Lyn Dupre.
   - Adhere to rules in "The Elements of Style, Fourth Edition" by William Strunk Jr. & E. B. White
 
-On this fork, commit `AGENTS.md` files in the same commits and branch as the code and docs they describe. Do not use a separate `Codex-context` branch or `scripts/Codex.sh push`.
+On this fork, commit `AGENTS.md` and `CLAUDE.md` files in the same commits and branch as the code and docs they describe. Do not use a separate `claude-context` branch or `scripts/claude.sh push`.
 
 ## Architecture
 
@@ -46,7 +46,8 @@ cargo clippy --workspace -- -D warnings
 # SQL compiler: full build (also builds Calcite), or the compiler alone
 cd sql-to-dbsp-compiler && ./build.sh
 cd sql-to-dbsp-compiler/SQL-compiler && mvn package -DskipTests
-# One JUnit test (generated Rust lands in sql-to-dbsp-compiler/temp/)
+# One JUnit test (generated Rust lands in sql-to-dbsp-compiler/temp/); tests that cargo-check
+# the generated crate call plain `cargo`, so also export RUSTUP_TOOLCHAIN=1.96.1
 mvn test -pl SQL-compiler -Dtest=<TestClass> -Dsurefire.failIfNoSpecifiedTests=false
 
 # Pipeline manager (needs the compiler built first)
