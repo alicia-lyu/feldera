@@ -1,0 +1,36 @@
+# Experiments: merged indexes and IVM harnesses
+
+Rules here apply to any merged index and any IVM harness in this directory. The Q3 instance is the example throughout. Research-wide rules (one worker, report only what was measured, terms, decision logs) are in the root [CLAUDE.md](../../CLAUDE.md). Q3-specific detail is in [q3-ivm-baseline/CLAUDE.md](q3-ivm-baseline/CLAUDE.md) and [merged-index-col/CLAUDE.md](merged-index-col/CLAUDE.md).
+
+## The experiments
+
+| Directory | What it is |
+| --- | --- |
+| `merged-index-col/` | The index library for Customer–Orders–Lineitem (COL): its spec `col.mi`, the generated definition, storage tests, and the Q3 readers. |
+| `q3-ivm-baseline/` | The Q3 harness: loading, RF1/RF2 refreshes, the index upkeep thread, measurement, and the circuits (base, native view, hand-written reconstructed view). |
+
+How the pieces relate:
+
+- An **index crate** holds a `.mi` spec, its generated module (committed), and any readers for its workload. The generic machinery (trie, batches, `ScanSession`, readers) is in `crates/dbsp/src/trace/merged_index/` (see its CLAUDE.md).
+- A **hand-written view circuit** (`q3-trie-view-circuit`) takes the readers' batches and the driving deltas through DBSP's `Input` operator handles.
+- A **harness** runs the base circuit and a view circuit in one runtime, maintains the index, and measures. It is the only place that wires index, circuits, and measurement together.
+
+A new index (such as MI_P for Q2, Q9, Q14, Q16, Q17, Q19, Q20) would add sibling crates here. Where its crates and its harness live, and whether it shares the Q3 harness, are open questions, not decided.
+
+## Rules for any index and harness
+
+- **Two circuits, one runtime.** The harness runs two chained circuits in one DBSP runtime, with one storage directory and one buffer cache (user decisions of 2026-10-23 and 2026-11-05). The base circuit holds the primary-key base tables. The view circuit maintains the view from the base circuit's net delta. Separate runtimes only bounded measurement; runtime isolation (separate caches) is an artifact, not part of the design. Q3: `base.sql`, `q3.sql`, `q3-trie-view-circuit`.
+- **One cache is enforced.** The index's upkeep thread must be on the runtime's foreground buffer cache; its constructor errors otherwise. Q3: `ManualIndex::new` (see the harness CLAUDE.md).
+- **Transaction order.** A DBSP transaction is `start_transaction`, any number of `step()` calls, then `commit_transaction`. It is not an OLTP commit: outputs appear at commit and the logical clock advances once. Base commits first. Then publish `Old` and `Dlt`, collect, run the view transaction (the driving deltas go to the input handles), and finish. The session collects once, before the transaction; the joins read the readers' batches at the commit flush. Steps inside one transaction share one publish; separate transactions cannot. Q3: `Q3State::publish(old, dlt)`, `collect(pass)`, `finish()`.
+- **The view gets the base circuit's net delta.** The index is fed the net delta, not the driver's logical change, so an upsert reaches it as a deletion of the old row and an insertion of the new one. The base tables' delta streams stay idle until enabled; reading the net delta drains them, and reading a base snapshot consumes it, so take one snapshot per transaction. Deletions in the view circuit need the complete row (`DeleteStyle::WholeRow`); the base circuit deletes by key. Q3: `workload::enable_net_delta` (called by `Pipeline::new`), `workload::net_delta`, `BaseState::new`.
+- **General deltas.** A reconstructed mode supports any delta of the base tables (user decision of 2026-11-10). Every changed row gets a before owner and an after owner, from the net delta or else from the pre-transaction base state; a row with no owner waits in a side store. Every delta row the view gets carries its trie keys, so a request outside the touched groups is a broken contract: the reader errors and the join panics the worker. Only Q3 implements this today: `reconstruction::prepare` and `OrphanLines`, in [q3-ivm-baseline/CLAUDE.md](q3-ivm-baseline/CLAUDE.md).
+- **Uniqueness.** Folded keys are unique because of the base tables' primary keys; no separate validator is needed.
+- **Accounting.** Index upkeep is base maintenance (user decision of 2026-10-26): `base_ms` includes `index_ms`, and `ivm_ms` equals the view's step time (`q3_ms` for Q3). Completing `Dlt` is in `index_ms`; `forward_ms` is the net-delta read only. Preparing the view circuit's transaction delta is view work, timed as `delta_ms` inside `ivm_ms = delta_ms + q3_ms` (user decision of 2026-11-12; the two modes' operations are not identical, so compare with and without `delta_ms`). The phases are told apart by transaction boundaries; the CPU profiler's per-circuit step CPU time (`profiled_cpu_ms`) is a cross-check. Always report the base and IVM phases side by side.
+- **Default run placement.** Both modes use DBSP's default placement (user decision of 2026-11-09): set no `min_storage_bytes` or `min_step_storage_bytes`, and let memory pressure decide what reaches disk. At low pressure runs stay in memory below `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB), so a smoke-scale run has no file runs; a test that needs them forces memory pressure. Storage tests that build file runs on purpose set `Some(0)`.
+- **Loading is not measured** (user decision of 2026-11-17). A load program writes an image per mode and prefix-truncation arm, outside any cgroup and with no memory target. The refresh program restores the matching image, then applies the refreshes under the cgroup limit; the window starts with an empty buffer cache, and every restored run is a file. A runtime with several circuits checkpoints them as one checkpoint (`DBSPHandle::checkpoint_circuits`; a single handle's `checkpoint()` refuses such a runtime). Q3 flags: `--write-image`, `--from-image`, `measure.py --build-images`, `--images`.
+- **DBSP operators stay.** A reconstructed mode replaces only the join partner reads (typed readers); the circuit is the plan (user decision of 2026-11-11). The view circuit is hand-written, with `add_input_stream` handles as inputs (user decision of 2026-11-10).
+- **Regenerate an index module.** After changing a `.mi` spec, the schema, or the emitter: rebuild the compiler JAR (`mvn package -DskipTests` in `SQL-compiler`, JDK 21), run the index's `generate.sh`, and commit its `src/generated.rs`. `verify.sh` fails on a stale file. Never edit a generated module by hand.
+
+## Commands
+
+See [WORKFLOW.md](../../docs/design/merged-index/WORKFLOW.md) for cross-directory commands and each directory's CLAUDE.md for its own. Use `+1.96.1` with cargo and JDK 21 for the compiler ([SQL-compiler/CLAUDE.md](../SQL-compiler/CLAUDE.md)).
