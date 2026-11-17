@@ -72,3 +72,4 @@ sql-to-dbsp-compiler/experiments/q3-ivm-baseline/measure.py.bak - moved to TRASH
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/summarize.py.bak2 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/summarize.py.bak2 - sed backup of edit
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - sed backup
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - sed backup
+sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md - deleted (safe: git-tracked) - Merged into q3-ivm-baseline/CLAUDE.md (R4 evidence), MEASUREMENT.md (definitions), and docs/design/merged-index/history.md (dated smoke results)
