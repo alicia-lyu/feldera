@@ -138,7 +138,7 @@ This is suboptimal, and the user accepted it for now (decision of 2026-11-16). O
 
 At a completed transaction boundary each folded K has at most one active payload. The argument ([decisions.md](decisions.md#2026-10-12-no-folded-key-uniqueness-validator)):
 
-- The base tables have primary keys `c_custkey`, `o_orderkey`, and `(l_orderkey, l_linenumber)`. The folded keys `C(c)`, `O(c, o)`, and `L(c, o, l)` extend them, and an order's customer never changes inside the workload. Source-index tags keep the three relations' keys apart.
+- The base tables have primary keys `c_custkey`, `o_orderkey`, and `(l_orderkey, l_linenumber)`. The folded keys `C(c)`, `O(c, o)`, and `L(c, o, l)` extend them. An order has one customer at a transaction boundary, so `o` appears under one `c`, and its lines under that `O(c, o)`. A general delta can move an order to another customer (decision of 2026-11-10). The move reaches the index as deletions of `O(c₁, o)` and of its lines' `L(c₁, o, l)`, read from `Old`, and insertions under `c₂` (`reconstruction::prepare`). After the transaction each key again has one owner. Line items whose order is absent wait in `OrphanLines`, outside the index, so they never hold a folded key of their own. Source-index tags keep the three relations' keys apart.
 - The merged index is fed the base circuit's net delta (`workload::net_delta`, converted by `reconstruction::prepare`), not the harness's logical change, since measurement version 3. An upsert therefore reaches it as a deletion of the old row and an insertion of the new one, and the primary keys keep folded keys unique without relying on `BaseState::validate`.
 - A workload with upserts must derive the merged-index rows from the base tables' net delta.
 
