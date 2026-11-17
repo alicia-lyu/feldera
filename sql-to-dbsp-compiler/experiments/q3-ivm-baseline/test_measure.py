@@ -333,6 +333,37 @@ class MeasureTest(unittest.TestCase):
         # An existing directory is refused.
         self.assertEqual(measure.build_images(args), 2)
 
+    def test_build_images_records_every_load_that_succeeds_when_one_fails(self) -> None:
+        images = self.root / "images-one-fails"
+
+        def process(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            if "--write-image" not in command:  # git, generate.sh, uname
+                return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
+            directory = Path(command[command.index("--write-image") + 1])
+            if directory.name == "merged-index-B":
+                return subprocess.CompletedProcess(command, 101, stdout="", stderr="boom")
+            (directory / "storage").mkdir(parents=True)
+            (directory / "image.json").write_text(json.dumps({
+                "settings": {}, "checkpoint": {"uuid": "u"}, "load": {}}))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / mode for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        args = measure.parse_args([
+            "--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+            "--lineitem", str(self.root / "lineitem"), "--cache-bytes", str(1024 * 1024),
+            "--build-images", str(images)])
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            self.assertNotEqual(measure.build_images(args), 0)
+        manifest = json.loads((images / measure.IMAGES_MANIFEST).read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(sorted(manifest["images"]), ["merged-index-A", "native-A", "native-B"])
+        self.assertEqual(len(manifest["errors"]), 1)
+        self.assertIn("merged-index-B exited 101", manifest["errors"][0])
+        self.assertIn("boom", (images / "merged-index-B.stderr.log").read_text())
+
     def test_cgroup_child_starts_cold_by_evicting_the_shared_inputs(self) -> None:
         group = self.root / "cgroup-evict"
         group.mkdir()

@@ -505,7 +505,10 @@ python3 measure.py --build-images "$R5_OUT/images" \
 ```
 
 It builds both release executables, then runs the load program (the driver's `--write-image`)
-four times, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. A is with
+four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. The
+loads are unmeasured and each uses one DBSP worker (one core, about 430 MiB at SF 10), so running
+them together costs nothing but disk bandwidth; every load finishes before a failure is reported,
+and each image that loaded is kept. A is with
 `--front-code-byte-keys`, B without; the refresh program reopens only an image with its own storage
 settings (`ImageSettings` in `src/main.rs`). Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -988,40 +989,53 @@ def build_images(args: argparse.Namespace) -> int:
         binaries = build_executables(root / "executables")
         manifest["executables"] = {mode: {"path": str(binary), "sha256": sha256(binary)}
                                    for mode, binary in binaries.items()}
-        for mode in MODES:
-            for _, front_code in IMAGE_ARMS:
-                name = image_name(mode, front_code)
-                directory = root / name
-                command = [str(binaries[mode]), "--write-image", str(directory),
-                           "--customer", str(inputs["customer"]),
-                           "--orders", str(inputs["orders"]),
-                           "--lineitem", str(inputs["lineitem"]),
-                           "--runs", "1", "--no-verify", "--batch", str(args.batch),
-                           "--cache-bytes", str(args.cache_bytes),
-                           "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
-                if args.setup_full_compaction:
-                    command.append("--setup-full-compaction")
-                if front_code:
-                    command.append("--front-code-byte-keys")
-                if args.elide_value_headers:
-                    command.append("--elide-value-headers")
-                started = time.monotonic()
-                completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True,
-                                           text=True)
-                (root / f"{name}.stdout.log").write_text(completed.stdout)
-                (root / f"{name}.stderr.log").write_text(completed.stderr)
-                if completed.returncode:
-                    raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
-                                       f"{completed.stderr[-2000:]}")
-                image = json.loads((directory / "image.json").read_text())
-                manifest["images"][name] = {
-                    "directory": str(directory), "mode": mode,
-                    "front_code_byte_keys": front_code, "settings": image["settings"],
-                    "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
-                    "size_bytes": tree_size(directory / "storage"),
-                    "elapsed_seconds": time.monotonic() - started,
-                }
-                write_json(path, manifest)
+        def load(mode: str, front_code: bool) -> dict[str, Any]:
+            name = image_name(mode, front_code)
+            directory = root / name
+            command = [str(binaries[mode]), "--write-image", str(directory),
+                       "--customer", str(inputs["customer"]),
+                       "--orders", str(inputs["orders"]),
+                       "--lineitem", str(inputs["lineitem"]),
+                       "--runs", "1", "--no-verify", "--batch", str(args.batch),
+                       "--cache-bytes", str(args.cache_bytes),
+                       "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
+            if args.setup_full_compaction:
+                command.append("--setup-full-compaction")
+            if front_code:
+                command.append("--front-code-byte-keys")
+            if args.elide_value_headers:
+                command.append("--elide-value-headers")
+            started = time.monotonic()
+            completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True, text=True)
+            (root / f"{name}.stdout.log").write_text(completed.stdout)
+            (root / f"{name}.stderr.log").write_text(completed.stderr)
+            if completed.returncode:
+                raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
+                                   f"{completed.stderr[-2000:]}")
+            image = json.loads((directory / "image.json").read_text())
+            return {
+                "directory": str(directory), "mode": mode,
+                "front_code_byte_keys": front_code, "settings": image["settings"],
+                "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
+                "size_bytes": tree_size(directory / "storage"),
+                "elapsed_seconds": time.monotonic() - started,
+            }
+
+        # The loads are independent and unmeasured, and each uses one DBSP worker, so they run
+        # at once. Every load finishes before any failure is reported, and each image that loads
+        # is recorded.
+        arms = [(mode, front_code) for mode in MODES for _, front_code in IMAGE_ARMS]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as pool:
+            futures = {image_name(*arm): pool.submit(load, *arm) for arm in arms}
+        failures = []
+        for name, future in futures.items():
+            try:
+                manifest["images"][name] = future.result()
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        write_json(path, manifest)
+        if failures:
+            raise RuntimeError("; ".join(failures))
         manifest["status"] = "complete"
     except Exception as error:  # Keep every image built so far.
         manifest["errors"].append(f"{type(error).__name__}: {error}")
