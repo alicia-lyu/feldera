@@ -13,7 +13,8 @@ levels, placement, snapshots): [dbsp-background.md](../../docs/design/merged-ind
   persistent ids carry its index (`-c0-`, `-c1-`); the handles share one checkpointer; the
   fingerprint combines the circuits' in order. A single handle's `checkpoint()` refuses such a
   runtime. Restoring from a checkpoint of other circuits is an error, as is a deferred restore.
-- Each generated crate exports `<circuit>::SqlCircuit::build` (see the root `CLAUDE.md`).
+- Each generated crate exports `<circuit>::SqlCircuit::build` (see
+  [`SQL-compiler/CLAUDE.md`](../../sql-to-dbsp-compiler/SQL-compiler/CLAUDE.md)).
 
 ## Shared buffer cache
 

@@ -1,8 +1,8 @@
 # General merged-index definition
 
-This document is a design and a roadmap. All five roadmap steps are implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, the spec parser and validator in the SQL compiler, the emitter, and the switch of COL to its generated module.
+This document is the design of the key-trie spec. It is implemented: the key encoders, the static trie with the reshaped `MergedIndexDefinition`, the spec parser and validator in the SQL compiler, the emitter, and COL's generated module. The roadmap that built them is in [history.md](history.md#2026-11-17-roadmap-of-the-general-definition-steps-1-5-done).
 
-It proposes a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler would emit typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
+It defines a key-trie spec, checked by the SQL compiler, as the single definition of a merged index. From the spec the compiler emits typed Rust: key and payload types, folding, and prefixes, with key field types taken from SQL column types at codegen time.
 
 The trie spec supersedes the flat `key_domain` / `source_index` / `merged_index` notation in the archived `TRASH/docs/design/merged-index/folded-key-layer-file-plan.md`.
 
@@ -99,7 +99,7 @@ Each failure is a compiler error that names the spec line.
 4. **Every path domain resolves.**
    - Each domain on a placement's path has either the relation's own column or a `via` that passes both checks above.
    - A `via` is an error if the relation already has a column in that domain, or if the domain is not on the path.
-5. **Keys are unique.** The resolved key columns contain the relation's primary key, and a relation without one is rejected. This is the condition that makes folded keys unique (see [col-storage.md](col-storage.md)).
+5. **Keys are unique.** The resolved key columns contain the relation's primary key, and a relation without one is rejected. This is the condition that makes folded keys unique (see [storage-layout.md](storage-layout.md)).
 6. **The trie is well formed.**
    - The trie has exactly one top-level node, its root domain. Two root domains need two merged indexes. Several relations may still be placed at the root node.
    - A node's child domains are distinct.
@@ -126,29 +126,9 @@ Three details of that implementation are confirmed decisions (see [decisions.md]
 
 ## The static trie
 
-The parsed trie becomes a static Rust value, `KeyTrie` in `merged_index/trie.rs`. It is a nested tree that mirrors the spec and stores nothing that can be derived:
+The parsed trie becomes a static Rust value, `KeyTrie` in `merged_index/trie.rs`. It is a nested tree that mirrors the spec and stores nothing that can be derived.
 
-```rust
-pub struct KeyTrie {
-    pub name: &'static str,
-    pub domains: &'static [Domain],   // the spec's `domains` block: column membership only
-    pub children: &'static [Node],    // the root's children; the root is implicit
-}
-
-pub struct Node {
-    pub domain: &'static str,         // the edge into this node, by domain name
-    pub placements: &'static [Placement],
-    pub children: &'static [Node],
-}
-
-pub struct Placement {
-    pub relation: &'static str,
-    pub via: &'static [Via],          // Via { domain, relation }
-    pub payload: Payload,             // All, or Columns(names); metadata only
-}
-```
-
-`Domain` is a name with its `(relation, column)` members, so a domain's columns are looked up by name.
+The Rust definitions of `KeyTrie`, `Node`, `Placement`, and `Domain` (with its byte `width`) are in [merged_index/CLAUDE.md](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md).
 
 The tree stores no indices, parent links, tags, ids, or paths. Each query walks the tree in pre-order and recomputes what it needs:
 
@@ -225,25 +205,4 @@ There is no encoding for NULL, because key columns are NOT NULL (see Validation)
 
 The user's decisions for this design, dated 2026-10-16, are recorded in [decisions.md](decisions.md).
 
-## Roadmap
-
-These steps are ordered. Each ends with an exit check and lands with its own doc updates. The steps are not numbered stages, because R1–R5 is the only numbering scheme in these docs.
-
-1. **Key encoders.** Implemented: `OrderedKey`, with its implementations in dbsp, sqllib, and fxp.
-   - Exit check: proptests that byte order equals `Ord`, that decoding round-trips, and that widths are exact, including boundary values.
-   - Exit check: the i32 and i64 bytes are unchanged.
-2. **Static trie and reshaped trait.** Implemented, for keys only: `KeyTrie`, the new `MergedIndexDefinition`, `KeyEncoder` and `KeyDecoder`, and the hand-written COL ported to them with a hand-written `TRIE`.
-   - Exit check: the COL tests and `verify.sh` pass with unchanged transcripts. The golden-byte tests are unchanged.
-   - Exit check: `check_against_trie` and a proptest tie COL's hard-coded tags and ids to its trie.
-3. **Parser and validator** in the SQL compiler, with no emission yet. Implemented; see the end of the Validation section.
-   - Exit check: JUnit tests of the derivation (`MergedIndexDerivationTest`). COL comes out as 1, 2, 3; sibling order follows the spec; `custkey via Orders` resolves to `o_custkey`; `*` expands in table order.
-   - Exit check: one failing case per validation rule (`MergedIndexValidatorTest`); syntax errors are in `MergedIndexSpecParserTest`.
-4. **Emitter, and COL regenerated.** Implemented: `merged-index-col/col.mi`, `generate.sh`, and the committed `src/generated.rs`, which sat beside the hand-written definition until Step 5. `verify.sh` regenerates the module and fails if the committed file differs. The flags report `SpecError`s as compiler errors; the compiler's own source positions refer only to the SQL file.
-   - Exit check: the generated and hand-written tries are equal (`generated_tests.rs`, retired with the hand-written definition in Step 5).
-   - Exit check: `fold` is byte-identical over property-based keys.
-   - Exit check: the prefixes match, and sample payloads encode to identical packed bytes. Since 2026-10-19 the stored value is packed bytes rather than an archive.
-5. **Switch.** Implemented: COL uses the generated module, re-exported at the crate root, and the hand-written definition is in `TRASH/`. `lib.rs` keeps only `build_batch`.
-   - The typed and rkyv value-level bytes that `layout_tests.rs` pinned are recorded in [col-storage.md](col-storage.md), and those measurements are retired. Only the packed measurement remains, so generated types keep plain derives (see [decisions.md](decisions.md), 2026-10-21).
-   - Exit check: `verify.sh` transcripts are unchanged.
-
-Later work, outside this roadmap, is listed in [deferred.md](deferred.md).
+Later work is listed in [deferred.md](deferred.md).

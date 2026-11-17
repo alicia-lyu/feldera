@@ -73,3 +73,6 @@ sql-to-dbsp-compiler/experiments/q3-ivm-baseline/summarize.py.bak2 - moved to TR
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b3 - sed backup
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - moved to TRASH/sql-to-dbsp-compiler/experiments/q3-ivm-baseline/test_summarize.py.b4 - sed backup
 sql-to-dbsp-compiler/experiments/q3-ivm-baseline/RESULTS.md - deleted (safe: git-tracked) - Merged into q3-ivm-baseline/CLAUDE.md (R4 evidence), MEASUREMENT.md (definitions), and docs/design/merged-index/history.md (dated smoke results)
+docs/design/merged-index/measurement.md - deleted (safe: git-tracked) - Split by owner: q3-ivm-baseline MEASUREMENT.md/CLAUDE.md/CIRCUIT.md, dbsp-background.md, history.md
+docs/design/merged-index/native-run-placement.md - deleted (safe: git-tracked) - Split by owner: q3-ivm-baseline MEASUREMENT.md/CLAUDE.md/CIRCUIT.md, dbsp-background.md, history.md
+docs/design/merged-index/native-state-read-contracts.md - deleted (safe: git-tracked) - Split by owner: q3-ivm-baseline MEASUREMENT.md/CLAUDE.md/CIRCUIT.md, dbsp-background.md, history.md

@@ -300,14 +300,14 @@ What remains deferred: `Visit` within a group, (A3) in general, and ready pairs 
 
 Deferred on 2026-11-12. The scan session visits every position of each touched customer's group, while the joins' partner reads need only a slice of it: an inserted line item needs its order and customer, not the customer's other orders and their lines.
 
-- **Evidence.** In the version 10 smoke run (`target/r5-v10-smoke/`, [measurement.md](measurement.md)), the session buffered 34 to 94 `Old` entries per touched group per refresh, against native's 73 to 134 DBSP operator key reads for the whole refresh. Each refresh touched 8 to 10 groups.
+- **Evidence.** In the version 10 smoke run (`target/r5-v10-smoke/`, [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md)), the session buffered 34 to 94 `Old` entries per touched group per refresh, against native's 73 to 134 DBSP operator key reads for the whole refresh. Each refresh touched 8 to 10 groups.
 - **The workloads do not test clustering.** At scale factor 0.01, clustered RF1 puts its 10 Orders on 8 to 10 Customers, so almost every touched customer receives one order. Reading a group once pays off only when one group serves many requests. A fair test needs many Orders per Customer.
 - **First mitigation (2026-11-12).** Each reader keeps only the rows its driving delta requests, and only those entries are decoded ([decisions.md](decisions.md)). The joins and their counters no longer see the over-read. The key read per position remains.
 - **Next step.** The routing cursor seeks past a subtree that no reader requests, such as an order with no change and no changed customer, together with its lines. This is the `Visit` of [selective execution](#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred), restricted to one group; the requests it needs already exist at routing.
 
 ## Search a prefix-truncated block without expanding it
 
-**Current cost.** A block written with prefix truncation (`--front-code-byte-keys`) or with elided value headers is rebuilt in full when a read of it misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The cache holds the expanded bytes, so prefix truncation saves disk space and I/O but not cache capacity. The user accepted this on 2026-11-16; only reconstructed mode pays it, since native's typed rows never qualify for either encoding ([decisions.md](decisions.md#2026-11-16-one-full-block-expansion-per-cache-miss-is-accepted-for-now)).
+**Current cost.** A block written with prefix truncation (`--front-code-byte-keys`) or with elided value headers is rebuilt in full when a read of it misses the buffer cache, and a seek expands at most one block per column ([storage-layout.md](storage-layout.md#prefix-truncation-on-the-read-path)). The cache holds the expanded bytes, so prefix truncation saves disk space and I/O but not cache capacity. The user accepted this on 2026-11-16; only reconstructed mode pays it, since native's typed rows never qualify for either encoding ([decisions.md](decisions.md#2026-11-16-one-full-block-expansion-per-cache-miss-is-accepted-for-now)).
 
 **Alternatives.** These are recalled from the literature and were not checked against the sources or against DBSP's code:
 
