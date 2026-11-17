@@ -244,8 +244,8 @@ The scans run outside the timed window. The runner rejects any driver report tha
 - `configuration.session_pass` is the pass that the runner asked for;
 - `front_coding.layout_fallbacks` is 0 when prefix truncation is on, and
   `value_header_elision.layout_fallbacks` is 0 when elision is on (decision of 2026-11-16);
-- `block_expansions` are well formed and are 0 for an encoding that is off (measurement version 12,
-  pending).
+- the report is measurement version 12, and `block_expansions` are well formed, sum over the
+  refreshes to the window's, and are 0 for an encoding that is off.
 
 The refresh list is a JSON array in execution order. Each item is
 `{"rf1_orders": "orders.tbl.u1", "rf1_lines": "lineitem.tbl.u1"}` or `{"rf2": "delete.1"}`;
@@ -285,8 +285,7 @@ machine.
   (`storage_device`: `path`, `device`, `filesystem`, `logical_sector_bytes`, `rotational`, `model`,
   `label`). Every field is `null` on macOS or when it cannot be resolved; a device-mapper device is
   reported unresolved, not guessed. `--device-label ssd|hdd` names the device, and the runner fails
-  if the label contradicts the device's `rotational` flag. The manifest block and the label arrive
-  with measurement version 12 (pending).
+  if the label contradicts the device's `rotational` flag. Both arrived with measurement version 12.
 
 Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
 inputs once (about 10 GB at SF 10, unchecked), 64 runs' storage (16 pilot runs and 48 campaign runs),
@@ -502,7 +501,7 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
 - `--session-pass`: how reconstructed mode's scan session passes the untouched groups. Native has
   no scan session; its report records `configuration.session_pass` as `null`.
 - `--device-label`: names the device of `--storage-path` in the manifest and fails the run if it
-  contradicts the device (measurement version 12, pending). Optional.
+  contradicts the device. Optional.
 
 **Pilot pass criterion.** For each of the eight pilots, and for both runs in its report (`runs[].qualification`), `status` must be
 `qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
@@ -533,7 +532,7 @@ pressure:
 - The run reads per owner: `dbsp_operator_*`, `partner_trace_*`, and `requested_slice_*` in the
   summary, and `driver_run_reads` and the `filtered_probes` counter in the report. (`filtered_probes`
   was `filter_rejections` before 2026-11-16, so older manifests use that name.)
-- `block_expansions` per refresh and owner (measurement version 12, pending): the storage-level
+- `block_expansions` per refresh and owner (`view_worker`, `driver`, `index_upkeep`): the storage-level
   rebuilds of encoded data blocks on buffer-cache misses, as `prefix_truncated_blocks`,
   `prefix_truncated_encoded_bytes`, `prefix_truncated_expanded_bytes`, `elided_blocks`,
   `elided_encoded_bytes`, and `elided_expanded_bytes`. They are not item decodes.
@@ -556,7 +555,7 @@ fixed makes the probe change one thing, where the maintained state lives. Name t
 ```
 
 The pilot pass criterion applies unchanged, and each manifest's `storage_device.rotational` should
-say rotational (the field's exact format is unverified until measurement version 12 lands). Report
+be `true`. Report
 the probe as evidence only: no HDD campaign exists, and nothing here supports a comparison between
 devices until the user decides one. Do not summarize `pilot-hdd-*` manifests together with the SSD
 campaign's.
@@ -610,7 +609,7 @@ When the pilots, or the campaign, are done, report:
   `sequence.cgroup.peak.window_peak_supported`), and `cgroup.proof.inputs_evicted` per run;
 - the revision (`manifest.revision`) and `git_status_short`, which must be empty;
 - each manifest's `measurement_version`, `storage_device`, and fallback counters (`front_coding`,
-  `value_header_elision`), and, from version 12, `block_expansions`;
+  `value_header_elision`), and `block_expansions`;
 - the timing split per refresh (`delta_ms`, `q3_ms`, `ivm_ms = delta_ms + q3_ms`, `base_ms`) and the
   run reads per owner, as `summarize.py` prints them (`dbsp_operator_*`, `partner_trace_*`,
   `requested_slice_*`, `driver_run_reads`, `filtered_probes`);
