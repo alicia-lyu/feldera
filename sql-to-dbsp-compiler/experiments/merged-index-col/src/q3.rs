@@ -61,7 +61,7 @@ use dbsp::{
             MergedIndexBatch, OrderedKey, Pass, Position, Reader, ReaderDefinition, ScanSession,
             SealedReader, SessionCounts, StoredReader,
         },
-        with_read_owner, BatchReader as DynamicBatchReader, Cursor, RunReads,
+        with_read_owner, BatchReader as DynamicBatchReader, BlockExpansions, Cursor, RunReads,
         SpineSnapshot as DynamicSnapshot,
     },
     typed_batch::{BatchReader, SpineSnapshot},
@@ -100,6 +100,9 @@ type Definition = CustomerOrdersLineitemDefinition;
 /// Run reads per read owner, indexed like [`Component::ALL`].
 pub type OwnerReads = [RunReads; Component::ALL.len()];
 
+/// Block expansions per read owner, indexed like [`Component::ALL`].
+pub type OwnerExpansions = [BlockExpansions; Component::ALL.len()];
+
 /// What one transaction's view maintenance read from the index: the scan
 /// session's moves, and the run reads they cost on the thread that collected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +115,10 @@ pub struct SessionReads {
     /// routing's reads of the driving deltas it merges alongside the scan, under the
     /// requested-slice owner. No other owner reads here.
     pub driver_reads: OwnerReads,
+    /// The blocks the collecting thread expanded from their disk encoding on cache misses, per
+    /// owner (measurement version 12). They are a storage-level step apart from the item decodes
+    /// in `driver_reads`.
+    pub driver_expansions: OwnerExpansions,
 }
 
 impl AddAssign for SessionReads {
@@ -120,6 +127,13 @@ impl AddAssign for SessionReads {
         self.run_reads += other.run_reads;
         for (total, reads) in self.driver_reads.iter_mut().zip(other.driver_reads) {
             *total += reads;
+        }
+        for (total, expansions) in self
+            .driver_expansions
+            .iter_mut()
+            .zip(other.driver_expansions)
+        {
+            *total += expansions;
         }
     }
 }
@@ -731,6 +745,7 @@ impl Q3State {
     pub fn collect(&self, pass: Pass) -> Result<Collection, String> {
         let views = self.views()?;
         let before = Component::ALL.map(RunReads::current_for);
+        let expansions_before = Component::ALL.map(BlockExpansions::current_for);
         let (sealed, driving, counts, delta_preparation) =
             with_read_owner(Component::MergedIndex, || {
                 let mut customers = Reader::<CustomersAfter>::new()?;
@@ -789,6 +804,9 @@ impl Q3State {
         let after = Component::ALL.map(RunReads::current_for);
         let driver_reads: OwnerReads = std::array::from_fn(|i| after[i].since(before[i]));
         let run_reads = driver_reads[Component::MergedIndex as usize];
+        let expansions_after = Component::ALL.map(BlockExpansions::current_for);
+        let driver_expansions: OwnerExpansions =
+            std::array::from_fn(|i| expansions_after[i].since(expansions_before[i]));
 
         let (customers, orders, joined, lines) = sealed;
         views
@@ -802,6 +820,7 @@ impl Q3State {
                     counts,
                     run_reads,
                     driver_reads,
+                    driver_expansions,
                 },
             })
             .map_err(|_| "the published views were already collected".to_owned())?;

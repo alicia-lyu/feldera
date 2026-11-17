@@ -52,9 +52,19 @@ reports, over the repetitions:
   (`sequence.index_upkeep_run_reads`, as `index_upkeep_<field>`). File runs count decodes and
   in-memory runs count memory reads; the two are never added.
 
+- `sequence.block_expansions` (measurement version 12), the blocks that cache misses rebuilt from
+  their disk encoding, as `expansion_<field>` for the six `BlockExpansions` fields
+  (`prefix_truncated_blocks`, `prefix_truncated_encoded_bytes`, `prefix_truncated_expanded_bytes`,
+  `elided_blocks`, `elided_encoded_bytes`, `elided_expanded_bytes`), summed over the view worker,
+  the driver's thread and base maintenance, and over the owners. The raw report keeps them apart.
+  A block expansion is a storage-level step; the item decodes above are separate.
+
+The manifest's `storage_device` (the device behind `--storage-path` and the operator's
+`--device-label`) is carried into `summary.json` and shown beside the campaign in `summary.md`.
+
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 11, a field is missing or not a finite non-negative number, a
+measurement version 12, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -68,12 +78,13 @@ import statistics
 import sys
 from typing import Any
 
-from measure import (INDEX_READERS, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS, WRITE_OWNERS,
-                     counter_problems, delta_phase_problems, driver_read_problems,
-                     index_read_problems, owner_write_problems, profiled_cpu_problems,
+from measure import (BLOCK_EXPANSION_FIELDS, EXPANSION_THREADS, INDEX_READERS,
+                     MEASUREMENT_VERSION, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS,
+                     WRITE_OWNERS, block_expansion_problems, counter_problems,
+                     delta_phase_problems, driver_read_problems, index_read_problems,
+                     layout_fallback_problems, owner_write_problems, profiled_cpu_problems,
                      view_read_problems)
 
-MEASUREMENT_VERSION = 11
 # The read owners of the joins' reads of the readers' requested slices (reconstructed mode) and of
 # their partner traces (native mode).
 REQUESTED_SLICE = "requested_slice"
@@ -131,7 +142,8 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
                 + driver_read_problems(driver)
                 + counter_problems(driver, "index_session_counts", SESSION_COUNT_FIELDS)
                 + counter_problems(driver, "index_upkeep_run_reads", RUN_READ_FIELDS)
-                + profiled_cpu_problems(driver) + delta_phase_problems(driver))
+                + profiled_cpu_problems(driver) + delta_phase_problems(driver)
+                + block_expansion_problems(driver) + layout_fallback_problems(driver))
     if problems:
         raise SummaryError(f"{where}: inconsistent counters: " + "; ".join(problems))
     for field in REFRESH_SUMS:
@@ -170,8 +182,27 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
             driver, ("sequence", "view_run_reads", REQUESTED_SLICE, field), where) + (
             0 if driver_reads is None else number(
                 driver, ("sequence", "driver_run_reads", REQUESTED_SLICE, field), where))
+    metrics.update(block_expansion_metrics(driver))
     metrics.update(window_memory_metrics(driver, where))
     return metrics
+
+
+def block_expansion_metrics(driver: dict[str, Any]) -> dict[str, float]:
+    """The sequence's block expansions (measurement version 12), as `expansion_<field>`: the
+    blocks rebuilt from their disk encoding on cache misses, summed over the view worker, the
+    driver's thread and base maintenance, and over the owners. The raw report keeps them apart.
+    `run_metrics` has already checked the fields."""
+    expansions = driver["sequence"]["block_expansions"]
+    totals = {f"expansion_{field}": 0 for field in BLOCK_EXPANSION_FIELDS}
+    for thread in EXPANSION_THREADS:
+        part = expansions.get(thread)
+        if part is None:
+            continue
+        counts = [part] if thread == "index_upkeep" else [part[owner] for owner in WRITE_OWNERS]
+        for count in counts:
+            for field in BLOCK_EXPANSION_FIELDS:
+                totals[f"expansion_{field}"] += count[field]
+    return totals
 
 
 def index_read_metrics(driver: dict[str, Any]) -> dict[str, float]:
@@ -286,7 +317,8 @@ def summarize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any]:
                 name: summarize_values([reads[name] for reads in index_by_mode[mode].values()])
                 for name in index_names}
     return {"platform": manifest.get("platform"), "revision": manifest.get("revision"),
-            "configuration": manifest.get("configuration"), "modes": modes}
+            "configuration": manifest.get("configuration"),
+            "storage_device": manifest.get("storage_device"), "modes": modes}
 
 
 def workload_label(path: Path) -> str:
@@ -314,6 +346,27 @@ def format_value(value: float) -> str:
     return f"{int(value):,}" if float(value).is_integer() else f"{value:,.3f}"
 
 
+def describe_device(device: Any) -> str:
+    """The storage device of a campaign for its heading: the operator's label first (`ssd`,
+    `hdd`, or `unlabelled`), then what the runner resolved. A manifest from before measurement
+    version 12 records none."""
+    if not isinstance(device, dict):
+        return "not recorded"
+    label = device.get("label") or "unlabelled"
+    details = []
+    if device.get("device"):
+        details.append(str(device["device"]))
+    if device.get("model"):
+        details.append(str(device["model"]))
+    if device.get("filesystem"):
+        details.append(str(device["filesystem"]))
+    if device.get("rotational") is not None:
+        details.append("rotational" if device["rotational"] else "non-rotational")
+    if device.get("logical_sector_bytes") is not None:
+        details.append(f"{device['logical_sector_bytes']}-byte sectors")
+    return f"{label} ({', '.join(details)})" if details else f"{label} (device not resolved)"
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
     lines = ["# R5 summary", "",
              "Median, minimum and maximum over the repetitions of each mode. "
@@ -325,7 +378,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines += [f"## {label}", "",
                   f"Source: `{workload['source']}`. Runs per mode: "
                   + ", ".join(f"{mode} {count}" for mode, count in runs.items())
-                  + f". Session pass: `{session_pass}`.", ""]
+                  + f". Session pass: `{session_pass}`. Storage device: "
+                  + describe_device(workload.get("storage_device")) + ".", ""]
         lines.append("| Metric | " + " | ".join(f"{mode} {stat}" for mode in MODES
                                                  for stat in STATISTICS) + " |")
         lines.append("| --- | " + " | ".join("---:" for _ in MODES for _ in STATISTICS) + " |")
@@ -337,7 +391,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
                       "worker; `partner_trace_*` are the joins' run reads of their partner "
                       "traces (native mode only); `requested_slice_*` are the joins' run reads "
                       "of the readers' requested slices, with the routing's reads of the "
-                      "driving deltas (reconstructed mode only).", ""]
+                      "driving deltas (reconstructed mode only). `expansion_*` are the "
+                      "blocks that a cache miss rebuilt from their disk encoding (prefix "
+                      "truncation, value-header elision), summed over the view worker, the "
+                      "driver's thread and base maintenance: blocks, their encoded bytes, and "
+                      "their bytes after expansion. They are a storage-level step, apart from "
+                      "the item decodes.", ""]
         for mode in MODES:
             reads = workload["modes"][mode].get("index_run_reads")
             if not reads:

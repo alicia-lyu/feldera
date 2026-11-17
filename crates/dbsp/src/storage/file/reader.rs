@@ -21,6 +21,7 @@ use crate::storage::{
     },
     file::item::ArchivedItem,
 };
+use crate::trace::cursor::block_expansions::{ExpandedEncoding, count_block_expansion};
 use crate::{
     dynamic::{DataTrait, DeserializeDyn, DynData, Factory},
     storage::{
@@ -1637,14 +1638,20 @@ fn decompress(
         }
         .into());
     }
-    if raw[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC
-        || raw[4..8] == ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC
-    {
-        return super::front_code::decode(&raw)
-            .map(Arc::new)
-            .map_err(|reason| CorruptionError::FrontCoding { location, reason }.into());
-    }
-    Ok(raw)
+    let encoding = if raw[4..8] == FRONT_CODED_DATA_BLOCK_MAGIC {
+        ExpandedEncoding::PrefixTruncated
+    } else if raw[4..8] == ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC {
+        ExpandedEncoding::Elided
+    } else {
+        return Ok(raw);
+    };
+    // A block expansion, charged to the consuming thread's read owner. The
+    // asynchronous fetches also decompress here, on the thread that polls their
+    // channel, so the owner is that thread's.
+    let expanded = super::front_code::decode(&raw)
+        .map_err(|reason| CorruptionError::FrontCoding { location, reason })?;
+    count_block_expansion(encoding, raw.len(), expanded.len());
+    Ok(Arc::new(expanded))
 }
 
 fn parse_filter_block<T: for<'a> BinRead<Args<'a> = ()>>(

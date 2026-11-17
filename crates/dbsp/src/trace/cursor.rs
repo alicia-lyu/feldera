@@ -1,6 +1,7 @@
 //! Traits and types for navigating ordered sequences of `(key, val, time,
 //! diff)` tuples.
 
+pub mod block_expansions;
 pub mod cursor_empty;
 pub mod cursor_group;
 pub mod cursor_list;
@@ -13,6 +14,7 @@ pub mod saturating_cursor;
 
 use std::{fmt::Debug, marker::PhantomData};
 
+pub use block_expansions::BlockExpansions;
 pub use cursor_empty::CursorEmpty;
 pub use cursor_group::CursorGroup;
 pub use cursor_list::CursorList;

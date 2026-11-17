@@ -628,6 +628,314 @@ class MeasureTest(unittest.TestCase):
         parsed = measure.parse_args([*self.args, "--batch", "512"])
         self.assertEqual(parsed.batch, 512)
 
+    # Storage device (manifest `storage_device`), on fixture /proc and /sys trees.
+
+    def write_proc_and_sys(self, mountinfo: list[str], disks: dict[str, dict]) -> tuple[Path, Path]:
+        """Write a fake `/proc/self/mountinfo` and `/sys/block` and return their roots.
+
+        `disks` maps a disk name to its `rotational` and `sector` values (strings, as sysfs
+        prints them), an optional `model`, optional `partitions`, and an optional `dm` flag that
+        gives the disk a `dm` directory, as a device-mapper device has.
+        """
+        proc, sys_root = self.root / "proc", self.root / "sys"
+        (proc / "self").mkdir(parents=True, exist_ok=True)
+        (proc / "self" / "mountinfo").write_text("\n".join(mountinfo) + "\n")
+        for name, disk in disks.items():
+            base = sys_root / "block" / name
+            (base / "queue").mkdir(parents=True, exist_ok=True)
+            if "rotational" in disk:
+                (base / "queue" / "rotational").write_text(disk["rotational"] + "\n")
+            if "sector" in disk:
+                (base / "queue" / "logical_block_size").write_text(disk["sector"] + "\n")
+            if "model" in disk:
+                (base / "device").mkdir(exist_ok=True)
+                (base / "device" / "model").write_text(disk["model"] + "\n")
+            for partition in disk.get("partitions", ()):
+                (base / partition).mkdir(exist_ok=True)
+            if disk.get("dm"):
+                (base / "dm").mkdir(exist_ok=True)
+        return proc, sys_root
+
+    MOUNTS = [
+        "26 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw",
+        "40 26 259:3 / /mnt/ssd rw,noatime shared:5 - xfs /dev/nvme1n1p1 rw",
+        "41 26 8:17 / /mnt/hdd rw,noatime shared:6 - ext4 /dev/sdb1 rw",
+        "42 26 253:0 / /mnt/lvm rw,noatime shared:7 - ext4 /dev/mapper/vg-data rw",
+        "43 26 252:0 / /mnt/dm0 rw,noatime shared:8 - ext4 /dev/dm-0 rw",
+        "44 26 0:50 / /mnt/ramdisk rw - tmpfs tmpfs rw,size=1g",
+        "45 26 8:33 / /mnt/with\\040space rw - ext4 /dev/sdc1 rw",
+        "46 26 0:60 / /mnt/net rw - nfs4 server:/export rw",
+    ]
+    DISKS = {
+        "nvme0n1": {"rotational": "0", "sector": "512", "model": "Boot NVMe",
+                    "partitions": ["nvme0n1p1", "nvme0n1p2"]},
+        "nvme1n1": {"rotational": "0", "sector": "512", "model": "Samsung SSD 990 PRO 1TB",
+                    "partitions": ["nvme1n1p1"]},
+        "sdb": {"rotational": "1", "sector": "512", "model": "ST4000DM004-2CV1   ",
+                "partitions": ["sdb1"]},
+        "sdc": {"rotational": "1", "sector": "4096", "partitions": ["sdc1"]},
+        "dm-0": {"rotational": "0", "sector": "512", "dm": True},
+    }
+
+    def device(self, path: str, label: str | None = None) -> dict:
+        proc, sys_root = self.write_proc_and_sys(self.MOUNTS, self.DISKS)
+        return measure.storage_device(Path(path), label, system="Linux", proc_root=proc,
+                                      sys_root=sys_root)
+
+    def test_an_nvme_partition_resolves_to_its_parent_disk(self) -> None:
+        self.assertEqual(self.device("/mnt/ssd/campaign", "ssd"), {
+            "path": "/mnt/ssd/campaign", "device": "/dev/nvme1n1", "filesystem": "xfs",
+            "logical_sector_bytes": 512, "rotational": False,
+            "model": "Samsung SSD 990 PRO 1TB", "label": "ssd"})
+
+    def test_a_sata_hard_disk_is_rotational_with_its_model_trimmed(self) -> None:
+        self.assertEqual(self.device("/mnt/hdd/campaign", "hdd"), {
+            "path": "/mnt/hdd/campaign", "device": "/dev/sdb", "filesystem": "ext4",
+            "logical_sector_bytes": 512, "rotational": True,
+            "model": "ST4000DM004-2CV1", "label": "hdd"})
+
+    def test_the_longest_matching_mount_point_holds_the_path(self) -> None:
+        # The root file system holds a path that no other mount contains, and a mount whose
+        # name only starts like the path's is not a parent of it.
+        self.assertEqual(self.device("/home/user/campaign")["device"], "/dev/nvme0n1")
+        self.assertEqual(self.device("/mnt/ssd2/campaign")["device"], "/dev/nvme0n1")
+        self.assertEqual(self.device("/mnt/ssd")["device"], "/dev/nvme1n1")
+        self.assertEqual(self.device("/mnt/with space/campaign")["device"], "/dev/sdc")
+
+    def test_a_missing_sysfs_file_leaves_only_its_field_null(self) -> None:
+        found = self.device("/mnt/with space/campaign")
+        self.assertEqual((found["logical_sector_bytes"], found["rotational"]), (4096, True))
+        self.assertIsNone(found["model"])
+
+    def test_device_mapper_and_other_virtual_devices_are_not_guessed(self) -> None:
+        unresolved = {field: None for field in measure.STORAGE_DEVICE_FIELDS}
+        for path in ("/mnt/lvm/campaign", "/mnt/dm0/campaign", "/mnt/ramdisk/campaign",
+                     "/mnt/net/campaign"):
+            with self.subTest(path=path):
+                self.assertEqual(self.device(path), unresolved)
+        # The operator's label is still recorded as given.
+        self.assertEqual(self.device("/mnt/lvm/campaign", "ssd"),
+                         {**unresolved, "label": "ssd"})
+
+    def test_the_device_is_unresolved_off_linux_and_without_proc(self) -> None:
+        unresolved = {field: None for field in measure.STORAGE_DEVICE_FIELDS}
+        proc, sys_root = self.write_proc_and_sys(self.MOUNTS, self.DISKS)
+        self.assertEqual(measure.storage_device(Path("/mnt/ssd/campaign"), system="Darwin",
+                                                proc_root=proc, sys_root=sys_root), unresolved)
+        self.assertEqual(measure.storage_device(Path("/mnt/ssd/campaign"), "hdd", system="Darwin"),
+                         {**unresolved, "label": "hdd"})
+        self.assertEqual(measure.storage_device(Path("/mnt/ssd/campaign"), system="Linux",
+                                                proc_root=self.root / "absent",
+                                                sys_root=sys_root), unresolved)
+
+    def test_a_label_must_agree_with_a_known_rotational_flag(self) -> None:
+        self.assertIsNone(measure.device_label_problem(self.device("/mnt/ssd/c", "ssd")))
+        self.assertIsNone(measure.device_label_problem(self.device("/mnt/hdd/c", "hdd")))
+        self.assertIn("--device-label hdd contradicts /dev/nvme1n1, which reports rotational=0",
+                      measure.device_label_problem(self.device("/mnt/ssd/c", "hdd")))
+        self.assertIn("--device-label ssd contradicts /dev/sdb, which reports rotational=1",
+                      measure.device_label_problem(self.device("/mnt/hdd/c", "ssd")))
+        # Nothing contradicts an absent label, an unresolved device, or an unknown flag.
+        self.assertIsNone(measure.device_label_problem(self.device("/mnt/ssd/c")))
+        self.assertIsNone(measure.device_label_problem(self.device("/mnt/lvm/c", "hdd")))
+        unknown = {**self.device("/mnt/ssd/c", "hdd"), "rotational": None}
+        self.assertIsNone(measure.device_label_problem(unknown))
+
+    def test_the_manifest_records_the_device_and_a_contradicting_label_stops_the_run(self) -> None:
+        def process(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / mode for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        # Off Linux, nothing resolves and nothing can contradict the label.
+        with patch.object(measure.platform, "system", return_value="Darwin"), \
+             patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            measure.run([*self.args, "--device-label", "hdd"])
+        recorded = json.loads(self.report.read_text())["storage_device"]
+        self.assertEqual(recorded, {**{field: None for field in measure.STORAGE_DEVICE_FIELDS},
+                                    "label": "hdd"})
+
+        self.report.unlink()
+        known = {"path": "/x", "device": "/dev/nvme0n1", "filesystem": "ext4",
+                 "logical_sector_bytes": 512, "rotational": False, "model": "m", "label": "hdd"}
+        with patch.object(measure, "storage_device", return_value=known), \
+             patch.object(measure, "build_executables") as build, \
+             patch.object(measure.subprocess, "run", side_effect=process), \
+             patch("sys.stderr") as stderr:
+            self.assertEqual(measure.run([*self.args, "--device-label", "hdd"]), 2)
+        build.assert_not_called()
+        self.assertFalse(self.report.exists())
+        self.assertIn("contradicts", "".join(call.args[0] for call in stderr.write.call_args_list))
+
+    def test_the_device_label_is_ssd_or_hdd(self) -> None:
+        self.assertIsNone(measure.parse_args(self.args).device_label)
+        self.assertEqual(measure.parse_args([*self.args, "--device-label", "ssd"]).device_label,
+                         "ssd")
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            measure.parse_args([*self.args, "--device-label", "nvme"])
+
+    # The layout-fallback gate and the block-expansion checks (measurement version 12).
+
+    def gate_report(self, mode: str = "reconstructed", truncation: bool = True,
+                    elision: bool = True, front: int = 0, value: int = 0) -> dict:
+        return {"mode": mode,
+                "configuration": {"front_code_byte_keys": truncation,
+                                  "elide_value_headers": elision},
+                "front_coding": {"blocks": 9, "layout_fallbacks": front, "size_fallbacks": 4},
+                "value_header_elision": {"blocks": 9, "layout_fallbacks": value,
+                                         "size_fallbacks": 4}}
+
+    def test_the_gate_accepts_zero_layout_fallbacks_and_ignores_size_fallbacks(self) -> None:
+        for mode in ("native", "reconstructed"):
+            self.assertEqual(measure.layout_fallback_problems(self.gate_report(mode)), [])
+
+    def test_the_gate_rejects_a_layout_fallback_of_each_encoding(self) -> None:
+        problems = measure.layout_fallback_problems(self.gate_report(front=2))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("front_coding.layout_fallbacks is 2, expected 0", problems[0])
+        problems = measure.layout_fallback_problems(self.gate_report(value=1))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("value_header_elision.layout_fallbacks is 1, expected 0", problems[0])
+        self.assertEqual(len(measure.layout_fallback_problems(
+            self.gate_report(front=1, value=1))), 2)
+
+    def test_the_gate_checks_only_the_encodings_that_are_on(self) -> None:
+        # A fallback of an encoding that was not asked for is not this run's problem.
+        report = self.gate_report(truncation=False, elision=True, front=3)
+        self.assertEqual(measure.layout_fallback_problems(report), [])
+        report = self.gate_report(truncation=True, elision=False, value=3)
+        self.assertEqual(measure.layout_fallback_problems(report), [])
+        report = self.gate_report(truncation=False, elision=False, front=3, value=3)
+        self.assertEqual(measure.layout_fallback_problems(report), [])
+
+    def test_the_gate_needs_a_counter_when_the_encoding_is_on(self) -> None:
+        report = self.gate_report()
+        del report["front_coding"]
+        self.assertIn("front_coding.layout_fallbacks is None",
+                      measure.layout_fallback_problems(report)[0])
+        report = self.gate_report()
+        report["value_header_elision"]["layout_fallbacks"] = -1
+        self.assertIn("is -1", measure.layout_fallback_problems(report)[0])
+        self.assertEqual(measure.layout_fallback_problems({"mode": "other"}), [])
+
+    def expansion_count(self, truncated: int = 0, elided: int = 0) -> dict[str, int]:
+        return {"prefix_truncated_blocks": truncated,
+                "prefix_truncated_encoded_bytes": 100 * truncated,
+                "prefix_truncated_expanded_bytes": 400 * truncated,
+                "elided_blocks": elided, "elided_encoded_bytes": 50 * elided,
+                "elided_expanded_bytes": 200 * elided}
+
+    def expansion_report(self, mode: str = "reconstructed", truncation: bool = True,
+                         elision: bool = True) -> dict:
+        """A report with two refreshes. A reconstructed run expands blocks on the view worker's
+        requested slices, in the driver's scan, and in base maintenance; a native run none."""
+        def block_expansions(number: int) -> dict:
+            zero = {owner: self.expansion_count() for owner in measure.WRITE_OWNERS}
+            if mode == "native":
+                return {"view_worker": zero, "driver": None, "index_upkeep": None}
+            view = {**zero, "requested_slice": self.expansion_count(number, 2 * number)}
+            driver = {**zero, "merged_index": self.expansion_count(number, number)}
+            return {"view_worker": view, "driver": driver,
+                    "index_upkeep": self.expansion_count(number, 0)}
+        return {"mode": mode, "measurement_version": 12,
+                "configuration": {"front_code_byte_keys": truncation,
+                                  "elide_value_headers": elision},
+                "sequence": {"block_expansions": block_expansions(3)},
+                "refreshes": [{"refresh": number, "block_expansions": block_expansions(number)}
+                              for number in (1, 2)]}
+
+    def test_block_expansions_are_complete_and_sum_to_the_sequence(self) -> None:
+        for mode in ("native", "reconstructed"):
+            self.assertEqual(measure.block_expansion_problems(self.expansion_report(mode)), [])
+        self.assertEqual(measure.block_expansion_problems({"mode": "other"}), [])
+
+        unsummed = self.expansion_report()
+        unsummed["sequence"]["block_expansions"]["index_upkeep"]["elided_blocks"] = 1
+        unsummed["sequence"]["block_expansions"]["index_upkeep"]["elided_encoded_bytes"] = 1
+        unsummed["sequence"]["block_expansions"]["index_upkeep"]["elided_expanded_bytes"] = 2
+        self.assertIn("not the sums", measure.block_expansion_problems(unsummed)[0])
+
+        negative = self.expansion_report()
+        negative["refreshes"][0]["block_expansions"]["view_worker"]["query"]["elided_blocks"] = -1
+        self.assertIn("view_worker.query.elided_blocks is -1",
+                      measure.block_expansion_problems(negative)[0])
+
+        missing = self.expansion_report()
+        del missing["refreshes"][1]["block_expansions"]["driver"]["merged_index"][
+            "prefix_truncated_blocks"]
+        self.assertIn("driver.merged_index.prefix_truncated_blocks is None",
+                      measure.block_expansion_problems(missing)[0])
+
+        flag = self.expansion_report()
+        flag["sequence"]["block_expansions"]["view_worker"]["query"]["elided_blocks"] = True
+        self.assertIn("is True", measure.block_expansion_problems(flag)[0])
+
+        none = self.expansion_report()
+        none["refreshes"][0]["block_expansions"] = None
+        self.assertIn("refresh 1: block_expansions is None",
+                      measure.block_expansion_problems(none)[0])
+
+    def test_a_native_run_reports_no_driver_or_upkeep_expansions(self) -> None:
+        native = self.expansion_report("native")
+        native["refreshes"][0]["block_expansions"]["driver"] = {
+            owner: self.expansion_count() for owner in measure.WRITE_OWNERS}
+        self.assertIn("a native run reports block_expansions.driver",
+                      measure.block_expansion_problems(native)[0])
+        # A reconstructed run reports both.
+        reconstructed = self.expansion_report()
+        reconstructed["refreshes"][0]["block_expansions"]["index_upkeep"] = None
+        self.assertIn("index_upkeep.prefix_truncated_blocks is None",
+                      measure.block_expansion_problems(reconstructed)[0])
+
+    def test_an_encoding_that_is_off_expands_nothing(self) -> None:
+        # Prefix truncation off: the prefix-truncated fields must be 0.
+        report = self.expansion_report(truncation=False)
+        problems = measure.block_expansion_problems(report)
+        self.assertTrue(problems)
+        self.assertTrue(all("prefix_truncated" in problem and "encoding off" in problem
+                            for problem in problems if "not the sums" not in problem))
+        # Elision off: the elided fields must be 0.
+        report = self.expansion_report(elision=False)
+        self.assertTrue(any("elided_blocks" in problem for problem in
+                            measure.block_expansion_problems(report)))
+        # Both off, and a run that expanded nothing, is fine.
+        quiet = self.expansion_report("native", truncation=False, elision=False)
+        self.assertEqual(measure.block_expansion_problems(quiet), [])
+
+    def test_expansion_bytes_follow_the_blocks(self) -> None:
+        bytes_without_blocks = self.expansion_report("native")
+        bytes_without_blocks["sequence"]["block_expansions"]["view_worker"]["query"][
+            "elided_encoded_bytes"] = 5
+        bytes_without_blocks["sequence"]["block_expansions"]["view_worker"]["query"][
+            "elided_expanded_bytes"] = 9
+        self.assertIn("counts bytes of no elided_blocks",
+                      measure.block_expansion_problems(bytes_without_blocks)[0])
+        shrunk = self.expansion_report("native")
+        shrunk["refreshes"][0]["block_expansions"]["view_worker"]["query"] = {
+            **self.expansion_count(1), "prefix_truncated_expanded_bytes": 99}
+        self.assertIn("prefix_truncated_expanded_bytes is below prefix_truncated_encoded_bytes",
+                      measure.block_expansion_problems(shrunk)[0])
+
+    def test_report_problems_require_measurement_version_12(self) -> None:
+        report = self.expansion_report()
+        report.update(self.gate_report())
+        self.assertEqual(measure.measurement_version_problems(report), [])
+        report["measurement_version"] = 11
+        self.assertEqual(measure.measurement_version_problems(report),
+                         ["measurement_version is 11, expected 12"])
+        del report["measurement_version"]
+        self.assertIn("is None", measure.measurement_version_problems(report)[0])
+        self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])
+        # The combined check reports the gate and the expansions too.
+        report = self.expansion_report()
+        report.update(self.gate_report(front=1))
+        problems = measure.report_problems(report, "seek")
+        self.assertTrue(any("front_coding.layout_fallbacks is 1" in p for p in problems))
+
 
 if __name__ == "__main__":
     unittest.main()
