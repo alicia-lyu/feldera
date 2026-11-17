@@ -132,6 +132,7 @@ export DBGEN_OUT=/mnt/ssd/dbgen-sf10 R5_INPUTS=/mnt/ssd/r5-inputs R5_OUT=/mnt/ss
 export HDD_MOUNT=/mnt/hdd
 EOF
 ```
+
 - Python: 3.9 or later. `measure.py` calls `Path.is_relative_to`, added in Python 3.9. It has no
   third-party imports.
 - `git`, `make`, and `gcc` to build dbgen.
@@ -554,4 +555,3 @@ When the pilots, or the campaign, are done, report:
   behavior, beyond-memory behavior, equal-memory performance, a disk saving at SF 10, or a
   maintenance-only I/O figure. The window fields are evidence, not proof. No SF 10 run has been
   measured.
-

@@ -385,7 +385,7 @@ The Catalog has no batch insert, and its input handles hide the typed `ZSetHandl
 - **Option 2: no JSON.** Return the view circuit's existing typed input handles (`handle_s0` to `handle_s2`, already created in Catalog-mode generated code) beside its Catalog. Generation needs either a post-process step in `generate.sh` or a "Catalog plus input handles" mode in `ToRustVisitor.preorder(DBSPCircuit)` with a `CompilerOptions` flag and a test. The driver gets a typed view feeder (`ZSetHandle::push(tuple, ±1)`), and `DeleteStyle::WholeRow` goes away. The base circuit stays in Catalog mode, and the view keeps its Catalog for V verification, `storage_evidence`, `finish_loading` and the checkpoint test.
 - **Not recommended: plain `--handles`.** It drops the Catalog, which breaks V verification, storage evidence, loading and the checkpoint test, and it drops the base circuit's tables-as-outputs.
 
-Unaffected under both options: `reconstruction::prepare`, `merged-index-col` `q3.rs`, `Q3State`, the `verify.sh` transcript comparison, `measure.py`, `summarize.py` (which keeps `forward_ms`), and the COL `generated.rs`. The "as JSON" wording in RESULTS.md, measurement.md, CIRCUIT.md and WORKFLOW.md would need updating.
+Unaffected under both options: `reconstruction::prepare`, `merged-index-col` `q3.rs`, `Q3State`, the `verify.sh` transcript comparison, `measure.py`, `summarize.py` (which keeps `forward_ms`), and the COL `generated.rs`. The "as JSON" wording in q3-ivm-baseline's MEASUREMENT.md and CIRCUIT.md (formerly RESULTS.md, measurement.md, and WORKFLOW.md) would need updating.
 
 ## Native packing
 

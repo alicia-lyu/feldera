@@ -8,7 +8,7 @@
 //!
 //! The typed payload archive and the `rkyv` byte-string measurements were
 //! retired at Step 5; their last figures are recorded in
-//! `docs/design/merged-index/col-storage.md`.
+//! `docs/design/merged-index/history.md` ("Retired value measurements").
 
 use std::sync::Arc;
 

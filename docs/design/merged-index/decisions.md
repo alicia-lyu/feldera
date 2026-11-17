@@ -313,7 +313,7 @@ The user's decision: "give each circuit its own module". The generated crate hol
 
 The harness's `runtime_config` (`q3-ivm-baseline/src/main.rs`) has set `min_storage_bytes: Some(0)` since commit `5ac3a8769` (2026-10-01, "Add native Q3 incremental join baseline experiment"). No decision recorded it. The setting is the merge threshold (`Runtime::min_merge_storage_bytes`; default 10 MiB at low memory pressure, 0 at Moderate and above), so every merge output went to a file, however small. Inserted runs follow `min_insert_storage_bytes` (memory at low pressure; `min_storage_bytes.unwrap_or(10 MiB)` at Moderate; 0 at High), so they stayed in memory at low pressure. No deployment would choose this combination.
 
-The user decided to use DBSP's default placement in both modes. Memory pressure, from the cgroup and RSS targets, decides what reaches disk. The harness drops the override and reports the resolved defaults; the measurement version is bumped when the code changes. [native-run-placement.md](native-run-placement.md#the-harnesss-override) records the override and its planned removal.
+The user decided to use DBSP's default placement in both modes. Memory pressure, from the cgroup and RSS targets, decides what reaches disk. The harness drops the override and reports the resolved defaults; the measurement version is bumped when the code changes. [q3-ivm-baseline/CLAUDE.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CLAUDE.md#q3-instances-of-the-shared-rules) records the override and its planned removal.
 
 ### 2026-11-09: Group reads use no exact probe
 
@@ -455,7 +455,7 @@ Confirmed in the second pass the same day:
 - **One enum names the components for reads and writes, with separate thread-locals for the current read and write owner.** The enum `WriteOwner` is renamed `Component`, in `storage/attribution.rs`; the functions keep "owner" for the role (`with_read_owner`, `with_write_owner`, `ReadOwnerCursor`).
 - **`ΔJ` is computed exactly:** `L⁻` is requested only where `ΔO ⋈ C⁺ + O⁻ ⋈ ΔC` has a row after consolidation.
 - **A join with a snapshot reader does not sample its partner:** the requested slice holds only requested rows, so the delta drives.
-- **Owner lookups read the base tables** (`BaseState` in the driver, `Reference` in tests, under `BaseRelation`), as [reconstruction.md](reconstruction.md#general-deltas) states.
+- **Owner lookups read the base tables** (`BaseState` in the driver, `Reference` in tests, under `BaseRelation`), as [reconstruction.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CLAUDE.md#general-deltas-reconstructed-mode) states.
 - **The compiler hook is removed.** `--q3-merged-index`, `Q3MergedIndexBinding.java`, and its test are deleted; the hand-written circuit replaced it on 2026-11-10.
 - **The current hybrid is named "selective routing"** (the scan reads each touched group once and routes only requested entries to the readers). It replaces "selective decoding with whole-group positioning" and the working name "routing by requests".
 

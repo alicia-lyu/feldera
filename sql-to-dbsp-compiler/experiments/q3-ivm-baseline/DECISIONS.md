@@ -20,7 +20,7 @@ The R1 table in `q3-ivm-baseline/RESULTS.md` has no raw artifact behind it, and 
 
 ### 2026-10-21: Pin and retire the typed and rkyv value measurements
 
-At roadmap Step 5, record the final typed (`SourcePayload`) and rkyv value-level bytes in [col-storage.md](../../../docs/design/merged-index/storage-layout.md), then retire those parts of `layout_tests.rs`. Only the packed measurement remains. Generated types keep plain derives. This replaces the last sentence of the 2026-10-20 plain-derives entry.
+At roadmap Step 5, record the final typed (`SourcePayload`) and rkyv value-level bytes in [storage-layout.md](../../../docs/design/merged-index/storage-layout.md), then retire those parts of `layout_tests.rs`. Only the packed measurement remains. Generated types keep plain derives. This replaces the last sentence of the 2026-10-20 plain-derives entry.
 
 Summing spine run bytes instead (`layer_file_block_bytes` per spine file, as `q3-ivm-baseline/src/diagnostics.rs` does) was considered and does not help. It changes how bytes are counted, not what is stored, so the typed and rkyv encodings would still need their rkyv and DBData derives.
 
@@ -34,7 +34,7 @@ At roadmap Step 5, `merged-index-col/src/lib.rs` re-exports the generated module
 
 ### 2026-10-22: The Linux measurement A/B tests key front coding
 
-The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers`, so the arms differ in the key encoding alone. (Setup compaction was also kept in both arms until 2026-11-09; see [The Linux campaign runs without setup compaction](#2026-11-09-the-linux-campaign-runs-without-setup-compaction).) The arms and their cost are in [measurement.md](MEASUREMENT.md#pending-linux-campaign).
+The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers`, so the arms differ in the key encoding alone. (Setup compaction was also kept in both arms until 2026-11-09; see [The Linux campaign runs without setup compaction](#2026-11-09-the-linux-campaign-runs-without-setup-compaction).) The arms and their cost are in [MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign).
 
 ### 2026-10-23: Linux campaign refresh selection
 

@@ -128,7 +128,7 @@ Costs:
 - The joins read only the requested slices, under the `requested_slice` read owner.
 - `ΔJ` is computed exactly, as a request set, and is never handed to the circuit.
 
-Ready pairs are Q3's hook (`q3.rs`), not derived from the spec: folded keys put a customer before its orders and each order before its lines, so `ΔJ` at `(c, o)` needs only `ΔO(c, o)` and `ΔC(c)`, both known before `(c, o)`'s lines. This is assumption (A3) for Q3 by trie order, not shown in general. The [Readers](#readers) section specifies the pieces.
+Ready pairs are Q3's hook (`q3.rs`), not derived from the spec: folded keys put a customer before its orders and each order before its lines, so `ΔJ` at `(c, o)` needs only `ΔO(c, o)` and `ΔC(c)`, both known before `(c, o)`'s lines. This is assumption (A3) for Q3 by trie order, not shown in general. The [Readers](#readers-step-5) section specifies the pieces.
 
 ### Worked transaction
 
@@ -161,7 +161,7 @@ The facts were checked against the code on 2026-11-09.
 | seek to a group | `CursorList::seek_key` seeks every run, then re-merges. | The session's `PassTo`, which counts logical seeks; the run cursors count per-run seeks. |
 | `Collect`'s range test | `key().starts_with(prefix)` after a step, as in `scan` and the merged-index tests. | None. |
 | decode | `unfold` and `decode_payload` in the client crate. | Decode only kept entries, from key bytes ([No extra decoding](#no-extra-decoding)). |
-| the four readers | `customers_after`, `orders_before`, `joined_orders_after`, and `lineitems_before` in `merged-index-col/src/q3.rs`. Since step 5 the first, second, and fourth return a typed reader's batches (`Old`'s for a before read, `Old`'s and `Dlt`'s unconsolidated for an after read, `prop:overlay`), and `J⁺` is `J`'s join on each requested path over two readers ([Readers](#readers)). They open no cursor on the index. A request outside the touched groups returns an error, which the joins' `expect` turns into a panic of the worker. | None (step 5). |
+| the four readers | `customers_after`, `orders_before`, `joined_orders_after`, and `lineitems_before` in `merged-index-col/src/q3.rs`. Since step 5 the first, second, and fourth return a typed reader's batches (`Old`'s for a before read, `Old`'s and `Dlt`'s unconsolidated for an after read, `prop:overlay`), and `J⁺` is `J`'s join on each requested path over two readers ([Readers](#readers-step-5)). They open no cursor on the index. A request outside the touched groups returns an error, which the joins' `expect` turns into a panic of the worker. | None (step 5). |
 | session operator | Not built. DBSP's joins stay, and the session runs in `Q3State::collect` (decision of 2026-11-11). | None. |
 | snapshot input | Before each transaction the harness puts `(Old, Dlt)` in a shared slot (`Q3State::publish`) and runs `Q3State::collect` once, which fills the readers. The driver then hands the readers' `Dlt` batches, the driving deltas, to the view circuit's `add_input_stream` handles, and at the commit the joins read the readers' batches. `Q3State::finish` releases the readers and returns the `SessionReads`. | None (step 5). One copy remains: `J⁺`'s partner rows. |
 | joins taking turns | A DBSP operator flushes only after all its predecessors have finished flushing (`FlushState::UnflushedDependencies` in `dynamic_scheduler.rs`). `V`'s join therefore starts only after `J`'s has passed every touched customer, so `Q3State` holds the readers from `collect` until `finish`. | Kept (decision of 2026-11-11). |

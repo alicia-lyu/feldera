@@ -32,7 +32,7 @@ machinery for a merged index: folded byte keys, a `MergedIndexDefinition`
 trait that supplies key domains and byte tags, and `batch::build_batch` and
 `batch::batch_cursor` for immutable weighted batches and consolidated reads.
 Concrete definitions and payload codecs belong to client crates. See
-[`docs/design/merged-index/col-storage.md`](../../docs/design/merged-index/col-storage.md).
+[`docs/design/merged-index/storage-layout.md`](../../docs/design/merged-index/storage-layout.md).
 
 `Stream::join_with_snapshot_readers` (and the indexed-output variant
 `join_index_with_snapshot_readers`) incrementally joins two delta streams using
