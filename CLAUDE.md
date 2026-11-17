@@ -59,7 +59,7 @@ uv run python -m pytest tests/platform/test_pipeline_crud.py::test_pipeline_post
 
 ## Merged-index research: range-aligned IVM
 
-Active branch: `docs/merged-index-tidy-up`. The former `feat/merged-index-storage` is archived as `archive/q3-investigation-abandoned`; do not build on it.
+Active branch: `main` (since 2026-11-17; `docs/merged-index-tidy-up` is retired and was fast-forwarded into it). Commit and push to `main`. The former `feat/merged-index-storage` is archived as `archive/q3-investigation-abandoned`; do not build on it.
 
 The fork maintains SQL views incrementally by reading join partners from a secondary *merged index* instead of DBSP's integrator traces. A merged index stores several tables in one run, sorted by folded keys along a key trie (for COL: customer > order > line). The first prototype is TPC-H Q3 over COL. The view `V = Customer ⋈ Orders ⋈ Lineitem` is compared in two modes. **Native** is ordinary Feldera state. **Reconstructed** uses the same DBSP operators, but their partner reads come from the index (user decision of 2026-11-11). The next index is MI_P (Part > Partsupp > Lineitem) for Q2, Q9, Q14, Q16, Q17, Q19, and Q20; start with [Building a second merged index](docs/design/merged-index/new-merged-index.md).
 

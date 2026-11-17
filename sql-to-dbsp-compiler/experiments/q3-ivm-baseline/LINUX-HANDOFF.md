@@ -66,12 +66,11 @@ rather than corrupting results. Run them before building anything.
 
 ## State a clone needs
 
-- Branch `docs/merged-index-tidy-up`, or any commit that contains this section. A plain `git
-  clone` checks out `main`, which lacks most of this work (it was 114 commits behind on
-  2026-11-17). Run `git checkout docs/merged-index-tidy-up` right after cloning. Before the Linux
-  clone, check that `origin` has the commit: `git rev-list --count
-  origin/docs/merged-index-tidy-up..HEAD` must print 0. Otherwise the user must push the verified
-  commit, or supply it (for example as a `git bundle`).
+- Branch `main`, or any commit that contains this section. Since 2026-11-17 the fork works on
+  `main` (`docs/merged-index-tidy-up` is retired), so a plain `git clone` checks out the right
+  branch. Before the Linux clone, check that `origin` has the commit: `git rev-list --count
+  origin/main..HEAD` must print 0. Otherwise the user must push the verified commit, or supply it
+  (for example as a `git bundle`).
 - `q3-ivm-baseline/q3-base-circuit/src/{lib,stubs}.rs`, `q3-view-circuit/src/{lib,stubs}.rs`, and
   `plan.json` are generated and git-ignored. `measure.py` runs `generate.sh` itself, which
   generates only the native pair. `q3-trie-view-circuit/` is hand-written and tracked.
