@@ -239,13 +239,16 @@ impl ManualIndex {
         self.request(Request::StorageEvidence)
     }
 
-    #[allow(dead_code)]
+    /// Saves the index's trace into the checkpoint directory `path` and commits its files, on
+    /// the index's thread. The checkpoint's own commit, which must follow, then records the
+    /// trace's batch files as the checkpoint's.
     pub(crate) fn save(&self, path: StoragePath) -> Result<()> {
         self.request(|reply| Request::Save(path, reply))?
             .map_err(anyhow::Error::msg)
     }
 
-    #[allow(dead_code)]
+    /// Replaces the index's (empty) trace with the one saved in the checkpoint directory
+    /// `path`, before the first append.
     pub(crate) fn restore(&self, path: StoragePath) -> Result<()> {
         self.request(|reply| Request::Restore(path, reply))?
             .map_err(anyhow::Error::msg)
@@ -363,7 +366,7 @@ fn line_row(row: &Line, customer: i64, insert: bool) -> Result<SourceRow> {
 /// orphan lines, beside the index. The index folds a line item under its order's customer, so
 /// a line item with no order has no folded key; it waits here until its order arrives, and
 /// native Feldera accepts it too (it never joins). The store is part of base maintenance.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OrphanLines(BTreeMap<i64, BTreeMap<i32, Line>>);
 
 impl OrphanLines {

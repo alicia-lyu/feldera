@@ -917,28 +917,33 @@ impl PosixBackend {
     }
 }
 
-impl StorageBackend for PosixBackend {
-    fn create_named(&self, name: &StoragePath) -> Result<Box<dyn FileWriter>, StorageError> {
-        fn try_create_named(this: &PosixBackend, path: &Path) -> Result<File, IoError> {
+impl PosixBackend {
+    /// Creates `name` for writing with the cache configuration `cache`.
+    fn create_named_with(
+        &self,
+        name: &StoragePath,
+        cache: StorageCacheConfig,
+    ) -> Result<Box<dyn FileWriter>, StorageError> {
+        fn try_create_named(cache: &StorageCacheConfig, path: &Path) -> Result<File, IoError> {
             OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .read(true)
-                .cache_flags(&this.cache)
+                .cache_flags(cache)
                 .open(path)
         }
 
         let path = append_to_path(self.fs_path(name), MUTABLE_EXTENSION);
         let _blocked = BlockingFor::new(ParkReason::StorageMetadata);
-        let file = match try_create_named(self, &path) {
+        let file = match try_create_named(&cache, &path) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     create_dir_all(parent).map_err(|e| {
                         StorageError::stdio(e.kind(), "recursive mkdir", path.display())
                     })?;
                 }
-                try_create_named(self, &path)
+                try_create_named(&cache, &path)
             }
             other => other,
         }
@@ -954,15 +959,55 @@ impl StorageBackend for PosixBackend {
         )))
     }
 
-    fn open(&self, name: &StoragePath) -> Result<Arc<dyn FileReader>, StorageError> {
+    /// Opens `name` for reading with the cache configuration `cache`.
+    fn open_with(
+        &self,
+        name: &StoragePath,
+        cache: StorageCacheConfig,
+    ) -> Result<Arc<dyn FileReader>, StorageError> {
         PosixReader::open(
             name.clone(),
             self.fs_path(name),
-            self.cache,
+            cache,
             self.usage.clone(),
             self.async_threads,
             self.ioop_delay,
         )
+    }
+}
+
+impl StorageBackend for PosixBackend {
+    fn create_named(&self, name: &StoragePath) -> Result<Box<dyn FileWriter>, StorageError> {
+        self.create_named_with(name, self.cache)
+    }
+
+    fn open(&self, name: &StoragePath) -> Result<Arc<dyn FileReader>, StorageError> {
+        self.open_with(name, self.cache)
+    }
+
+    /// Reads a whole file, such as a checkpoint's catalog or an operator's
+    /// state, through the page cache. These files have arbitrary lengths,
+    /// while `FelderaCache`'s `O_DIRECT` needs every read and write to be a
+    /// whole number of 512-byte sectors, so it fails them with `EINVAL`. Batch
+    /// files, which are written in aligned blocks, keep the configured cache.
+    fn read(&self, name: &StoragePath) -> Result<Arc<FBuf>, StorageError> {
+        let reader = self.open_with(name, StorageCacheConfig::PageCache)?;
+        let size = reader.get_size()?.try_into().unwrap();
+        reader.read_block(BlockLocation { offset: 0, size })
+    }
+
+    /// Writes a whole file through the page cache, for the reason given at
+    /// [`Self::read`].
+    fn write(
+        &self,
+        name: &StoragePath,
+        content: FBuf,
+    ) -> Result<Arc<dyn FileCommitter>, StorageError> {
+        let mut writer = self.create_named_with(name, StorageCacheConfig::PageCache)?;
+        writer.write_block(content)?;
+        let reader = writer.complete()?;
+        reader.mark_for_checkpoint();
+        Ok(reader)
     }
 
     fn list(

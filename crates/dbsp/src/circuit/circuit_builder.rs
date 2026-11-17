@@ -989,17 +989,24 @@ pub trait Node: Any {
     ///   restarts even if the circuit changes, as long as all ancestors of the node remain the
     ///   same. The function will return `None` in persistent mode if the operator
     ///   does not have a compiler-assigned persistent Id.
+    ///
+    /// In a runtime with several circuits ([`Runtime::init_circuits`]), the id
+    /// also names the operator's circuit (`{worker}-c{circuit}-...`), so that
+    /// the circuits, whose node ids all start at 0, save their state under
+    /// distinct names in one checkpoint. A runtime with one circuit keeps the
+    /// ids without it.
     fn persistent_id(&self) -> Option<String> {
         let worker_index = Runtime::worker_index();
+        let prefix = match Runtime::circuit_tag() {
+            Some(circuit) => format!("{worker_index}-c{circuit}"),
+            None => worker_index.to_string(),
+        };
 
         match Runtime::mode() {
-            Mode::Ephemeral => Some(format!(
-                "{worker_index}-{}",
-                self.global_id().path_as_string()
-            )),
+            Mode::Ephemeral => Some(format!("{prefix}-{}", self.global_id().path_as_string())),
             Mode::Persistent => self
                 .get_label(LABEL_PERSISTENT_OPERATOR_ID)
-                .map(|operator_id| format!("{worker_index}-{operator_id}")),
+                .map(|operator_id| format!("{prefix}-{operator_id}")),
         }
     }
 

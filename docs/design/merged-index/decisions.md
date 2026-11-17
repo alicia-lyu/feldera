@@ -230,6 +230,8 @@ This supersedes the choice in "Separate base-table maintenance from IVM" that `M
 
 ### 2026-10-26: Feldera's buffer cache stays warm at window start
 
+*Superseded on 2026-11-17 for runs started from an image: their window starts with the cache empty, or warmed by `--warm-up` ([the entry](#2026-11-17-load-once-into-an-image-each-refresh-run-is-a-new-process-from-a-copy-of-it)). It still holds for the single-process driver.*
+
 The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded (`cache_occupancy_at_window_start_bytes` in the `main.rs` report). Before 2026-11-05 it was recorded per runtime, under both the base and the view runtime; there is now one runtime and one cache. Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
 
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
@@ -582,6 +584,14 @@ A run is rejected when `front_coding.layout_fallbacks` is not 0 with prefix trun
 ### 2026-11-16: One full block expansion per cache miss is accepted for now
 
 A block written with prefix truncation (or with elided value headers) is rebuilt in full when its read misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The user accepts this cost for now and requires it to be documented as suboptimal. Only reconstructed mode pays it: native runs with the same flags, but its typed rows never qualify for either encoding (`front_codable_key`, `elidable_value_headers` in the storage file writer), so it saves no disk and expands no block. The encodings are part of the merged index's design, since only its byte-string keys and values qualify (user decision of 2026-11-16). The session-pass arms pay it equally; arm A expands key and value blocks, arm B value blocks only. Alternatives that search the encoded block are deferred ([deferred.md](deferred.md#search-a-prefix-truncated-block-without-expanding-it)). The rebuild is called a block expansion and is counted apart from item decodes, from measurement version 12.
+
+### 2026-11-17: Load once into an image; each refresh run is a new process from a copy of it
+
+Loading is not measured, so it runs once, with no cgroup limit and no DBSP memory target, and writes a reusable image: one DBSP checkpoint of the base and the view circuit (and, in reconstructed mode, the merged index and its orphan lines), with `image.json` beside it (`measure.py --build-images`, the driver's `--write-image`). Every measured run starts a new process from its own full copy of the matching image (`measure.py --images`, the driver's `--from-image`), under the cgroup limit from the start and with the DBSP memory target, and runs only the refreshes. Whatever the refreshes need besides the loaded state is the refresh program's own work (the republish transaction, the catalogs, `Q3State`). The image is per mode and per prefix-truncation arm (`native-A`, `native-B`, `merged-index-A`, `merged-index-B`), because the refresh program reopens only an image written with its own storage settings. The first Linux pilot prompted this: it loaded SF 10 under the 1 GiB limit for 96 minutes and timed out in the background merges before any refresh ran. Measurement version 13.
+
+- **Cache at the window's start:** cold by default, since every run starts from the same image in a new process. Optionally (`--warm-up`, user answer "both"), one RF1/RF2 pair from an extra dbgen update set, untimed and unreported, runs before the window in both modes. This supersedes the 2026-10-26 rule that the window starts with the cache warm from loading.
+- **Every restored run is a file:** the restore reopens each batch from its file, so the window starts with no in-memory run.
+- **One runtime still hosts both circuits** (2026-10-23, 2026-11-05). DBSP now checkpoints a runtime with several circuits as one checkpoint: each circuit's persistent ids carry its index (`-c0-`, `-c1-`), the handles share one checkpointer, and the checkpoint's fingerprint combines the circuits' in order (`DBSPHandle::checkpoint_circuits`).
 
 ## Superseded and withdrawn
 

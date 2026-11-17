@@ -88,6 +88,34 @@ class PrepareInputsTest(unittest.TestCase):
         prepare_inputs.prepare(self.base, self.updates, out, seed, pairs)
         return out
 
+    def test_the_warm_up_pair_follows_the_measured_pairs_and_leaves_them_unchanged(self) -> None:
+        measured = PAIRS - 1
+        plain = self.root / "plain"
+        prepare_inputs.prepare(self.base, self.updates, plain, 11, measured)
+        warmed = self.root / "warmed"
+        manifest = prepare_inputs.prepare(self.base, self.updates, warmed, 11, measured,
+                                          warm_up=True)
+        self.assertTrue(manifest["warm_up"])
+        for workload in prepare_inputs.WORKLOADS:
+            with self.subTest(workload=workload):
+                files = sorted(path.name for path in (plain / workload).iterdir())
+                for name in files:
+                    self.assertEqual((plain / workload / name).read_bytes(),
+                                     (warmed / workload / name).read_bytes(), name)
+                warm = warmed / workload / "warm-up"
+                refreshes = json.loads((warm / "refreshes.json").read_text())
+                self.assertEqual(refreshes, [
+                    {"rf1_orders": f"rf1-orders-{PAIRS}.tbl",
+                     "rf1_lines": f"rf1-lines-{PAIRS}.tbl"},
+                    {"rf2": f"rf2-delete-{PAIRS}.tbl"}])
+                warm_rf2 = set(read_keys(warm / f"rf2-delete-{PAIRS}.tbl"))
+                measured_rf2 = {key for keys in self.rf2_sets(warmed, workload, measured)
+                                for key in keys}
+                self.assertTrue(warm_rf2)
+                self.assertFalse(warm_rf2 & measured_rf2)
+                self.assertEqual(len(manifest["workloads"][workload]["pairs"]), measured)
+                self.assertEqual(len(manifest["workloads"][workload]["warm_up"]["pairs"]), 1)
+
     def rf2_sets(self, out: Path, workload: str, pairs: int = PAIRS) -> list[list[int]]:
         return [read_keys(out / workload / f"rf2-delete-{n}.tbl") for n in range(1, pairs + 1)]
 

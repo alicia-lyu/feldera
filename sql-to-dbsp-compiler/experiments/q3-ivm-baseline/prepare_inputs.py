@@ -21,6 +21,11 @@ For each workload (`clustered`, `scattered`) the script writes, under
 `<out>/prepare-manifest.json` records the seed, the pair count, the sizes of
 every set, and the SHA-256 of every input and output file.
 
+With `--warm-up`, each workload also gets `<out>/<workload>/warm-up/`: one more
+pair, from update set `pairs + 1` (run `dbgen -U pairs+1`), chosen by the same
+rules after the measured pairs, with its own `refreshes.json` for the refresh
+program's `--warm-up`. The measured pairs are the same with or without it.
+
 Let N(K) be the number of Orders in update set K. Pair K is RF1 set K plus an
 RF2 set of N(K) distinct base Orders. No base Order appears in two RF2 sets of
 one workload. The base Order keys must be strictly ascending (what the driver's
@@ -252,7 +257,7 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
 
 
 def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
-            zipf_exponent: float = 1.0) -> dict[str, Any]:
+            zipf_exponent: float = 1.0, warm_up: bool = False) -> dict[str, Any]:
     if pair_count < 1:
         raise InputError("--pairs must be at least 1")
     if not (math.isfinite(zipf_exponent) and zipf_exponent > 0):
@@ -265,7 +270,10 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
         if (out / workload).exists():
             raise InputError(f"{out / workload} already exists; use a fresh --out")
 
-    update_sets = [read_update_set(updates, number) for number in range(1, pair_count + 1)]
+    # The warm-up pair, if any, is one more pair after the measured ones, so the measured
+    # pairs do not depend on it.
+    set_count = pair_count + (1 if warm_up else 0)
+    update_sets = [read_update_set(updates, number) for number in range(1, set_count + 1)]
     rf1_keys: set[int] = set()
     for number, (orders, _) in enumerate(update_sets, start=1):
         keys = {order_key(row, updates / f"orders.tbl.u{number}") for row in orders}
@@ -279,7 +287,7 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     order_count = scan_base_orders(base_paths["orders"], customers, rf1_keys)
     if order_count < needed:
         raise InputError(f"base Orders hold {order_count}, fewer than the {needed} "
-                         f"RF2 deletions needed for {pair_count} pairs")
+                         f"RF2 deletions needed for {set_count} pairs")
 
     oldest = oldest_orders(base_paths["orders"], needed)
 
@@ -310,25 +318,34 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
         })
 
     manifest: dict[str, Any] = {
-        "seed": seed, "pairs": pair_count, "zipf_exponent": zipf_exponent,
+        "seed": seed, "pairs": pair_count, "warm_up": warm_up, "zipf_exponent": zipf_exponent,
         "base": {"customers": len(customers), "orders": order_count,
                  "rf2_highest_order_key": oldest[-1][1]},
         "inputs": {}, "workloads": {},
-        "unused_dbgen_files": [f"delete.{n}" for n in range(1, pair_count + 1)],
+        "unused_dbgen_files": [f"delete.{n}" for n in range(1, set_count + 1)],
     }
     for name, path in base_paths.items():
         manifest["inputs"][name] = {"path": str(path), **file_record(path)}
-    for number in range(1, pair_count + 1):
+    for number in range(1, set_count + 1):
         for table in ("orders", "lineitem"):
             path = updates / f"{table}.tbl.u{number}"
             manifest["inputs"][f"{table}_u{number}"] = {"path": str(path), **file_record(path)}
     for name in WORKLOADS:
         directory = out / name
-        write_workload(directory, workloads[name])
+        measured, warming = workloads[name][:pair_count], workloads[name][pair_count:]
+        write_workload(directory, measured)
         manifest["workloads"][name] = {
-            "pairs": [describe_pair(pair) for pair in workloads[name]],
-            "files": {path.name: file_record(path) for path in sorted(directory.iterdir())},
+            "pairs": [describe_pair(pair) for pair in measured],
+            "files": {path.name: file_record(path)
+                      for path in sorted(directory.iterdir()) if path.is_file()},
         }
+        if warming:
+            write_workload(directory / "warm-up", warming)
+            manifest["workloads"][name]["warm_up"] = {
+                "pairs": [describe_pair(pair) for pair in warming],
+                "files": {path.name: file_record(path)
+                          for path in sorted((directory / "warm-up").iterdir())},
+            }
     write_json(out / "prepare-manifest.json", manifest)
     return manifest
 
@@ -346,6 +363,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--pairs", type=int, default=3, help="RF1/RF2 pairs per workload")
     parser.add_argument("--zipf-exponent", type=float, default=1.0,
                         help="Zipf exponent s of the clustered RF1 Customer draw (finite, > 0)")
+    parser.add_argument("--warm-up", action="store_true",
+                        help="also write one warm-up pair per workload, from update set "
+                             "pairs + 1, into <workload>/warm-up/")
     return parser.parse_args(argv)
 
 
@@ -353,7 +373,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         manifest = prepare(args.base, args.updates, args.out, args.seed, args.pairs,
-                           args.zipf_exponent)
+                           args.zipf_exponent, args.warm_up)
     except (InputError, OSError) as error:
         print(f"prepare_inputs: {error}", file=sys.stderr)
         return 1

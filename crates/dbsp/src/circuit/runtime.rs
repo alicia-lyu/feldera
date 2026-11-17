@@ -150,6 +150,14 @@ thread_local! {
     /// runtime.
     static WORKER_INDEX: Cell<usize> = const { Cell::new(0) };
 
+    /// The index of the circuit that this worker thread is building or running
+    /// a command for, when its runtime holds several circuits; `None` when it
+    /// holds one. [`Node::persistent_id`] includes it, so that the circuits of
+    /// one runtime save their state under distinct names in one checkpoint.
+    ///
+    /// [`Node::persistent_id`]: crate::circuit::circuit_builder::Node::persistent_id
+    static CIRCUIT_TAG: Cell<Option<usize>> = const { Cell::new(None) };
+
     /// Buffer cache for this foreground worker thread.
     static BUFFER_CACHE: RefCell<Option<Arc<BufferCache>>> = const { RefCell::new(None) };
 }
@@ -973,6 +981,18 @@ impl Runtime {
             })
     }
 
+    /// Returns the storage backend of this runtime, if storage is configured.
+    /// Unlike [`Self::storage_backend`], it works from any thread, including
+    /// a client thread outside the runtime.
+    pub fn backend(&self) -> Result<Arc<dyn StorageBackend>, StorageError> {
+        self.inner()
+            .storage
+            .as_ref()
+            .map_or(Err(StorageError::StorageDisabled), |storage| {
+                Ok(storage.backend.clone())
+            })
+    }
+
     /// Returns this thread's buffer-cache handle:
     ///
     /// - If the thread is a foreground thread or a background task, returns
@@ -1203,6 +1223,22 @@ impl Runtime {
             .with(|rt| Some(rt.borrow().as_ref()?.layout().local_workers().start))
             .unwrap_or_default();
         Self::worker_index() - local_workers_start
+    }
+
+    /// The index of the circuit that the current worker thread is building or
+    /// running a command for, when its runtime holds several circuits (see
+    /// [`Runtime::init_circuits`]); `None` when it holds one, and on every
+    /// thread other than a foreground worker.
+    pub fn circuit_tag() -> Option<usize> {
+        match current_thread_type() {
+            Some(ThreadType::Foreground) => CIRCUIT_TAG.get(),
+            _ => None,
+        }
+    }
+
+    /// Sets [`Self::circuit_tag`] for the current worker thread.
+    pub(crate) fn set_circuit_tag(tag: Option<usize>) {
+        CIRCUIT_TAG.set(tag);
     }
 
     pub fn mode() -> Mode {

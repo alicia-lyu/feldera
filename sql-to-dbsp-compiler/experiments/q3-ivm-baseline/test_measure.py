@@ -205,6 +205,134 @@ class MeasureTest(unittest.TestCase):
         self.assertFalse(result["evicted"])
         self.assertIn("unavailable", result["reason"])
 
+    def image_args(self, images: Path) -> list[str]:
+        """A campaign over images, with no base files."""
+        return ["--refresh-list", str(self.refresh), "--report", str(self.report),
+                "--storage-path", str(self.root / "campaign"), "--images", str(images),
+                "--cache-bytes", str(1024 * 1024), "--memory-target-bytes", "2048",
+                "--runs", "1"]
+
+    def test_images_are_named_by_mode_and_prefix_truncation_arm(self) -> None:
+        self.assertEqual([measure.image_name(mode, front) for mode in measure.MODES
+                          for _, front in measure.IMAGE_ARMS],
+                         ["native-A", "native-B", "merged-index-A", "merged-index-B"])
+
+    def test_build_images_and_campaigns_take_disjoint_arguments(self) -> None:
+        base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem"), "--cache-bytes", str(1024 * 1024)]
+        build = measure.parse_args(base + ["--build-images", str(self.root / "images")])
+        self.assertIsNone(build.memory_target_bytes)
+        for extra in (["--refresh-list", str(self.refresh)], ["--report", str(self.report)],
+                      ["--memory-target-bytes", "2048"], ["--images", "i"],
+                      ["--cgroup-root", "/sys/fs/cgroup/r5", "--total-memory-bytes", "1"]):
+            with self.subTest(extra=extra), patch("sys.stderr"), self.assertRaises(SystemExit):
+                measure.parse_args(base + ["--build-images", "i"] + extra)
+        images = measure.parse_args(self.image_args(self.root / "images"))
+        self.assertIsNone(images.customer)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(self.image_args(self.root / "images") + base[:2])
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(self.args + ["--warm-up", str(self.refresh)])
+
+    def test_a_run_from_an_image_starts_the_refresh_program(self) -> None:
+        spec = {"run_dir": str(self.root), "executable": "/bin/driver",
+                "image": str(self.root / "image"),
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "warm_up": str(self.refresh)}}
+        command = measure.driver_command(spec, {"refresh_list": str(self.refresh)})
+        self.assertEqual(command[command.index("--from-image") + 1], str(self.root / "image"))
+        self.assertEqual(command[command.index("--warm-up") + 1], str(self.refresh))
+        for absent in ("--customer", "--orders", "--lineitem", "--storage-path"):
+            self.assertNotIn(absent, command)
+
+    def test_qualification_reads_the_loaded_size_of_an_image(self) -> None:
+        report = {"load": None, "image": {"load": {"observed_storage_bytes": 101}}}
+        self.assertEqual(measure.qualification("Linux", 100, report, enforced=True,
+                                               cold=True)["status"], "qualifying")
+
+    def test_a_run_from_an_image_evicts_its_copy(self) -> None:
+        group = self.root / "cgroup-image"
+        group.mkdir()
+        (group / "memory.max").write_text("4096")
+        run_dir = self.root / "image-run"
+        (run_dir / "image" / "storage" / "uuid").mkdir(parents=True)
+        (run_dir / "image" / "image.json").write_text("{}")
+        (run_dir / "image" / "storage" / "uuid" / "batch.feldera").write_text("batch")
+        spec = {**self.shared_input_spec(run_dir), "cgroup": str(group),
+                "total_memory_bytes": 4096, "executable": "/bin/driver",
+                "image": str(run_dir / "image"),
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True}}
+        spec_path = self.root / "image-spec.json"
+        spec_path.write_text(json.dumps(spec))
+        with patch.object(measure, "verify_membership"), \
+             patch.object(measure.os, "execv", side_effect=RuntimeError("stop")), \
+             patch.object(measure, "evict_from_page_cache",
+                          return_value={"evicted": True}) as evict:
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                measure.run_inside_cgroup(spec_path)
+        evicted = {str(path) for path in evict.call_args.args[0]}
+        self.assertIn(str(run_dir / "image" / "storage" / "uuid" / "batch.feldera"), evicted)
+        self.assertIn(str(run_dir / "image" / "image.json"), evicted)
+        self.assertTrue(set(spec["inputs"].values()) <= evicted)
+
+    def test_images_must_be_complete_and_of_this_revision(self) -> None:
+        images = self.root / "images"
+        images.mkdir()
+        (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
+            {"status": "complete", "revision": "abc", "images": {}}))
+        self.assertEqual(measure.read_images(images, "abc")["revision"], "abc")
+        with self.assertRaisesRegex(ValueError, "built at abc"):
+            measure.read_images(images, "def")
+        (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
+            {"status": "failed", "revision": "abc", "images": {}}))
+        with self.assertRaisesRegex(ValueError, "not complete"):
+            measure.read_images(images, "abc")
+
+    def test_build_images_loads_each_mode_and_arm_outside_any_cgroup(self) -> None:
+        images = self.root / "images"
+        commands = []
+
+        def process(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            if "--write-image" not in command:  # git, generate.sh, uname
+                return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
+            commands.append(command)
+            directory = Path(command[command.index("--write-image") + 1])
+            (directory / "storage").mkdir(parents=True)
+            (directory / "storage" / "file").write_text("12345")
+            (directory / "image.json").write_text(json.dumps({
+                "settings": {"mode": "m"}, "checkpoint": {"uuid": "u"},
+                "load": {"observed_storage_bytes": 5}}))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / mode for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        args = measure.parse_args([
+            "--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+            "--lineitem", str(self.root / "lineitem"), "--cache-bytes", str(1024 * 1024),
+            "--build-images", str(images), "--setup-full-compaction", "--elide-value-headers"])
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            self.assertEqual(measure.build_images(args), 0)
+        manifest = json.loads((images / measure.IMAGES_MANIFEST).read_text())
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(sorted(manifest["images"]),
+                         ["merged-index-A", "merged-index-B", "native-A", "native-B"])
+        self.assertEqual(manifest["images"]["native-A"]["size_bytes"], 5)
+        self.assertEqual(len(commands), 4)
+        for command in commands:
+            # Loading has no memory target and no cgroup: it is not measured.
+            self.assertNotIn("--memory-target-bytes", command)
+            self.assertNotIn("--r5", command)
+            self.assertIn("--setup-full-compaction", command)
+            self.assertIn("--elide-value-headers", command)
+            name = Path(command[command.index("--write-image") + 1]).name
+            self.assertEqual("--front-code-byte-keys" in command, name.endswith("-A"))
+        # An existing directory is refused.
+        self.assertEqual(measure.build_images(args), 2)
+
     def test_cgroup_child_starts_cold_by_evicting_the_shared_inputs(self) -> None:
         group = self.root / "cgroup-evict"
         group.mkdir()
@@ -841,7 +969,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 12,
+        return {"mode": mode, "measurement_version": 13,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -920,13 +1048,13 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("prefix_truncated_expanded_bytes is below prefix_truncated_encoded_bytes",
                       measure.block_expansion_problems(shrunk)[0])
 
-    def test_report_problems_require_measurement_version_12(self) -> None:
+    def test_report_problems_require_measurement_version_13(self) -> None:
         report = self.expansion_report()
         report.update(self.gate_report())
         self.assertEqual(measure.measurement_version_problems(report), [])
-        report["measurement_version"] = 11
+        report["measurement_version"] = 12
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 11, expected 12"])
+                         ["measurement_version is 12, expected 13"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

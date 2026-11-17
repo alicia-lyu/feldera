@@ -15,7 +15,7 @@ pub struct Order {
     pub ship_priority: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, size_of::SizeOf)]
+#[derive(Clone, Debug, Eq, PartialEq, size_of::SizeOf, serde::Serialize, serde::Deserialize)]
 pub struct Line {
     pub order_key: i64,
     pub number: i32,

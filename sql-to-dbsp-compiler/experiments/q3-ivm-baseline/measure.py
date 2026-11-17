@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,7 +42,7 @@ SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_step
 SESSION_PASSES = ("seek", "step")
 # The version of the driver report that this runner and `summarize.py` understand. Version 12
 # adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses).
-MEASUREMENT_VERSION = 12
+MEASUREMENT_VERSION = 13
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -59,6 +60,23 @@ DEVICE_LABELS = ("ssd", "hdd")
 # device is not resolved.
 STORAGE_DEVICE_FIELDS = ("path", "device", "filesystem", "logical_sector_bytes", "rotational",
                          "model", "label")
+
+
+# An image is the loaded state of one mode with one storage format. The refresh program refuses an
+# image whose settings differ from its own, so each mode has an image per prefix-truncation arm:
+# arm A with --front-code-byte-keys, arm B without.
+IMAGE_ARMS = (("A", True), ("B", False))
+IMAGES_MANIFEST = "images.json"
+
+
+def image_name(mode: str, front_code_byte_keys: bool) -> str:
+    """The directory name of the image of `mode` (`native` or `merged-index`) for an arm."""
+    return f"{mode}-{'A' if front_code_byte_keys else 'B'}"
+
+
+def tree_size(root: Path) -> int:
+    """The total length of the regular files under `root`."""
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
 def sha256(path: Path) -> str:
@@ -708,6 +726,11 @@ def evict_from_page_cache(paths: list[Path]) -> dict[str, Any]:
             "files": evicted, "failures": failures}
 
 
+def tree_files(root: Path) -> list[Path]:
+    """Every regular file under `root`."""
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
 def run_inside_cgroup(spec_path: Path) -> None:
     spec = json.loads(spec_path.read_text())
     group = Path(spec["cgroup"])
@@ -718,7 +741,12 @@ def run_inside_cgroup(spec_path: Path) -> None:
     # Each run starts cold: no page of the shared inputs that an earlier run, or the
     # campaign's hashing, left in the page cache survives into this one. The driver's
     # reads then fault the pages again, charged to this run's cgroup.
-    eviction = evict_from_page_cache([Path(raw) for raw in spec["inputs"].values()])
+    # A run started from an image also starts with its copy of the image out of the page cache,
+    # which the copy left there in the runner's cgroup.
+    evicted = [Path(raw) for raw in spec["inputs"].values()]
+    if spec.get("image"):
+        evicted += tree_files(Path(spec["image"]))
+    eviction = evict_from_page_cache(evicted)
     write_json(Path(spec["run_dir"]) / "input-eviction.json", eviction)
     write_json(Path(spec["run_dir"]) / "cgroup-proof.json", {
         "cgroup": str(group), "memory_max": spec["total_memory_bytes"],
@@ -730,12 +758,23 @@ def run_inside_cgroup(spec_path: Path) -> None:
 
 
 def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
+    """The driver's command line for one run: the single-process driver, which loads the base
+    files into `<run dir>/storage`, or, when `spec` names an image, the refresh program, which
+    reopens the run's copy of that image."""
     args = spec["args"]
-    command = [
-        spec["executable"], "--r5",
-        "--customer", inputs["customer"],
-        "--orders", inputs["orders"],
-        "--lineitem", inputs["lineitem"],
+    command = [spec["executable"], "--r5"]
+    if spec.get("image"):
+        command += ["--from-image", spec["image"]]
+        if args.get("warm_up"):
+            command += ["--warm-up", args["warm_up"]]
+    else:
+        command += [
+            "--customer", inputs["customer"],
+            "--orders", inputs["orders"],
+            "--lineitem", inputs["lineitem"],
+            "--storage-path", str(Path(spec["run_dir"]) / "storage"),
+        ]
+    command += [
         "--refresh-list", inputs["refresh_list"],
         "--report", str(Path(spec["run_dir"]) / "driver.json"),
         "--cache-bytes", str(args["cache_bytes"]),
@@ -743,7 +782,6 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         "--compaction-timeout-secs", str(args["compaction_timeout_secs"]),
         "--batch", str(args.get("batch", 10000)),
         "--workers", "1", "--runs", "1",
-        "--storage-path", str(Path(spec["run_dir"]) / "storage"),
     ]
     if args["no_verify"]:
         command.append("--no-verify")
@@ -795,7 +833,9 @@ def qualification(system: str, limit: int | None, result: dict[str, Any],
                 "reason": "the shared inputs were not evicted from the page cache before the run"}
     if verify:
         return {"status": "nonqualifying", "reason": "independent verification was enabled"}
-    loaded = result.get("load", {}).get("observed_storage_bytes")
+    # A refresh program's report carries the loaded size in its image's load record.
+    load = result.get("load") or (result.get("image") or {}).get("load") or {}
+    loaded = load.get("observed_storage_bytes")
     if isinstance(loaded, bool) or not isinstance(loaded, int) or loaded < 0:
         return {"status": "nonqualifying", "reason": "loaded storage size unavailable"}
     if loaded <= limit:
@@ -830,9 +870,19 @@ def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("customer", "orders", "lineitem", "refresh-list", "report"):
-        parser.add_argument("--" + name, type=Path, required=True)
+        parser.add_argument("--" + name, type=Path)
     parser.add_argument("--cache-bytes", type=int, required=True)
-    parser.add_argument("--memory-target-bytes", type=int, required=True)
+    parser.add_argument("--memory-target-bytes", type=int)
+    parser.add_argument("--build-images", type=Path, metavar="IMAGES_DIR",
+                        help="load the base files once per mode and prefix-truncation arm, "
+                             "outside any cgroup and with no memory target, and write the "
+                             "images and images.json into this new directory; runs no refresh")
+    parser.add_argument("--images", type=Path, metavar="IMAGES_DIR",
+                        help="start every run from a copy of the matching image in this "
+                             "directory (built by --build-images) instead of loading")
+    parser.add_argument("--warm-up", type=Path, metavar="REFRESH_LIST",
+                        help="with --images, apply these refreshes untimed before the window, "
+                             "so that the window starts with their buffer cache")
     parser.add_argument("--compaction-timeout-secs", type=float, default=300)
     parser.add_argument("--batch", type=int, default=10000)
     parser.add_argument("--runs", type=int, default=3)
@@ -860,7 +910,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
-    if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or args.memory_target_bytes < 1:
+    base_files = [args.customer, args.orders, args.lineitem]
+    if args.build_images:
+        if None in base_files:
+            parser.error("--build-images needs --customer, --orders and --lineitem")
+        if args.images or args.refresh_list or args.report or args.storage_path or \
+                args.cgroup_root or args.warm_up or args.memory_target_bytes is not None:
+            parser.error("--build-images loads only: it takes the base files and the loading "
+                         "settings, and no refresh, report, storage, cgroup or memory target")
+    else:
+        if args.refresh_list is None or args.report is None:
+            parser.error("a campaign needs --refresh-list and --report")
+        if args.memory_target_bytes is None:
+            parser.error("a campaign needs --memory-target-bytes")
+        if args.images:
+            if any(path is not None for path in base_files):
+                parser.error("--images replaces the base files: an image holds the loaded state")
+        elif None in base_files:
+            parser.error("a campaign needs --customer, --orders and --lineitem, or --images")
+        if args.warm_up and not args.images:
+            parser.error("--warm-up applies to runs started from --images")
+    if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or \
+            (args.memory_target_bytes is not None and args.memory_target_bytes < 1):
         parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
     if args.cache_bytes % (1024 * 1024):
         parser.error("cache bytes must be a whole MiB")
@@ -875,8 +946,111 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def git_state() -> tuple[str, str]:
+    """The checkout's revision and `git status --short`."""
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=EXPERIMENT,
+                              check=True, capture_output=True, text=True)
+    status = subprocess.run(["git", "status", "--short"], cwd=EXPERIMENT,
+                            check=True, capture_output=True, text=True)
+    return revision.stdout.strip(), status.stdout
+
+
+def build_images(args: argparse.Namespace) -> int:
+    """The load program: load the base files once per mode and prefix-truncation arm into an
+    image (`--write-image`), outside any cgroup and with no memory target, since loading is not
+    measured (user decision of 2026-11-17). Writes `images.json` beside the images."""
+    root = args.build_images.resolve()
+    if root.exists():
+        print(f"measure: {root} already exists", file=sys.stderr)
+        return 2
+    root.mkdir(parents=True)
+    path = root / IMAGES_MANIFEST
+    manifest: dict[str, Any] = {
+        "status": "failed", "revision": None, "git_status_short": None,
+        "platform": platform.platform(),
+        "storage_device": storage_device(root, args.device_label),
+        "configuration": {"cache_bytes": args.cache_bytes, "batch": args.batch,
+                          "compaction_timeout_secs": args.compaction_timeout_secs,
+                          "setup_full_compaction": args.setup_full_compaction,
+                          "elide_value_headers": args.elide_value_headers,
+                          "memory_target_bytes": None, "cgroup": None},
+        "inputs": {}, "executables": {}, "images": {}, "errors": [],
+    }
+    try:
+        manifest["revision"], manifest["git_status_short"] = git_state()
+        inputs = {name: Path(getattr(args, name)).resolve()
+                  for name in ("customer", "orders", "lineitem")}
+        for name, source in inputs.items():
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            manifest["inputs"][name] = {"path": str(source), "sha256": sha256(source),
+                                        **file_identity(source)}
+        binaries = build_executables(root / "executables")
+        manifest["executables"] = {mode: {"path": str(binary), "sha256": sha256(binary)}
+                                   for mode, binary in binaries.items()}
+        for mode in MODES:
+            for _, front_code in IMAGE_ARMS:
+                name = image_name(mode, front_code)
+                directory = root / name
+                command = [str(binaries[mode]), "--write-image", str(directory),
+                           "--customer", str(inputs["customer"]),
+                           "--orders", str(inputs["orders"]),
+                           "--lineitem", str(inputs["lineitem"]),
+                           "--runs", "1", "--no-verify", "--batch", str(args.batch),
+                           "--cache-bytes", str(args.cache_bytes),
+                           "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
+                if args.setup_full_compaction:
+                    command.append("--setup-full-compaction")
+                if front_code:
+                    command.append("--front-code-byte-keys")
+                if args.elide_value_headers:
+                    command.append("--elide-value-headers")
+                started = time.monotonic()
+                completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True,
+                                           text=True)
+                (root / f"{name}.stdout.log").write_text(completed.stdout)
+                (root / f"{name}.stderr.log").write_text(completed.stderr)
+                if completed.returncode:
+                    raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
+                                       f"{completed.stderr[-2000:]}")
+                image = json.loads((directory / "image.json").read_text())
+                manifest["images"][name] = {
+                    "directory": str(directory), "mode": mode,
+                    "front_code_byte_keys": front_code, "settings": image["settings"],
+                    "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
+                    "size_bytes": tree_size(directory / "storage"),
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                write_json(path, manifest)
+        manifest["status"] = "complete"
+    except Exception as error:  # Keep every image built so far.
+        manifest["errors"].append(f"{type(error).__name__}: {error}")
+    finally:
+        try:
+            subprocess.run([str(EXPERIMENT / "generate.sh")], cwd=EXPERIMENT, check=True)
+        except Exception as error:
+            manifest["errors"].append(f"native generation restoration failed: {error}")
+            manifest["status"] = "failed"
+        write_json(path, manifest)
+    return 0 if manifest["status"] == "complete" else 1
+
+
+def read_images(root: Path, revision: str) -> dict[str, Any]:
+    """The manifest of the images in `root`, which must be complete and built from `revision`:
+    an image is reopened by the build of the revision that wrote it."""
+    manifest = json.loads((root / IMAGES_MANIFEST).read_text())
+    if manifest.get("status") != "complete":
+        raise ValueError(f"{root / IMAGES_MANIFEST} is not complete")
+    if manifest.get("revision") != revision:
+        raise ValueError(f"the images were built at {manifest.get('revision')}, "
+                         f"but this checkout is {revision}")
+    return manifest
+
+
 def run(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.build_images:
+        return build_images(args)
     report = args.report.resolve()
     campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     root = (args.storage_path or EXPERIMENT / "target" / "r5-measurements" /
@@ -901,20 +1075,28 @@ def run(argv: list[str]) -> int:
                           "elide_value_headers": args.elide_value_headers,
                           "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
-                          "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None},
-        "inputs": {}, "executables": {}, "runs": [], "errors": [],
+                          "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None,
+                          "images": str(args.images.resolve()) if args.images else None,
+                          "warm_up": str(args.warm_up.resolve()) if args.warm_up else None},
+        "inputs": {}, "executables": {}, "images": None, "runs": [], "errors": [],
     }
     try:
-        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=EXPERIMENT,
-                                  check=True, capture_output=True, text=True)
-        manifest["revision"] = revision.stdout.strip()
-        status = subprocess.run(["git", "status", "--short"], cwd=EXPERIMENT,
-                                check=True, capture_output=True, text=True)
-        manifest["git_status_short"] = status.stdout
+        manifest["revision"], manifest["git_status_short"] = git_state()
+        images = None
+        if args.images:
+            images = read_images(args.images.resolve(), manifest["revision"])
+            manifest["images"] = {
+                "directory": str(args.images.resolve()),
+                "manifest_sha256": sha256(args.images.resolve() / IMAGES_MANIFEST),
+                "inputs": images["inputs"], "images": images["images"]}
         refreshes, refresh_paths = refresh_inputs(args.refresh_list.resolve())
-        inputs = {name: Path(getattr(args, name)).resolve()
-                  for name in ("customer", "orders", "lineitem")}
+        inputs = {} if images else {name: Path(getattr(args, name)).resolve()
+                                    for name in ("customer", "orders", "lineitem")}
         inputs.update(refresh_paths)
+        if args.warm_up:
+            _, warm_up_paths = refresh_inputs(args.warm_up.resolve())
+            inputs.update({f"warm_up_{name}": path for name, path in warm_up_paths.items()})
+            inputs["warm_up_list"] = args.warm_up.resolve()
         inputs["refresh_list"] = args.refresh_list.resolve()
         for name, path in inputs.items():
             if not path.is_file():
@@ -947,7 +1129,21 @@ def run(argv: list[str]) -> int:
                                  "setup_full_compaction": args.setup_full_compaction,
                                  "front_code_byte_keys": args.front_code_byte_keys,
                                  "elide_value_headers": args.elide_value_headers,
-                                 "session_pass": args.session_pass}}
+                                 "session_pass": args.session_pass,
+                                 "warm_up": str(args.warm_up.resolve()) if args.warm_up else None}}
+                if images:
+                    # Each run refreshes its own full copy of its mode's and arm's image, made
+                    # outside the run's cgroup; the run evicts the copy before the driver starts.
+                    name = image_name(mode, args.front_code_byte_keys)
+                    if name not in images["images"]:
+                        raise ValueError(f"{args.images} has no image {name}")
+                    copy = run_dir / "image"
+                    subprocess.run(["cp", "-a", images["images"][name]["directory"], str(copy)],
+                                   check=True)
+                    spec["image"] = str(copy)
+                    record["storage_path"] = str(copy / "storage")
+                    record["image"] = {"name": name,
+                                       "checkpoint": images["images"][name]["checkpoint"]}
                 group = None
                 if args.cgroup_root:
                     group = configure_cgroup(args.cgroup_root, f"r5-{campaign_id}-{run_dir.name}",

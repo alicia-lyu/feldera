@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use data::{Customer, Line, Order};
+#[cfg(feature = "merged-index")]
+use dbsp::circuit::checkpointer::Checkpointer;
 use dbsp::circuit::metadata::{MetaItem, CIRCUIT_CPU_TIME_SECONDS};
 use dbsp::circuit::{
     CircuitConfig, CircuitConstructor, CircuitStorageConfig, GlobalNodeId, StorageCacheConfig,
@@ -37,6 +39,7 @@ use dbsp::trace::with_read_owner;
 use dbsp::trace::{BlockExpansions, RunReads};
 use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
+use feldera_types::checkpoint::CheckpointMetadata;
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
 use merged_index_col::q3::{Collection, DrivingDeltas, Q3State, SessionReads};
@@ -331,6 +334,11 @@ impl Stage {
 /// one (`q3-trie-view-circuit`), takes its inputs from `Dlt` and reads the index's touched
 /// groups through the transaction's scan session. The index is base storage, written through
 /// the runtime's buffer cache, which the session's reads use too.
+/// The file, in an image's checkpoint directory, that holds the merged index's side store of
+/// orphan lines (`OrphanLines`).
+#[cfg(feature = "merged-index")]
+const ORPHAN_LINES_FILE: &str = "q3-orphan-lines.json";
+
 struct Pipeline {
     base: Stage,
     view: Stage,
@@ -440,6 +448,50 @@ impl Pipeline {
             #[cfg(all(test, feature = "merged-index"))]
             view_worker_cache,
         })
+    }
+
+    /// Checkpoints both circuits, and in reconstructed mode the merged index, into one DBSP
+    /// checkpoint of the runtime's storage directory, and publishes it. This is the image that
+    /// a refresh process reopens ([`Self::reopen`]). It must run between transactions.
+    fn write_checkpoint(&mut self) -> Result<CheckpointMetadata> {
+        let committer =
+            DBSPHandle::checkpoint_circuits(&mut [&mut self.base.circuit, &mut self.view.circuit])?;
+        // The index and its side store of orphan lines are state outside the circuits: they
+        // are saved into the checkpoint's directory before the commit, which then protects
+        // their files.
+        #[cfg(feature = "merged-index")]
+        {
+            let directory = Checkpointer::checkpoint_dir(committer.uuid());
+            self.index.save(directory.clone())?;
+            self.runtime()
+                .backend()?
+                .write_json(&directory.join(ORPHAN_LINES_FILE), &self.orphans)?
+                .commit()?;
+        }
+        Ok(committer.commit()?.publish()?)
+    }
+
+    /// Builds both circuits from the checkpoint `image` of the storage directory in `config`,
+    /// and in reconstructed mode restores the merged index from it. Like a freshly loaded
+    /// pipeline, it needs [`republish`] before its first refresh.
+    fn reopen(mut config: CircuitConfig, image: &CheckpointMetadata) -> Result<Self> {
+        config
+            .storage
+            .as_mut()
+            .context("reopening an image needs file storage")?
+            .init_checkpoint = Some(image.uuid);
+        #[cfg_attr(not(feature = "merged-index"), allow(unused_mut))]
+        let mut pipeline = Self::new(config)?;
+        #[cfg(feature = "merged-index")]
+        {
+            let directory = Checkpointer::checkpoint_dir(image.uuid);
+            pipeline.index.restore(directory.clone())?;
+            pipeline.orphans = pipeline
+                .runtime()
+                .backend()?
+                .read_json(&directory.join(ORPHAN_LINES_FILE))?;
+        }
+        Ok(pipeline)
     }
 
     /// The runtime that hosts both circuits.
@@ -1152,6 +1204,16 @@ struct Config {
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
     session_pass: Option<Pass>,
+    /// Load the base files, then write the loaded state as an image to this new directory and
+    /// stop (`--write-image`): the load program. See [`ImageManifest`].
+    write_image: Option<PathBuf>,
+    /// Reopen the image in this directory and run only the refreshes (`--from-image`): the
+    /// refresh program. The directory is the run's own copy of an image; its `storage/` is the
+    /// runtime's storage directory and changes as the refreshes run.
+    from_image: Option<PathBuf>,
+    /// Refresh list applied, untimed and unreported, after reopening the image and before the
+    /// window (`--warm-up`). Without it the window starts with an empty buffer cache.
+    warm_up: Option<PathBuf>,
     workers: usize,
     batch: usize,
     runs: usize,
@@ -1228,6 +1290,27 @@ impl Config {
                     )?)
                 }
                 "--r5" => config.r5 = true,
+                "--write-image" => {
+                    config.write_image = Some(
+                        args.next()
+                            .context("--write-image needs a new directory")?
+                            .into(),
+                    )
+                }
+                "--from-image" => {
+                    config.from_image = Some(
+                        args.next()
+                            .context("--from-image needs an image directory")?
+                            .into(),
+                    )
+                }
+                "--warm-up" => {
+                    config.warm_up = Some(
+                        args.next()
+                            .context("--warm-up needs a refresh list")?
+                            .into(),
+                    )
+                }
                 "--refresh-list" => {
                     config.refresh_list =
                         Some(args.next().context("--refresh-list needs path")?.into())
@@ -1285,10 +1368,37 @@ impl Config {
         if config.refresh_list.is_some() && (config.rf1_orders.is_some() || config.rf2.is_some()) {
             bail!("refresh list cannot be combined with individual refresh arguments");
         }
+        if config.write_image.is_some() && config.from_image.is_some() {
+            bail!("--write-image and --from-image are the load and the refresh program; pass one");
+        }
+        if config.write_image.is_some()
+            && (config.r5
+                || config.runs != 1
+                || config.storage_path.is_some()
+                || config.report.is_some()
+                || config.refresh_list.is_some()
+                || config.rf1_orders.is_some()
+                || config.rf2.is_some())
+        {
+            bail!("--write-image loads only: it takes the base files and one run, and writes its storage and manifest into the image directory");
+        }
+        if config.from_image.is_some()
+            && (config.runs != 1
+                || config.storage_path.is_some()
+                || config.customer.is_some()
+                || config.orders.is_some()
+                || config.lineitem.is_some()
+                || config.verify)
+        {
+            bail!("--from-image refreshes only: it takes no base files and no --storage-path (the image holds the state), one run, and --no-verify (verification runs in the single-process mode)");
+        }
+        if config.warm_up.is_some() && config.from_image.is_none() {
+            bail!("--warm-up applies to a refresh program started --from-image");
+        }
         if config.r5
             && (config.workers != 1
                 || config.runs != 1
-                || config.storage_path.is_none()
+                || (config.storage_path.is_none() && config.from_image.is_none())
                 || config.cache_bytes.is_none()
                 || config.memory_target_bytes.is_none()
                 || config.report.is_none())
@@ -1302,6 +1412,87 @@ impl Config {
             bail!("--diagnostics requires file storage and one run per process");
         }
         Ok(config)
+    }
+}
+
+/// The settings that shape an image's stored state. A refresh program reopens an image only
+/// with the same settings, so that its writes use the image's storage format.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageSettings {
+    mode: String,
+    workers: usize,
+    front_code_byte_keys: bool,
+    elide_value_headers: bool,
+}
+
+impl ImageSettings {
+    fn of(config: &Config) -> Self {
+        Self {
+            mode: mode_name().to_owned(),
+            workers: config.workers,
+            front_code_byte_keys: config.front_code_byte_keys,
+            elide_value_headers: config.elide_value_headers,
+        }
+    }
+}
+
+/// `image.json`, beside an image's `storage/` directory: what the load program loaded and the
+/// checkpoint that holds it. Loading is not measured; `load` is its record, not a measurement.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageManifest {
+    /// 1 for this layout.
+    format: u32,
+    settings: ImageSettings,
+    /// The published runtime checkpoint of both circuits (and the merged index and its orphan
+    /// lines in reconstructed mode).
+    checkpoint: CheckpointMetadata,
+    /// The base files loaded, as given.
+    inputs: BTreeMap<String, PathBuf>,
+    /// The load report: rows, transactions, setup compaction, storage after loading.
+    load: Value,
+}
+
+impl ImageManifest {
+    const FILE: &'static str = "image.json";
+    const STORAGE: &'static str = "storage";
+
+    fn read(image: &Path) -> Result<Self> {
+        let path = image.join(Self::FILE);
+        let manifest: Self = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?;
+        if manifest.format != 1 {
+            bail!(
+                "{}: unsupported image format {}",
+                path.display(),
+                manifest.format
+            );
+        }
+        Ok(manifest)
+    }
+
+    /// Fails unless the image was loaded with the settings that `config` refreshes with.
+    fn check(&self, config: &Config) -> Result<()> {
+        let wanted = ImageSettings::of(config);
+        if self.settings != wanted {
+            bail!(
+                "the image was written with {:?}, but this refresh runs with {wanted:?}",
+                self.settings
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `native` or `reconstructed`, the build's mode.
+fn mode_name() -> &'static str {
+    if cfg!(feature = "merged-index") {
+        "reconstructed"
+    } else {
+        "native"
     }
 }
 
@@ -1381,25 +1572,65 @@ fn memory_pressure_levels(pipeline: &Pipeline) -> Result<Value> {
     }))
 }
 
-fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
-    let mut refreshes = if let Some(path) = &config.refresh_list {
-        let mut list: Vec<Refresh> = serde_json::from_reader(File::open(path)?)?;
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        for refresh in &mut list {
-            for source in [
-                &mut refresh.rf1_orders,
-                &mut refresh.rf1_lines,
-                &mut refresh.rf2,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if source.is_relative() {
-                    *source = directory.join(&*source);
-                }
+/// The refreshes of the refresh list at `path`, with relative file names resolved against the
+/// list's directory.
+fn refresh_list_at(path: &Path) -> Result<Vec<Refresh>> {
+    let mut list: Vec<Refresh> = serde_json::from_reader(
+        File::open(path).with_context(|| format!("opening {}", path.display()))?,
+    )?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    for refresh in &mut list {
+        for source in [
+            &mut refresh.rf1_orders,
+            &mut refresh.rf1_lines,
+            &mut refresh.rf2,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if source.is_relative() {
+                *source = directory.join(&*source);
             }
         }
-        list
+    }
+    Ok(list)
+}
+
+/// The change that a prepared refresh applies, the Orders an RF2 names that are absent, the
+/// refresh's phase, and whether its rows were discovered from the base state (RF2). An RF2's
+/// discovery reads the base state and, in reconstructed mode, the merged index.
+fn refresh_change(
+    pipeline: &Pipeline,
+    base: &workload::BaseState,
+    prepared: PreparedRefresh,
+) -> Result<(Change, usize, &'static str, bool)> {
+    Ok(match prepared {
+        PreparedRefresh::Rf2(keys) => {
+            #[cfg(feature = "merged-index")]
+            let snapshot = pipeline.index.snapshot()?;
+            #[cfg(not(feature = "merged-index"))]
+            let _ = pipeline;
+            let (change, absent) = workload::rf2_changes(base, &keys, |order| {
+                #[cfg(feature = "merged-index")]
+                {
+                    // The index's files are read through the runtime's buffer cache, as the
+                    // view circuit's readers read them.
+                    pipeline.in_cache(|| reconstruction::lines(&snapshot, order))
+                }
+                #[cfg(not(feature = "merged-index"))]
+                {
+                    base.native_lines(order.key)
+                }
+            })?;
+            (change, absent, "rf2", true)
+        }
+        PreparedRefresh::Rf1(change) => (change, 0, "rf1", false),
+    })
+}
+
+fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
+    let mut refreshes = if let Some(path) = &config.refresh_list {
+        refresh_list_at(path)?
     } else {
         let mut list = Vec::new();
         if config.rf1_orders.is_some() {
@@ -1622,6 +1853,21 @@ fn finish_loading(
         .then(|| setup_full_compaction(pipeline, timeout.saturating_sub(started.elapsed())))
         .transpose()?;
     let setup_compaction_elapsed = setup_compaction_started.elapsed();
+    republish(pipeline, base)?;
+    wait_for_loading_merges(pipeline, timeout.saturating_sub(started.elapsed()))?;
+    // Setup compaction is reported on its own, not as background merge wait.
+    Ok((
+        started.elapsed().saturating_sub(setup_compaction_elapsed),
+        setup_compaction,
+    ))
+}
+
+/// Publishes the current batches of both circuits to their catalogs without changing the
+/// logical input, with one empty transaction of each circuit (and, in reconstructed mode, an
+/// empty publication of the merged index), then refreshes `base` and drains the delta outputs.
+/// A loaded pipeline and a pipeline reopened from an image both need it before their first
+/// refresh: after a restore, the output snapshots are empty until a transaction runs.
+fn republish(pipeline: &mut Pipeline, base: &mut workload::BaseState) -> Result<()> {
     for (stage, names) in [
         (
             &pipeline.base,
@@ -1680,12 +1926,7 @@ fn finish_loading(
             drop(output.delta_handle.concat());
         }
     }
-    wait_for_loading_merges(pipeline, timeout.saturating_sub(started.elapsed()))?;
-    // Setup compaction is reported on its own, not as background merge wait.
-    Ok((
-        started.elapsed().saturating_sub(setup_compaction_elapsed),
-        setup_compaction,
-    ))
+    Ok(())
 }
 
 /// The phases of a refresh (since measurement version 4).
@@ -1873,11 +2114,34 @@ fn runtime_config(config: &Config, storage_path: Option<&Path>) -> Result<Circui
 fn run(config: &Config, run_number: usize) -> Result<()> {
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(config.compaction_timeout_secs);
-    let storage_root = config
-        .storage_path
-        .as_ref()
-        .map(|root| root.join(format!("run-{run_number}")));
-    if let Some(path) = &storage_root {
+    // The load program writes its storage into a new image; the refresh program runs in its
+    // copy of one; otherwise each run gets a new directory under --storage-path.
+    let image = config
+        .from_image
+        .as_deref()
+        .map(ImageManifest::read)
+        .transpose()?;
+    if let Some(image) = &image {
+        image.check(config)?;
+    }
+    let storage_root = if let Some(directory) = &config.from_image {
+        let path = directory.join(ImageManifest::STORAGE);
+        if !path.is_dir() {
+            bail!("image has no storage directory: {}", path.display());
+        }
+        Some(path)
+    } else if let Some(directory) = &config.write_image {
+        if directory.exists() {
+            bail!("image directory already exists: {}", directory.display());
+        }
+        Some(directory.join(ImageManifest::STORAGE))
+    } else {
+        config
+            .storage_path
+            .as_ref()
+            .map(|root| root.join(format!("run-{run_number}")))
+    };
+    if let (None, Some(path)) = (&config.from_image, &storage_root) {
         if path.exists() {
             bail!("storage directory already exists: {}", path.display());
         }
@@ -1900,7 +2164,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             )
         })
         .transpose()?;
-    let mut pipeline = Pipeline::new(pipeline_config)?;
+    let mut pipeline = match &image {
+        Some(image) => Pipeline::reopen(pipeline_config, &image.checkpoint)?,
+        None => Pipeline::new(pipeline_config)?,
+    };
     if config.verify {
         pipeline.enable_contract_check();
     }
@@ -1911,13 +2178,18 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let runtime = pipeline.runtime().clone();
     // The driver thread binds the runtime's buffer cache, as the workers do.
     runtime.with_buffer_cache(0, || {
+    let mut state = config.verify.then(Reference::default);
+    let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
+    // The refresh program reopens a loaded image instead of loading; it only republishes.
+    let load_report = if image.is_some() {
+        republish(&mut pipeline, &mut base)?;
+        Value::Null
+    } else {
     let sampler = storage_root
         .clone()
         .map(measurement::StorageSampler::start)
         .transpose()?;
-    let mut state = config.verify.then(Reference::default);
     let mut stats = Measurements::default();
-    let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
     let load = workload::load_batches(
         config.customer.as_deref().context("--customer required")?,
         config.orders.as_deref().context("--orders required")?,
@@ -1953,6 +2225,58 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         stats.transactions, config.verify, milliseconds(stats.base_phase()), milliseconds(stats.forward),
         milliseconds(stats.delta), milliseconds(stats.view_circuit), milliseconds(stats.preparation),
         milliseconds(load_drain), milliseconds(load_elapsed), state.as_ref().map_or(0, |s| s.size_of().total_bytes()), load.max_retained_rows, rss_bytes(), latency_summary(&stats.latencies));
+    json!({"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
+        "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
+        "sampled_peak_storage_bytes": load_peak_storage_bytes,
+        "observed_storage_bytes": load_observed_storage_bytes,
+        "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed),
+        "setup_full_compaction": setup_compaction})
+    };
+
+    // The load program stops here: it checkpoints the loaded state and writes the manifest.
+    if let Some(directory) = &config.write_image {
+        let checkpoint = pipeline.write_checkpoint()?;
+        let manifest = ImageManifest {
+            format: 1,
+            settings: ImageSettings::of(config),
+            checkpoint,
+            inputs: [
+                ("customer", &config.customer),
+                ("orders", &config.orders),
+                ("lineitem", &config.lineitem),
+            ]
+            .into_iter()
+            .filter_map(|(name, path)| Some((name.to_owned(), path.clone()?)))
+            .collect(),
+            load: load_report,
+        };
+        std::fs::write(
+            directory.join(ImageManifest::FILE),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        println!(
+            "run={run_number} phase=image directory={} checkpoint={}",
+            directory.display(),
+            manifest.checkpoint.uuid
+        );
+        return Ok(());
+    }
+
+    // An optional warm-up, untimed and unreported, so that the window can start with the
+    // buffer cache that these refreshes leave instead of an empty one.
+    let warm_up = match &config.warm_up {
+        None => Value::Null,
+        Some(list) => {
+            let started = Instant::now();
+            let refreshes = refresh_list_at(list)?;
+            for refresh in &refreshes {
+                let (change, ..) = refresh_change(&pipeline, &base, PreparedRefresh::read(refresh)?)?;
+                transact_inner(&mut pipeline, None, change, Some((&base, false)), &mut Measurements::default())?;
+                base = workload::BaseState::new(&pipeline.base.catalog)?;
+            }
+            json!({"refresh_list": list, "refreshes": refreshes.len(), "elapsed_ms": milliseconds(started.elapsed())})
+        }
+    };
 
     // Parse every refresh file now, so that the window reads no input file. The loop consumes
     // each prepared refresh by value and drops it once applied.
@@ -2020,28 +2344,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
         let mut measurement = Measurements::default();
-        let (change, absent, phase, discovered) = match prepared {
-            PreparedRefresh::Rf2(keys) => {
-                #[cfg(feature = "merged-index")]
-                let snapshot = pipeline.index.snapshot()?;
-                // Discovery is the lookup alone: the keys were read before the window.
-                let (change, absent) = workload::rf2_changes(&base, &keys, |order| {
-                    #[cfg(feature = "merged-index")]
-                    {
-                        // The index's files are read through the runtime's buffer cache,
-                        // as the view circuit's readers read them.
-                        pipeline.in_cache(|| reconstruction::lines(&snapshot, order))
-                    }
-                    #[cfg(not(feature = "merged-index"))]
-                    {
-                        base.native_lines(order.key)
-                    }
-                })?;
-                measurement.discovery += phase_started.elapsed();
-                (change, absent, "rf2", true)
-            }
-            PreparedRefresh::Rf1(change) => (change, 0, "rf1", false),
-        };
+        // Discovery is the RF2 lookup alone: the keys were read before the window.
+        let (change, absent, phase, discovered) = refresh_change(&pipeline, &base, prepared)?;
+        if discovered {
+            measurement.discovery += phase_started.elapsed();
+        }
         let workload_stats_started = Instant::now();
         let customers: HashSet<_> = change
             .orders
@@ -2228,9 +2535,9 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 12,
+        "measurement_version": 13,
         "os": std::env::consts::OS,
-        "mode": if cfg!(feature = "merged-index") { "reconstructed" } else { "native" },
+        "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
         "configuration": {
             "workers": config.workers, "load_batch_target": config.batch, "verification": config.verify,
@@ -2256,7 +2563,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "front_code_byte_keys": config.front_code_byte_keys,
             "elide_value_headers": config.elide_value_headers,
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
-            "durability": "no checkpoint; refresh completion is not a durability guarantee",
+            "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
         },
         // Process-wide writer counters: this process runs one measurement.
@@ -2270,12 +2577,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "layout_fallbacks": VALUE_ELISION_LAYOUT_FALLBACKS.load(Ordering::Relaxed),
             "size_fallbacks": VALUE_ELISION_SIZE_FALLBACKS.load(Ordering::Relaxed),
         },
-        "load": {"rows": load_rows, "transactions": load.transactions, "max_retained_rows": load.max_retained_rows,
-            "catalog_storage": load_storage, "snapshot_publication_transactions": 1,
-            "sampled_peak_storage_bytes": load_peak_storage_bytes,
-            "observed_storage_bytes": load_observed_storage_bytes,
-            "background_merge_wait_ms": milliseconds(load_drain), "elapsed_ms": milliseconds(load_elapsed),
-            "setup_full_compaction": setup_compaction},
+        "load": load_report,
+        "image": image.as_ref().map(|image| json!({
+            "directory": config.from_image, "settings": image.settings,
+            "checkpoint": image.checkpoint, "inputs": image.inputs, "load": image.load,
+        })),
+        "warm_up": warm_up,
         "refresh_inputs": refresh_inputs,
         "inputs_evicted": inputs_evicted,
         "refreshes": reports,
@@ -2448,6 +2755,47 @@ mod tests {
         assert!(parse(&["--session-pass"]).is_err());
         assert!(parse(&["--session-pass", "Seek"]).is_err());
         assert_eq!(parse(&[]).unwrap().session_pass(), Pass::Seek);
+        // The load and the refresh program take disjoint inputs.
+        assert!(parse(&["--write-image", "i", "--from-image", "j", "--no-verify"]).is_err());
+        assert!(parse(&["--write-image", "i", "--refresh-list", "r.json"]).is_err());
+        assert!(parse(&["--write-image", "i", "--storage-path", "s"]).is_err());
+        assert!(parse(&["--write-image", "i", "--runs", "1"]).is_ok());
+        assert!(
+            parse(&["--from-image", "i", "--runs", "1"]).is_err(),
+            "verification needs the single process"
+        );
+        assert!(parse(&[
+            "--from-image",
+            "i",
+            "--runs",
+            "1",
+            "--no-verify",
+            "--customer",
+            "c"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--from-image",
+            "i",
+            "--runs",
+            "1",
+            "--no-verify",
+            "--storage-path",
+            "s"
+        ])
+        .is_err());
+        assert!(parse(&["--from-image", "i", "--runs", "1", "--no-verify"]).is_ok());
+        assert!(parse(&["--warm-up", "w.json", "--no-verify"]).is_err());
+        assert!(parse(&[
+            "--from-image",
+            "i",
+            "--runs",
+            "1",
+            "--no-verify",
+            "--warm-up",
+            "w.json"
+        ])
+        .is_ok());
         for name in ["seek", "step"] {
             let pass = parse(&["--session-pass", name]).unwrap().session_pass();
             assert_eq!(pass_name(pass), name);
@@ -3218,6 +3566,134 @@ mod measurement_tests {
         }
     }
 
+    /// The load program writes an image, and the refresh program, started from a copy of it,
+    /// reports the same refreshes as the single-process driver on the same inputs. A refresh
+    /// program with other storage settings refuses the image.
+    #[test]
+    fn a_refresh_program_from_an_image_matches_the_single_process_driver() -> Result<()> {
+        let directory = directory()?;
+        let customers = directory.join("customer.tbl");
+        let orders = directory.join("orders.tbl");
+        let lines = directory.join("lineitem.tbl");
+        std::fs::write(&customers, "1|n|a|1|p|1.00|BUILDING|comment|\n")?;
+        let keys: Vec<i64> = (1..=40).collect();
+        std::fs::write(
+            &orders,
+            keys.iter()
+                .map(|key| format!("{key}|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n"))
+                .collect::<String>(),
+        )?;
+        std::fs::write(&lines, keys.iter().map(|key| {
+            format!("{key}|2|3|1|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n")
+        }).collect::<String>())?;
+        std::fs::write(
+            directory.join("insert-orders.tbl"),
+            "50|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n",
+        )?;
+        std::fs::write(
+            directory.join("insert-lines.tbl"),
+            "50|2|3|1|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n",
+        )?;
+        std::fs::write(directory.join("delete.tbl"), "3|\n50|\n")?;
+        let list = directory.join("refreshes.json");
+        std::fs::write(
+            &list,
+            serde_json::to_vec(&json!([
+                {"rf1_orders": "insert-orders.tbl", "rf1_lines": "insert-lines.tbl"},
+                {"rf2": "delete.tbl"}
+            ]))?,
+        )?;
+        let common = || Config {
+            workers: 1,
+            runs: 1,
+            batch: 8,
+            cache_bytes: Some(8 * 1024 * 1024),
+            compaction_timeout_secs: 30.0,
+            verify: false,
+            ..Config::default()
+        };
+        let refresh_rows = |report: &Path| -> Result<Vec<(Value, Value)>> {
+            let output: Value = serde_json::from_reader(File::open(report)?)?;
+            Ok(output["refreshes"]
+                .as_array()
+                .context("refreshes")?
+                .iter()
+                .map(|refresh| (refresh["phase"].clone(), refresh["absent_orders"].clone()))
+                .collect())
+        };
+
+        // The single-process driver.
+        let single_report = directory.join("single.json");
+        run(
+            &Config {
+                customer: Some(customers.clone()),
+                orders: Some(orders.clone()),
+                lineitem: Some(lines.clone()),
+                refresh_list: Some(list.clone()),
+                report: Some(single_report.clone()),
+                storage_path: Some(directory.join("single-storage")),
+                ..common()
+            },
+            1,
+        )?;
+
+        // The load program, then the refresh program on a copy of its image.
+        let image = directory.join("image");
+        run(
+            &Config {
+                customer: Some(customers),
+                orders: Some(orders),
+                lineitem: Some(lines),
+                write_image: Some(image.clone()),
+                ..common()
+            },
+            1,
+        )?;
+        let manifest = ImageManifest::read(&image)?;
+        assert_eq!(manifest.settings.mode, mode_name());
+        assert_eq!(manifest.load["rows"], 81);
+        let copy = directory.join("image-copy");
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&image)
+            .arg(&copy)
+            .status()?;
+        assert!(copied.success());
+        let image_report = directory.join("from-image.json");
+        let from_image = || Config {
+            refresh_list: Some(list.clone()),
+            report: Some(image_report.clone()),
+            from_image: Some(copy.clone()),
+            ..common()
+        };
+        run(&from_image(), 1)?;
+        assert_eq!(refresh_rows(&image_report)?, refresh_rows(&single_report)?);
+        let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
+        assert!(output["load"].is_null());
+        assert_eq!(output["image"]["settings"]["mode"], mode_name());
+        assert_eq!(output["measurement_version"], 13);
+        // The original image is untouched by the refreshes of its copy.
+        assert_eq!(
+            ImageManifest::read(&image)?.checkpoint.uuid,
+            manifest.checkpoint.uuid
+        );
+
+        // Other storage settings than the image's are refused before anything runs.
+        let error = run(
+            &Config {
+                front_code_byte_keys: true,
+                ..from_image()
+            },
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("the image was written with"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn storage_backed_driver_preserves_runs_and_discovers_repeated_refreshes() -> Result<()> {
         let directory = directory()?;
@@ -3334,7 +3810,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 12);
+        assert_eq!(output["measurement_version"], 13);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");

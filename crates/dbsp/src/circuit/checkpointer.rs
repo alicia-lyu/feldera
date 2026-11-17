@@ -283,7 +283,13 @@ impl Checkpointer {
         Ok(usage)
     }
 
-    pub(super) fn checkpoint_dir(uuid: Uuid) -> StoragePath {
+    /// The directory, relative to the storage root, that holds the checkpoint
+    /// `uuid`. State kept outside the circuits is saved into it before the
+    /// checkpoint is committed ([`CheckpointCommitter::uuid`]), and restored
+    /// from it.
+    ///
+    /// [`CheckpointCommitter::uuid`]: crate::circuit::CheckpointCommitter::uuid
+    pub fn checkpoint_dir(uuid: Uuid) -> StoragePath {
         uuid.to_string().into()
     }
 

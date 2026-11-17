@@ -64,7 +64,7 @@ The manifest's `storage_device` (the device behind `--storage-path` and the oper
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 12, a field is missing or not a finite non-negative number, a
+measurement version 13, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 

@@ -1,6 +1,7 @@
 use crate::circuit::GlobalNodeId;
 use crate::circuit::checkpointer::Checkpointer;
 use crate::circuit::circuit_builder::{CircuitHandle, ConcurrentRestoreOutcome};
+use crate::circuit::fingerprinter::Fingerprinter;
 use crate::circuit::metrics::{DBSP_STEP, DBSP_STEP_LATENCY_MICROSECONDS};
 use crate::circuit::schedule::CommitProgress;
 use crate::monitor::visual_graph::Graph;
@@ -796,12 +797,17 @@ impl Runtime {
             && config
                 .storage
                 .as_ref()
-                .is_some_and(|storage| storage.init_checkpoint.is_some())
+                .is_some_and(|storage| storage.init_checkpoint.is_some() && storage.defer_restore)
         {
             return Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(
-                "a runtime with several circuits cannot restore an initial checkpoint".to_string(),
+                "a runtime with several circuits cannot defer its restore to a concurrent bootstrap"
+                    .to_string(),
             )));
         }
+        // A circuit's operators include its index in their persistent ids only
+        // when the runtime holds several circuits, so a single circuit keeps the
+        // ids of its existing checkpoints.
+        let circuit_tag = move |circuit_index: usize| (ncircuits > 1).then_some(circuit_index);
 
         // When a worker finishes building the circuits, it sends completion status back
         // to us via this channel.  The function returns after receiving a
@@ -834,7 +840,9 @@ impl Runtime {
             // structurally identical second copy of that circuit.
             let mut slots: Vec<CircuitSlot<T>> = Vec::with_capacity(constructors.len());
             let mut built = Vec::with_capacity(constructors.len());
-            for constructor in constructors {
+            for (circuit_index, constructor) in constructors.into_iter().enumerate() {
+                // Operators record their persistent ids while the circuit is built.
+                Runtime::set_circuit_tag(circuit_tag(circuit_index));
                 let circuit_fn = |circuit: &mut RootCircuit| {
                     let profiler = Profiler::new(circuit);
                     constructor.construct(circuit).map(|res| (res, profiler))
@@ -865,6 +873,9 @@ impl Runtime {
                     Ok((circuit_index, command)) => (circuit_index, Ok(command)),
                     Err(error) => (0, Err(error)),
                 };
+                // Every command runs with its circuit's tag, so that checkpoint and
+                // restore use the persistent ids the circuit was built with.
+                Runtime::set_circuit_tag(circuit_tag(circuit_index));
                 let CircuitSlot {
                     circuit,
                     profiler,
@@ -1286,6 +1297,37 @@ impl Runtime {
             None => (None, None, false),
         };
 
+        // One checkpoint covers every circuit of the runtime, so the handles
+        // share one checkpointer, and its checkpoints carry the fingerprint of
+        // all the circuits in order.
+        let checkpoint_fingerprint =
+            checkpoint_fingerprint(built.iter().map(|(_, fingerprint)| *fingerprint));
+        // TODO: We allow the circuit to change between suspend and resume in Persistent mode;
+        // we therefore only validate the fingerprint in ephemeral mode; however it can sometimes
+        // be useful to validate it in persistent mode too, e.g., when recovering after a crash.
+        // In that case, do we need to change the checkpointer logic to only validate the
+        // fingerprint of the last checkpoint (it currently checks all checkpoints in the backend
+        // directory)?
+        let checkpointer = match backend {
+            Some(backend) => {
+                let checkpointer = match Checkpointer::new(backend) {
+                    Ok(checkpointer) => checkpointer,
+                    Err(error) => {
+                        let _ = runtime.kill();
+                        return Err(error);
+                    }
+                };
+                if runtime.runtime().get_mode() == Mode::Ephemeral
+                    && let Err(error) = checkpointer.verify_fingerprint(checkpoint_fingerprint)
+                {
+                    let _ = runtime.kill();
+                    return Err(error);
+                }
+                Some(Arc::new(Mutex::new(checkpointer)))
+            }
+            None => None,
+        };
+
         // All handles share the runtime and the channels; `round_trip` keeps
         // one command's replies from being taken by another handle.
         let runtime = Arc::new(runtime);
@@ -1293,14 +1335,16 @@ impl Runtime {
         let mut circuits = Vec::with_capacity(ncircuits);
         for (circuit_index, (ret, fingerprint)) in built.into_iter().enumerate() {
             let mut dbsp = DBSPHandle::new(
-                backend.clone(),
+                checkpointer.clone(),
                 Arc::clone(&runtime),
                 circuit_index,
+                ncircuits,
                 Arc::clone(&round_trip),
                 command_senders.clone(),
                 status_receivers.clone(),
                 fingerprint,
-            )?;
+                checkpoint_fingerprint,
+            );
             // When `defer_restore` is set the caller drives a concurrent bootstrap
             // (`start_concurrent_bootstrap`) instead of the automatic stop-the-world
             // restore; the circuit comes up un-restored and the caller supplies the
@@ -1313,6 +1357,27 @@ impl Runtime {
             circuits.push((dbsp, ret));
         }
         Ok(circuits)
+    }
+}
+
+/// The fingerprint that a runtime's checkpoints carry: the circuit's own
+/// fingerprint when the runtime holds one circuit, so its checkpoints keep
+/// their fingerprints, and otherwise a combination of the circuits'
+/// fingerprints in order, so a checkpoint restores only into the same circuits
+/// in the same order.
+fn checkpoint_fingerprint(fingerprints: impl IntoIterator<Item = u64>) -> u64 {
+    let fingerprints: Vec<u64> = fingerprints.into_iter().collect();
+    match fingerprints.as_slice() {
+        [single] => *single,
+        several => {
+            // `Fingerprinter` is FNV-1a, stable across builds, as a fingerprint
+            // stored with a checkpoint must be.
+            let mut fingerprinter = Fingerprinter::default();
+            for (position, fingerprint) in several.iter().enumerate() {
+                fingerprinter.hash(&format!("circuit {position}: {fingerprint:016x};"));
+            }
+            fingerprinter.finish()
+        }
     }
 }
 
@@ -1591,6 +1656,15 @@ pub struct DBSPHandle {
     /// Circuit fingerprint.
     fingerprint: u64,
 
+    /// The number of circuits in the runtime. A runtime with several circuits
+    /// checkpoints them together ([`DBSPHandle::checkpoint_circuits`]).
+    ncircuits: usize,
+
+    /// The fingerprint recorded in, and checked against, the runtime's
+    /// checkpoints: this circuit's fingerprint when the runtime holds one
+    /// circuit, and the fingerprint of all its circuits in order otherwise.
+    checkpoint_fingerprint: u64,
+
     /// Information about operators that participate in bootstrapping the new parts of the circuit.
     bootstrap_info: Option<BootstrapInfo>,
 
@@ -1657,40 +1731,29 @@ impl WorkersCommitProgress {
 }
 
 impl DBSPHandle {
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        backend: Option<Arc<dyn StorageBackend>>,
+        checkpointer: Option<Arc<Mutex<Checkpointer>>>,
         runtime: Arc<RuntimeHandle>,
         circuit_index: usize,
+        ncircuits: usize,
         round_trip: Arc<Mutex<()>>,
         command_senders: Vec<Sender<(usize, Command)>>,
         status_receivers: Vec<Receiver<Result<Response, DbspError>>>,
         fingerprint: u64,
-    ) -> Result<Self, DbspError> {
-        // TODO: We allow the circuit to change between suspend and resume in Persistent mode;
-        // we therefore only validate the fingerprint in ephemeral mode; however it can sometimes
-        // be useful to validate it in persistent mode too, e.g., when recovering after a crash.
-        // In that case, do we need to change the checkpointer logic to only validate the
-        // fingerprint of the last checkpoint (it currently checks all checkpoints in the backend
-        // directory)?
-        let checkpointer = backend
-            .map(|backend| {
-                let checkpointer = Checkpointer::new(backend)?;
-                if runtime.runtime().get_mode() == Mode::Ephemeral {
-                    checkpointer.verify_fingerprint(fingerprint)?;
-                };
-                Ok::<_, DbspError>(checkpointer)
-            })
-            .transpose()?
-            .map(|checkpointer| Arc::new(Mutex::new(checkpointer)));
-        Ok(Self {
+        checkpoint_fingerprint: u64,
+    ) -> Self {
+        Self {
             start_time: Instant::now(),
             runtime: Some(runtime),
             circuit_index,
+            ncircuits,
             round_trip,
             command_senders,
             status_receivers,
             checkpointer,
             fingerprint,
+            checkpoint_fingerprint,
             runtime_elapsed: Duration::ZERO,
             bootstrap_info: None,
             bootstrap_circuit_state: BootstrapCircuitState::None,
@@ -1698,7 +1761,7 @@ impl DBSPHandle {
             concurrent_bootstrap_phase: None,
             main_transaction_start: None,
             concurrent_bootstrap_aborted: false,
-        })
+        }
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -2508,6 +2571,82 @@ impl DBSPHandle {
             .ok_or(DbspError::Storage(StorageError::StorageDisabled))
     }
 
+    /// Prepares one checkpoint of every circuit of a runtime with several
+    /// circuits ([`Runtime::init_circuits`]).
+    ///
+    /// `handles` must be the runtime's handles, one per circuit, in the order
+    /// of their constructors. Each circuit saves its operators under its own
+    /// persistent ids into the one checkpoint directory, and the checkpoint
+    /// carries the fingerprint of all the circuits in order, which a runtime
+    /// restoring it checks. [`CheckpointBuilder::prepare`] refuses a single
+    /// handle of such a runtime, since a checkpoint of one circuit would not
+    /// restore the others.
+    ///
+    /// Commit and publish the result as with [`CheckpointBuilder::prepare`].
+    /// Before the commit, state kept outside the circuits can be saved into
+    /// the checkpoint's directory ([`CheckpointCommitter::uuid`]).
+    pub fn checkpoint_circuits(
+        handles: &mut [&mut DBSPHandle],
+    ) -> Result<CheckpointCommitter, DbspError> {
+        let invalid =
+            |reason: String| Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(reason)));
+        let Some(first) = handles.first() else {
+            return invalid("checkpoint_circuits needs the runtime's handles".to_string());
+        };
+        let ncircuits = first.ncircuits;
+        if handles.len() != ncircuits {
+            return invalid(format!(
+                "checkpoint_circuits got {} handles for a runtime with {ncircuits} circuits",
+                handles.len()
+            ));
+        }
+        let checkpointer = first.checkpointer()?.clone();
+        for (position, handle) in handles.iter().enumerate() {
+            if handle.circuit_index != position
+                || !Arc::ptr_eq(handle.checkpointer()?, &checkpointer)
+            {
+                return invalid(
+                    "checkpoint_circuits needs one runtime's handles, in circuit order".to_string(),
+                );
+            }
+            handle.check_bootstrap_circuit_state(
+                &[BootstrapCircuitState::None],
+                "create a checkpoint",
+            )?;
+            if handle.concurrent_bootstrap_phase.is_some() || handle.concurrent_bootstrap_aborted {
+                return invalid(
+                    "cannot create a checkpoint while a concurrent bootstrap is in progress \
+                     or after one was aborted"
+                        .to_string(),
+                );
+            }
+        }
+
+        // As in `CheckpointBuilder::prepare`, the catalog exists before the
+        // operators create the checkpoint's directory.
+        checkpointer.lock().unwrap().ensure_catalog_exists()?;
+        let uuid = Uuid::now_v7();
+        let checkpoint_dir = Checkpointer::checkpoint_dir(uuid);
+        let mut readers = Vec::new();
+        for handle in handles.iter_mut() {
+            handle.broadcast_command(Command::Checkpoint(checkpoint_dir.clone()), |_, resp| {
+                let Response::CheckpointCreated(r) = resp else {
+                    panic!("Expected checkpoint response, got {resp:?}");
+                };
+                readers.push(r);
+            })?;
+        }
+        Ok(CheckpointCommitter {
+            checkpointer,
+            readers,
+            uuid,
+            fingerprint: handles[0].checkpoint_fingerprint,
+            name: None,
+            steps: None,
+            processed_records: None,
+        })
+    }
+
     /// Allows creating a new checkpoint by taking a consistent snapshot of the
     /// state in dbsp.
     pub fn checkpoint(&mut self) -> CheckpointBuilder<'_> {
@@ -2948,6 +3087,13 @@ impl<'a> CheckpointBuilder<'a> {
     /// Prepares the checkpoint and returns a committer that can be used to
     /// commit and publish it later.
     pub fn prepare(self) -> Result<CheckpointCommitter, DbspError> {
+        if self.handle.ncircuits > 1 {
+            return Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(
+                "a runtime with several circuits checkpoints them together, with \
+                 DBSPHandle::checkpoint_circuits"
+                    .to_string(),
+            )));
+        }
         // Don't allow checkpointing during concurrent bootstrapping.
         // Both circuit copies derive checkpoint file names from the same
         // persistent ids, so checkpointing while a bootstrap circuit exists
@@ -2987,7 +3133,7 @@ impl<'a> CheckpointBuilder<'a> {
             checkpointer,
             readers,
             uuid,
-            fingerprint: self.handle.fingerprint,
+            fingerprint: self.handle.checkpoint_fingerprint,
             name: self.name,
             steps: self.steps,
             processed_records: self.processed_records,
@@ -3102,7 +3248,9 @@ pub(crate) mod tests {
     use std::time::Duration;
     use std::{fs, vec};
 
-    use super::{CircuitConstructor, CircuitStorageConfig};
+    use super::{
+        CheckpointCommitter, CheckpointPublisher, CircuitConstructor, CircuitStorageConfig,
+    };
     use crate::algebra::OrdZSet as DynOrdZSet;
     use crate::circuit::CircuitConfig;
     use crate::circuit::checkpointer::Checkpointer;
@@ -3125,6 +3273,7 @@ pub(crate) mod tests {
     };
     use anyhow::anyhow;
     use feldera_buffer_cache::ThreadType;
+    use feldera_types::checkpoint::CheckpointMetadata;
     use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -3778,18 +3927,240 @@ pub(crate) mod tests {
         assert_eq!(circuits[0].1, circuits[1].1);
     }
 
-    /// Several circuits cannot restore one checkpoint directory.
+    /// Several circuits cannot defer their restore to a concurrent bootstrap.
     #[test]
-    fn init_circuits_rejects_an_initial_checkpoint() {
+    fn init_circuits_rejects_a_deferred_restore() {
         let temp = tempdir().expect("Can't create temp dir for storage");
         let mut config = mkconfig(temp.path());
-        config.storage.as_mut().unwrap().init_checkpoint = Some(Uuid::now_v7());
+        let storage = config.storage.as_mut().unwrap();
+        storage.init_checkpoint = Some(Uuid::now_v7());
+        storage.defer_restore = true;
         let nothing = || CircuitConstructor::new(|_circuit: &mut RootCircuit| Ok(()));
         let result = Runtime::init_circuits(config, vec![nothing(), nothing()]);
         assert!(matches!(
             result,
             Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(_)))
         ));
+    }
+
+    type JoinHandles = (
+        IndexedZSetHandle<u64, u64>,
+        IndexedZSetHandle<u64, u64>,
+        OutputHandle<OrdZSet<Tup2<u64, Tup2<u64, u64>>>>,
+    );
+
+    /// A circuit that keeps both inputs of a join in traces. Two of them have
+    /// identical node ids, so they would read each other's checkpoint files if
+    /// their persistent ids did not name the circuit.
+    fn joining() -> CircuitConstructor<JoinHandles> {
+        CircuitConstructor::new(|circuit: &mut RootCircuit| {
+            let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let output = left
+                .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                .output();
+            Ok((left_input, right_input, output))
+        })
+    }
+
+    /// A different circuit: the join's output is mapped.
+    fn joining_and_mapping() -> CircuitConstructor<JoinHandles> {
+        CircuitConstructor::new(|circuit: &mut RootCircuit| {
+            let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let output = left
+                .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                .map(|row| *row)
+                .output();
+            Ok((left_input, right_input, output))
+        })
+    }
+
+    /// Loads distinct rows into the right-hand trace of each of two circuits,
+    /// compacts them to files, and returns one checkpoint of both.
+    fn checkpoint_two_loaded_circuits(path: &Path) -> CheckpointMetadata {
+        let mut circuits =
+            Runtime::init_circuits(mkconfig(path), vec![joining(), joining()]).unwrap();
+        let (mut second, (_, second_right, _)) = circuits.pop().unwrap();
+        let (mut first, (_, first_right, _)) = circuits.pop().unwrap();
+        first_right.append(&mut (0..10).map(|key| Tup2(key, Tup2(100 + key, 1))).collect());
+        first.transaction().unwrap();
+        second_right.append(&mut (0..10).map(|key| Tup2(key, Tup2(200 + key, 1))).collect());
+        second.transaction().unwrap();
+        for handle in [&mut first, &mut second] {
+            handle.start_compaction().unwrap();
+            handle.wait_for_compaction(Duration::from_secs(60)).unwrap();
+        }
+
+        // A single handle of a runtime with several circuits cannot checkpoint.
+        assert!(matches!(
+            first.checkpoint().prepare(),
+            Err(DbspError::Runtime(RuntimeError::BootstrapCircuit(_)))
+        ));
+        // Nor can the handles out of order, or only some of them.
+        assert!(DBSPHandle::checkpoint_circuits(&mut [&mut second, &mut first]).is_err());
+        assert!(DBSPHandle::checkpoint_circuits(&mut [&mut first]).is_err());
+
+        let metadata = DBSPHandle::checkpoint_circuits(&mut [&mut first, &mut second])
+            .and_then(CheckpointCommitter::commit)
+            .and_then(CheckpointPublisher::publish)
+            .unwrap();
+        first.kill().unwrap();
+        drop(second);
+        metadata
+    }
+
+    /// Restores two joining circuits from `metadata` and returns each one's join
+    /// output for one left-hand row per key.
+    fn probe_restored_circuits(
+        path: &Path,
+        metadata: &CheckpointMetadata,
+    ) -> Vec<OrdZSet<Tup2<u64, Tup2<u64, u64>>>> {
+        let mut config = mkconfig(path);
+        config.storage.as_mut().unwrap().init_checkpoint = Some(metadata.uuid);
+        let circuits = Runtime::init_circuits(config, vec![joining(), joining()]).unwrap();
+        let mut outputs = Vec::new();
+        let mut handles = Vec::new();
+        for (mut handle, (left, _, output)) in circuits {
+            left.append(&mut vec![Tup2(3, Tup2(7, 1))]);
+            handle.transaction().unwrap();
+            outputs.push(output.consolidate());
+            handles.push(handle);
+        }
+        for handle in handles {
+            drop(handle);
+        }
+        outputs
+    }
+
+    /// Each of two circuits restores its own state from one checkpoint, and
+    /// restores it again after a restart, so the startup GC kept both circuits'
+    /// files.
+    #[test]
+    fn init_circuits_restore_each_circuit_from_one_checkpoint() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let metadata = checkpoint_two_loaded_circuits(temp.path());
+
+        // Both circuits' operators saved under their own names.
+        let checkpoint = temp.path().join(metadata.uuid.to_string());
+        let names: Vec<String> = fs::read_dir(&checkpoint)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains("-c0-")), "{names:?}");
+        assert!(names.iter().any(|name| name.contains("-c1-")), "{names:?}");
+
+        let expected = vec![
+            crate::zset! { Tup2(3u64, Tup2(7u64, 103u64)) => 1 },
+            crate::zset! { Tup2(3u64, Tup2(7u64, 203u64)) => 1 },
+        ];
+        for _restart in 0..2 {
+            assert_eq!(probe_restored_circuits(temp.path(), &metadata), expected);
+        }
+    }
+
+    /// A checkpoint of two circuits restores only into the same circuits in
+    /// the same order.
+    #[test]
+    fn init_circuits_reject_a_checkpoint_of_other_circuits() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let metadata = checkpoint_two_loaded_circuits(temp.path());
+        for constructors in [
+            vec![joining(), joining_and_mapping()],
+            vec![joining_and_mapping(), joining()],
+            vec![joining()],
+        ] {
+            let mut config = mkconfig(temp.path());
+            config.storage.as_mut().unwrap().init_checkpoint = Some(metadata.uuid);
+            let result = Runtime::init_circuits(config, constructors);
+            assert!(
+                matches!(
+                    result,
+                    Err(DbspError::Runtime(RuntimeError::IncompatibleStorage))
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// A checkpoint is written and restored with `FelderaCache`, whose
+    /// `O_DIRECT` on Linux rejects reads and writes that are not whole
+    /// sectors: the catalog and the operators' state files have arbitrary
+    /// lengths, so the backend reads and writes them through the page cache.
+    #[test]
+    fn checkpoint_and_restore_with_feldera_cache() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let config = || {
+            CircuitConfig::with_workers(1).with_storage(Some(
+                CircuitStorageConfig::for_config(
+                    StorageConfig {
+                        path: temp.path().to_string_lossy().into_owned(),
+                        cache: StorageCacheConfig::FelderaCache,
+                    },
+                    StorageOptions {
+                        min_storage_bytes: Some(0),
+                        ..StorageOptions::default()
+                    },
+                )
+                .unwrap(),
+            ))
+        };
+        let build = |circuit: &mut RootCircuit| {
+            let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let output = left
+                .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                .output();
+            Ok((left_input, right_input, output))
+        };
+        let (mut handle, (_, right, _)) = Runtime::init_circuit(config(), build).unwrap();
+        right.append(&mut (0..100).map(|key| Tup2(key, Tup2(key + 1000, 1))).collect());
+        handle.transaction().unwrap();
+        handle.start_compaction().unwrap();
+        handle.wait_for_compaction(Duration::from_secs(60)).unwrap();
+        let metadata = handle.checkpoint().run().unwrap();
+        handle.kill().unwrap();
+
+        let mut config = config();
+        config.storage.as_mut().unwrap().init_checkpoint = Some(metadata.uuid);
+        let (mut handle, (left, _, output)) = Runtime::init_circuit(config, build).unwrap();
+        left.append(&mut vec![Tup2(42, Tup2(7, 1))]);
+        handle.transaction().unwrap();
+        assert_eq!(
+            output.consolidate(),
+            crate::zset! { Tup2(42u64, Tup2(7u64, 1042u64)) => 1 }
+        );
+        handle.kill().unwrap();
+    }
+
+    /// A runtime with one circuit keeps the persistent ids without a circuit
+    /// tag, so its existing checkpoints still restore.
+    #[test]
+    fn a_single_circuit_keeps_untagged_persistent_ids() {
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let (mut handle, (_, right, _)) = Runtime::init_circuit(mkconfig(temp.path()), |circuit| {
+            let (left, left_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let (right, right_input) = circuit.add_input_indexed_zset::<u64, u64>();
+            let output = left
+                .join(&right, |key, left, right| Tup2(*key, Tup2(*left, *right)))
+                .output();
+            Ok((left_input, right_input, output))
+        })
+        .unwrap();
+        right.append(&mut vec![Tup2(1, Tup2(2, 1))]);
+        handle.transaction().unwrap();
+        let metadata = handle.checkpoint().run().unwrap();
+        let names: Vec<String> = fs::read_dir(temp.path().join(metadata.uuid.to_string()))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.starts_with("pspine-0-")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|name| name.contains("-c0-")), "{names:?}");
+        handle.kill().unwrap();
     }
 
     /// Run reads are the worker thread's, so every handle reports the same.

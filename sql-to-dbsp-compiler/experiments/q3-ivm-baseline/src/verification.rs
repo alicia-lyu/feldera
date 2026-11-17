@@ -420,19 +420,78 @@ type Fixture = (&'static str, Change, bool);
 /// and the base relations, and returns the V transcript: each fixture's delta and view.
 /// `session_pass` is the reconstructed build's scan-session pass; the native build has no
 /// session.
-#[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
-    let config = || CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
-    let mut pipeline = Pipeline::new(config())?;
-    pipeline.enable_contract_check();
-    #[cfg(feature = "merged-index")]
-    {
-        pipeline.session_pass = session_pass;
+    replay_with_image(fixtures, session_pass, None)
+}
+
+/// A scratch storage directory for one test, removed when dropped.
+struct ScratchStorage(PathBuf);
+
+impl ScratchStorage {
+    fn new(name: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("q3-image-{name}-{}", std::process::id()));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
     }
+}
+
+impl Drop for ScratchStorage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Like [`replay`]. With `image_after = Some(count)`, the pipeline keeps its state in a scratch
+/// storage directory, writes an image (`Pipeline::write_checkpoint`) after the first `count`
+/// fixtures, and runs the rest on a pipeline reopened from that image in a new runtime, as a
+/// refresh process does (`Pipeline::reopen`, then `republish`).
+#[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
+fn replay_with_image(
+    fixtures: Vec<Fixture>,
+    session_pass: Pass,
+    image_after: Option<usize>,
+) -> Result<Vec<Value>> {
+    let storage = image_after
+        .map(|_| ScratchStorage::new(&format!("{session_pass:?}")))
+        .transpose()?;
+    let config = || -> Result<CircuitConfig> {
+        let config = CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
+        Ok(match &storage {
+            None => config,
+            Some(storage) => config.with_storage(Some(CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: storage.0.to_string_lossy().into_owned(),
+                    cache: StorageCacheConfig::default(),
+                },
+                StorageOptions::default(),
+            )?)),
+        })
+    };
+    let prepare = |pipeline: &mut Pipeline| {
+        pipeline.enable_contract_check();
+        #[cfg(feature = "merged-index")]
+        {
+            pipeline.session_pass = session_pass;
+        }
+    };
+    let mut pipeline = Pipeline::new(config()?)?;
+    prepare(&mut pipeline);
     let mut state = Reference::default();
     let mut transcript = Vec::new();
 
-    for (name, change, multi_step) in fixtures {
+    for (position, (name, change, multi_step)) in fixtures.into_iter().enumerate() {
+        if image_after == Some(position) {
+            let image = pipeline.write_checkpoint()?;
+            drop(pipeline);
+            pipeline = Pipeline::reopen(config()?, &image)?;
+            prepare(&mut pipeline);
+            let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
+            republish(&mut pipeline, &mut base)?;
+            assert!(base.matches(&state)?, "{name}: the reopened base relations");
+        }
         let before = state.clone();
         let before_view = before.evaluate();
         let mut expected_after = before.clone();
@@ -489,6 +548,26 @@ fn rf1_rf2_transcript() -> Result<()> {
     let transcript = replay(rf1_rf2_fixtures(), Pass::Seek)?;
     assert_eq!(transcript.len(), 13);
     write_transcript("Q3_VERIFICATION_TRANSCRIPT", &transcript)
+}
+
+/// A pipeline reopened from an image continues exactly where the pipeline that wrote it
+/// stopped: splitting the fixtures at any point by an image and a new runtime leaves the V
+/// transcript byte-identical to the single runtime's. This is the guarantee that a refresh
+/// process started from a loaded image depends on.
+#[test]
+fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
+        for split in [1, fixtures().len() / 2, fixtures().len() - 1] {
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split))?;
+            assert_eq!(
+                serde_json::to_vec(&reopened)?,
+                whole,
+                "an image after {split} fixtures"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The scan session's other pass leaves every transcript unchanged, so it matches the native
