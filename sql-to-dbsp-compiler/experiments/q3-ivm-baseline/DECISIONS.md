@@ -98,7 +98,7 @@ The driver's `--session-pass seek|step` (default `seek`) selects the scan sessio
 
 ### 2026-11-11: The Linux campaign crosses prefix truncation with the session pass
 
-The Linux pilot and campaign run four arms, a full 2×2: prefix truncation on (A) or off (B), crossed with the scan session's pass, `seek` or `step`. The arms are `A-seek`, `A-step`, `B-seek`, and `B-step`. All keep `--elide-value-headers` and drop `--setup-full-compaction`. Native runs in every arm, though neither factor changes it, and must match across the four. This amends the two-arm design of 2026-10-22 and 2026-11-09. The user calls the key encoding of `--front-code-byte-keys` prefix truncation from 2026-11-11. *Amended on 2026-11-16: the full campaign runs on the SSD, and the hard disk gets only the eight pilots as a probe (see [the entry](#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)). The four arms stand.*
+The Linux pilot and campaign run four arms, a full 2×2: prefix truncation on (A) or off (B), crossed with the scan session's pass, `seek` or `step`. The arms are `A-seek`, `A-step`, `B-seek`, and `B-step`. All keep `--elide-value-headers` and drop `--setup-full-compaction`. Native runs in every arm, though neither factor changes it, and must match across the four. This amends the two-arm design of 2026-10-22 and 2026-11-09. The user calls the key encoding of `--front-code-byte-keys` prefix truncation from 2026-11-11. *Amended on 2026-11-16: the full campaign runs on the SSD, and the hard disk gets only the eight pilots as a probe (see [the entry](#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)). The four arms stand.* *Amended on 2026-11-18: the step arms are dropped, leaving `A-seek` and `B-seek` (see [the entry](#2026-11-18-the-step-arms-are-dropped)).*
 
 ### 2026-11-11: One set of inputs, read in place; every run starts cold
 
@@ -157,6 +157,10 @@ The TPC-H refresh functions are batch loads: at SF 10 one RF1 is a single transa
 - **Popularity.** Clustered replaces the Zipf draw of 2026-10-23 with TPC-C's customer NURand(1023, 1, 3000) (clause 2.1.6), with one seeded constant C. TPC-H has no districts, so consecutive blocks of 3,000 eligible Customers stand in for them (user choice among three synthetic scalings: these blocks, one NURand over all eligible Customers, or nations); a block is chosen in proportion to its size. Real districts arrive with CH-benCHmark.
 - **Locality within a transaction.** Independent draws make the Customers a transaction spans a function of popularity and size, and a Zipf steep enough to put 10 Orders on 2 or 3 Customers would hand most Orders to one Customer. So locality is its own parameter: each transaction of n Orders draws ceil(n / m) Customers and gives them its Orders m at a time (`--orders-per-session`, m = 4), which keeps each Customer's expected Order count while bunching it. At about 10 rows a transaction is one Customer's session, as a TPC-C New-Order is.
 - **Unchanged.** Deletes stay oldest-first in both workloads; dbgen's Order keys stay (the order-key dimension is deferred, [deferred.md](deferred.md#order-key-assignment-as-a-dimension)).
+
+### 2026-11-18: The step arms are dropped
+
+The pilot and the campaign run two arms, `A-seek` and `B-seek`: prefix truncation on or off, with the scan session's `seek` pass. Under the `step` pass a small transaction walks the index from the session's start to its touched groups, about half the index per transaction ([LINUX-HANDOFF.md](LINUX-HANDOFF.md#known-limits)); the reconstructed run of `A-step` clustered at K = 10 was stopped after 49 minutes. `Pass::Step` and `--session-pass` stay in the code. This amends the four arms of 2026-11-11.
 
 ## Superseded and withdrawn
 

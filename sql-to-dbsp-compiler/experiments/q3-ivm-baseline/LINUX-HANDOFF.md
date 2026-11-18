@@ -33,7 +33,7 @@ TB, 512-byte logical sectors).
   the cgroup, so host RAM does not change them.
 - **Disks:** one SSD and, for the probe, one hard disk. Both need 512-byte logical sectors
   (`O_DIRECT`, `FBuf::ALIGNMENT`; a 4Kn drive may fail) and ext4 or xfs. The SSD holds the inputs,
-  the build, and the campaign's storage. The hard disk holds only the probe's 16 runs
+  the build, and the campaign's storage. The hard disk holds only the probe's 8 runs
   ("Hard-disk probe" below). `measure.py` records the device of `--storage-path` in the manifest
   (`storage_device`: `path`, `device`, `filesystem`, `logical_sector_bytes`, `rotational`, `model`,
   `label`). Every field is `null` on macOS or when it cannot be resolved; a device-mapper device is
@@ -411,7 +411,7 @@ Maven and Calcite.
   campaign stops. So a device needs room for the images and one run's copy at a time: the image's
   size plus what the six refreshes write (a native copy is about 20 GB at SF 10). Keeping every copy
   does not fit: one campaign of `--runs N` makes `2N` runs (native and reconstructed), so the
-  eight pilots make 16 and the eight campaigns 48. In the hard-disk probe, each run copies its image
+  four pilots make 8 and the four campaigns 24. In the hard-disk probe, each run copies its image
   from the SSD's `$R5_OUT/images` to its run directory on the hard disk.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
@@ -440,12 +440,13 @@ python3 measure.py \
   --device-label ssd
 ```
 
-This is arm `A-seek` for clustered. The four arms differ in two flags ("Campaign and four arms"
-below): A keeps `--front-code-byte-keys` and B drops it, and `--session-pass` is `seek` or `step`.
+This is arm `A-seek` for clustered. The two arms differ in one flag ("Campaign and two arms"
+below): A keeps `--front-code-byte-keys` and B drops it. Both use `--session-pass seek`; the step
+arms were dropped on 2026-11-18 ("Known limits").
 Give each pilot its own `--report` and `--storage-path`, named by arm and workload:
 `--report "$R5_OUT/pilot-<arm>-<workload>/manifest.json"` and
-`--storage-path "$R5_OUT/pilot-<arm>-<workload>/runs"`. Run the eight pilots in the order `A-seek`,
-`A-step`, `B-seek`, `B-step` for clustered, then the same for scattered. Why each flag:
+`--storage-path "$R5_OUT/pilot-<arm>-<workload>/runs"`. Run the four pilots in the order `A-seek`,
+`B-seek` for clustered, then the same for scattered. Why each flag:
 
 - `--images`: start each run from a copy of its mode's and arm's image ("Build the images"),
   in a new process that runs only the refreshes (the driver's `--from-image`). The window starts
@@ -465,7 +466,7 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
 - `--device-label`: names the device of `--storage-path` in the manifest and fails the run if it
   contradicts the device. Optional.
 
-**Pilot pass criterion.** For each of the eight pilots, and for both runs in its report (`runs[].qualification`), `status` must be
+**Pilot pass criterion.** For each of the four pilots, and for both runs in its report (`runs[].qualification`), `status` must be
 `qualifying`. `qualification` in `measure.py` returns that only when the run was on Linux with a
 limit, the cgroup proof matched (`cgroup.enforced`), the shared inputs were evicted before the
 driver started (`cgroup.proof.inputs_evicted`, which with `--images` also covers the run's copy
@@ -503,7 +504,7 @@ pressure:
 
 ## Hard-disk probe
 
-The user decided on 2026-11-16 that the hard disk gets only the eight pilots, as a probe of 16 runs
+The user decided on 2026-11-16 that the hard disk gets only the pilots, as a probe (8 runs since the step arms were dropped)
 ([DECISIONS.md](DECISIONS.md#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)).
 Run it after the SSD pilots pass. Repeat each pilot command with `--storage-path` on a directory of
 the hard disk and `--device-label hdd`, and keep every other flag. The inputs (`$DBGEN_OUT`,
@@ -525,22 +526,20 @@ the probe as evidence only: no HDD campaign exists, and nothing here supports a 
 devices until the user decides one. Do not summarize `pilot-hdd-*` manifests together with the SSD
 campaign's.
 
-## Campaign and four arms
+## Campaign and two arms
 
-Run the campaign on the SSD, only after all eight SSD pilots pass and the pressure instrumentation
+Run the campaign on the SSD, only after all four SSD pilots pass and the pressure instrumentation
 exists ([MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign)); the hard-disk probe does not
-gate it. It has four arms, prefix truncation
-crossed with the session pass (decision of 2026-11-11), each the pilot command with `--runs 3` and
+gate it. It has two arms, prefix truncation on or off with the `seek` pass (decisions of
+2026-11-11 and 2026-11-18), each the pilot command with `--runs 3` and
 fresh `--report` and `--storage-path` values:
 
 | Arm | `--front-code-byte-keys` | `--session-pass` |
 | --- | --- | --- |
 | `A-seek` | yes | `seek` |
-| `A-step` | yes | `step` |
 | `B-seek` | no | `seek` |
-| `B-step` | no | `step` |
 
-Keep every other flag. Run them in the order `A-seek`, `A-step`, `B-seek`, `B-step` for clustered,
+Keep every other flag. Run them in the order `A-seek`, `B-seek` for clustered,
 then the same for scattered. Give each run its own directory named by arm and workload, with
 `--report "$R5_OUT/campaign-A-seek-clustered/manifest.json"` and
 `--storage-path "$R5_OUT/campaign-A-seek-clustered/runs"`, and so on. Then check:
@@ -548,19 +547,19 @@ then the same for scattered. Give each run its own directory named by arm and wo
 - each manifest's `configuration.front_code_byte_keys` and `configuration.session_pass` against its
   arm (`measure.py` already rejects a driver report whose `session_pass` is not the one it asked
   for);
-- that the input hashes match across all eight manifests;
-- that native's storage and run reads are equal across the four arms of each workload.
+- that the input hashes match across all four manifests;
+- that native's storage and run reads are equal across the two arms of each workload.
 
-Then summarize the eight manifests together:
+Then summarize the four manifests together:
 
 ```bash
 python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
 ```
 
 `summarize.py` labels each manifest by its parent directory, which is why each needs its own, and
-its Markdown names each workload's session pass. The four arms quadruple both stages: the pilot is
-4 arms × 2 workloads × 1 repetition × 2 modes = 16 runs per device (the SSD, then the hard-disk
-probe), and the campaign 4 × 2 × 3 × 2 = 48 on the SSD. The inputs are shared, so the disk holds
+its Markdown names each workload's session pass. The two arms double both stages: the pilot is
+2 arms × 2 workloads × 1 repetition × 2 modes = 8 runs per device (the SSD, then the hard-disk
+probe), and the campaign 2 × 2 × 3 × 2 = 24 on the SSD. The inputs are shared, so the disk holds
 them once, plus each run's storage (see "Storage path and disk budget").
 
 ## Report back
@@ -589,7 +588,8 @@ When the pilots, or the campaign, are done, report:
   about 10 rows touches 1 to 3 customers, so each transaction walks about half the index (about
   76 million entries at SF 10). On the first Linux host, the reconstructed run of pilot
   `A-step` clustered at K = 10 read 15 GB from the SSD in 49 minutes, against about 7 minutes for
-  the whole `A-seek` run, and was stopped (2026-11-18). Run the step arms only at the TPC-H batch
+  the whole `A-seek` run, and was stopped (2026-11-18). The step arms were dropped on 2026-11-18
+  ([DECISIONS.md](DECISIONS.md#2026-11-18-the-step-arms-are-dropped)). If they return, run them only at the TPC-H batch
   size, or after the pass seeks to the first touched group of each transaction.
 - Without `--cgroup-root`, a Linux run is `nonqualifying` (reason "no cgroup v2 total memory
   limit"), yet the campaign still reports `status: complete`. Read each run's `qualification`.
