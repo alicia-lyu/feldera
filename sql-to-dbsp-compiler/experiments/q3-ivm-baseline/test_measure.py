@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -250,7 +251,8 @@ class MeasureTest(unittest.TestCase):
         base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
                 "--lineitem", str(self.root / "lineitem")]
         build = measure.parse_args(base + ["--build-images", "i"])
-        self.assertEqual(build.cache_bytes, 16 * 1024 ** 3)
+        # The cache is sized from the host when the images are built.
+        self.assertIsNone(build.cache_bytes)
         self.assertEqual(build.batch, 1_000_000)
         self.assertEqual(build.compaction_timeout_secs, 3600)
         chosen = measure.parse_args(base + ["--build-images", "i", "--cache-bytes",
@@ -267,6 +269,73 @@ class MeasureTest(unittest.TestCase):
         del without_cache[index:index + 2]
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             measure.parse_args(without_cache)
+
+    def test_each_loads_cache_is_a_share_of_available_memory(self) -> None:
+        meminfo = self.root / "meminfo"
+        meminfo.write_text("MemTotal: 196000000 kB\nMemAvailable:   100000000 kB\n")
+        self.assertEqual(measure.memory_available_bytes(meminfo), 100_000_000 * 1024)
+        meminfo.write_text("MemTotal: 1 kB\n")
+        self.assertIsNone(measure.memory_available_bytes(meminfo))
+        self.assertIsNone(measure.memory_available_bytes(self.root / "absent"))
+        available = 100 * 1024 ** 3
+        quarter = 75 * 1024 ** 3 // 4 // 2 ** 20 * 2 ** 20
+        self.assertEqual(measure.load_cache_bytes(available, 4), quarter)
+        self.assertEqual(measure.load_cache_bytes(available, 1), 75 * 1024 ** 3)
+        self.assertEqual(measure.load_cache_bytes(available, 4) % (1024 * 1024), 0)
+        self.assertEqual(measure.load_cache_bytes(1024, 4), 2 * 1024 * 1024)
+        self.assertEqual(measure.load_cache_bytes(None, 4), measure.LOAD_CACHE_FALLBACK_BYTES)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(self.args + ["--sequential-loads"])
+        # The help text renders (a bare % in it would break argparse's formatting).
+        with patch("sys.stdout", new_callable=io.StringIO) as out, \
+             self.assertRaises(SystemExit) as exit:
+            measure.parse_args(["--help"])
+        self.assertEqual(exit.exception.code, 0)
+        self.assertIn("75% of MemAvailable", " ".join(out.getvalue().split()))
+
+    def test_build_images_sizes_the_cache_for_concurrent_or_sequential_loads(self) -> None:
+        def build(name: str, extra: list[str]) -> tuple[dict, list[list[str]]]:
+            images = self.root / name
+            commands = []
+
+            def process(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+                if "--write-image" not in command:
+                    return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
+                commands.append(command)
+                directory = Path(command[command.index("--write-image") + 1])
+                (directory / "storage").mkdir(parents=True)
+                (directory / "image.json").write_text(json.dumps({
+                    "settings": {}, "checkpoint": {"uuid": "u"}, "load": {}}))
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            binaries = {mode: self.root / f"{name}-{mode}" for mode in measure.MODES}
+            for binary in binaries.values():
+                binary.write_bytes(b"binary")
+            args = measure.parse_args([
+                "--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem"), "--build-images", str(images),
+                *extra])
+            with patch.object(measure, "build_executables", return_value=binaries), \
+                 patch.object(measure, "memory_available_bytes", return_value=8 * 1024 ** 3), \
+                 patch.object(measure.subprocess, "run", side_effect=process):
+                self.assertEqual(measure.build_images(args), 0)
+            return json.loads((images / measure.IMAGES_MANIFEST).read_text()), commands
+
+        def caches(commands: list[list[str]]) -> set[int]:
+            return {int(command[command.index("--cache-bytes") + 1]) for command in commands}
+
+        together, commands = build("together", [])
+        self.assertEqual(together["configuration"]["concurrent_loads"], 4)
+        self.assertEqual(together["configuration"]["mem_available_bytes"], 8 * 1024 ** 3)
+        self.assertEqual(caches(commands), {measure.load_cache_bytes(8 * 1024 ** 3, 4)})
+        self.assertEqual(together["configuration"]["cache_bytes"],
+                         measure.load_cache_bytes(8 * 1024 ** 3, 4))
+        alone, commands = build("alone", ["--sequential-loads"])
+        self.assertEqual(alone["configuration"]["concurrent_loads"], 1)
+        self.assertEqual(caches(commands), {6 * 1024 ** 3})
+        chosen, commands = build("chosen", ["--cache-bytes", str(64 * 1024 * 1024)])
+        self.assertEqual(caches(commands), {64 * 1024 * 1024})
+        self.assertEqual(chosen["configuration"]["cache_source"], "--cache-bytes")
 
     def test_a_run_from_an_image_starts_the_refresh_program(self) -> None:
         spec = {"run_dir": str(self.root), "executable": "/bin/driver",

@@ -236,10 +236,14 @@ four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merge
 settings (`ImageSettings` in `src/main.rs`). Every load finishes before a failure is reported, and
 each image that loaded is kept.
 
-**Load settings.** Loading has its own defaults in `measure.py` (`LOAD_CACHE_BYTES`, `LOAD_BATCH`,
-`LOAD_COMPACTION_TIMEOUT_SECS`; decision of 2026-11-17): a 16 GiB buffer cache per load,
-1,000,000-row load transactions, and a 3600 s wait for the background merges. Flags override
-them, but do not pass the campaign's `--cache-bytes 134217728` or `--batch 10000` here. None of
+**Load settings.** Loading has its own defaults in `measure.py` (`LOAD_MEMORY_SHARE`, `LOAD_BATCH`,
+`LOAD_COMPACTION_TIMEOUT_SECS`; decisions of 2026-11-17): each load's buffer cache is 75% of the
+host's `MemAvailable`, split evenly among the loads that run at once (all four by default, about
+35 GiB each on a 187 GiB host; one with `--sequential-loads`, which gives each load the whole
+budget), with 1,000,000-row load transactions and a 3600 s wait for the background merges.
+`images.json` records the cache used (`configuration.cache_bytes`, `concurrent_loads`,
+`mem_available_bytes`). Flags override them, but do not pass the campaign's
+`--cache-bytes 134217728` or `--batch 10000` here. None of
 them reaches a refresh run, which uses the campaign's flags, and neither the cache nor the batch is
 part of `ImageSettings`. All four images must use the same batch, though: no full compaction runs
 after loading (decision of 2026-11-09), so the batch shapes each image's runs.
@@ -259,11 +263,13 @@ customer's whole group in the merged index, which clusters by customer, while th
 orders in `orderkey` order: each transaction touches customers spread over the whole index. On the
 first Linux host, with the campaign's 128 MiB cache and 10,000-row transactions, a reconstructed
 SF 10 load read 0.35% of `lineitem.tbl` per minute, a profile put about 68% of its main thread in
-`Q3State::collect`, and its time went to block reads, checksums, and block expansion. With the load
-defaults it read about 2% per minute and nothing from the device in its first 15 minutes
-(`read_bytes` in `/proc/<pid>/io`). Each load then holds up to its cache plus a few GiB of working
-memory, about 80 GiB for the four on a 187 GiB host; on a smaller host lower `--cache-bytes`, or
-watch `read_bytes` to see whether the working set still fits.
+`Q3State::collect`, and its time went to block reads, checksums, and block expansion. With a
+16 GiB cache per load (four at once) and 1,000,000-row transactions it read about 2% per minute
+and nothing from the device until the caches filled, at about 30% of `lineitem.tbl`; then it read
+17 to 29 GB back from the SSD (`read_bytes` in `/proc/<pid>/io`) and slowed to about 0.9% per
+minute, and native from about 1.8% to 1.4%. Hence the cache sized from the host. Each load holds up
+to its cache plus a few GiB of working memory; if `read_bytes` still grows, the working set does
+not fit, and `--sequential-loads` gives each load the whole budget.
 
 `images.json` records the settings used, the revision, the input hashes, the executables' SHA-256,
 and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both

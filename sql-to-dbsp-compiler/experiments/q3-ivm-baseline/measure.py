@@ -916,10 +916,17 @@ def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
 # The load program's defaults (`--build-images`). Loading is not measured, so its settings serve
 # speed and never reach a refresh run (decision of 2026-11-17). The view phase of every load
 # transaction scans the touched customers' groups of the merged index; storage files bypass the
-# page cache (`O_DIRECT`), so a small buffer cache sends those reads to the device. With the
-# campaign's 128 MiB and 10,000-row transactions, a reconstructed SF 10 load ran about six times
-# slower than with these. Four loads run at once: about 80 GiB of memory in all.
-LOAD_CACHE_BYTES = 16 * 1024 ** 3
+# page cache (`O_DIRECT`), so a buffer-cache miss reads the device. With the campaign's 128 MiB
+# and 10,000-row transactions a reconstructed SF 10 load read 0.35% of `lineitem.tbl` per
+# minute; with 16 GiB per load (four at once) and 1,000,000-row transactions about 2% until the
+# caches filled, then about 0.9% while it read 17 to 29 GB back from the SSD. So each load's
+# cache is sized from the host: `LOAD_MEMORY_SHARE` of `MemAvailable`, split evenly among the
+# loads that run at once (all four, or one with `--sequential-loads`), leaving the rest for the
+# loads' working memory. `--cache-bytes` overrides it; a host without `/proc/meminfo` falls back
+# to `LOAD_CACHE_FALLBACK_BYTES`.
+LOAD_MEMORY_SHARE = 0.75
+LOAD_CACHE_FALLBACK_BYTES = 16 * 1024 ** 3
+MIB = 1024 * 1024
 LOAD_BATCH = 1_000_000
 LOAD_COMPACTION_TIMEOUT_SECS = 3600.0
 # The single-process driver's defaults, which also load.
@@ -933,9 +940,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--cache-bytes", type=int,
                         help="the buffer cache in bytes, a whole MiB; required for a campaign. "
-                             "With --build-images it is the load's own cache (default "
-                             f"{LOAD_CACHE_BYTES >> 30} GiB per load) and never reaches a "
-                             "refresh run")
+                             "With --build-images it is each load's own cache (default: "
+                             f"{LOAD_MEMORY_SHARE:.0%}% of MemAvailable split among the loads "
+                             "that run at once) and never reaches a refresh run")
     parser.add_argument("--memory-target-bytes", type=int)
     parser.add_argument("--build-images", type=Path, metavar="IMAGES_DIR",
                         help="load the base files once per mode and prefix-truncation arm, "
@@ -944,6 +951,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--images", type=Path, metavar="IMAGES_DIR",
                         help="start every run from a copy of the matching image in this "
                              "directory (built by --build-images) instead of loading")
+    parser.add_argument("--sequential-loads", action="store_true",
+                        help="with --build-images, run the loads one at a time, each with the "
+                             "whole load cache budget (default: all four at once)")
     parser.add_argument("--keep-run-storage", action="store_true",
                         help="with --images, keep each completed run's copy of its image "
                              "(default: delete it once the run's report is recorded)")
@@ -982,7 +992,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
     if args.build_images:
-        defaults = (LOAD_CACHE_BYTES, LOAD_BATCH, LOAD_COMPACTION_TIMEOUT_SECS)
+        # The cache stays None unless given: `build_images` sizes it from the host.
+        defaults = (args.cache_bytes, LOAD_BATCH, LOAD_COMPACTION_TIMEOUT_SECS)
     else:
         if args.cache_bytes is None:
             parser.error("a campaign needs --cache-bytes")
@@ -1011,12 +1022,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("a campaign needs --customer, --orders and --lineitem, or --images")
         if args.warm_up and not args.images:
             parser.error("--warm-up applies to runs started from --images")
+        if args.sequential_loads:
+            parser.error("--sequential-loads applies to --build-images")
         if args.keep_run_storage and not args.images:
             parser.error("--keep-run-storage applies to runs started from --images")
-    if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or \
+    if args.runs < 1 or args.batch < 1 or (args.cache_bytes is not None
+                                           and args.cache_bytes < 1) or \
             (args.memory_target_bytes is not None and args.memory_target_bytes < 1):
         parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
-    if args.cache_bytes % (1024 * 1024):
+    if args.cache_bytes is not None and args.cache_bytes % MIB:
         parser.error("cache bytes must be a whole MiB")
     if not math.isfinite(args.compaction_timeout_secs) or args.compaction_timeout_secs <= 0:
         parser.error("compaction timeout must be finite and positive")
@@ -1038,6 +1052,26 @@ def git_state() -> tuple[str, str]:
     return revision.stdout.strip(), status.stdout
 
 
+def memory_available_bytes(meminfo: Path = Path("/proc/meminfo")) -> int | None:
+    """The host's `MemAvailable`, or None where `/proc/meminfo` does not give it."""
+    try:
+        for line in meminfo.read_text().splitlines():
+            name, _, value = line.partition(":")
+            if name == "MemAvailable":
+                return int(value.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def load_cache_bytes(available: int | None, concurrent: int) -> int:
+    """Each load's buffer cache: `LOAD_MEMORY_SHARE` of `available` split among `concurrent`
+    loads, in whole MiB and at least 2 MiB (the driver's minimum), or the fallback."""
+    if available is None:
+        return LOAD_CACHE_FALLBACK_BYTES
+    return max(int(available * LOAD_MEMORY_SHARE / concurrent) // MIB * MIB, 2 * MIB)
+
+
 def build_images(args: argparse.Namespace) -> int:
     """The load program: load the base files once per mode and prefix-truncation arm into an
     image (`--write-image`), outside any cgroup and with no memory target, since loading is not
@@ -1052,13 +1086,27 @@ def build_images(args: argparse.Namespace) -> int:
         "status": "failed", "revision": None, "git_status_short": None,
         "platform": platform.platform(),
         "storage_device": storage_device(root, args.device_label),
-        "configuration": {"cache_bytes": args.cache_bytes, "batch": args.batch,
+        "configuration": {"cache_bytes": None, "batch": args.batch,
                           "compaction_timeout_secs": args.compaction_timeout_secs,
                           "setup_full_compaction": args.setup_full_compaction,
                           "elide_value_headers": args.elide_value_headers,
                           "memory_target_bytes": None, "cgroup": None},
         "inputs": {}, "executables": {}, "images": {}, "errors": [],
     }
+    # The loads are independent and unmeasured, and each uses one DBSP worker, so by default
+    # they run at once and share the host's memory; `--sequential-loads` gives each the whole
+    # budget instead. Every load finishes before any failure is reported, and each image that
+    # loads is recorded.
+    arms = [(mode, front_code) for mode in MODES for _, front_code in IMAGE_ARMS]
+    concurrent_loads = 1 if args.sequential_loads else len(arms)
+    available = memory_available_bytes()
+    cache_bytes = args.cache_bytes or load_cache_bytes(available, concurrent_loads)
+    manifest["configuration"].update({
+        "cache_bytes": cache_bytes, "concurrent_loads": concurrent_loads,
+        "cache_source": "--cache-bytes" if args.cache_bytes else (
+            f"{LOAD_MEMORY_SHARE} of MemAvailable / concurrent_loads" if available is not None
+            else "fallback: MemAvailable unknown"),
+        "mem_available_bytes": available})
     try:
         manifest["revision"], manifest["git_status_short"] = git_state()
         inputs = {name: Path(getattr(args, name)).resolve()
@@ -1079,7 +1127,7 @@ def build_images(args: argparse.Namespace) -> int:
                        "--orders", str(inputs["orders"]),
                        "--lineitem", str(inputs["lineitem"]),
                        "--runs", "1", "--no-verify", "--batch", str(args.batch),
-                       "--cache-bytes", str(args.cache_bytes),
+                       "--cache-bytes", str(cache_bytes),
                        "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
             if args.setup_full_compaction:
                 command.append("--setup-full-compaction")
@@ -1103,11 +1151,7 @@ def build_images(args: argparse.Namespace) -> int:
                 "elapsed_seconds": time.monotonic() - started,
             }
 
-        # The loads are independent and unmeasured, and each uses one DBSP worker, so they run
-        # at once. Every load finishes before any failure is reported, and each image that loads
-        # is recorded.
-        arms = [(mode, front_code) for mode in MODES for _, front_code in IMAGE_ARMS]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_loads) as pool:
             futures = {image_name(*arm): pool.submit(load, *arm) for arm in arms}
         failures = []
         for name, future in futures.items():
