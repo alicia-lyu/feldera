@@ -582,6 +582,15 @@ When the pilots, or the campaign, are done, report:
 
 ## Known limits
 
+- The `step` session pass cannot finish at small transaction sizes. `ScanSession::next_group`
+  under `Pass::Step` steps one entry at a time from the session's position, which starts at the
+  first key of `Old`, to the next touched group. A TPC-H batch transaction touches thousands of
+  customers spread over the index, so one pass over the index serves them all; a transaction of
+  about 10 rows touches 1 to 3 customers, so each transaction walks about half the index (about
+  76 million entries at SF 10). On the first Linux host, the reconstructed run of pilot
+  `A-step` clustered at K = 10 read 15 GB from the SSD in 49 minutes, against about 7 minutes for
+  the whole `A-seek` run, and was stopped (2026-11-18). Run the step arms only at the TPC-H batch
+  size, or after the pass seeks to the first touched group of each transaction.
 - Without `--cgroup-root`, a Linux run is `nonqualifying` (reason "no cgroup v2 total memory
   limit"), yet the campaign still reports `status: complete`. Read each run's `qualification`.
 - `memory.peak`, `memory.events`, and `io.stat` are read once, after the run exits. With
