@@ -327,9 +327,9 @@ TB, 512-byte logical sectors).
   with the rest of the SSD unpartitioned and the hard disk blank. See "Prepare the disks" below.
 
 Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
-inputs once (about 10 GB at SF 10, unchecked), 64 runs' storage (16 pilot runs and 48 campaign runs),
-and the build; the hard disk takes 16 runs' storage. Take the per-run figure from the pilot's
-`load.observed_storage_bytes`, which the pilot aims at about 4 GiB.
+inputs once (about 10 GB at SF 10, unchecked), the four images (see "Build the images"), one run's
+copy at a time, the load's peak while the images are built (about 41 GB per native load at SF 10,
+all four at once), and the build.
 
 ### Pre-flight checks
 
@@ -513,8 +513,13 @@ and each image that loaded is kept. A is with
 settings (`ImageSettings` in `src/main.rs`). Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
 settings, the checkpoint, and the load record. `images.json` beside them records the revision, the
-input hashes, and each image's size and load time. Campaign runs refuse images built at another
-revision (`read_images`), so commit before building them. Pre-build the release executables with
+input hashes, the executables' SHA-256, and each image's size and load time. A campaign reopens
+an image only with the executable that wrote it, byte for byte (`image_executable_problems`): it
+stops before any run if the executables it builds differ. A commit that leaves the driver's sources
+alone (docs, `measure.py`) rebuilds the same executables and keeps the images usable; a change to
+the driver, its circuits, or DBSP needs new images. At SF 10 the native images took 84 and 95
+minutes and hold 19.4 GB each (40.8 GB at the load's peak); the reconstructed loads ran about four
+times slower than the native ones while the four ran together. Pre-build the release executables with
 `cargo +1.96.1 build --release --offline --locked -j"$(nproc)"`, with and without
 `--features merged-index`: `measure.py` builds with `-j2`, and on the first Linux host that took 56
 minutes from a cold target. Already-built executables make its build a no-op.
@@ -626,14 +631,14 @@ Maven and Calcite.
   size and modification time against the campaign's hash record and fails if one changed.
 - The four images are kept once, in `$R5_OUT/images`; `images.json` gives each one's
   `size_bytes`.
-- Each run copies its image into `<run dir>/image` (`cp -a`, outside the run's cgroup) and keeps
-  the copy, refreshed, afterwards; nothing deletes it. One campaign of `--runs N` makes `2N` runs
-  (native and reconstructed), so one pilot command (`--runs 1`) makes two, the eight pilots make 16,
-  and the eight campaigns make 48. On the SSD, budget the inputs and the images once, plus 64 run
-  copies (16 pilot runs and 48 campaign runs), or 48 if the pilot's run directories are moved off
-  the disk before the campaign. A run's copy is its image's size plus what the six refreshes write.
-  The hard-disk probe repeats the eight pilots on the hard disk: 16 copies there, and none on the
-  SSD.
+- Each run copies its image into `<run dir>/image` (`cp -a`, outside the run's cgroup) and deletes
+  the copy once the run completes and its report is recorded (`storage_deleted` in the run's
+  record); `--keep-run-storage` keeps it. A failed run keeps its copy for diagnosis, and the
+  campaign stops. So a device needs room for the images and one run's copy at a time: the image's
+  size plus what the six refreshes write (a native copy is about 20 GB at SF 10). Keeping every copy
+  does not fit: one campaign of `--runs N` makes `2N` runs (native and reconstructed), so the
+  eight pilots make 16 and the eight campaigns 48. In the hard-disk probe, each run copies its image
+  from the SSD's `$R5_OUT/images` to its run directory on the hard disk.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
 

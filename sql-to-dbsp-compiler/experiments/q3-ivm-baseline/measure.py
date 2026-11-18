@@ -881,6 +881,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--images", type=Path, metavar="IMAGES_DIR",
                         help="start every run from a copy of the matching image in this "
                              "directory (built by --build-images) instead of loading")
+    parser.add_argument("--keep-run-storage", action="store_true",
+                        help="with --images, keep each completed run's copy of its image "
+                             "(default: delete it once the run's report is recorded)")
     parser.add_argument("--warm-up", type=Path, metavar="REFRESH_LIST",
                         help="with --images, apply these refreshes untimed before the window, "
                              "so that the window starts with their buffer cache")
@@ -916,7 +919,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if None in base_files:
             parser.error("--build-images needs --customer, --orders and --lineitem")
         if args.images or args.refresh_list or args.report or args.storage_path or \
-                args.cgroup_root or args.warm_up or args.memory_target_bytes is not None:
+                args.cgroup_root or args.warm_up or args.keep_run_storage or \
+                args.memory_target_bytes is not None:
             parser.error("--build-images loads only: it takes the base files and the loading "
                          "settings, and no refresh, report, storage, cgroup or memory target")
     else:
@@ -931,6 +935,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("a campaign needs --customer, --orders and --lineitem, or --images")
         if args.warm_up and not args.images:
             parser.error("--warm-up applies to runs started from --images")
+        if args.keep_run_storage and not args.images:
+            parser.error("--keep-run-storage applies to runs started from --images")
     if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or \
             (args.memory_target_bytes is not None and args.memory_target_bytes < 1):
         parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
@@ -1049,16 +1055,27 @@ def build_images(args: argparse.Namespace) -> int:
     return 0 if manifest["status"] == "complete" else 1
 
 
-def read_images(root: Path, revision: str) -> dict[str, Any]:
-    """The manifest of the images in `root`, which must be complete and built from `revision`:
-    an image is reopened by the build of the revision that wrote it."""
+def read_images(root: Path) -> dict[str, Any]:
+    """The manifest of the images in `root`, which must be complete."""
     manifest = json.loads((root / IMAGES_MANIFEST).read_text())
     if manifest.get("status") != "complete":
         raise ValueError(f"{root / IMAGES_MANIFEST} is not complete")
-    if manifest.get("revision") != revision:
-        raise ValueError(f"the images were built at {manifest.get('revision')}, "
-                         f"but this checkout is {revision}")
     return manifest
+
+
+def image_executable_problems(images: dict[str, Any],
+                              executables: dict[str, dict[str, Any]]) -> list[str]:
+    """Why the campaign's executables may not reopen the images: an image is reopened only by
+    the executable that wrote it, byte for byte. A commit that leaves the driver's sources alone
+    (docs, `measure.py`) rebuilds the same executables, so it keeps the images usable."""
+    problems = []
+    for mode, executable in executables.items():
+        written_by = images.get("executables", {}).get(mode, {}).get("sha256")
+        if written_by != executable["sha256"]:
+            problems.append(f"the {mode} images were written by an executable with sha256 "
+                            f"{written_by}, but this campaign built {executable['sha256']} "
+                            f"(rebuild the images with --build-images)")
+    return problems
 
 
 def run(argv: list[str]) -> int:
@@ -1098,7 +1115,7 @@ def run(argv: list[str]) -> int:
         manifest["revision"], manifest["git_status_short"] = git_state()
         images = None
         if args.images:
-            images = read_images(args.images.resolve(), manifest["revision"])
+            images = read_images(args.images.resolve())
             manifest["images"] = {
                 "directory": str(args.images.resolve()),
                 "manifest_sha256": sha256(args.images.resolve() / IMAGES_MANIFEST),
@@ -1122,6 +1139,10 @@ def run(argv: list[str]) -> int:
         binaries = build_executables(EXPERIMENT / "target" / "r5-executables" / campaign_id)
         manifest["executables"] = {mode: {"path": str(path), "sha256": sha256(path)}
                                    for mode, path in binaries.items()}
+        if images:
+            problems = image_executable_problems(images, manifest["executables"])
+            if problems:
+                raise ValueError("; ".join(problems))
         for repetition in range(1, args.runs + 1):
             for mode in MODES:
                 run_dir = root / f"run-{repetition}-{mode}"
@@ -1194,6 +1215,12 @@ def run(argv: list[str]) -> int:
                     enforced=record.get("cgroup", {}).get("enforced", False),
                     cold=(record.get("cgroup", {}).get("proof") or {}).get("inputs_evicted", False))
                 record["status"] = "complete"
+                if images and not args.keep_run_storage:
+                    # The copy holds only the state after the run's refreshes, which no report
+                    # reads; at SF 10 a native copy is about 19 GB, so the campaign's copies do
+                    # not fit on the disks. A failed run keeps its copy for diagnosis.
+                    shutil.rmtree(run_dir / "image")
+                    record["storage_deleted"] = True
                 write_json(report, manifest)
         manifest["status"] = "complete"
     except Exception as error:  # Preserve every partial result for a failed campaign.

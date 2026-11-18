@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import types
@@ -277,18 +279,88 @@ class MeasureTest(unittest.TestCase):
         self.assertIn(str(run_dir / "image" / "image.json"), evicted)
         self.assertTrue(set(spec["inputs"].values()) <= evicted)
 
-    def test_images_must_be_complete_and_of_this_revision(self) -> None:
+    def test_images_must_be_complete(self) -> None:
         images = self.root / "images"
         images.mkdir()
         (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
             {"status": "complete", "revision": "abc", "images": {}}))
-        self.assertEqual(measure.read_images(images, "abc")["revision"], "abc")
-        with self.assertRaisesRegex(ValueError, "built at abc"):
-            measure.read_images(images, "def")
+        self.assertEqual(measure.read_images(images)["revision"], "abc")
         (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
             {"status": "failed", "revision": "abc", "images": {}}))
         with self.assertRaisesRegex(ValueError, "not complete"):
-            measure.read_images(images, "abc")
+            measure.read_images(images)
+
+    def test_images_reopen_only_with_the_executables_that_wrote_them(self) -> None:
+        images = {"executables": {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}}
+        same = {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}
+        self.assertEqual(measure.image_executable_problems(images, same), [])
+        rebuilt = {"native": {"sha256": "n"}, "merged-index": {"sha256": "x"}}
+        problems = measure.image_executable_problems(images, rebuilt)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("merged-index images were written by an executable with sha256 m",
+                      problems[0])
+        self.assertEqual(len(measure.image_executable_problems({}, same)), 2)
+
+    def image_campaign(self, name: str, written_by: bytes = b"binary",
+                       extra: list[str] = ()) -> tuple[int, dict, Path]:
+        """Runs a campaign over fake images, with drivers that report success."""
+        images = self.root / f"{name}-images"
+        binaries = {mode: self.root / f"{name}-{mode}" for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        entries = {}
+        for mode in measure.MODES:
+            image = images / measure.image_name(mode, False)
+            (image / "storage").mkdir(parents=True)
+            (image / "storage" / "batch.feldera").write_text("batch")
+            entries[image.name] = {"directory": str(image), "checkpoint": "u"}
+        (images / measure.IMAGES_MANIFEST).write_text(json.dumps({
+            "status": "complete", "revision": "older", "inputs": {}, "images": entries,
+            "executables": {mode: {"sha256": hashlib.sha256(written_by).hexdigest()}
+                            for mode in measure.MODES}}))
+        launched = []
+
+        def process(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            if command[0] in map(str, binaries.values()):
+                launched.append(command)
+                mode = "native" if command[0] == str(binaries["native"]) else "reconstructed"
+                report = self.owner_report(mode)
+                Path(command[command.index("--report") + 1]).write_text(json.dumps(report))
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if command[:2] == ["cp", "-a"]:
+                shutil.copytree(command[2], command[3])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        storage = self.root / f"{name}-campaign"
+        args = [*self.image_args(images), "--storage-path", str(storage), *extra]
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure, "report_problems", return_value=[]), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            code = measure.run(args)
+        return code, json.loads(self.report.read_text()), storage
+
+    def test_a_campaign_refuses_images_written_by_other_executables(self) -> None:
+        code, manifest, storage = self.image_campaign("other", written_by=b"older")
+        self.assertEqual(code, 1)
+        self.assertIn("rebuild the images", manifest["errors"][0])
+        self.assertEqual(manifest["runs"], [])
+        self.assertFalse(storage.exists() and any(storage.iterdir()))
+
+    def test_a_completed_run_deletes_its_copy_unless_asked_to_keep_it(self) -> None:
+        code, manifest, storage = self.image_campaign("delete")
+        self.assertEqual(code, 0, manifest["errors"])
+        for record in manifest["runs"]:
+            self.assertTrue(record["storage_deleted"])
+            self.assertFalse(Path(record["storage_path"]).exists())
+        code, manifest, storage = self.image_campaign("keep", extra=["--keep-run-storage"])
+        self.assertEqual(code, 0, manifest["errors"])
+        for record in manifest["runs"]:
+            self.assertNotIn("storage_deleted", record)
+            self.assertTrue((Path(record["storage_path"]) / "batch.feldera").is_file())
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(self.args + ["--keep-run-storage"])
 
     def test_build_images_loads_each_mode_and_arm_outside_any_cgroup(self) -> None:
         images = self.root / "images"
