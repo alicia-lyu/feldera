@@ -271,6 +271,18 @@ minute, and native from about 1.8% to 1.4%. Hence the cache sized from the host.
 to its cache plus a few GiB of working memory; if `read_bytes` still grows, the working set does
 not fit, and `--sequential-loads` gives each load the whole budget.
 
+Measured on the first Linux host (SF 10, revision `da074ff7e`, four loads at once with a 16 GiB
+cache each and 1,000,000-row transactions, before the cache was sized from the host):
+
+| Image | Load (min) | Of which merge wait (min) | Stored (GB) | Peak while loading (GB) |
+| --- | ---: | ---: | ---: | ---: |
+| `native-A` | 78.9 | 18.9 | 19.51 | 34.9 |
+| `native-B` | 82.3 | 22.4 | 19.51 | 35.8 |
+| `merged-index-A` | 135.5 | 8.1 | 17.41 | 25.4 |
+| `merged-index-B` | 142.1 | 6.5 | 20.40 | 29.2 |
+
+The four images take 77 GB, and the build peaked near 125 GB on the SSD.
+
 `images.json` records the settings used, the revision, the input hashes, the executables' SHA-256,
 and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
