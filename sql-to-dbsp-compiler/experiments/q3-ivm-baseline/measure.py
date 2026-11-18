@@ -950,6 +950,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="load the base files once per mode and prefix-truncation arm, "
                              "outside any cgroup and with no memory target, and write the "
                              "images and images.json into this new directory; runs no refresh")
+    parser.add_argument("--complete-images", type=Path, metavar="IMAGES_DIR",
+                        help="load, all at once, the images that IMAGES_DIR/images.json lacks, "
+                             "with the executables that wrote the others; each load's cache is "
+                             f"{LOAD_MEMORY_SHARE:.0%}% of MemAvailable split by mode weight "
+                             "(merged-index twice native) unless --cache-bytes is given")
     parser.add_argument("--images", type=Path, metavar="IMAGES_DIR",
                         help="start every run from a copy of the matching image in this "
                              "directory (built by --build-images) instead of loading")
@@ -993,8 +998,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
-    if args.build_images:
-        # The cache stays None unless given: `build_images` sizes it from the host.
+    loading = args.build_images or args.complete_images
+    if args.build_images and args.complete_images:
+        parser.error("--build-images and --complete-images are alternatives")
+    if loading:
+        # The cache stays None unless given: the load program sizes it from the host.
         defaults = (args.cache_bytes, LOAD_BATCH, LOAD_COMPACTION_TIMEOUT_SECS)
     else:
         if args.cache_bytes is None:
@@ -1004,9 +1012,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if getattr(args, name) is None:
             setattr(args, name, default)
     base_files = [args.customer, args.orders, args.lineitem]
-    if args.build_images:
+    if loading:
         if None in base_files:
             parser.error("--build-images needs --customer, --orders and --lineitem")
+        if args.complete_images and args.sequential_loads:
+            parser.error("--complete-images runs its loads at once")
         if args.images or args.refresh_list or args.report or args.storage_path or \
                 args.cgroup_root or args.warm_up or args.keep_run_storage or \
                 args.memory_target_bytes is not None:
@@ -1074,6 +1084,118 @@ def load_cache_bytes(available: int | None, concurrent: int) -> int:
     return max(int(available * LOAD_MEMORY_SHARE / concurrent) // MIB * MIB, 2 * MIB)
 
 
+def load_image(root: Path, binaries: dict[str, Path], inputs: dict[str, Path], mode: str,
+               front_code: bool, cache_bytes: int, args: argparse.Namespace) -> dict[str, Any]:
+    """Runs the load program for one image in `root` and returns its `images.json` entry."""
+    name = image_name(mode, front_code)
+    directory = root / name
+    command = [str(binaries[mode]), "--write-image", str(directory),
+               "--customer", str(inputs["customer"]),
+               "--orders", str(inputs["orders"]),
+               "--lineitem", str(inputs["lineitem"]),
+               "--runs", "1", "--no-verify", "--batch", str(args.batch),
+               "--cache-bytes", str(cache_bytes),
+               "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
+    if args.setup_full_compaction:
+        command.append("--setup-full-compaction")
+    if front_code:
+        command.append("--front-code-byte-keys")
+    if args.elide_value_headers:
+        command.append("--elide-value-headers")
+    started = time.monotonic()
+    completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True, text=True)
+    (root / f"{name}.stdout.log").write_text(completed.stdout)
+    (root / f"{name}.stderr.log").write_text(completed.stderr)
+    if completed.returncode:
+        raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
+                           f"{completed.stderr[-2000:]}")
+    image = json.loads((directory / "image.json").read_text())
+    return {
+        "directory": str(directory), "mode": mode,
+        "front_code_byte_keys": front_code, "settings": image["settings"],
+        "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
+        "size_bytes": tree_size(directory / "storage"),
+        "elapsed_seconds": time.monotonic() - started,
+        "cache_bytes": cache_bytes,
+    }
+
+
+# `--complete-images` gives each load a share of the load budget in proportion to its mode's
+# weight: a reconstructed load reads the merged index's touched groups in every load transaction,
+# so it gains more from cache than a native load does (user direction of 2026-11-18).
+LOAD_MODE_WEIGHTS = {"native": 1, "merged-index": 2}
+
+
+def weighted_load_cache_bytes(available: int | None, modes: list[str]) -> list[int]:
+    """Each pending load's cache when `modes` load at once: `LOAD_MEMORY_SHARE` of `available`
+    split in proportion to `LOAD_MODE_WEIGHTS`, in whole MiB and at least 2 MiB, or the
+    fallback each."""
+    if available is None:
+        return [LOAD_CACHE_FALLBACK_BYTES for _ in modes]
+    total = sum(LOAD_MODE_WEIGHTS[mode] for mode in modes)
+    return [max(int(available * LOAD_MEMORY_SHARE * LOAD_MODE_WEIGHTS[mode] / total) // MIB * MIB,
+                2 * MIB) for mode in modes]
+
+
+def complete_images(args: argparse.Namespace) -> int:
+    """Loads the images that `images.json` in an existing image directory lacks, all at once,
+    with the executables that wrote the others, so that every image in the directory comes from
+    the same executables. A missing image's directory may exist only empty (a placeholder that
+    kept an interrupted sequential build from starting it). Marks the manifest complete when all
+    four images are present."""
+    root = args.complete_images.resolve()
+    path = root / IMAGES_MANIFEST
+    manifest = json.loads(path.read_text())
+    binaries = {mode: Path(entry["path"]) for mode, entry in manifest["executables"].items()}
+    for mode, entry in manifest["executables"].items():
+        if sha256(binaries[mode]) != entry["sha256"]:
+            raise ValueError(f"{binaries[mode]} no longer matches images.json")
+    inputs = {name: Path(getattr(args, name)).resolve()
+              for name in ("customer", "orders", "lineitem")}
+    for name, source in inputs.items():
+        if sha256(source) != manifest["inputs"][name]["sha256"]:
+            raise ValueError(f"{source} is not the input the other images loaded")
+    arms = [(mode, front_code) for mode in MODES for _, front_code in IMAGE_ARMS]
+    pending = [arm for arm in arms if image_name(*arm) not in manifest["images"]]
+    for arm in pending:
+        directory = root / image_name(*arm)
+        if directory.exists():
+            if any(directory.iterdir()):
+                raise ValueError(f"{directory} exists and is not empty")
+            directory.rmdir()
+    available = memory_available_bytes()
+    caches = ([args.cache_bytes] * len(pending) if args.cache_bytes
+              else weighted_load_cache_bytes(available, [mode for mode, _ in pending]))
+    manifest["configuration"]["completion"] = {
+        "images": [image_name(*arm) for arm in pending], "mem_available_bytes": available,
+        "cache_bytes": dict(zip((image_name(*arm) for arm in pending), caches)),
+        "cache_source": "--cache-bytes" if args.cache_bytes else (
+            f"{LOAD_MEMORY_SHARE} of MemAvailable, weighted by mode {LOAD_MODE_WEIGHTS}"),
+        "concurrent_loads": len(pending)}
+    manifest["errors"] = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(pending), 1)) as pool:
+            futures = {image_name(*arm): pool.submit(load_image, root, binaries, inputs, *arm,
+                                                     cache, args)
+                       for arm, cache in zip(pending, caches)}
+        for name, future in futures.items():
+            try:
+                manifest["images"][name] = future.result()
+            except Exception as error:
+                manifest["errors"].append(f"{type(error).__name__}: {error}")
+        manifest["status"] = ("complete" if not manifest["errors"]
+                              and all(image_name(*arm) in manifest["images"] for arm in arms)
+                              else "failed")
+    finally:
+        try:
+            subprocess.run([str(EXPERIMENT / "generate.sh")], cwd=EXPERIMENT, check=True)
+        except Exception as error:
+            manifest["errors"].append(f"native generation restoration failed: {error}")
+            manifest["status"] = "failed"
+        write_json(path, manifest)
+    return 0 if manifest["status"] == "complete" else 1
+
+
 def build_images(args: argparse.Namespace) -> int:
     """The load program: load the base files once per mode and prefix-truncation arm into an
     image (`--write-image`), outside any cgroup and with no memory target, since loading is not
@@ -1122,36 +1244,7 @@ def build_images(args: argparse.Namespace) -> int:
         manifest["executables"] = {mode: {"path": str(binary), "sha256": sha256(binary)}
                                    for mode, binary in binaries.items()}
         def load(mode: str, front_code: bool) -> dict[str, Any]:
-            name = image_name(mode, front_code)
-            directory = root / name
-            command = [str(binaries[mode]), "--write-image", str(directory),
-                       "--customer", str(inputs["customer"]),
-                       "--orders", str(inputs["orders"]),
-                       "--lineitem", str(inputs["lineitem"]),
-                       "--runs", "1", "--no-verify", "--batch", str(args.batch),
-                       "--cache-bytes", str(cache_bytes),
-                       "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
-            if args.setup_full_compaction:
-                command.append("--setup-full-compaction")
-            if front_code:
-                command.append("--front-code-byte-keys")
-            if args.elide_value_headers:
-                command.append("--elide-value-headers")
-            started = time.monotonic()
-            completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True, text=True)
-            (root / f"{name}.stdout.log").write_text(completed.stdout)
-            (root / f"{name}.stderr.log").write_text(completed.stderr)
-            if completed.returncode:
-                raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
-                                   f"{completed.stderr[-2000:]}")
-            image = json.loads((directory / "image.json").read_text())
-            return {
-                "directory": str(directory), "mode": mode,
-                "front_code_byte_keys": front_code, "settings": image["settings"],
-                "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
-                "size_bytes": tree_size(directory / "storage"),
-                "elapsed_seconds": time.monotonic() - started,
-            }
+            return load_image(root, binaries, inputs, mode, front_code, cache_bytes, args)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_loads) as pool:
             futures = {image_name(*arm): pool.submit(load, *arm) for arm in arms}
@@ -1204,6 +1297,8 @@ def run(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.build_images:
         return build_images(args)
+    if args.complete_images:
+        return complete_images(args)
     report = args.report.resolve()
     campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     root = (args.storage_path or EXPERIMENT / "target" / "r5-measurements" /

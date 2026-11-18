@@ -174,6 +174,10 @@ Filter partitions now share the buffer cache with data blocks, so the cache grow
 
 Small transactions leave many small runs (14 to 75 in the merged index at the ends of the K = 10 refreshes), and each group read seeks every run. The user deferred any compaction change and asked for a document that sets the options against measurements, respecting the current spine design and aiming at a good layout for every spine, not only the merged index: [compaction.md](../../../docs/design/merged-index/compaction.md). Measurement version 15 adds the counters it needs (`run_counts`).
 
+### 2026-11-18: The version 15 images load native-A alone, then the other three at once
+
+The rebuild started sequentially (user direction: as much memory as possible). During native-A the user judged parallel loads with a larger budget for merged-index better, at least for the remaining three. Native-A finished alone with the whole budget; native-B, merged-index-A, and merged-index-B load at once with `measure.py --complete-images`, which splits 75% of `MemAvailable` by mode weight, merged-index twice native (`LOAD_MODE_WEIGHTS`). `images.json` records each image's `cache_bytes`.
+
 ## Superseded and withdrawn
 
 Rows that apply to any index or harness are in the [generic log](../../../docs/design/merged-index/decisions.md#superseded-and-withdrawn).

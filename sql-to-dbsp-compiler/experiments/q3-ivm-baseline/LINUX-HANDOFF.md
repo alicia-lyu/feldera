@@ -236,6 +236,15 @@ four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merge
 settings (`ImageSettings` in `src/main.rs`). Every load finishes before a failure is reported, and
 each image that loaded is kept.
 
+**Completing an image directory.** `measure.py --complete-images "$R5_OUT/images" --customer ...
+--orders ... --lineitem ... --elide-value-headers` loads, all at once, the images that
+`images.json` lacks, with the executables recorded there (so every image comes from the same
+build), and marks the manifest complete. Each load's cache is 75% of `MemAvailable` split by mode,
+a merged-index load getting twice a native one (`LOAD_MODE_WEIGHTS`), unless `--cache-bytes` is
+given. A missing image's directory may exist only empty: an empty directory is how a running
+sequential build is kept from starting a load (the load program refuses an existing directory),
+since stopping `measure.py` would stop its running load too.
+
 **Load settings.** Loading has its own defaults in `measure.py` (`LOAD_MEMORY_SHARE`, `LOAD_BATCH`,
 `LOAD_COMPACTION_TIMEOUT_SECS`; decisions of 2026-11-17): each load's buffer cache is 75% of the
 host's `MemAvailable`, split evenly among the loads that run at once (all four by default, about

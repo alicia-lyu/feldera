@@ -337,6 +337,76 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(caches(commands), {64 * 1024 * 1024})
         self.assertEqual(chosen["configuration"]["cache_source"], "--cache-bytes")
 
+    def test_merged_index_loads_get_twice_a_native_loads_cache(self) -> None:
+        available = 100 * 1024 ** 3
+        native, merged_a, merged_b = measure.weighted_load_cache_bytes(
+            available, ["native", "merged-index", "merged-index"])
+        self.assertEqual(merged_a, merged_b)
+        self.assertLessEqual(abs(merged_a - 2 * native), 2 * 1024 * 1024)
+        self.assertLessEqual(native + merged_a + merged_b, int(available * 0.75))
+        self.assertTrue(all(cache % (1024 * 1024) == 0 for cache in (native, merged_a)))
+        self.assertEqual(measure.weighted_load_cache_bytes(None, ["native"]),
+                         [measure.LOAD_CACHE_FALLBACK_BYTES])
+
+    def test_complete_images_loads_the_missing_images_at_once(self) -> None:
+        images = self.root / "partial"
+        commands: list[list[str]] = []
+
+        def process(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            if "--write-image" not in command:
+                return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
+            directory = Path(command[command.index("--write-image") + 1])
+            if directory.exists():  # A placeholder stops the queued load, as the driver does.
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="exists")
+            commands.append(command)
+            (directory / "storage").mkdir(parents=True)
+            (directory / "image.json").write_text(json.dumps({
+                "settings": {}, "checkpoint": {"uuid": "u"}, "load": {}}))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / f"partial-{mode}" for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem")]
+        # A sequential build whose last three loads met placeholders: only native-A loaded.
+        real_mkdir = Path.mkdir
+
+        def mkdir_with_placeholders(path: Path, *args: object, **kwargs: object) -> None:
+            real_mkdir(path, *args, **kwargs)
+            if path == images.resolve():
+                for name in ("native-B", "merged-index-A", "merged-index-B"):
+                    real_mkdir(path / name, exist_ok=True)
+
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure, "memory_available_bytes", return_value=8 * 1024 ** 3), \
+             patch.object(measure.subprocess, "run", side_effect=process), \
+             patch.object(Path, "mkdir", mkdir_with_placeholders):
+            args = measure.parse_args(base + ["--build-images", str(images),
+                                              "--sequential-loads"])
+            self.assertEqual(measure.build_images(args), 1)
+        partial = json.loads((images / measure.IMAGES_MANIFEST).read_text())
+        self.assertEqual(sorted(partial["images"]), ["native-A"])
+        self.assertEqual(len(commands), 1)
+
+        with patch.object(measure, "memory_available_bytes", return_value=10 * 1024 ** 3), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            args = measure.parse_args(base + ["--complete-images", str(images)])
+            self.assertEqual(measure.complete_images(args), 0)
+        complete = json.loads((images / measure.IMAGES_MANIFEST).read_text())
+        self.assertEqual(complete["status"], "complete")
+        self.assertEqual(sorted(complete["images"]),
+                         ["merged-index-A", "merged-index-B", "native-A", "native-B"])
+        loaded = {Path(command[command.index("--write-image") + 1]).name:
+                  int(command[command.index("--cache-bytes") + 1]) for command in commands[1:]}
+        expected = measure.weighted_load_cache_bytes(
+            10 * 1024 ** 3, ["native", "merged-index", "merged-index"])
+        self.assertEqual(loaded, dict(zip(["native-B", "merged-index-A", "merged-index-B"],
+                                          expected)))
+        self.assertEqual(complete["configuration"]["completion"]["concurrent_loads"], 3)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(base + ["--complete-images", str(images), "--sequential-loads"])
+
     def test_a_run_from_an_image_starts_the_refresh_program(self) -> None:
         spec = {"run_dir": str(self.root), "executable": "/bin/driver",
                 "image": str(self.root / "image"),
