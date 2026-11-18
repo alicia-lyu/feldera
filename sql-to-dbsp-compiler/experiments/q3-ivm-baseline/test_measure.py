@@ -236,6 +236,28 @@ class MeasureTest(unittest.TestCase):
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             measure.parse_args(self.args + ["--warm-up", str(self.refresh)])
 
+    def test_loading_has_its_own_cache_batch_and_timeout_defaults(self) -> None:
+        base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem")]
+        build = measure.parse_args(base + ["--build-images", "i"])
+        self.assertEqual(build.cache_bytes, 16 * 1024 ** 3)
+        self.assertEqual(build.batch, 1_000_000)
+        self.assertEqual(build.compaction_timeout_secs, 3600)
+        chosen = measure.parse_args(base + ["--build-images", "i", "--cache-bytes",
+                                            str(1024 * 1024), "--batch", "7",
+                                            "--compaction-timeout-secs", "9"])
+        self.assertEqual((chosen.cache_bytes, chosen.batch, chosen.compaction_timeout_secs),
+                         (1024 * 1024, 7, 9))
+        # A campaign keeps its measured settings: the cache is required, and the load
+        # defaults do not apply.
+        campaign = measure.parse_args(self.image_args(self.root / "images"))
+        self.assertEqual((campaign.batch, campaign.compaction_timeout_secs), (10000, 300))
+        without_cache = self.image_args(self.root / "images")
+        index = without_cache.index("--cache-bytes")
+        del without_cache[index:index + 2]
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(without_cache)
+
     def test_a_run_from_an_image_starts_the_refresh_program(self) -> None:
         spec = {"run_dir": str(self.root), "executable": "/bin/driver",
                 "image": str(self.root / "image"),

@@ -593,6 +593,12 @@ Loading is not measured, so it runs once, with no cgroup limit and no DBSP memor
 - **Every restored run is a file:** the restore reopens each batch from its file, so the window starts with no in-memory run.
 - **One runtime still hosts both circuits** (2026-10-23, 2026-11-05). DBSP now checkpoints a runtime with several circuits as one checkpoint: each circuit's persistent ids carry its index (`-c0-`, `-c1-`), the handles share one checkpointer, and the checkpoint's fingerprint combines the circuits' in order (`DBSPHandle::checkpoint_circuits`).
 
+### 2026-11-17: The load program uses its own cache and 1,000,000-row load transactions
+
+Loading is unmeasured, so its settings serve speed, not the campaign. `measure.py --build-images` defaults to a 16 GiB buffer cache per load (four loads at once), 1,000,000-row load transactions, and a 3600 s merge wait (`LOAD_CACHE_BYTES`, `LOAD_BATCH`, `LOAD_COMPACTION_TIMEOUT_SECS`). None reaches a refresh run, which takes the campaign's `--cache-bytes`; `ImageSettings` holds only the mode, the workers, and the two storage encodings. No full compaction runs after loading (user answer of 2026-11-17, keeping 2026-11-09), so the batch size shapes each image's runs, and all four images are loaded with the same settings.
+
+The first SF 10 build, with the campaign's 128 MiB cache and 10,000-row transactions, loaded native in 84 to 95 minutes and reconstructed at 0.35% of `lineitem.tbl` per minute (about 5 hours). A profile put about 68% of the reconstructed load's main thread in the view phase's scan session (`Q3State::collect`): the loader reads orders in `orderkey` order, the index clusters by customer, and storage files bypass the page cache (`O_DIRECT`), so the scattered group reads missed a small buffer cache and read the SSD. With the new settings, both modes read about 2% per minute and nothing from the device in the first 15 minutes. Rejected for now: sorting the load input by customer, which needs a loader change and costs native's `orderkey`-keyed join its locality.
+
 ## Superseded and withdrawn
 
 | Date | Earlier position | Replaced by |

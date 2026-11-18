@@ -868,11 +868,29 @@ def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
             "memory_swap_max": swap_max, "counters": counters}
 
 
+# The load program's defaults (`--build-images`). Loading is not measured, so its settings serve
+# speed and never reach a refresh run (decision of 2026-11-17). The view phase of every load
+# transaction scans the touched customers' groups of the merged index; storage files bypass the
+# page cache (`O_DIRECT`), so a small buffer cache sends those reads to the device. With the
+# campaign's 128 MiB and 10,000-row transactions, a reconstructed SF 10 load ran about six times
+# slower than with these. Four loads run at once: about 80 GiB of memory in all.
+LOAD_CACHE_BYTES = 16 * 1024 ** 3
+LOAD_BATCH = 1_000_000
+LOAD_COMPACTION_TIMEOUT_SECS = 3600.0
+# The single-process driver's defaults, which also load.
+CAMPAIGN_BATCH = 10000
+CAMPAIGN_COMPACTION_TIMEOUT_SECS = 300.0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("customer", "orders", "lineitem", "refresh-list", "report"):
         parser.add_argument("--" + name, type=Path)
-    parser.add_argument("--cache-bytes", type=int, required=True)
+    parser.add_argument("--cache-bytes", type=int,
+                        help="the buffer cache in bytes, a whole MiB; required for a campaign. "
+                             "With --build-images it is the load's own cache (default "
+                             f"{LOAD_CACHE_BYTES >> 30} GiB per load) and never reaches a "
+                             "refresh run")
     parser.add_argument("--memory-target-bytes", type=int)
     parser.add_argument("--build-images", type=Path, metavar="IMAGES_DIR",
                         help="load the base files once per mode and prefix-truncation arm, "
@@ -887,8 +905,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--warm-up", type=Path, metavar="REFRESH_LIST",
                         help="with --images, apply these refreshes untimed before the window, "
                              "so that the window starts with their buffer cache")
-    parser.add_argument("--compaction-timeout-secs", type=float, default=300)
-    parser.add_argument("--batch", type=int, default=10000)
+    parser.add_argument("--compaction-timeout-secs", type=float,
+                        help=f"default {CAMPAIGN_COMPACTION_TIMEOUT_SECS:g}, or "
+                             f"{LOAD_COMPACTION_TIMEOUT_SECS:g} with --build-images")
+    parser.add_argument("--batch", type=int,
+                        help=f"rows per load transaction: default {CAMPAIGN_BATCH}, or "
+                             f"{LOAD_BATCH} with --build-images")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--storage-path", type=Path)
     parser.add_argument("--device-label", choices=DEVICE_LABELS,
@@ -914,6 +936,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
+    if args.build_images:
+        defaults = (LOAD_CACHE_BYTES, LOAD_BATCH, LOAD_COMPACTION_TIMEOUT_SECS)
+    else:
+        if args.cache_bytes is None:
+            parser.error("a campaign needs --cache-bytes")
+        defaults = (args.cache_bytes, CAMPAIGN_BATCH, CAMPAIGN_COMPACTION_TIMEOUT_SECS)
+    for name, default in zip(("cache_bytes", "batch", "compaction_timeout_secs"), defaults):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
     base_files = [args.customer, args.orders, args.lineitem]
     if args.build_images:
         if None in base_files:

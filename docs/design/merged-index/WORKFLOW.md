@@ -328,8 +328,8 @@ TB, 512-byte logical sectors).
 
 Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
 inputs once (about 10 GB at SF 10, unchecked), the four images (see "Build the images"), one run's
-copy at a time, the load's peak while the images are built (about 41 GB per native load at SF 10,
-all four at once), and the build.
+copy at a time, the loads' peak while the images are built (all four at once; a native SF 10 load
+with 10,000-row transactions peaked at about 41 GB), and the build.
 
 ### Pre-flight checks
 
@@ -497,32 +497,59 @@ python3 measure.py --build-images "$R5_OUT/images" \
   --customer "$DBGEN_OUT/customer.tbl" \
   --orders "$DBGEN_OUT/orders.tbl" \
   --lineitem "$DBGEN_OUT/lineitem.tbl" \
-  --cache-bytes 134217728 \
-  --batch 10000 \
-  --compaction-timeout-secs 3600 \
   --elide-value-headers \
   --device-label ssd
 ```
 
 It builds both release executables, then runs the load program (the driver's `--write-image`)
-four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. The
-loads are unmeasured and each uses one DBSP worker (one core, about 430 MiB at SF 10), so running
-them together costs nothing but disk bandwidth; every load finishes before a failure is reported,
-and each image that loaded is kept. A is with
+four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. A is with
 `--front-code-byte-keys`, B without; the refresh program reopens only an image with its own storage
-settings (`ImageSettings` in `src/main.rs`). Each image is `storage/` (one DBSP checkpoint of both
+settings (`ImageSettings` in `src/main.rs`). Every load finishes before a failure is reported, and
+each image that loaded is kept.
+
+**Load settings.** Loading has its own defaults in `measure.py` (`LOAD_CACHE_BYTES`, `LOAD_BATCH`,
+`LOAD_COMPACTION_TIMEOUT_SECS`; decision of 2026-11-17): a 16 GiB buffer cache per load,
+1,000,000-row load transactions, and a 3600 s wait for the background merges. Flags override
+them, but do not pass the campaign's `--cache-bytes 134217728` or `--batch 10000` here. None of
+them reaches a refresh run, which uses the campaign's flags, and neither the cache nor the batch is
+part of `ImageSettings`. All four images must use the same batch, though: no full compaction runs
+after loading (decision of 2026-11-09), so the batch shapes each image's runs.
+
+DBSP has two memory controls, and loading needs the second one large:
+
+- The memory target (`--memory-target-bytes`, DBSP's RSS pressure) decides when in-memory batches
+  spill to files. Loading sets none.
+- The buffer cache (`--cache-bytes`) holds storage-file blocks, written and read. Storage files are
+  opened with `O_DIRECT` (`StorageCacheConfig::FelderaCache` in `circuit_config`), which bypasses
+  the page cache, so a block that is not in this cache is read from the device. Files exist even
+  with no memory pressure: a merge output of `min_storage_bytes` (10 MiB) or more is written to a
+  file.
+
+The view phase of every reconstructed load transaction (`Q3State::collect`) reads each touched
+customer's whole group in the merged index, which clusters by customer, while the loader reads
+orders in `orderkey` order: each transaction touches customers spread over the whole index. On the
+first Linux host, with the campaign's 128 MiB cache and 10,000-row transactions, a reconstructed
+SF 10 load read 0.35% of `lineitem.tbl` per minute, a profile put about 68% of its main thread in
+`Q3State::collect`, and its time went to block reads, checksums, and block expansion. With the load
+defaults it read about 2% per minute and nothing from the device in its first 15 minutes
+(`read_bytes` in `/proc/<pid>/io`). Each load then holds up to its cache plus a few GiB of working
+memory, about 80 GiB for the four on a 187 GiB host; on a smaller host lower `--cache-bytes`, or
+watch `read_bytes` to see whether the working set still fits.
+
+`images.json` records the settings used, the revision, the input hashes, the executables' SHA-256,
+and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
-settings, the checkpoint, and the load record. `images.json` beside them records the revision, the
-input hashes, the executables' SHA-256, and each image's size and load time. A campaign reopens
-an image only with the executable that wrote it, byte for byte (`image_executable_problems`): it
-stops before any run if the executables it builds differ. A commit that leaves the driver's sources
-alone (docs, `measure.py`) rebuilds the same executables and keeps the images usable; a change to
-the driver, its circuits, or DBSP needs new images. At SF 10 the native images took 84 and 95
-minutes and hold 19.4 GB each (40.8 GB at the load's peak); the reconstructed loads ran about four
-times slower than the native ones while the four ran together. Pre-build the release executables with
-`cargo +1.96.1 build --release --offline --locked -j"$(nproc)"`, with and without
-`--features merged-index`: `measure.py` builds with `-j2`, and on the first Linux host that took 56
-minutes from a cold target. Already-built executables make its build a no-op.
+settings, the checkpoint, and the load record. The checkpoint writes every in-memory batch to a
+file (`Spine::save`), so an image holds file runs only. A campaign reopens an image only with the
+executable that wrote it, byte for byte (`image_executable_problems`): it stops before any run if
+the executables it builds differ. A commit that leaves the driver's sources alone (docs,
+`measure.py`) rebuilds the same executables and keeps the images usable; a change to the driver,
+its circuits, or DBSP needs new images.
+
+Pre-build the release executables with `cargo +1.96.1 build --release --offline --locked
+-j"$(nproc)"`, with and without `--features merged-index`: `measure.py` builds with `-j2`, and on
+the first Linux host that took 56 minutes from a cold target. Already-built executables make its
+build a no-op.
 
 ### cgroup v2 root
 
