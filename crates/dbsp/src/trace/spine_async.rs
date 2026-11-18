@@ -896,10 +896,12 @@ where
     fn register_run_counter(&self) {
         let state = Arc::downgrade(&self.state);
         let owner = self.write_owner();
+        let id = diagnostics::next_run_counter_id();
         diagnostics::register_run_counter(Box::new(move || {
             let state = state.upgrade()?;
             let state = state.lock().unwrap();
             let mut counts = diagnostics::SpineRunCounts {
+                id,
                 owner,
                 name: state.name.to_string(),
                 ..Default::default()

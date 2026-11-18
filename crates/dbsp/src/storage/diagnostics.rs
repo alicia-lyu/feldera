@@ -200,6 +200,9 @@ pub fn spine_contents() -> Vec<SpineContents> {
 /// under the spine's lock without touching storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SpineRunCounts {
+    /// The spine's registration number, unique in the process, so that a
+    /// spine can be followed across samples while others come and go.
+    pub id: u64,
     /// The owner the spine captured when it was created.
     pub owner: Component,
     /// The spine's name.
@@ -228,6 +231,14 @@ impl SpineRunCounts {
 }
 
 type RunCounter = Box<dyn Fn() -> Option<SpineRunCounts> + Send + Sync>;
+
+/// The next spine registration number.
+static NEXT_RUN_COUNTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new spine registration number, for [`SpineRunCounts::id`].
+pub(crate) fn next_run_counter_id() -> u64 {
+    NEXT_RUN_COUNTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Every live spine's counter. Unlike [`SPINES`], spines register here
 /// whether or not diagnostics are on, since a counter costs a lock and a few

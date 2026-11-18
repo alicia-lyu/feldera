@@ -4,25 +4,33 @@
 //!
 //! The samples are taken after each transaction's timers stop, and the driver subtracts the time
 //! they take from the refresh's foreground time, so they change no reported latency.
+//!
+//! Spines are followed by their registration id. The spines alive at the refresh's start are the
+//! persistent state (base tables, join traces, `V`, the merged index); spines that appear later
+//! and are gone by the next sample are transient (created and dropped within a transaction or
+//! between two), and are reported apart, as counts only.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use dbsp::storage::attribution::{read_snapshot, Component, ReadSnapshot, ReadThread};
+use dbsp::storage::attribution::{read_snapshot, Component, ReadCounts, ReadSnapshot, ReadThread};
 use dbsp::storage::diagnostics::{spine_run_counts, SpineRunCounts};
 use serde_json::{json, Map, Value};
 
 /// The run counts of one refresh: one sample per transaction, plus the spines' state at the
 /// refresh's start and end.
 pub(crate) struct RunCountSampler {
-    start: Vec<SpineRunCounts>,
-    /// `runs[spine][transaction]`: the spine's runs after the transaction.
-    runs: Vec<Vec<usize>>,
-    /// The spines' total runs after each transaction.
+    /// The spines alive at the start, by id.
+    start: BTreeMap<u64, SpineRunCounts>,
+    /// `runs[id]`: a starting spine's runs after each transaction, while it lives.
+    runs: BTreeMap<u64, Vec<usize>>,
+    /// The starting spines' total runs after each transaction.
     total_runs: Vec<usize>,
+    /// Spines that were not alive at the start, seen in some sample.
+    transient_ids: BTreeSet<u64>,
+    /// The transient spines' runs after each transaction.
+    transient_runs: Vec<usize>,
     reads_before: ReadSnapshot,
-    /// A transaction after which the spines were not the ones at the start: their counts are not
-    /// comparable from then on, and the report says so.
-    changed_after: Option<usize>,
     /// Time spent sampling, which the caller removes from the refresh's foreground time.
     pub(crate) sampling: Duration,
 }
@@ -30,16 +38,20 @@ pub(crate) struct RunCountSampler {
 impl RunCountSampler {
     /// Takes the refresh's starting state.
     pub(crate) fn start(transactions: usize) -> Self {
-        let start = spine_run_counts();
+        let start: BTreeMap<u64, SpineRunCounts> = spine_run_counts()
+            .into_iter()
+            .map(|spine| (spine.id, spine))
+            .collect();
         Self {
             runs: start
-                .iter()
-                .map(|_| Vec::with_capacity(transactions))
+                .keys()
+                .map(|id| (*id, Vec::with_capacity(transactions)))
                 .collect(),
             start,
             total_runs: Vec::with_capacity(transactions),
+            transient_ids: BTreeSet::new(),
+            transient_runs: Vec::with_capacity(transactions),
             reads_before: read_snapshot(),
-            changed_after: None,
             sampling: Duration::ZERO,
         }
     }
@@ -47,33 +59,40 @@ impl RunCountSampler {
     /// Samples every spine after a transaction.
     pub(crate) fn sample(&mut self) {
         let started = Instant::now();
-        let now = spine_run_counts();
-        if self.changed_after.is_none() && !same_spines(&self.start, &now) {
-            self.changed_after = Some(self.total_runs.len());
-        }
-        if self.changed_after.is_none() {
-            for (samples, spine) in self.runs.iter_mut().zip(&now) {
-                samples.push(spine.runs());
+        let (mut total, mut transient) = (0, 0);
+        for spine in spine_run_counts() {
+            match self.runs.get_mut(&spine.id) {
+                Some(samples) => {
+                    samples.push(spine.runs());
+                    total += spine.runs();
+                }
+                None => {
+                    self.transient_ids.insert(spine.id);
+                    transient += spine.runs();
+                }
             }
         }
-        self.total_runs
-            .push(now.iter().map(SpineRunCounts::runs).sum());
+        self.total_runs.push(total);
+        self.transient_runs.push(transient);
         self.sampling += started.elapsed();
     }
 
-    /// The refresh's report: per spine, the runs after each transaction (minimum, median,
-    /// maximum), the levels at the end, and the merges during the refresh; the total runs; and
-    /// the device reads.
+    /// The refresh's report: per starting spine, the runs after each transaction (minimum,
+    /// median, maximum), the levels at the end, and the merges during the refresh; the total
+    /// runs; the transient spines; and the device reads.
     pub(crate) fn json(self) -> Value {
-        let end = spine_run_counts();
-        let spines: Vec<Value> = if same_spines(&self.start, &end) {
-            self.start
-                .iter()
-                .zip(&end)
-                .zip(&self.runs)
-                .map(|((start, end), runs)| {
-                    json!({
-                        "owner": end.owner.name(), "name": end.name,
+        let end: BTreeMap<u64, SpineRunCounts> = spine_run_counts()
+            .into_iter()
+            .map(|spine| (spine.id, spine))
+            .collect();
+        let spines: Vec<Value> = self
+            .start
+            .iter()
+            .map(|(id, start)| {
+                let runs = &self.runs[id];
+                match end.get(id) {
+                    Some(end) => json!({
+                        "owner": end.owner.name(), "name": end.name, "alive_at_end": true,
                         "runs_after_transaction": spread(runs),
                         "runs_at_start": start.runs(), "runs_at_end": end.runs(),
                         "storage_runs_at_end": end.storage_runs,
@@ -82,28 +101,23 @@ impl RunCountSampler {
                         "completed_merges": end.completed_merges - start.completed_merges,
                         "merge_real_ms": (end.merge_real_micros - start.merge_real_micros) as f64 / 1000.0,
                         "merge_cpu_ms": (end.merge_cpu_micros - start.merge_cpu_micros) as f64 / 1000.0,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                    }),
+                    None => json!({
+                        "owner": start.owner.name(), "name": start.name, "alive_at_end": false,
+                        "runs_after_transaction": spread(runs), "runs_at_start": start.runs(),
+                    }),
+                }
+            })
+            .collect();
         json!({
-            "note": "Runs per spine after each transaction (loose and merging; minimum, median, maximum), sampled after the transaction's timers; merges are the ones completed during the refresh, with their real and CPU time on the merger threads. Device reads are every storage read of the process during the refresh, split by the reading thread (foreground worker, background merger, other) and once by its read owner and once by its write owner.",
+            "note": "Spines alive at the refresh's start, followed by registration id: runs after each transaction (loose and merging; minimum, median, maximum), sampled after the transaction's timers, and the merges completed during the refresh with their real and CPU time on the merger threads. Transient spines are those created during the refresh; only their number and their runs are counted. Device reads are every storage read of the process during the refresh, split by the reading thread (foreground worker, background merger, other) and once by its read owner and once by its write owner.",
             "spines": spines,
-            "spines_changed_after_transaction": self.changed_after,
             "total_runs_after_transaction": spread(&self.total_runs),
+            "transient_spines": self.transient_ids.len(),
+            "transient_runs_after_transaction": spread(&self.transient_runs),
             "device_reads": reads_json(&read_snapshot().since(&self.reads_before)),
         })
     }
-}
-
-/// Whether two samples list the same spines in the same order.
-fn same_spines(a: &[SpineRunCounts], b: &[SpineRunCounts]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(a, b)| a.owner == b.owner && a.name == b.name)
 }
 
 /// The minimum, median (nearest rank), and maximum of `values`; nulls when there are none.
@@ -120,7 +134,7 @@ fn spread(values: &[usize]) -> Value {
 }
 
 fn reads_json(reads: &ReadSnapshot) -> Value {
-    let split = |by: &[[dbsp::storage::attribution::ReadCounts; 5]; 3]| {
+    let split = |by: &[[ReadCounts; 5]; 3]| {
         let mut threads = Map::new();
         for (thread, owners) in ReadThread::ALL.iter().zip(by) {
             let mut row = Map::new();
