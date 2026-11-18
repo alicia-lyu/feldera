@@ -38,25 +38,40 @@ be the sum of the N(K). The T lowest base Order keys are the candidates, and
 pair K takes the next N(K) of them in key order. Nothing is random, so the two
 workloads share their RF2 sets and differ only in RF1.
 
-RF1 remapping. Only o_custkey of each RF1 Order changes. Let C be the sorted
-list of all Customer keys in `customer.tbl`. Neither rule looks at the RF2
-sets. Orders stay in ascending Order-key order whatever Customer they get, so
-the Customer keys of a file are not sorted:
+Transactions. With `--transaction-rows K`, each RF1 and RF2 set is cut into
+consecutive transactions of about K rows (decision of 2026-11-17): Orders are
+taken in file order, an Order counts as 1 + its Lineitems, and a transaction
+closes once it holds K rows or more, so every Order stays whole and only a set's
+last transaction can be smaller. An RF2 Order's Lineitems are counted from the
+head of `lineitem.tbl`, which dbgen sorts by Order key. Each refresh of
+`refreshes.json` then carries `transaction_orders`, the Order count of each of
+its transactions in file order; the driver applies them one by one. The
+refreshes keep their order (all of RF1 1, then all of RF2 1, ...). Without the
+option each set is one transaction and the field is absent.
 
-- clustered: popularity skew without key locality. Shuffle C once into the
-  permutation P with `random.Random(f"{seed}:clustered-rf1-permutation")`; all
-  pairs share P, so the same Customers stay popular across pairs. Each Order
-  draws a rank r in 0..len(C)-1 with probability proportional to
-  1 / (r + 1)^s (Zipf with exponent s, `--zipf-exponent`, default 1.0) and gets
-  Customer P[r]. The draws of pair K come from
-  `random.Random(f"{seed}:clustered-rf1:{K}")`, one per Order in file order,
-  by binary search over the cumulative weights.
-- scattered: every Order gets an independent uniform draw from all of C, from
+RF1 remapping. Only o_custkey of each RF1 Order changes. As TPC-H specifies,
+only Customers whose key is not a multiple of 3 receive Orders (the eligible
+Customers, E, in key order). Neither rule looks at the RF2 sets. Orders stay in
+ascending Order-key order whatever Customer they get, so the Customer keys of a
+file are not sorted:
+
+- clustered: TPC-C's skew in sessions. E is cut into consecutive blocks of 3,000
+  (`NURAND_BLOCK`; the last may be shorter), which stand in for TPC-C's
+  districts, since TPC-H has none. A Customer is drawn by choosing a block with
+  probability proportional to its size, then position NURand(1023, 1, size)
+  within it, where NURand(A, x, y) = (((random(0, A) | random(x, y)) + C) %
+  (y - x + 1)) + x (TPC-C clause 2.1.6) and C, one constant in 0..A, comes from
+  `random.Random(f"{seed}:clustered-nurand-c")`. Each transaction of n Orders
+  draws ceil(n / m) Customers (m = `--orders-per-session`, default 4) and gives
+  them its Orders m at a time, in file order. The draws of pair K come from
+  `random.Random(f"{seed}:clustered-rf1:{K}")`.
+- scattered: every Order gets an independent uniform draw from E, from
   `random.Random(f"{seed}:scattered-rf1")` consumed in pair and file order.
 
-The manifest records s, and for every pair the distinct RF1 Customers
-(`rf1_distinct_customers`) and the number of RF1 Orders held by the 1, 10 and
-100 most popular Customers of that pair (`rf1_top_customer_orders`).
+The manifest records the NURand constants, m, and K, and for every pair the
+distinct RF1 Customers (`rf1_distinct_customers`), the number of RF1 Orders held
+by the 1, 10 and 100 most popular Customers of that pair
+(`rf1_top_customer_orders`), and the transactions' sizes.
 
 Equal seeds and inputs give byte-identical outputs on one Python version.
 """
@@ -64,20 +79,23 @@ Equal seeds and inputs give byte-identical outputs on one Python version.
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
 from collections import Counter
-from itertools import accumulate, islice
-import math
+from itertools import islice
 from pathlib import Path
 import json
 import random
 import sys
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from measure import sha256, write_json
 
 
 WORKLOADS = ("clustered", "scattered")
+# TPC-C's customer NURand (clause 2.1.6): NURand(1023, 1, 3000) over a district's 3,000
+# Customers. TPC-H has no districts, so consecutive blocks of the eligible Customers stand in.
+NURAND_A = 1023
+NURAND_BLOCK = 3000
+DEFAULT_ORDERS_PER_SESSION = 4
 BASE_FILES = {"customer": "customer.tbl", "orders": "orders.tbl", "lineitem": "lineitem.tbl"}
 
 
@@ -199,19 +217,79 @@ def file_record(path: Path) -> dict[str, Any]:
     return {"sha256": sha256(path), "bytes": path.stat().st_size}
 
 
-def zipf_cumulative_weights(count: int, exponent: float) -> list[float]:
-    """Cumulative weights of rank r = 0..count-1 with weight 1 / (r + 1)^exponent."""
-    return list(accumulate(1.0 / (rank + 1) ** exponent for rank in range(count)))
+def eligible_customers(customers: list[int]) -> list[int]:
+    """The Customers that may place Orders: TPC-H gives none to a key that is a multiple of 3."""
+    eligible = [key for key in customers if key % 3]
+    if not eligible:
+        raise InputError("no Customer key is outside the multiples of 3")
+    return eligible
 
 
-def draw_zipf_customers(permutation: list[int], cumulative: list[float],
-                        generator: random.Random, count: int) -> list[int]:
-    """Draw `count` Customers: rank by Zipf weight, then look the rank up in `permutation`."""
-    total = cumulative[-1]
-    last_rank = len(permutation) - 1
-    # min() guards the float edge where u * total rounds up to the total.
-    return [permutation[min(bisect_right(cumulative, generator.random() * total), last_rank)]
-            for _ in range(count)]
+def nurand(generator: random.Random, a: int, x: int, y: int, c: int) -> int:
+    """TPC-C's NURand(A, x, y) with run-time constant C (clause 2.1.6)."""
+    return (((generator.randint(0, a) | generator.randint(x, y)) + c) % (y - x + 1)) + x
+
+
+def draw_nurand_customer(eligible: list[int], generator: random.Random, c: int) -> int:
+    """One Customer: a block of `NURAND_BLOCK` eligible Customers chosen in proportion to its
+    size, then NURand(`NURAND_A`, 1, size) within the block."""
+    start = generator.randrange(len(eligible)) // NURAND_BLOCK * NURAND_BLOCK
+    size = min(NURAND_BLOCK, len(eligible) - start)
+    return eligible[start + nurand(generator, NURAND_A, 1, size, c) - 1]
+
+
+def cut_transactions(rows_per_order: list[int], target: int | None) -> list[int]:
+    """The Order count of each consecutive transaction: a transaction closes once it holds
+    `target` rows or more; with no target the whole set is one transaction."""
+    if target is None:
+        return [len(rows_per_order)]
+    counts: list[int] = []
+    orders = rows = 0
+    for order_rows in rows_per_order:
+        orders += 1
+        rows += order_rows
+        if rows >= target:
+            counts.append(orders)
+            orders = rows = 0
+    if orders:
+        counts.append(orders)
+    return counts
+
+
+def session_customers(transaction_orders: list[int], per_session: int,
+                      draw: Callable[[], int]) -> list[int]:
+    """One Customer per Order: each transaction of n Orders draws ceil(n / per_session)
+    Customers and gives them its Orders `per_session` at a time."""
+    customers: list[int] = []
+    for count in transaction_orders:
+        drawn = [draw() for _ in range(-(-count // per_session))]
+        customers.extend(drawn[index // per_session] for index in range(count))
+    return customers
+
+
+def rf1_rows_per_order(orders: list[bytes], lines: list[bytes], path: Path) -> list[int]:
+    """1 + the Lineitem count of each Order of an update set, in file order."""
+    counts = Counter(order_key(row, path) for row in lines)
+    return [1 + counts[order_key(row, path)] for row in orders]
+
+
+def base_line_counts(path: Path, keys: list[int]) -> dict[int, int]:
+    """The Lineitem count of each Order in `keys`, read from the head of the base
+    `lineitem.tbl`, whose Order keys ascend (dbgen's order)."""
+    wanted = set(keys)
+    highest = max(keys)
+    counts: Counter[int] = Counter()
+    previous = None
+    for row in tbl_rows(path):
+        key = order_key(row, path)
+        if previous is not None and key < previous:
+            raise InputError(f"{path}: base Lineitem Order keys must ascend (at {key})")
+        previous = key
+        if key > highest:
+            break
+        if key in wanted:
+            counts[key] += 1
+    return counts
 
 
 def top_customer_orders(customers: list[int], tops: tuple[int, ...] = (1, 10, 100)
@@ -236,14 +314,37 @@ def write_workload(directory: Path, pairs: list[dict[str, Any]]) -> list[dict[st
         write_rows(directory / lines_file, pair["lines"])
         write_rows(directory / delete_file,
                    (str(key).encode() for key in sorted(pair["rf2_keys"])))
-        refreshes.append({"rf1_orders": orders_file, "rf1_lines": lines_file})
-        refreshes.append({"rf2": delete_file})
+        rf1: dict[str, Any] = {"rf1_orders": orders_file, "rf1_lines": lines_file}
+        rf2: dict[str, Any] = {"rf2": delete_file}
+        if pair["cut"]:
+            rf1["transaction_orders"] = pair["rf1_transactions"]
+            rf2["transaction_orders"] = pair["rf2_transactions"]
+        refreshes.append(rf1)
+        refreshes.append(rf2)
     write_json(directory / "refreshes.json", refreshes)
     return refreshes
 
 
+def transaction_sizes(orders: list[int], rows_per_order: list[int]) -> dict[str, Any]:
+    """The count and the row sizes (minimum, mean, maximum) of a set's transactions."""
+    sizes, cursor = [], 0
+    for count in orders:
+        sizes.append(sum(rows_per_order[cursor:cursor + count]))
+        cursor += count
+    return {"count": len(orders), "rows_min": min(sizes), "rows_max": max(sizes),
+            "rows_mean": sum(sizes) / len(sizes),
+            "orders_mean": sum(orders) / len(orders)}
+
+
 def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
+    per_transaction, cursor = [], 0
+    for count in pair["rf1_transactions"]:
+        per_transaction.append(len(set(pair["rf1_customers"][cursor:cursor + count])))
+        cursor += count
     return {
+        "rf1_transactions": transaction_sizes(pair["rf1_transactions"], pair["rf1_rows"]),
+        "rf2_transactions": transaction_sizes(pair["rf2_transactions"], pair["rf2_rows"]),
+        "rf1_customers_per_transaction_mean": sum(per_transaction) / len(per_transaction),
         "pair": pair["number"],
         "rf1_orders": len(pair["orders"]),
         "rf1_lines": len(pair["lines"]),
@@ -257,11 +358,14 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
 
 
 def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
-            zipf_exponent: float = 1.0, warm_up: bool = False) -> dict[str, Any]:
+            warm_up: bool = False, transaction_rows: int | None = None,
+            orders_per_session: int = DEFAULT_ORDERS_PER_SESSION) -> dict[str, Any]:
     if pair_count < 1:
         raise InputError("--pairs must be at least 1")
-    if not (math.isfinite(zipf_exponent) and zipf_exponent > 0):
-        raise InputError(f"--zipf-exponent must be finite and positive, got {zipf_exponent}")
+    if transaction_rows is not None and transaction_rows < 1:
+        raise InputError(f"--transaction-rows must be positive, got {transaction_rows}")
+    if orders_per_session < 1:
+        raise InputError(f"--orders-per-session must be positive, got {orders_per_session}")
     base_paths = {name: base / file for name, file in BASE_FILES.items()}
     for path in base_paths.values():
         if not path.is_file():
@@ -290,36 +394,41 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
                          f"RF2 deletions needed for {set_count} pairs")
 
     oldest = oldest_orders(base_paths["orders"], needed)
+    deleted_lines = base_line_counts(base_paths["lineitem"], [key for _, key in oldest])
 
+    eligible = eligible_customers(customers)
+    nurand_c = random.Random(f"{seed}:clustered-nurand-c").randint(0, NURAND_A)
     scattered_rf1 = random.Random(f"{seed}:scattered-rf1")
-    popularity = customers.copy()
-    random.Random(f"{seed}:clustered-rf1-permutation").shuffle(popularity)
-    cumulative = zipf_cumulative_weights(len(popularity), zipf_exponent)
     workloads: dict[str, list[dict[str, Any]]] = {name: [] for name in WORKLOADS}
     cursor = 0
     for index, (size, (orders, lines)) in enumerate(zip(sizes, update_sets)):
         number = index + 1
         block = oldest[cursor:cursor + size]
         cursor += size
-        workloads["clustered"].append({
-            "number": number, "orders": orders, "lines": lines,
-            "rf2_keys": [key for _, key in block],
+        rf1_rows = rf1_rows_per_order(orders, lines, updates / f"lineitem.tbl.u{number}")
+        rf2_keys = [key for _, key in block]
+        rf2_rows = [1 + deleted_lines[key] for key in rf2_keys]
+        shared = {
+            "number": number, "orders": orders, "lines": lines, "cut": transaction_rows is not None,
+            "rf1_rows": rf1_rows, "rf2_rows": rf2_rows,
+            "rf1_transactions": cut_transactions(rf1_rows, transaction_rows),
+            "rf2_transactions": cut_transactions(rf2_rows, transaction_rows),
+            "rf2_keys": rf2_keys,
             "rf2_customers": [customer for customer, _ in block],
-            "rf1_customers": draw_zipf_customers(
-                popularity, cumulative,
-                random.Random(f"{seed}:clustered-rf1:{number}"), len(orders)),
-        })
-        workloads["scattered"].append({
-            "number": number, "orders": orders, "lines": lines,
-            "rf2_keys": [key for _, key in block],
-            "rf2_customers": [customer for customer, _ in block],
-            "rf1_customers": [customers[scattered_rf1.randrange(len(customers))]
-                              for _ in orders],
-        })
+        }
+        clustered_draws = random.Random(f"{seed}:clustered-rf1:{number}")
+        workloads["clustered"].append({**shared, "rf1_customers": session_customers(
+            shared["rf1_transactions"], orders_per_session,
+            lambda: draw_nurand_customer(eligible, clustered_draws, nurand_c))})
+        workloads["scattered"].append({**shared, "rf1_customers": [
+            eligible[scattered_rf1.randrange(len(eligible))] for _ in orders]})
 
     manifest: dict[str, Any] = {
-        "seed": seed, "pairs": pair_count, "warm_up": warm_up, "zipf_exponent": zipf_exponent,
-        "base": {"customers": len(customers), "orders": order_count,
+        "seed": seed, "pairs": pair_count, "warm_up": warm_up,
+        "transaction_rows": transaction_rows, "orders_per_session": orders_per_session,
+        "nurand": {"a": NURAND_A, "block": NURAND_BLOCK, "c": nurand_c},
+        "base": {"customers": len(customers), "eligible_customers": len(eligible),
+                 "orders": order_count,
                  "rf2_highest_order_key": oldest[-1][1]},
         "inputs": {}, "workloads": {},
         "unused_dbgen_files": [f"delete.{n}" for n in range(1, set_count + 1)],
@@ -361,8 +470,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True,
                         help="seed of the scattered RF2 sample and of both RF1 remappings")
     parser.add_argument("--pairs", type=int, default=3, help="RF1/RF2 pairs per workload")
-    parser.add_argument("--zipf-exponent", type=float, default=1.0,
-                        help="Zipf exponent s of the clustered RF1 Customer draw (finite, > 0)")
+    parser.add_argument("--transaction-rows", type=int,
+                        help="cut every RF1 and RF2 set into transactions of about this many "
+                             "rows (whole Orders, an Order counting 1 + its Lineitems); by "
+                             "default each set is one transaction")
+    parser.add_argument("--orders-per-session", type=int, default=DEFAULT_ORDERS_PER_SESSION,
+                        help="clustered: Orders each drawn Customer gets within a transaction "
+                             f"(default {DEFAULT_ORDERS_PER_SESSION})")
     parser.add_argument("--warm-up", action="store_true",
                         help="also write one warm-up pair per workload, from update set "
                              "pairs + 1, into <workload>/warm-up/")
@@ -373,7 +487,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         manifest = prepare(args.base, args.updates, args.out, args.seed, args.pairs,
-                           args.zipf_exponent, args.warm_up)
+                           args.warm_up, args.transaction_rows, args.orders_per_session)
     except (InputError, OSError) as error:
         print(f"prepare_inputs: {error}", file=sys.stderr)
         return 1

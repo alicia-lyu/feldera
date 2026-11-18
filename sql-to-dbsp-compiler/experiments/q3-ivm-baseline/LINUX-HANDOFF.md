@@ -44,9 +44,9 @@ TB, 512-byte logical sectors).
   with the rest of the SSD unpartitioned and the hard disk blank. See "Prepare the disks" below.
 
 Disk budget per device, with the run counts of "Storage path and disk budget": the SSD takes the
-inputs once (about 10 GB at SF 10, unchecked), 64 runs' storage (16 pilot runs and 48 campaign runs),
-and the build; the hard disk takes 16 runs' storage. Take the per-run figure from the pilot's
-`load.observed_storage_bytes`, which the pilot aims at about 4 GiB.
+inputs once (about 10 GB at SF 10, unchecked), the four images (see "Build the images"), one run's
+copy at a time, the loads' peak while the images are built (all four at once; a native SF 10 load
+with 10,000-row transactions peaked at about 41 GB), and the build.
 
 ## Pre-flight checks
 
@@ -183,8 +183,17 @@ next to the refresh files it names. Both workloads share the base files in `$DBG
 `q3-ivm-baseline`:
 
 ```bash
-python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS" --seed 1 --pairs 3 --warm-up
+for rows in 10 100 1000; do
+  python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS/k$rows" \
+    --seed 1 --pairs 3 --warm-up --transaction-rows "$rows"
+done
 ```
+
+`--transaction-rows K` cuts every RF1 and RF2 set into consecutive transactions of about K rows
+(whole Orders; an Order counts 1 + its Lineitems), and each refresh of `refreshes.json` then carries
+`transaction_orders`, the Order count of each transaction. The window applies all of RF1 1 as small
+transactions, then all of RF2 1, and so on (decision of 2026-11-17). Without the option each set is
+one transaction, the TPC-H batch. Each size gets its own `--out`; the images serve every size.
 
 `--warm-up` also writes `<workload>/warm-up/` (pair 4, from update set 4, with its own
 `refreshes.json`) for the refresh program's optional warm-up. The measured pairs are the same with
@@ -194,7 +203,10 @@ It writes, for each of `clustered/` and `scattered/`, the files `rf1-orders-K.tb
 `rf1-lines-K.tbl`, and `rf2-delete-K.tbl` for each pair K, and a `refreshes.json` ordered RF1 1,
 RF2 1, RF1 2, and so on. `$R5_INPUTS/prepare-manifest.json` records the seed, the base and per-pair
 counts, each pair's distinct Customers and the Order counts of its top 1, 10, and 100 Customers, and the SHA-256 of every input and output. The script refuses
-an `--out` that already holds either workload. Clustered RF1 draws Customers from a Zipf distribution (`--zipf-exponent`, default 1.0) independent of the RF2 sets. The selection rules are in its module docstring and
+an `--out` that already holds either workload. Only Customers whose key is not a multiple of 3
+receive RF1 Orders, as TPC-H specifies. Scattered draws them uniformly; clustered draws TPC-C's
+NURand(1023, 1, 3000) over blocks of 3,000 eligible Customers, in sessions of
+`--orders-per-session` (default 4) Orders per Customer per transaction, independent of the RF2 sets. The selection rules are in its module docstring and
 summarized in [MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign). The whole path (dbgen,
 `prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01. At SF 10 the
 command above took about 100 seconds and wrote 15,000 RF1 Orders and 15,000 RF2 deletes per pair in
@@ -214,24 +226,59 @@ python3 measure.py --build-images "$R5_OUT/images" \
   --customer "$DBGEN_OUT/customer.tbl" \
   --orders "$DBGEN_OUT/orders.tbl" \
   --lineitem "$DBGEN_OUT/lineitem.tbl" \
-  --cache-bytes 134217728 \
-  --batch 10000 \
-  --compaction-timeout-secs 3600 \
   --elide-value-headers \
   --device-label ssd
 ```
 
 It builds both release executables, then runs the load program (the driver's `--write-image`)
-four times, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. A is with
+four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merged-index-B`. A is with
 `--front-code-byte-keys`, B without; the refresh program reopens only an image with its own storage
-settings (`ImageSettings` in `src/main.rs`). Each image is `storage/` (one DBSP checkpoint of both
+settings (`ImageSettings` in `src/main.rs`). Every load finishes before a failure is reported, and
+each image that loaded is kept.
+
+**Load settings.** Loading has its own defaults in `measure.py` (`LOAD_CACHE_BYTES`, `LOAD_BATCH`,
+`LOAD_COMPACTION_TIMEOUT_SECS`; decision of 2026-11-17): a 16 GiB buffer cache per load,
+1,000,000-row load transactions, and a 3600 s wait for the background merges. Flags override
+them, but do not pass the campaign's `--cache-bytes 134217728` or `--batch 10000` here. None of
+them reaches a refresh run, which uses the campaign's flags, and neither the cache nor the batch is
+part of `ImageSettings`. All four images must use the same batch, though: no full compaction runs
+after loading (decision of 2026-11-09), so the batch shapes each image's runs.
+
+DBSP has two memory controls, and loading needs the second one large:
+
+- The memory target (`--memory-target-bytes`, DBSP's RSS pressure) decides when in-memory batches
+  spill to files. Loading sets none.
+- The buffer cache (`--cache-bytes`) holds storage-file blocks, written and read. Storage files are
+  opened with `O_DIRECT` (`StorageCacheConfig::FelderaCache` in `circuit_config`), which bypasses
+  the page cache, so a block that is not in this cache is read from the device. Files exist even
+  with no memory pressure: a merge output of `min_storage_bytes` (10 MiB) or more is written to a
+  file.
+
+The view phase of every reconstructed load transaction (`Q3State::collect`) reads each touched
+customer's whole group in the merged index, which clusters by customer, while the loader reads
+orders in `orderkey` order: each transaction touches customers spread over the whole index. On the
+first Linux host, with the campaign's 128 MiB cache and 10,000-row transactions, a reconstructed
+SF 10 load read 0.35% of `lineitem.tbl` per minute, a profile put about 68% of its main thread in
+`Q3State::collect`, and its time went to block reads, checksums, and block expansion. With the load
+defaults it read about 2% per minute and nothing from the device in its first 15 minutes
+(`read_bytes` in `/proc/<pid>/io`). Each load then holds up to its cache plus a few GiB of working
+memory, about 80 GiB for the four on a 187 GiB host; on a smaller host lower `--cache-bytes`, or
+watch `read_bytes` to see whether the working set still fits.
+
+`images.json` records the settings used, the revision, the input hashes, the executables' SHA-256,
+and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
-settings, the checkpoint, and the load record. `images.json` beside them records the revision, the
-input hashes, and each image's size and load time. Campaign runs refuse images built at another
-revision (`read_images`), so commit before building them. Pre-build the release executables with
-`cargo +1.96.1 build --release --offline --locked -j"$(nproc)"`, with and without
-`--features merged-index`: `measure.py` builds with `-j2`, and on the first Linux host that took 56
-minutes from a cold target. Already-built executables make its build a no-op.
+settings, the checkpoint, and the load record. The checkpoint writes every in-memory batch to a
+file (`Spine::save`), so an image holds file runs only. A campaign reopens an image only with the
+executable that wrote it, byte for byte (`image_executable_problems`): it stops before any run if
+the executables it builds differ. A commit that leaves the driver's sources alone (docs,
+`measure.py`) rebuilds the same executables and keeps the images usable; a change to the driver,
+its circuits, or DBSP needs new images.
+
+Pre-build the release executables with `cargo +1.96.1 build --release --offline --locked
+-j"$(nproc)"`, with and without `--features merged-index`: `measure.py` builds with `-j2`, and on
+the first Linux host that took 56 minutes from a cold target. Already-built executables make its
+build a no-op.
 
 ## cgroup v2 root
 
@@ -340,14 +387,14 @@ Maven and Calcite.
   size and modification time against the campaign's hash record and fails if one changed.
 - The four images are kept once, in `$R5_OUT/images`; `images.json` gives each one's
   `size_bytes`.
-- Each run copies its image into `<run dir>/image` (`cp -a`, outside the run's cgroup) and keeps
-  the copy, refreshed, afterwards; nothing deletes it. One campaign of `--runs N` makes `2N` runs
-  (native and reconstructed), so one pilot command (`--runs 1`) makes two, the eight pilots make 16,
-  and the eight campaigns make 48. On the SSD, budget the inputs and the images once, plus 64 run
-  copies (16 pilot runs and 48 campaign runs), or 48 if the pilot's run directories are moved off
-  the disk before the campaign. A run's copy is its image's size plus what the six refreshes write.
-  The hard-disk probe repeats the eight pilots on the hard disk: 16 copies there, and none on the
-  SSD.
+- Each run copies its image into `<run dir>/image` (`cp -a`, outside the run's cgroup) and deletes
+  the copy once the run completes and its report is recorded (`storage_deleted` in the run's
+  record); `--keep-run-storage` keeps it. A failed run keeps its copy for diagnosis, and the
+  campaign stops. So a device needs room for the images and one run's copy at a time: the image's
+  size plus what the six refreshes write (a native copy is about 20 GB at SF 10). Keeping every copy
+  does not fit: one campaign of `--runs N` makes `2N` runs (native and reconstructed), so the
+  eight pilots make 16 and the eight campaigns 48. In the hard-disk probe, each run copies its image
+  from the SSD's `$R5_OUT/images` to its run directory on the hard disk.
 - `measure.py` also hashes the inputs once for the manifest, and builds both release executables
   under `q3-ivm-baseline/target/`; keep room for the build.
 
@@ -360,7 +407,7 @@ compiler built and `JAVA_HOME` set, from a shell inside the cgroup tree above. U
 ```bash
 python3 measure.py \
   --images "$R5_OUT/images" \
-  --refresh-list "$R5_INPUTS/clustered/refreshes.json" \
+  --refresh-list "$R5_INPUTS/k10/clustered/refreshes.json" \
   --report "$R5_OUT/pilot-A-seek-clustered/manifest.json" \
   --storage-path "$R5_OUT/pilot-A-seek-clustered/runs" \
   --cgroup-root /sys/fs/cgroup/r5 \
@@ -384,7 +431,7 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
 
 - `--images`: start each run from a copy of its mode's and arm's image ("Build the images"),
   in a new process that runs only the refreshes (the driver's `--from-image`). The window starts
-  with the buffer cache empty; add `--warm-up "$R5_INPUTS/clustered/warm-up/refreshes.json"` (the
+  with the buffer cache empty; add `--warm-up "$R5_INPUTS/k10/clustered/warm-up/refreshes.json"` (the
   workload's own warm-up pair) to run one unmeasured RF1/RF2 pair before it instead. Run the
   pilots without `--warm-up` unless the user asks for the warm arm.
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.

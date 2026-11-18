@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -42,7 +43,7 @@ SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_step
 SESSION_PASSES = ("seek", "step")
 # The version of the driver report that this runner and `summarize.py` understand. Version 12
 # adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses).
-MEASUREMENT_VERSION = 13
+MEASUREMENT_VERSION = 14
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -87,19 +88,32 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def refresh_inputs(path: Path) -> tuple[list[dict[str, str]], dict[str, Path]]:
+def refresh_inputs(path: Path) -> tuple[list[dict[str, Any]], dict[str, Path]]:
+    """The refreshes of a refresh list with their paths resolved, and every input file. A
+    refresh may carry `transaction_orders` (`prepare_inputs.py --transaction-rows`): the
+    Order count of each consecutive transaction it is cut into, which must cover its rows."""
     entries = json.loads(path.read_text())
     if not isinstance(entries, list):
         raise ValueError("refresh list must be a JSON array")
-    resolved: list[dict[str, str]] = []
+    resolved: list[dict[str, Any]] = []
     inputs: dict[str, Path] = {}
     for number, entry in enumerate(entries):
-        if not isinstance(entry, dict) or set(entry) not in (
+        if not isinstance(entry, dict) or set(entry) - {"transaction_orders"} not in (
             {"rf1_orders", "rf1_lines"}, {"rf2"}
         ):
             raise ValueError(f"refresh {number} must contain RF1 paths or one RF2 path")
-        item: dict[str, str] = {}
+        item: dict[str, Any] = {}
+        if "transaction_orders" in entry:
+            counts = entry["transaction_orders"]
+            if not isinstance(counts, list) or not counts or not all(
+                    isinstance(count, int) and not isinstance(count, bool) and count > 0
+                    for count in counts):
+                raise ValueError(f"refresh {number} transaction_orders must be a non-empty "
+                                 "list of positive integers")
+            item["transaction_orders"] = counts
         for field, raw in entry.items():
+            if field == "transaction_orders":
+                continue
             if not isinstance(raw, str) or not raw:
                 raise ValueError(f"refresh {number} {field} must be a path")
             source = (path.parent / raw).resolve()
@@ -376,9 +390,41 @@ def block_expansion_problems(report: dict[str, Any]) -> list[str]:
     return problems
 
 
+LATENCY_PHASES = ("total_ms", "base_ms", "ivm_ms")
+
+
+def transaction_latency_problems(report: dict[str, Any]) -> list[str]:
+    """List where a report's per-transaction latencies (measurement version 14) are malformed:
+    each refresh's `transaction_latency` gives, for `total_ms`, `base_ms` and `ivm_ms`, one
+    finite non-negative value per transaction of the refresh, and `max` is their largest."""
+    problems = []
+    for number, refresh in enumerate(report.get("refreshes", []), start=1):
+        latency = refresh.get("transaction_latency")
+        transactions = refresh.get("transactions")
+        if not isinstance(latency, dict):
+            problems.append(f"refresh {number}: transaction_latency is {latency!r}")
+            continue
+        if latency.get("transactions") != transactions:
+            problems.append(f"refresh {number}: transaction_latency counts "
+                            f"{latency.get('transactions')!r} transactions, the refresh "
+                            f"{transactions!r}")
+        for phase in LATENCY_PHASES:
+            values = (latency.get(phase) or {}).get("values")
+            if not isinstance(values, list) or len(values) != transactions or not all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0 for value in values):
+                problems.append(f"refresh {number}: transaction_latency.{phase}.values must "
+                                f"hold {transactions!r} finite non-negative values")
+            elif values and latency[phase].get("max") != max(values):
+                problems.append(f"refresh {number}: transaction_latency.{phase}.max is not the "
+                                "largest value")
+    return problems
+
+
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """Every consistency check of one driver report."""
     return (measurement_version_problems(report) + layout_fallback_problems(report)
+            + transaction_latency_problems(report)
             + block_expansion_problems(report)
             + owner_write_problems(report) + index_read_problems(report)
             + view_read_problems(report) + driver_read_problems(report)
@@ -867,11 +913,29 @@ def cgroup_evidence(group: Path, run_dir: Path, limit: int) -> dict[str, Any]:
             "memory_swap_max": swap_max, "counters": counters}
 
 
+# The load program's defaults (`--build-images`). Loading is not measured, so its settings serve
+# speed and never reach a refresh run (decision of 2026-11-17). The view phase of every load
+# transaction scans the touched customers' groups of the merged index; storage files bypass the
+# page cache (`O_DIRECT`), so a small buffer cache sends those reads to the device. With the
+# campaign's 128 MiB and 10,000-row transactions, a reconstructed SF 10 load ran about six times
+# slower than with these. Four loads run at once: about 80 GiB of memory in all.
+LOAD_CACHE_BYTES = 16 * 1024 ** 3
+LOAD_BATCH = 1_000_000
+LOAD_COMPACTION_TIMEOUT_SECS = 3600.0
+# The single-process driver's defaults, which also load.
+CAMPAIGN_BATCH = 10000
+CAMPAIGN_COMPACTION_TIMEOUT_SECS = 300.0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("customer", "orders", "lineitem", "refresh-list", "report"):
         parser.add_argument("--" + name, type=Path)
-    parser.add_argument("--cache-bytes", type=int, required=True)
+    parser.add_argument("--cache-bytes", type=int,
+                        help="the buffer cache in bytes, a whole MiB; required for a campaign. "
+                             "With --build-images it is the load's own cache (default "
+                             f"{LOAD_CACHE_BYTES >> 30} GiB per load) and never reaches a "
+                             "refresh run")
     parser.add_argument("--memory-target-bytes", type=int)
     parser.add_argument("--build-images", type=Path, metavar="IMAGES_DIR",
                         help="load the base files once per mode and prefix-truncation arm, "
@@ -880,11 +944,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--images", type=Path, metavar="IMAGES_DIR",
                         help="start every run from a copy of the matching image in this "
                              "directory (built by --build-images) instead of loading")
+    parser.add_argument("--keep-run-storage", action="store_true",
+                        help="with --images, keep each completed run's copy of its image "
+                             "(default: delete it once the run's report is recorded)")
     parser.add_argument("--warm-up", type=Path, metavar="REFRESH_LIST",
                         help="with --images, apply these refreshes untimed before the window, "
                              "so that the window starts with their buffer cache")
-    parser.add_argument("--compaction-timeout-secs", type=float, default=300)
-    parser.add_argument("--batch", type=int, default=10000)
+    parser.add_argument("--compaction-timeout-secs", type=float,
+                        help=f"default {CAMPAIGN_COMPACTION_TIMEOUT_SECS:g}, or "
+                             f"{LOAD_COMPACTION_TIMEOUT_SECS:g} with --build-images")
+    parser.add_argument("--batch", type=int,
+                        help=f"rows per load transaction: default {CAMPAIGN_BATCH}, or "
+                             f"{LOAD_BATCH} with --build-images")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--storage-path", type=Path)
     parser.add_argument("--device-label", choices=DEVICE_LABELS,
@@ -910,12 +981,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cgroup-root", type=Path)
     parser.add_argument("--total-memory-bytes", type=int)
     args = parser.parse_args(argv)
+    if args.build_images:
+        defaults = (LOAD_CACHE_BYTES, LOAD_BATCH, LOAD_COMPACTION_TIMEOUT_SECS)
+    else:
+        if args.cache_bytes is None:
+            parser.error("a campaign needs --cache-bytes")
+        defaults = (args.cache_bytes, CAMPAIGN_BATCH, CAMPAIGN_COMPACTION_TIMEOUT_SECS)
+    for name, default in zip(("cache_bytes", "batch", "compaction_timeout_secs"), defaults):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
     base_files = [args.customer, args.orders, args.lineitem]
     if args.build_images:
         if None in base_files:
             parser.error("--build-images needs --customer, --orders and --lineitem")
         if args.images or args.refresh_list or args.report or args.storage_path or \
-                args.cgroup_root or args.warm_up or args.memory_target_bytes is not None:
+                args.cgroup_root or args.warm_up or args.keep_run_storage or \
+                args.memory_target_bytes is not None:
             parser.error("--build-images loads only: it takes the base files and the loading "
                          "settings, and no refresh, report, storage, cgroup or memory target")
     else:
@@ -930,6 +1011,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("a campaign needs --customer, --orders and --lineitem, or --images")
         if args.warm_up and not args.images:
             parser.error("--warm-up applies to runs started from --images")
+        if args.keep_run_storage and not args.images:
+            parser.error("--keep-run-storage applies to runs started from --images")
     if args.runs < 1 or args.batch < 1 or args.cache_bytes < 1 or \
             (args.memory_target_bytes is not None and args.memory_target_bytes < 1):
         parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
@@ -988,40 +1071,53 @@ def build_images(args: argparse.Namespace) -> int:
         binaries = build_executables(root / "executables")
         manifest["executables"] = {mode: {"path": str(binary), "sha256": sha256(binary)}
                                    for mode, binary in binaries.items()}
-        for mode in MODES:
-            for _, front_code in IMAGE_ARMS:
-                name = image_name(mode, front_code)
-                directory = root / name
-                command = [str(binaries[mode]), "--write-image", str(directory),
-                           "--customer", str(inputs["customer"]),
-                           "--orders", str(inputs["orders"]),
-                           "--lineitem", str(inputs["lineitem"]),
-                           "--runs", "1", "--no-verify", "--batch", str(args.batch),
-                           "--cache-bytes", str(args.cache_bytes),
-                           "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
-                if args.setup_full_compaction:
-                    command.append("--setup-full-compaction")
-                if front_code:
-                    command.append("--front-code-byte-keys")
-                if args.elide_value_headers:
-                    command.append("--elide-value-headers")
-                started = time.monotonic()
-                completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True,
-                                           text=True)
-                (root / f"{name}.stdout.log").write_text(completed.stdout)
-                (root / f"{name}.stderr.log").write_text(completed.stderr)
-                if completed.returncode:
-                    raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
-                                       f"{completed.stderr[-2000:]}")
-                image = json.loads((directory / "image.json").read_text())
-                manifest["images"][name] = {
-                    "directory": str(directory), "mode": mode,
-                    "front_code_byte_keys": front_code, "settings": image["settings"],
-                    "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
-                    "size_bytes": tree_size(directory / "storage"),
-                    "elapsed_seconds": time.monotonic() - started,
-                }
-                write_json(path, manifest)
+        def load(mode: str, front_code: bool) -> dict[str, Any]:
+            name = image_name(mode, front_code)
+            directory = root / name
+            command = [str(binaries[mode]), "--write-image", str(directory),
+                       "--customer", str(inputs["customer"]),
+                       "--orders", str(inputs["orders"]),
+                       "--lineitem", str(inputs["lineitem"]),
+                       "--runs", "1", "--no-verify", "--batch", str(args.batch),
+                       "--cache-bytes", str(args.cache_bytes),
+                       "--compaction-timeout-secs", str(args.compaction_timeout_secs)]
+            if args.setup_full_compaction:
+                command.append("--setup-full-compaction")
+            if front_code:
+                command.append("--front-code-byte-keys")
+            if args.elide_value_headers:
+                command.append("--elide-value-headers")
+            started = time.monotonic()
+            completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True, text=True)
+            (root / f"{name}.stdout.log").write_text(completed.stdout)
+            (root / f"{name}.stderr.log").write_text(completed.stderr)
+            if completed.returncode:
+                raise RuntimeError(f"loading image {name} exited {completed.returncode}: "
+                                   f"{completed.stderr[-2000:]}")
+            image = json.loads((directory / "image.json").read_text())
+            return {
+                "directory": str(directory), "mode": mode,
+                "front_code_byte_keys": front_code, "settings": image["settings"],
+                "checkpoint": image["checkpoint"]["uuid"], "load": image["load"],
+                "size_bytes": tree_size(directory / "storage"),
+                "elapsed_seconds": time.monotonic() - started,
+            }
+
+        # The loads are independent and unmeasured, and each uses one DBSP worker, so they run
+        # at once. Every load finishes before any failure is reported, and each image that loads
+        # is recorded.
+        arms = [(mode, front_code) for mode in MODES for _, front_code in IMAGE_ARMS]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as pool:
+            futures = {image_name(*arm): pool.submit(load, *arm) for arm in arms}
+        failures = []
+        for name, future in futures.items():
+            try:
+                manifest["images"][name] = future.result()
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        write_json(path, manifest)
+        if failures:
+            raise RuntimeError("; ".join(failures))
         manifest["status"] = "complete"
     except Exception as error:  # Keep every image built so far.
         manifest["errors"].append(f"{type(error).__name__}: {error}")
@@ -1035,16 +1131,27 @@ def build_images(args: argparse.Namespace) -> int:
     return 0 if manifest["status"] == "complete" else 1
 
 
-def read_images(root: Path, revision: str) -> dict[str, Any]:
-    """The manifest of the images in `root`, which must be complete and built from `revision`:
-    an image is reopened by the build of the revision that wrote it."""
+def read_images(root: Path) -> dict[str, Any]:
+    """The manifest of the images in `root`, which must be complete."""
     manifest = json.loads((root / IMAGES_MANIFEST).read_text())
     if manifest.get("status") != "complete":
         raise ValueError(f"{root / IMAGES_MANIFEST} is not complete")
-    if manifest.get("revision") != revision:
-        raise ValueError(f"the images were built at {manifest.get('revision')}, "
-                         f"but this checkout is {revision}")
     return manifest
+
+
+def image_executable_problems(images: dict[str, Any],
+                              executables: dict[str, dict[str, Any]]) -> list[str]:
+    """Why the campaign's executables may not reopen the images: an image is reopened only by
+    the executable that wrote it, byte for byte. A commit that leaves the driver's sources alone
+    (docs, `measure.py`) rebuilds the same executables, so it keeps the images usable."""
+    problems = []
+    for mode, executable in executables.items():
+        written_by = images.get("executables", {}).get(mode, {}).get("sha256")
+        if written_by != executable["sha256"]:
+            problems.append(f"the {mode} images were written by an executable with sha256 "
+                            f"{written_by}, but this campaign built {executable['sha256']} "
+                            f"(rebuild the images with --build-images)")
+    return problems
 
 
 def run(argv: list[str]) -> int:
@@ -1084,7 +1191,7 @@ def run(argv: list[str]) -> int:
         manifest["revision"], manifest["git_status_short"] = git_state()
         images = None
         if args.images:
-            images = read_images(args.images.resolve(), manifest["revision"])
+            images = read_images(args.images.resolve())
             manifest["images"] = {
                 "directory": str(args.images.resolve()),
                 "manifest_sha256": sha256(args.images.resolve() / IMAGES_MANIFEST),
@@ -1108,6 +1215,10 @@ def run(argv: list[str]) -> int:
         binaries = build_executables(EXPERIMENT / "target" / "r5-executables" / campaign_id)
         manifest["executables"] = {mode: {"path": str(path), "sha256": sha256(path)}
                                    for mode, path in binaries.items()}
+        if images:
+            problems = image_executable_problems(images, manifest["executables"])
+            if problems:
+                raise ValueError("; ".join(problems))
         for repetition in range(1, args.runs + 1):
             for mode in MODES:
                 run_dir = root / f"run-{repetition}-{mode}"
@@ -1180,6 +1291,12 @@ def run(argv: list[str]) -> int:
                     enforced=record.get("cgroup", {}).get("enforced", False),
                     cold=(record.get("cgroup", {}).get("proof") or {}).get("inputs_evicted", False))
                 record["status"] = "complete"
+                if images and not args.keep_run_storage:
+                    # The copy holds only the state after the run's refreshes, which no report
+                    # reads; at SF 10 a native copy is about 19 GB, so the campaign's copies do
+                    # not fit on the disks. A failed run keeps its copy for diagnosis.
+                    shutil.rmtree(run_dir / "image")
+                    record["storage_deleted"] = True
                 write_json(report, manifest)
         manifest["status"] = "complete"
     except Exception as error:  # Preserve every partial result for a failed campaign.

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import types
@@ -46,6 +48,16 @@ class MeasureTest(unittest.TestCase):
         self.refresh.write_text('[{"rf1_orders":"rf1_orders"}]')
         with self.assertRaisesRegex(ValueError, "RF1 paths"):
             measure.refresh_inputs(self.refresh)
+        # A refresh cut into transactions keeps its Order counts, which are not paths.
+        self.refresh.write_text('[{"rf2":"rf2","transaction_orders":[2,1]}]')
+        refreshes, files = measure.refresh_inputs(self.refresh)
+        self.assertEqual(refreshes[0]["transaction_orders"], [2, 1])
+        self.assertEqual(list(files), ["refresh_0_rf2"])
+        for bad in ("[]", "[0]", "[1.5]", "[true]", '"2"'):
+            self.refresh.write_text(f'[{{"rf2":"rf2","transaction_orders":{bad}}}]')
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError,
+                                                                "transaction_orders"):
+                measure.refresh_inputs(self.refresh)
 
     def test_failure_records_manifest_and_restores_native_generation(self) -> None:
         calls = []
@@ -234,6 +246,28 @@ class MeasureTest(unittest.TestCase):
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             measure.parse_args(self.args + ["--warm-up", str(self.refresh)])
 
+    def test_loading_has_its_own_cache_batch_and_timeout_defaults(self) -> None:
+        base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem")]
+        build = measure.parse_args(base + ["--build-images", "i"])
+        self.assertEqual(build.cache_bytes, 16 * 1024 ** 3)
+        self.assertEqual(build.batch, 1_000_000)
+        self.assertEqual(build.compaction_timeout_secs, 3600)
+        chosen = measure.parse_args(base + ["--build-images", "i", "--cache-bytes",
+                                            str(1024 * 1024), "--batch", "7",
+                                            "--compaction-timeout-secs", "9"])
+        self.assertEqual((chosen.cache_bytes, chosen.batch, chosen.compaction_timeout_secs),
+                         (1024 * 1024, 7, 9))
+        # A campaign keeps its measured settings: the cache is required, and the load
+        # defaults do not apply.
+        campaign = measure.parse_args(self.image_args(self.root / "images"))
+        self.assertEqual((campaign.batch, campaign.compaction_timeout_secs), (10000, 300))
+        without_cache = self.image_args(self.root / "images")
+        index = without_cache.index("--cache-bytes")
+        del without_cache[index:index + 2]
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(without_cache)
+
     def test_a_run_from_an_image_starts_the_refresh_program(self) -> None:
         spec = {"run_dir": str(self.root), "executable": "/bin/driver",
                 "image": str(self.root / "image"),
@@ -277,18 +311,88 @@ class MeasureTest(unittest.TestCase):
         self.assertIn(str(run_dir / "image" / "image.json"), evicted)
         self.assertTrue(set(spec["inputs"].values()) <= evicted)
 
-    def test_images_must_be_complete_and_of_this_revision(self) -> None:
+    def test_images_must_be_complete(self) -> None:
         images = self.root / "images"
         images.mkdir()
         (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
             {"status": "complete", "revision": "abc", "images": {}}))
-        self.assertEqual(measure.read_images(images, "abc")["revision"], "abc")
-        with self.assertRaisesRegex(ValueError, "built at abc"):
-            measure.read_images(images, "def")
+        self.assertEqual(measure.read_images(images)["revision"], "abc")
         (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
             {"status": "failed", "revision": "abc", "images": {}}))
         with self.assertRaisesRegex(ValueError, "not complete"):
-            measure.read_images(images, "abc")
+            measure.read_images(images)
+
+    def test_images_reopen_only_with_the_executables_that_wrote_them(self) -> None:
+        images = {"executables": {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}}
+        same = {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}
+        self.assertEqual(measure.image_executable_problems(images, same), [])
+        rebuilt = {"native": {"sha256": "n"}, "merged-index": {"sha256": "x"}}
+        problems = measure.image_executable_problems(images, rebuilt)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("merged-index images were written by an executable with sha256 m",
+                      problems[0])
+        self.assertEqual(len(measure.image_executable_problems({}, same)), 2)
+
+    def image_campaign(self, name: str, written_by: bytes = b"binary",
+                       extra: list[str] = ()) -> tuple[int, dict, Path]:
+        """Runs a campaign over fake images, with drivers that report success."""
+        images = self.root / f"{name}-images"
+        binaries = {mode: self.root / f"{name}-{mode}" for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        entries = {}
+        for mode in measure.MODES:
+            image = images / measure.image_name(mode, False)
+            (image / "storage").mkdir(parents=True)
+            (image / "storage" / "batch.feldera").write_text("batch")
+            entries[image.name] = {"directory": str(image), "checkpoint": "u"}
+        (images / measure.IMAGES_MANIFEST).write_text(json.dumps({
+            "status": "complete", "revision": "older", "inputs": {}, "images": entries,
+            "executables": {mode: {"sha256": hashlib.sha256(written_by).hexdigest()}
+                            for mode in measure.MODES}}))
+        launched = []
+
+        def process(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout="revision\n")
+            if command[0] in map(str, binaries.values()):
+                launched.append(command)
+                mode = "native" if command[0] == str(binaries["native"]) else "reconstructed"
+                report = self.owner_report(mode)
+                Path(command[command.index("--report") + 1]).write_text(json.dumps(report))
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if command[:2] == ["cp", "-a"]:
+                shutil.copytree(command[2], command[3])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        storage = self.root / f"{name}-campaign"
+        args = [*self.image_args(images), "--storage-path", str(storage), *extra]
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure, "report_problems", return_value=[]), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            code = measure.run(args)
+        return code, json.loads(self.report.read_text()), storage
+
+    def test_a_campaign_refuses_images_written_by_other_executables(self) -> None:
+        code, manifest, storage = self.image_campaign("other", written_by=b"older")
+        self.assertEqual(code, 1)
+        self.assertIn("rebuild the images", manifest["errors"][0])
+        self.assertEqual(manifest["runs"], [])
+        self.assertFalse(storage.exists() and any(storage.iterdir()))
+
+    def test_a_completed_run_deletes_its_copy_unless_asked_to_keep_it(self) -> None:
+        code, manifest, storage = self.image_campaign("delete")
+        self.assertEqual(code, 0, manifest["errors"])
+        for record in manifest["runs"]:
+            self.assertTrue(record["storage_deleted"])
+            self.assertFalse(Path(record["storage_path"]).exists())
+        code, manifest, storage = self.image_campaign("keep", extra=["--keep-run-storage"])
+        self.assertEqual(code, 0, manifest["errors"])
+        for record in manifest["runs"]:
+            self.assertNotIn("storage_deleted", record)
+            self.assertTrue((Path(record["storage_path"]) / "batch.feldera").is_file())
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            measure.parse_args(self.args + ["--keep-run-storage"])
 
     def test_build_images_loads_each_mode_and_arm_outside_any_cgroup(self) -> None:
         images = self.root / "images"
@@ -332,6 +436,37 @@ class MeasureTest(unittest.TestCase):
             self.assertEqual("--front-code-byte-keys" in command, name.endswith("-A"))
         # An existing directory is refused.
         self.assertEqual(measure.build_images(args), 2)
+
+    def test_build_images_records_every_load_that_succeeds_when_one_fails(self) -> None:
+        images = self.root / "images-one-fails"
+
+        def process(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            if "--write-image" not in command:  # git, generate.sh, uname
+                return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
+            directory = Path(command[command.index("--write-image") + 1])
+            if directory.name == "merged-index-B":
+                return subprocess.CompletedProcess(command, 101, stdout="", stderr="boom")
+            (directory / "storage").mkdir(parents=True)
+            (directory / "image.json").write_text(json.dumps({
+                "settings": {}, "checkpoint": {"uuid": "u"}, "load": {}}))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        binaries = {mode: self.root / mode for mode in measure.MODES}
+        for binary in binaries.values():
+            binary.write_bytes(b"binary")
+        args = measure.parse_args([
+            "--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
+            "--lineitem", str(self.root / "lineitem"), "--cache-bytes", str(1024 * 1024),
+            "--build-images", str(images)])
+        with patch.object(measure, "build_executables", return_value=binaries), \
+             patch.object(measure.subprocess, "run", side_effect=process):
+            self.assertNotEqual(measure.build_images(args), 0)
+        manifest = json.loads((images / measure.IMAGES_MANIFEST).read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(sorted(manifest["images"]), ["merged-index-A", "native-A", "native-B"])
+        self.assertEqual(len(manifest["errors"]), 1)
+        self.assertIn("merged-index-B exited 101", manifest["errors"][0])
+        self.assertIn("boom", (images / "merged-index-B.stderr.log").read_text())
 
     def test_cgroup_child_starts_cold_by_evicting_the_shared_inputs(self) -> None:
         group = self.root / "cgroup-evict"
@@ -969,7 +1104,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 13,
+        return {"mode": mode, "measurement_version": 14,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1048,13 +1183,35 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("prefix_truncated_expanded_bytes is below prefix_truncated_encoded_bytes",
                       measure.block_expansion_problems(shrunk)[0])
 
-    def test_report_problems_require_measurement_version_13(self) -> None:
+    def test_transaction_latency_problems_check_counts_values_and_maximum(self) -> None:
+        def report(values: list, transactions: int = 2, maximum: object = None) -> dict:
+            phase = {"values": values, "max": max(values) if maximum is None else maximum}
+            return {"refreshes": [{"transactions": transactions, "transaction_latency": {
+                "transactions": transactions,
+                **{part: dict(phase) for part in measure.LATENCY_PHASES}}}]}
+
+        self.assertEqual(measure.transaction_latency_problems(report([1.0, 2.5])), [])
+        self.assertIn("must hold 2", measure.transaction_latency_problems(report([1.0]))[0])
+        self.assertIn("must hold 2",
+                      measure.transaction_latency_problems(report([1.0, -1.0]))[0])
+        self.assertIn("must hold 2",
+                      measure.transaction_latency_problems(report([1.0, True]))[0])
+        self.assertIn("not the largest",
+                      measure.transaction_latency_problems(report([1.0, 2.0], maximum=1.0))[0])
+        mismatched = report([1.0, 2.0])
+        mismatched["refreshes"][0]["transactions"] = 3
+        self.assertIn("counts 2 transactions, the refresh 3",
+                      measure.transaction_latency_problems(mismatched)[0])
+        self.assertIn("transaction_latency is None",
+                      measure.transaction_latency_problems({"refreshes": [{}]})[0])
+
+    def test_report_problems_require_measurement_version_14(self) -> None:
         report = self.expansion_report()
         report.update(self.gate_report())
         self.assertEqual(measure.measurement_version_problems(report), [])
-        report["measurement_version"] = 12
+        report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 12, expected 13"])
+                         ["measurement_version is 13, expected 14"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

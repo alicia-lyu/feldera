@@ -177,48 +177,152 @@ class PrepareInputsTest(unittest.TestCase):
     def test_clustered_rf1_customers_are_valid_unsorted_and_seeded(self) -> None:
         out = self.prepare()
         manifest = json.loads((out / "prepare-manifest.json").read_text())
-        valid = set(range(1, CUSTOMERS + 1))
+        valid = {key for key in range(1, CUSTOMERS + 1) if key % 3}
         for number in range(1, PAIRS + 1):
             customers = read_customers(out / "clustered" / f"rf1-orders-{number}.tbl")
             self.assertEqual(len(customers), UPDATE_ORDERS)
             self.assertTrue(set(customers) <= valid)
-        # The permutation is shared by the pairs, and the seed changes it.
+        # The seed changes the draws.
         other = self.prepare("other", seed=12)
         pooled = [read_customers(directory / "clustered" / f"rf1-orders-{n}.tbl")
                   for directory in (out, other) for n in range(1, PAIRS + 1)]
         self.assertNotEqual(pooled[:PAIRS], pooled[PAIRS:])
         self.assertIn("rf1_top_customer_orders", manifest["workloads"]["clustered"]["pairs"][0])
 
-    def test_zipf_draw_favors_the_top_rank_and_skew_grows_with_the_exponent(self) -> None:
-        permutation = list(range(100, 0, -1))  # rank 0 is Customer 100
-        draws = 20000
+    def test_only_customers_outside_the_multiples_of_3_receive_orders(self) -> None:
+        out = self.prepare()
+        manifest = json.loads((out / "prepare-manifest.json").read_text())
+        eligible = [key for key in range(1, CUSTOMERS + 1) if key % 3]
+        self.assertEqual(manifest["base"]["eligible_customers"], len(eligible))
+        self.assertEqual(prepare_inputs.eligible_customers(list(range(1, CUSTOMERS + 1))),
+                         eligible)
+        for workload in prepare_inputs.WORKLOADS:
+            for number in range(1, PAIRS + 1):
+                customers = read_customers(out / workload / f"rf1-orders-{number}.tbl")
+                self.assertTrue(all(customer % 3 for customer in customers), workload)
+        with self.assertRaisesRegex(prepare_inputs.InputError, "multiples of 3"):
+            prepare_inputs.eligible_customers([3, 6, 9])
 
-        def counts(exponent: float) -> list[int]:
-            cumulative = prepare_inputs.zipf_cumulative_weights(len(permutation), exponent)
-            drawn = prepare_inputs.draw_zipf_customers(
-                permutation, cumulative, random.Random("zipf-test"), draws)
-            tally = collections.Counter(drawn)
-            self.assertEqual(sum(tally.values()), draws)
-            return [tally[customer] for customer in permutation]
+    def test_nurand_follows_tpcc(self) -> None:
+        class Fixed:
+            """Returns the queued values from randint, checking each requested range."""
 
-        mild, steep = counts(0.5), counts(1.5)
-        for tally in (mild, steep):
-            self.assertEqual(tally[0], max(tally))
-            self.assertGreater(tally[0], tally[9])
-        self.assertGreater(steep[0], mild[0])
-        # Rank 0 has weight 1 of the total, so its share is the reciprocal of that total.
-        expected = 1 / sum(1 / (rank + 1) ** 1.5 for rank in range(len(permutation)))
-        self.assertAlmostEqual(steep[0] / draws, expected, delta=0.02)
+            def __init__(self, values: list[tuple[int, int, int]]) -> None:
+                self.values = values
+
+            def randint(self, low: int, high: int) -> int:
+                expected_low, expected_high, value = self.values.pop(0)
+                assert (low, high) == (expected_low, expected_high), (low, high)
+                return value
+
+        # (((5 | 9) + 7) % 10) + 1 = ((13 + 7) % 10) + 1 = 1
+        self.assertEqual(prepare_inputs.nurand(Fixed([(0, 15, 5), (1, 10, 9)]), 15, 1, 10, 7), 1)
+        # (((2 | 4) + 0) % 10) + 1 = 7
+        self.assertEqual(prepare_inputs.nurand(Fixed([(0, 15, 2), (1, 10, 4)]), 15, 1, 10, 0), 7)
+        generator = random.Random("nurand")
+        drawn = [prepare_inputs.nurand(generator, 1023, 1, 3000, 123) for _ in range(30000)]
+        self.assertTrue(all(1 <= value <= 3000 for value in drawn))
+        top = collections.Counter(drawn).most_common(1)[0][1]
+        self.assertGreater(top, 5 * len(drawn) / 3000, "NURand should be skewed")
+
+    def test_nurand_customers_stay_in_proportional_blocks(self) -> None:
+        eligible = list(range(1, 7001))  # blocks of 3,000, 3,000 and 1,000
+        generator = random.Random("blocks")
+        drawn = [prepare_inputs.draw_nurand_customer(eligible, generator, 5)
+                 for _ in range(70000)]
+        self.assertTrue(set(drawn) <= set(eligible))
+        blocks = collections.Counter((customer - 1) // prepare_inputs.NURAND_BLOCK
+                                     for customer in drawn)
+        for block, share in ((0, 3 / 7), (1, 3 / 7), (2, 1 / 7)):
+            self.assertAlmostEqual(blocks[block] / len(drawn), share, delta=0.01)
+
+    def test_transactions_close_at_the_row_target_and_keep_orders_whole(self) -> None:
+        self.assertEqual(prepare_inputs.cut_transactions([3, 2, 5, 1, 1], 4), [2, 1, 2])
+        self.assertEqual(prepare_inputs.cut_transactions([3, 2, 5, 1, 1], None), [5])
+        self.assertEqual(prepare_inputs.cut_transactions([9, 9], 1), [1, 1])
+
+    def test_sessions_give_each_drawn_customer_up_to_m_orders(self) -> None:
+        draws = iter([10, 20, 30, 40])
+        self.assertEqual(prepare_inputs.session_customers([5, 2], 2, lambda: next(draws)),
+                         [10, 10, 20, 20, 30, 40, 40])
+        expected = collections.Counter()
+        for count in range(1, 9):
+            customers = prepare_inputs.session_customers([count], 4, iter(range(100)).__next__)
+            self.assertEqual(len(customers), count)
+            self.assertEqual(len(set(customers)), -(-count // 4))
+            expected[count] = max(collections.Counter(customers).values())
+        self.assertTrue(all(value <= 4 for value in expected.values()))
+
+    def test_transaction_rows_cut_each_set_in_file_order(self) -> None:
+        out = self.root / "cut"
+        manifest = prepare_inputs.prepare(self.base, self.updates, out, 11, PAIRS,
+                                          transaction_rows=5, orders_per_session=2)
+        self.assertEqual((manifest["transaction_rows"], manifest["orders_per_session"]), (5, 2))
+        base_lines = collections.Counter(read_keys(self.base / "lineitem.tbl"))
+        for workload in prepare_inputs.WORKLOADS:
+            refreshes = json.loads((out / workload / "refreshes.json").read_text())
+            self.assertEqual([sorted(item) for item in refreshes],
+                             [["rf1_lines", "rf1_orders", "transaction_orders"],
+                              ["rf2", "transaction_orders"]] * PAIRS)
+            for number in range(1, PAIRS + 1):
+                rf1, rf2 = refreshes[2 * number - 2], refreshes[2 * number - 1]
+                orders = read_keys(out / workload / rf1["rf1_orders"])
+                lines = collections.Counter(read_keys(out / workload / rf1["rf1_lines"]))
+                deleted = read_keys(out / workload / rf2["rf2"])
+                for keys, counts, rows_of in ((orders, rf1["transaction_orders"], lines),
+                                              (deleted, rf2["transaction_orders"], base_lines)):
+                    self.assertEqual(sum(counts), len(keys))
+                    cursor = 0
+                    for index, count in enumerate(counts):
+                        rows = sum(1 + rows_of[key] for key in keys[cursor:cursor + count])
+                        if index < len(counts) - 1:
+                            self.assertGreaterEqual(rows, 5)
+                            # Without its last Order the transaction was below the target.
+                            last = keys[cursor + count - 1]
+                            self.assertLess(rows - 1 - rows_of[last], 5)
+                        cursor += count
+                pair = manifest["workloads"][workload]["pairs"][number - 1]
+                self.assertEqual(pair["rf1_transactions"]["count"],
+                                 len(rf1["transaction_orders"]))
+                if workload == "clustered":
+                    customers = read_customers(out / workload / rf1["rf1_orders"])
+                    cursor = 0
+                    for count in rf1["transaction_orders"]:
+                        self.assertLessEqual(len(set(customers[cursor:cursor + count])),
+                                             -(-count // 2))
+                        cursor += count
+        import measure
+
+        resolved, _ = measure.refresh_inputs(out / "clustered" / "refreshes.json")
+        self.assertEqual(resolved[0]["transaction_orders"],
+                         json.loads((out / "clustered" / "refreshes.json").read_text())[0][
+                             "transaction_orders"])
+        # Without the option each set is one transaction and the field is absent.
+        plain = self.prepare("plain")
+        refreshes = json.loads((plain / "clustered" / "refreshes.json").read_text())
+        self.assertTrue(all("transaction_orders" not in item for item in refreshes))
+
+    def test_invalid_transaction_sizes_are_rejected(self) -> None:
+        for index, arguments in enumerate(({"transaction_rows": 0},
+                                           {"orders_per_session": 0})):
+            with self.assertRaisesRegex(prepare_inputs.InputError, "must be positive"):
+                prepare_inputs.prepare(self.base, self.updates, self.root / f"bad{index}", 11,
+                                       PAIRS, **arguments)
+            self.assertFalse((self.root / f"bad{index}").exists())
 
     def test_top_customer_orders_counts_the_most_popular_customers(self) -> None:
         customers = [5] * 7 + [6] * 3 + [7, 8]
         self.assertEqual(prepare_inputs.top_customer_orders(customers),
                          {"1": 7, "10": 12, "100": 12})
 
-    def test_manifest_records_the_exponent_and_the_rf1_skew(self) -> None:
+    def test_manifest_records_the_nurand_constants_and_the_rf1_skew(self) -> None:
         out = self.prepare()
         manifest = json.loads((out / "prepare-manifest.json").read_text())
-        self.assertEqual(manifest["zipf_exponent"], 1.0)
+        self.assertEqual(manifest["nurand"]["a"], 1023)
+        self.assertEqual(manifest["nurand"]["block"], 3000)
+        self.assertTrue(0 <= manifest["nurand"]["c"] <= 1023)
+        self.assertEqual((manifest["transaction_rows"], manifest["orders_per_session"]),
+                         (None, 4))
         for workload in prepare_inputs.WORKLOADS:
             for number, pair in enumerate(manifest["workloads"][workload]["pairs"], start=1):
                 customers = read_customers(out / workload / f"rf1-orders-{number}.tbl")
@@ -227,16 +331,7 @@ class PrepareInputsTest(unittest.TestCase):
                 self.assertEqual(sorted(top), ["1", "10", "100"])
                 self.assertEqual(top["100"], UPDATE_ORDERS)
                 self.assertLessEqual(top["1"], top["10"])
-        steep = prepare_inputs.prepare(self.base, self.updates, self.root / "steep", 11,
-                                       PAIRS, zipf_exponent=3.0)
-        self.assertEqual(steep["zipf_exponent"], 3.0)
-
-    def test_invalid_zipf_exponents_are_rejected(self) -> None:
-        for index, exponent in enumerate((0.0, -1.0, float("nan"), float("inf"))):
-            with self.assertRaisesRegex(prepare_inputs.InputError, "zipf-exponent"):
-                prepare_inputs.prepare(self.base, self.updates, self.root / f"bad{index}", 11,
-                                       PAIRS, zipf_exponent=exponent)
-            self.assertFalse((self.root / f"bad{index}").exists())
+                self.assertEqual(pair["rf1_transactions"]["count"], 1)
 
     def test_same_seed_gives_identical_bytes_and_other_seed_differs(self) -> None:
         first, second = self.prepare("first"), self.prepare("second")
@@ -324,14 +419,14 @@ class PrepareInputsTest(unittest.TestCase):
         self.assertIn("already exists", stderr.getvalue())
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             prepare_inputs.parse_args(["--base", "a", "--updates", "b", "--out", "c"])
-        self.assertEqual(prepare_inputs.parse_args(
-            argv + ["--zipf-exponent", "1.5"]).zipf_exponent, 1.5)
+        parsed = prepare_inputs.parse_args(argv + ["--transaction-rows", "10"])
+        self.assertEqual((parsed.transaction_rows, parsed.orders_per_session), (10, 4))
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(prepare_inputs.main(
                 argv[:-4] + ["--out", str(self.root / "cli-bad"), "--seed", "3",
-                             "--zipf-exponent", "0"]), 1)
-        self.assertIn("zipf-exponent", stderr.getvalue())
+                             "--transaction-rows", "0"]), 1)
+        self.assertIn("transaction-rows", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -41,9 +41,9 @@ The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs 
 The user decided how `prepare_inputs.py` chooses refreshes:
 
 - RF1 inserts and RF2 deletes are chosen independently and never deliberately correlated.
-- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0, which the user confirmed on 2026-10-26.
+- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0, which the user confirmed on 2026-10-26. *Superseded on 2026-11-17: clustered draws TPC-C's NURand in sessions ([the entry](#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order)).*
 - Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block. *Superseded on 2026-11-04: both workloads delete the lowest Order keys.*
-- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders. *Superseded on 2026-11-04, as above.*
+- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders. *Superseded on 2026-11-04, as above. Superseded on 2026-11-17 for RF1: only Customers whose key is not a multiple of 3, as TPC-H specifies.*
 
 `prepare_inputs.py` implements this.
 
@@ -140,6 +140,23 @@ Loading is not measured, so it runs once, with no cgroup limit and no DBSP memor
 - **Cache at the window's start:** cold by default, since every run starts from the same image in a new process. Optionally (`--warm-up`, user answer "both"), one RF1/RF2 pair from an extra dbgen update set, untimed and unreported, runs before the window in both modes. This supersedes the 2026-10-26 rule that the window starts with the cache warm from loading.
 - **Every restored run is a file:** the restore reopens each batch from its file, so the window starts with no in-memory run.
 - **One runtime still hosts both circuits** (2026-10-23, 2026-11-05). DBSP now checkpoints a runtime with several circuits as one checkpoint: each circuit's persistent ids carry its index (`-c0-`, `-c1-`), the handles share one checkpointer, and the checkpoint's fingerprint combines the circuits' in order (`DBSPHandle::checkpoint_circuits`).
+
+### 2026-11-17: The load program uses its own cache and 1,000,000-row load transactions
+
+Loading is unmeasured, so its settings serve speed, not the campaign. `measure.py --build-images` defaults to a 16 GiB buffer cache per load (four loads at once), 1,000,000-row load transactions, and a 3600 s merge wait (`LOAD_CACHE_BYTES`, `LOAD_BATCH`, `LOAD_COMPACTION_TIMEOUT_SECS`). None reaches a refresh run, which takes the campaign's `--cache-bytes`; `ImageSettings` holds only the mode, the workers, and the two storage encodings. No full compaction runs after loading (user answer of 2026-11-17, keeping 2026-11-09), so the batch size shapes each image's runs, and all four images are loaded with the same settings.
+
+The first SF 10 build, with the campaign's 128 MiB cache and 10,000-row transactions, loaded native in 84 to 95 minutes and reconstructed at 0.35% of `lineitem.tbl` per minute (about 5 hours). A profile put about 68% of the reconstructed load's main thread in the view phase's scan session (`Q3State::collect`): the loader reads orders in `orderkey` order, the index clusters by customer, and storage files bypass the page cache (`O_DIRECT`), so the scattered group reads missed a small buffer cache and read the SSD. With the new settings, both modes read about 2% per minute and nothing from the device in the first 15 minutes. Rejected for now: sorting the load input by customer, which needs a loader change and costs native's `orderkey`-keyed join its locality.
+
+### 2026-11-17: Transaction size is a dimension, small transactions first
+
+The TPC-H refresh functions are batch loads: at SF 10 one RF1 is a single transaction of 15,000 Orders and about 60,000 Lineitems, the ETL pattern that incremental view maintenance exists to avoid. The campaign measures small transactions first, closer to a hybrid transactional and analytical database: about 10, 100, and 1,000 rows per transaction (`prepare_inputs.py --transaction-rows`), with the TPC-H batch kept as a later ETL reference point. A transaction holds whole Orders, an Order counting 1 + its Lineitems. Inserts and deletes stay in groups: pair by pair, all of RF1 K as consecutive small transactions, then all of RF2 K, since interleaving them would mix the two operations within the size being measured. Each transaction is timed on its own (`transaction_latency`, measurement version 14), and percentiles, not only sums, are reported per phase.
+
+### 2026-11-17: Clustered RF1 draws TPC-C's NURand in sessions; only eligible Customers order
+
+- **Eligible Customers.** As TPC-H specifies, RF1 Orders go only to Customers whose key is not a multiple of 3, in both workloads (1,000,000 of 1,500,000 at SF 10). Scattered draws them uniformly.
+- **Popularity.** Clustered replaces the Zipf draw of 2026-10-23 with TPC-C's customer NURand(1023, 1, 3000) (clause 2.1.6), with one seeded constant C. TPC-H has no districts, so consecutive blocks of 3,000 eligible Customers stand in for them (user choice among three synthetic scalings: these blocks, one NURand over all eligible Customers, or nations); a block is chosen in proportion to its size. Real districts arrive with CH-benCHmark.
+- **Locality within a transaction.** Independent draws make the Customers a transaction spans a function of popularity and size, and a Zipf steep enough to put 10 Orders on 2 or 3 Customers would hand most Orders to one Customer. So locality is its own parameter: each transaction of n Orders draws ceil(n / m) Customers and gives them its Orders m at a time (`--orders-per-session`, m = 4), which keeps each Customer's expected Order count while bunching it. At about 10 rows a transaction is one Customer's session, as a TPC-C New-Order is.
+- **Unchanged.** Deletes stay oldest-first in both workloads; dbgen's Order keys stay (the order-key dimension is deferred, [deferred.md](deferred.md#order-key-assignment-as-a-dimension)).
 
 ## Superseded and withdrawn
 

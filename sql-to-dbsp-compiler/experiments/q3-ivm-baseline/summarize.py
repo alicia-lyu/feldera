@@ -15,6 +15,10 @@ reports, over the repetitions:
   mode) and `ivm_ms` (`delta_ms + q3_ms`, the IVM figure; the two modes' `delta_ms` are not
   identical operations, so compare with and without it). Base and IVM are always reported side
   by side;
+- per-transaction latency (measurement version 14): over all transactions of each phase,
+  `rf1_` or `rf2_`, the nearest-rank p50, p95, p99 and maximum of `total_ms` (a transaction's
+  foreground wall time), `base_ms` and `ivm_ms`, as `rf1_total_ms_p50` and so on, and each
+  phase's transaction count (`rf1_transactions`);
 - the sums over the refreshes of the CPU profiler's step CPU time per circuit,
   `refresh_profiled_cpu_base_ms` and `refresh_profiled_cpu_q3_ms` (`profiled_cpu_ms.base` and
   `.q3`): a cross-check of `base_ms` and `q3_ms`, not a phase;
@@ -64,7 +68,7 @@ The manifest's `storage_device` (the device behind `--storage-path` and the oper
 
 It writes `summary.json` and `summary.md` to `--out`. It exits nonzero and
 writes nothing if a campaign or run did not complete, a driver report is not
-measurement version 13, a field is missing or not a finite non-negative number, a
+measurement version 14, a field is missing or not a finite non-negative number, a
 mode has no runs, or the modes' repetitions differ. It never substitutes a zero for a missing value.
 """
 
@@ -82,8 +86,8 @@ from measure import (BLOCK_EXPANSION_FIELDS, EXPANSION_THREADS, INDEX_READERS,
                      MEASUREMENT_VERSION, MODES, RUN_READ_FIELDS, SESSION_COUNT_FIELDS,
                      WRITE_OWNERS, block_expansion_problems, counter_problems,
                      delta_phase_problems, driver_read_problems, index_read_problems,
-                     layout_fallback_problems, owner_write_problems, profiled_cpu_problems,
-                     view_read_problems)
+                     LATENCY_PHASES, layout_fallback_problems, owner_write_problems,
+                     profiled_cpu_problems, transaction_latency_problems, view_read_problems)
 
 # The read owners of the joins' reads of the readers' requested slices (reconstructed mode) and of
 # their partner traces (native mode).
@@ -143,7 +147,8 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
                 + counter_problems(driver, "index_session_counts", SESSION_COUNT_FIELDS)
                 + counter_problems(driver, "index_upkeep_run_reads", RUN_READ_FIELDS)
                 + profiled_cpu_problems(driver) + delta_phase_problems(driver)
-                + block_expansion_problems(driver) + layout_fallback_problems(driver))
+                + block_expansion_problems(driver) + layout_fallback_problems(driver)
+                + transaction_latency_problems(driver))
     if problems:
         raise SummaryError(f"{where}: inconsistent counters: " + "; ".join(problems))
     for field in REFRESH_SUMS:
@@ -184,6 +189,31 @@ def run_metrics(run: dict[str, Any], where: str) -> dict[str, float]:
                 driver, ("sequence", "driver_run_reads", REQUESTED_SLICE, field), where))
     metrics.update(block_expansion_metrics(driver))
     metrics.update(window_memory_metrics(driver, where))
+    metrics.update(transaction_latency_metrics(refreshes))
+    return metrics
+
+
+def nearest_rank(sorted_values: list[float], percent: int) -> float:
+    """The nearest-rank percentile of non-empty, sorted values (the driver's rule)."""
+    return sorted_values[max(-(-len(sorted_values) * percent // 100) - 1, 0)]
+
+
+def transaction_latency_metrics(refreshes: list[dict[str, Any]]) -> dict[str, float]:
+    """Per-transaction latency percentiles of a run, over all transactions of each phase
+    (measurement version 14): `rf1_total_ms_p50`, `rf2_ivm_ms_p99`, and so on, with each
+    phase's transaction count. `transaction_latency_problems` has checked the values."""
+    metrics: dict[str, float] = {}
+    for phase in ("rf1", "rf2"):
+        chosen = [refresh["transaction_latency"] for refresh in refreshes
+                  if refresh.get("phase") == phase]
+        if not chosen:
+            continue
+        metrics[f"{phase}_transactions"] = sum(item["transactions"] for item in chosen)
+        for part in LATENCY_PHASES:
+            values = sorted(value for item in chosen for value in item[part]["values"])
+            for percent in (50, 95, 99):
+                metrics[f"{phase}_{part}_p{percent}"] = nearest_rank(values, percent)
+            metrics[f"{phase}_{part}_max"] = values[-1]
     return metrics
 
 

@@ -395,3 +395,7 @@ Native packing (packed tuples, narrowed decimals) is not planned. Two barriers s
 2. Native types are shared by the whole program and by DBSP's storage format, so the change needs a new storage format version for every pipeline.
 
 Neither barrier is a decoding cost. No native packing number has been measured.
+
+## Order-key assignment as a dimension
+
+Deferred by the user on 2026-11-17. TPC-H's dbgen gives each update set the next 15,000 base row numbers, in slots 8 to 15 of each block of 32 keys (`mk_sparse`), so RF1 inserts land in the gaps of the very key range that RF2 deletes from, near the low end; at SF 10 pair 1 inserts keys 9 to 60,008 and deletes 1 to 60,000. That gives native's `orderkey`-keyed traces (`J`, Lineitem) strong locality, while the merged index, clustered by Customer, sees each Order only within its Customer's group. Real systems assign keys otherwise: a sequence appends above the largest key; a random ID (UUIDv4, unique with overwhelming probability, with a unique index rejecting the rare collision) scatters inserts; a time-ordered ID (UUIDv7, ULID, Snowflake: timestamp, node, counter) is unique by construction and nearly monotonic. Ageing out the oldest Orders then deletes the lowest keys only when keys follow time. The prediction to test: random keys slow native's `orderkey` side and barely change the reconstructed mode. `prepare_inputs.py` would rewrite `o_orderkey` and `l_orderkey` together and keep the new keys absent from the base Orders.
