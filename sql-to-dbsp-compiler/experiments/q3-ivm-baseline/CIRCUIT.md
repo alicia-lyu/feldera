@@ -2,7 +2,7 @@
 
 ## Two chained circuits
 
-The experiment runs two generated circuits, each in its own DBSP runtime:
+The experiment runs two generated circuits in one DBSP runtime (`Runtime::init_circuits`, one worker, one storage directory, one buffer cache; since 2026-11-05, measurement version 6):
 
 - **Base circuit** (`q3-base-circuit/`, from [base.sql](base.sql)). It has the three
   tables with their primary keys and no view. Each table is an input map
@@ -22,7 +22,7 @@ The experiment runs two generated circuits, each in its own DBSP runtime:
 
 The driver times the two circuits separately, so `q3_ms` is the view circuit's transaction
 (`ivm_ms` adds `delta_ms`, the preparation of its input delta) and `base_ms` is the base circuit plus, in reconstructed mode, the merged index's upkeep;
-[measurement.md](../../../docs/design/merged-index/measurement.md) defines the phases.
+[MEASUREMENT.md](MEASUREMENT.md) defines the phases.
 The runtime graphs captured before the split (under `target/q3-circuit-exports/`) show
 the earlier single-circuit program, which also held the primary-key input maps. They
 remain valid for the join regions and `V`'s integral, and not for the base maps.
@@ -36,7 +36,7 @@ graphs; they do not reconstruct the topology.
 
 Run [generate.sh](generate.sh) before following local `q3-view-circuit/src/lib.rs` and
 `plan.json` links below. Those compiler outputs, `q3-base-circuit/src/lib.rs`, and both
-`src/stubs.rs` files are Git-ignored; the [workflow](../../../docs/design/merged-index/WORKFLOW.md#generate-and-test)
+`src/stubs.rs` files are Git-ignored; the [harness CLAUDE.md](CLAUDE.md)
 describes their regeneration.
 
 ## Compiler-expanded logical graph
@@ -119,7 +119,7 @@ presentation only.
 Runtime `Accumulator` is a **transaction delta collector**: it collects the
 current transaction's changes in a Spine. Historical trace accumulation retains
 relation state across transactions. The
-[naming distinction](../../../docs/design/merged-index/native-state-read-contracts.md#weird-feldera-naming-accumulation)
+[naming distinction](../../../docs/design/merged-index/dbsp-background.md#weird-feldera-naming-accumulation)
 records these separate roles.
 `Operator::flush` (`crates/dbsp/src/circuit/operator_traits.rs`)
 asks an operator to finish processing that transaction and emit its remaining
@@ -128,8 +128,8 @@ replaces it with an empty one. The returned Spine can still contain multiple
 memory batches or files; `flush` does not consolidate it into a single batch
 or request a storage write. Snapshots can retain memory-backed and file-backed
 batches without requiring a spill; see the
-[R2 snapshot contract](../../../docs/design/merged-index/native-state-read-contracts.md#existing-snapshot-fetch-and-cursor-behavior).
-The [naming note and join example](../../../docs/design/merged-index/native-state-read-contracts.md#weird-feldera-naming-flush)
+[R2 snapshot contract](../../../docs/design/merged-index/dbsp-background.md#existing-snapshot-fetch-and-cursor-behavior).
+The [naming note and join example](../../../docs/design/merged-index/dbsp-background.md#weird-feldera-naming-flush)
 explain why `JoinTrace` couples this notification with its accumulated-state
 snapshot reads: the current trace must include the transaction's complete
 updates, while the other branch receives the delayed prior trace.
@@ -212,3 +212,164 @@ initial load bootstraps the incremental circuit from empty before state; RF1
 and RF2 use that same circuit and materialized output. The independent full
 join in [main.rs](src/main.rs) is a checker outside the measured transaction
 call.
+
+## Generated native state-read contracts (R2)
+
+Inspected on 2026-10-06 at Feldera revision `308950de73a28bb014c8ad002365d2aa64f1f152`; symbol names were rechecked on 2026-10-12. Code is cited by symbol and file path, not by line, because line anchors drift. Stream names such as `s3` to `s7` come from the generated `q3-view-circuit/src/lib.rs`, which is git-ignored and may change between compiler versions; run [generate.sh](generate.sh) and read the generator (`ToRustVisitor.java`) to confirm them. "Reading the generated program" above records the generated topology; this part binds its accumulated-state reads. The native behavior inspected here remains the comparison contract for reconstruction (see [reconstruction.md](../../../docs/design/merged-index/reconstruction.md)). The snapshot, fetch, and cursor behavior of the native joins, with the naming notes on "flush" and "accumulation", is in [dbsp-background.md](../../../docs/design/merged-index/dbsp-background.md).
+
+### Relations and state notation
+
+`O`, `C`, and `L` denote logical Orders, Customer, and Lineitem. Following the
+[storage design notation](../../../docs/design/merged-index/storage-layout.md),
+for any relation `X`:
+
+- `X⁻` is accumulated state immediately before the current update set.
+- `X⁺` is accumulated state after applying that update set.
+- `ΔX = X⁺ − X⁻`, so `X⁺ = X⁻ + ΔX`.
+
+The superscripts identify states, **not negative and positive tuple weights**.
+Unchanged tuples belong to both states. Insertions, deletions, and replacements
+contribute through the signed relation `ΔX`; addition consolidates weights of
+identical complete tuples.
+
+`B` names the actual generated Orders–Customer intermediate, stream
+s6.
+It is an order-keyed projection of `O ⋈ C`, retaining customer ID, segment,
+order date, and ship priority. It is not a named SQL view. `V` is the
+materialized nine-field Customer–Orders–Lineitem join generated as
+s7.
+Neither join applies Q3's residual filters or aggregation.
+
+### Generated bindings and equations
+
+The first generated call is `s3.join_index_balanced(&s4)`; the second is
+`s5.join_balanced(&s6)`. Thus Orders is the first join's left input, and
+Lineitem is the second join's left input. Each row below identifies the
+accumulated operand read by a delta branch, rather than a separate input delta.
+
+| Delta input | Accumulated state read | Lookup key | Generated stream and runtime wiring |
+| --- | --- | --- | --- |
+| `ΔO` (`s3`) | `C⁺` (`s4` integral) | Customer ID | s3/s4 join; left delta with current right trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔC` (`s4`) | `O⁻` (`s3` integral) | Customer ID | s3/s4 join; right delta with delayed left trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔL` (`s5`) | `B⁺` (`s6` integral) | Order ID | s5/s6 join; left delta with current right trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+| `ΔB` (`s6`) | `L⁻` (`s5` integral) | Order ID | s5/s6 join; right delta with delayed left trace (`dyn_join_generic`, `crates/dbsp/src/operator/dynamic/join.rs`). |
+
+These bindings give the generated equations:
+
+```text
+ΔB = ΔO ⋈ C⁺ + O⁻ ⋈ ΔC
+ΔV = ΔL ⋈ B⁺ + L⁻ ⋈ ΔB
+V⁺ = V⁻ + ΔV
+```
+
+The first equality expands to
+`ΔO ⋈ C⁻ + ΔO ⋈ ΔC + O⁻ ⋈ ΔC`; the simultaneous-change term occurs once.
+The same reasoning applies to the second join. `dyn_join_generic` (`crates/dbsp/src/operator/dynamic/join.rs`)
+creates each input trace, wires the two branches as cited above, and adds their outputs.
+The delayed-trace accessor (`accumulate_delay_trace` in `crates/dbsp/src/operator/dynamic/accumulate_trace.rs`)
+uses the cached prior-cycle trace; its
+snapshot operator (`AccumulateDelayTrace`, same file)
+captures that trace on initialization or on evaluation after the runtime's
+notification that transaction inputs are complete (`Operator::flush`). A delayed snapshot is a
+read of existing accumulation, not a second accumulation of the input.
+
+The generated `*_balanced` wrappers use ordinary joins when adaptive joins are
+disabled, as in the native baseline: see
+join_balanced (`crates/dbsp/src/mono.rs`),
+join_index_balanced (`crates/dbsp/src/mono.rs`), and the
+default setting (`crates/feldera-types/src/config/dev_tweaks.rs`).
+This contract describes that configuration, without extending it to adaptive
+or multiworker maintenance.
+
+### Concrete keyed values
+
+The generated stream declarations and projection closures establish these
+types and field orders. Each indexed collection associates a signed
+i64 weight (`crates/dbsp/src/algebra/zset.rs`) with a complete
+`(key, value)` pair; the superscript selects visibility, not the weight's sign.
+
+| Read | Concrete key type | Concrete value type | Value fields in order | Generated source |
+| --- | --- | --- | --- | --- |
+| `C⁺` | `Tup1<i64>` | `Tup1<SqlString>` | Market segment | s4 |
+| `O⁻` | `Tup1<i64>` | `Tup3<i64, Date, i32>` | Order ID, order date, ship priority | s3 |
+| `B⁺` | `Tup1<i64>` | `Tup4<i64, SqlString, Date, i32>` | Customer ID, market segment, order date, ship priority | s6 |
+| `L⁻` | `Tup1<i64>` | `Tup4<i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>` | Line number, extended price, discount, ship date | s5 |
+
+The keys are customer ID for `C⁺` and `O⁻`, and order ID for `B⁺` and `L⁻`.
+The logical Lineitem identity is `(order ID, line number)`; its generated
+indexed value retains the line number. Its schema has no customer ID.
+
+The output `s7` declaration and closure
+use `WSet<Tup9<i64, SqlString, i64, Date, i32, i32, SqlDecimal<15, 2>, SqlDecimal<4, 2>, Date>>`.
+The fields are customer ID, segment, order ID, order date, ship priority,
+line number, extended price, discount, and ship date, in that order. The
+materialized output registration
+exposes `V` through Catalog. Base input maps and materialized `V` are outside
+the four accumulated join-read bindings above.
+
+
+### Worked signed examples
+
+**Validation status:** These are agent-authored algebraic illustrations, not
+executable test cases. They have not been executed as written or reviewed or
+validated by a human expert. R2 added no runtime code or executable tests.
+The native baseline has tests for related scenarios (`native_deltas_match_full_join_across_updates` and `simultaneous_three_source_changes_match_reference` in `sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs`),
+but those do not establish validation of these exact examples. The examples
+illustrate the equations above; they are not correctness evidence for R3.
+
+All examples use unit source weights and matching identities: customer 7,
+order 10 owned by customer 7, and line 1 of order 10. Unmentioned payload
+fields are fixed. `{+x}` means tuple `x` with weight `+1`; `{-x}` means weight
+`−1`. Braces denote weighted relations, not before/after states. Each example
+is a separate update set.
+
+#### Empty bootstrap
+
+Start with `O⁻ = C⁻ = L⁻ = B⁻ = V⁻ = ∅` and supply
+`ΔO = {+o}`, `ΔC = {+c}`, and `ΔL = {+l}` together.
+The resulting states have `C⁺ = {+c}` and `B⁺ = {+b}`, where `b` is the
+generated order-keyed projection of the matching order/customer pair.
+
+```text
+ΔB = {+o} ⋈ {+c} + ∅ ⋈ {+c} = {+b}
+ΔV = {+l} ⋈ {+b} + ∅ ⋈ {+b} = {+v}
+V⁺ = ∅ + {+v} = {+v}
+```
+
+Every row enters through the native delta ports; no accumulated bootstrap
+relation is supplied as a second delta.
+
+#### Simultaneous customer and order deletion
+
+Start with `O⁻ = {+o}`, `C⁻ = {+c}`, `L⁻ = {+l}`, `B⁻ = {+b}`,
+and `V⁻ = {+v}`. Supply `ΔO = {-o}`, `ΔC = {-c}`, and `ΔL = ∅`.
+Now `C⁺ = B⁺ = ∅` while the unchanged line belongs to both `L⁻` and `L⁺`.
+
+```text
+ΔB = {-o} ⋈ ∅ + {+o} ⋈ {-c} = {-b}
+ΔV = ∅ ⋈ ∅ + {+l} ⋈ {-b} = {-v}
+V⁺ = {+v} + {-v} = ∅
+```
+
+Reading `C⁻` on the first branch would instead count the deletion twice.
+The correct expanded first join has weights `−1 − 1 + 1 = −1`.
+
+#### Simultaneous payload replacement at unchanged keys
+
+Start with customer `c_old` in BUILDING and line `l_old` priced at 100.00,
+with the unchanged order `o`. Replace the customer segment with AUTOMOBILE
+and the line price with 120.00 in the same update set:
+`ΔC = {-c_old, +c_new}`, `ΔL = {-l_old, +l_new}`, and `ΔO = ∅`.
+Thus `ΔB = {-b_old, +b_new}` and `B⁺ = {+b_new}`. Let `v(l,b)` denote
+the generated nine-field output for a matching line/intermediate pair.
+
+```text
+ΔL ⋈ B⁺ = {-v(l_old,b_new), +v(l_new,b_new)}
+L⁻ ⋈ ΔB = {-v(l_old,b_old), +v(l_old,b_new)}
+ΔV       = {-v(l_old,b_old), +v(l_new,b_new)}
+```
+
+The mixed old-line/new-segment tuple cancels. `V⁺` contains the new segment
+and price; no BUILDING filter runs in this circuit. The unchanged order
+belongs to both `O⁻` and `O⁺`. Projecting either replacement delta to its
+unchanged identity and summing would yield zero, although its payload changes.

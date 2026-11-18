@@ -1,6 +1,8 @@
 # Decisions
 
-This file records the user's confirmed decisions for the merged-index prototype. Each entry is dated. A "decision" that appears elsewhere in these docs without an entry here is unconfirmed.
+This file records the user's confirmed decisions for the merged-index prototype that apply to any merged index or IVM harness: the key trie and spec syntax, the emitter, encodings and storage, the scan session and readers, the one runtime, the accounting rules, and the process and terminology. Each entry is dated. A "decision" that appears elsewhere in these docs without an entry in this file or in [DECISIONS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md) is unconfirmed.
+
+Split rule (user decision of 2026-11-17): decisions are split by owner. Generic design and process decisions stay here. Decisions specific to the Q3 harness and its measurement (the Linux arms, the SSD and hard disk, images, inputs, counters as measured, the smoke defaults, the `measure.py` gates, the hand-written Q3 view circuit, `delta_ms`, and so on) are in [DECISIONS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md). When in doubt, an entry stays here, so that a rule that will bind a new index (MI_P) stays findable from the design directory.
 
 Entries come from two sources:
 
@@ -9,7 +11,47 @@ Entries come from two sources:
 
 Terminology: entries before 2026-11-11 say "front coding" for the key encoding of `--front-code-byte-keys`; the user renamed it "prefix truncation" on 2026-11-11. The code's identifiers keep the old name.
 
+Entries are sorted by date, ascending.
+
+## Topic index
+
+- **Trie and spec syntax:** [2026-09-28: Maintained views exclude selection predicates](#2026-09-28-maintained-views-exclude-selection-predicates); [2026-09-28: Merged-index keys are folded byte strings in flat key-value storage](#2026-09-28-merged-index-keys-are-folded-byte-strings-in-flat-key-value-storage); [2026-10-12: No folded-key uniqueness validator](#2026-10-12-no-folded-key-uniqueness-validator); [2026-10-16: "Key level" and "value level", not "column 0"](#2026-10-16-key-level-and-value-level-not-column-0); [2026-10-16: Merged indexes are declared as key-trie specs](#2026-10-16-merged-indexes-are-declared-as-key-trie-specs); [2026-10-16: The static trie is a nested literal](#2026-10-16-the-static-trie-is-a-nested-literal); [2026-10-16: Key fields are fixed-width and NOT NULL](#2026-10-16-key-fields-are-fixed-width-and-not-null); [2026-10-16: The first scope is the definition](#2026-10-16-the-first-scope-is-the-definition); [2026-10-16: Hand-written prefix names match the emitter's](#2026-10-16-hand-written-prefix-names-match-the-emitters); [2026-10-20: Views cannot be placed, for now](#2026-10-20-views-cannot-be-placed-for-now); [2026-10-20: Placements come before child nodes in a spec](#2026-10-20-placements-come-before-child-nodes-in-a-spec); [2026-10-20: Spec names are unquoted SQL identifiers](#2026-10-20-spec-names-are-unquoted-sql-identifiers); [2026-10-20: The spec flags arrive with the emitter](#2026-10-20-the-spec-flags-arrive-with-the-emitter); [2026-10-20: Generated names come from the spec](#2026-10-20-generated-names-come-from-the-spec); [2026-10-20: Index-id constants are named `INDEX_ID_`](#2026-10-20-index-id-constants-are-named-index_id_); [2026-10-20: Generated structs get plain derives](#2026-10-20-generated-structs-get-plain-derives); [2026-10-20: Payloads must be packable, and a trie must place something](#2026-10-20-payloads-must-be-packable-and-a-trie-must-place-something); [2026-10-20: The emitter checks generated Rust names](#2026-10-20-the-emitter-checks-generated-rust-names); [2026-10-20: The generated `unfold` reports an "unknown index id"](#2026-10-20-the-generated-unfold-reports-an-unknown-index-id); [2026-11-09: Generated names fail fast](#2026-11-09-generated-names-fail-fast); [2026-11-09: Each generated circuit has its own module](#2026-11-09-each-generated-circuit-has-its-own-module); [2026-11-09: A key trie has exactly one root domain](#2026-11-09-a-key-trie-has-exactly-one-root-domain); [2026-11-10: The compiler's validator is the only trie check](#2026-11-10-the-compilers-validator-is-the-only-trie-check); [2026-11-10: `decode_payload` keys on the stream id](#2026-11-10-decode_payload-keys-on-the-stream-id)
+- **Encodings and storage:** [2026-10-12: Secondary storage only](#2026-10-12-secondary-storage-only); [2026-10-12: Placement limitation accepted](#2026-10-12-placement-limitation-accepted); [2026-10-16: Typed merged-index values](#2026-10-16-typed-merged-index-values); [2026-10-16: Front-code byte-string keys, decoded on load](#2026-10-16-front-code-byte-string-keys-decoded-on-load); [2026-10-16: Measure without block compression](#2026-10-16-measure-without-block-compression); [2026-10-19: Drop the stored payload enum](#2026-10-19-drop-the-stored-payload-enum); [2026-10-19: Packed per-placement payload encoding](#2026-10-19-packed-per-placement-payload-encoding); [2026-10-19: Elide the byte-string header on disk, as a separate transform](#2026-10-19-elide-the-byte-string-header-on-disk-as-a-separate-transform); [2026-11-09: One buffer cache, enforced](#2026-11-09-one-buffer-cache-enforced); [2026-11-09: DBSP's default placement in both modes](#2026-11-09-dbsps-default-placement-in-both-modes)
+- **Session and readers:** [2026-10-29: Derived deltas are computed inside one scan session](#2026-10-29-derived-deltas-are-computed-inside-one-scan-session); [2026-11-03: Buffered execution comes before selective execution](#2026-11-03-buffered-execution-comes-before-selective-execution); [2026-11-03: One scan session serves both executions](#2026-11-03-one-scan-session-serves-both-executions); [2026-11-04: Path reads and subtree roots probe exact keys](#2026-11-04-path-reads-and-subtree-roots-probe-exact-keys); [2026-11-09: The doc follows the buffered-only write-up](#2026-11-09-the-doc-follows-the-buffered-only-write-up); [2026-11-09: Step 2 includes lazy values and the session's own merging cursor](#2026-11-09-step-2-includes-lazy-values-and-the-sessions-own-merging-cursor); [2026-11-09: The session does not seek past unread domains](#2026-11-09-the-session-does-not-seek-past-unread-domains); [2026-11-09: Groups are inferred from `Dlt`, with a width per domain](#2026-11-09-groups-are-inferred-from-dlt-with-a-width-per-domain); [2026-11-09: `Skip` is kept, and `Pass` is an A/B knob](#2026-11-09-skip-is-kept-and-pass-is-an-ab-knob); [2026-11-09: `GroupStart` A/B-tests the root probe](#2026-11-09-groupstart-ab-tests-the-root-probe); [2026-11-09: Maintain takes an `on_group` callback](#2026-11-09-maintain-takes-an-on_group-callback); [2026-11-09: Group reads use no exact probe](#2026-11-09-group-reads-use-no-exact-probe); [2026-11-09: The session is bound to its index definition](#2026-11-09-the-session-is-bound-to-its-index-definition); [2026-11-09: The session's step-2 choices](#2026-11-09-the-sessions-step-2-choices); [2026-11-12: Each reader holds its driving delta's requests and keeps only the rows it drives](#2026-11-12-each-reader-holds-its-driving-deltas-requests-and-keeps-only-the-rows-it-drives)
+- **Runtime and circuits:** [2026-09-28: Before/after read handles, not stored status bits](#2026-09-28-beforeafter-read-handles-not-stored-status-bits); [2026-09-28: Reconstruction is interchangeable with retained state](#2026-09-28-reconstruction-is-interchangeable-with-retained-state); [2026-09-28: No multi-versioning or expiration policies](#2026-09-28-no-multi-versioning-or-expiration-policies); [2026-10-12: One DBSP worker](#2026-10-12-one-dbsp-worker); [2026-10-26: Logical views and physical merged indexes](#2026-10-26-logical-views-and-physical-merged-indexes); [2026-10-29: Shared-traversal IVM uses a hand-written view circuit](#2026-10-29-shared-traversal-ivm-uses-a-hand-written-view-circuit); [2026-10-29: Merged-index deltas come from the base transaction](#2026-10-29-merged-index-deltas-come-from-the-base-transaction); [2026-11-05: One runtime for the base and view circuits](#2026-11-05-one-runtime-for-the-base-and-view-circuits); [2026-11-10: General deltas with an orphan side store](#2026-11-10-general-deltas-with-an-orphan-side-store); [2026-11-11: Completing `Dlt` is base maintenance](#2026-11-11-completing-dlt-is-base-maintenance); [2026-11-11: DBSP's operators stay; the partner reads become typed readers](#2026-11-11-dbsps-operators-stay-the-partner-reads-become-typed-readers)
+- **Harness rules:** [2026-10-23: Separate base-table maintenance from IVM](#2026-10-23-separate-base-table-maintenance-from-ivm); [2026-10-26: Merged-index maintenance in the base phase](#2026-10-26-merged-index-maintenance-in-the-base-phase); [2026-11-10: One memory-pressure mechanism for both sides of the worked-transaction comparison](#2026-11-10-one-memory-pressure-mechanism-for-both-sides-of-the-worked-transaction-comparison); [2026-11-13: Minor implementation choices confirmed](#2026-11-13-minor-implementation-choices-confirmed); [2026-11-16: Third pass over the unconfirmed choices](#2026-11-16-third-pass-over-the-unconfirmed-choices)
+- **Process and terms:** [2026-10-08: Slide-deck directions](#2026-10-08-slide-deck-directions); [2026-10-12: "Residual execution" is an acceptable term](#2026-10-12-residual-execution-is-an-acceptable-term); [2026-10-12: Report only what was measured](#2026-10-12-report-only-what-was-measured); [2026-10-19: Report three attributions, and frame packing as neither unique nor orthogonal](#2026-10-19-report-three-attributions-and-frame-packing-as-neither-unique-nor-orthogonal); [2026-11-03: Write-up fixes go to the thesis BUFFER.md first](#2026-11-03-write-up-fixes-go-to-the-thesis-buffermd-first); [2026-11-17: Directory CLAUDE.md files are short; long reference goes to sibling files](#2026-11-17-directory-claudemd-files-are-short-long-reference-goes-to-sibling-files); [2026-11-17: An onboarding guide for a new merged index](#2026-11-17-an-onboarding-guide-for-a-new-merged-index); [2026-11-17: Superseded material is folded into history.md](#2026-11-17-superseded-material-is-folded-into-historymd); [2026-11-17: Decisions are split by owner, and rules for any index or harness sit one level up](#2026-11-17-decisions-are-split-by-owner-and-rules-for-any-index-or-harness-sit-one-level-up); [2026-11-17: The goal is CH-benCHmark](#2026-11-17-the-goal-is-ch-benchmark)
+
 ## Current decisions
+
+### 2026-09-28: Maintained views exclude selection predicates
+
+The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
+
+### 2026-09-28: Merged-index keys are folded byte strings in flat key-value storage
+
+Merged-index keys are opaque byte strings, folded differently for each record type. Each key ends in the record's own identifier. Each value holds one payload; a payload list is never packed into one value. Feldera's LSM machinery (spines of immutable sorted runs) remains the backend: the merged index changes representation and comparison rules, not run management.
+
+### 2026-09-28: Before/after read handles, not stored status bits
+
+The user chose Feldera's existing operator wiring and removed any old/new or base/pending bit from storage. The index appends the transaction delta before view maintenance. Operators hold separate handles to the delta and to the accumulated state before and after the append. Completion releases those handles and never appends the delta a second time. Storage adds no parent-lookup records, relational-consistency checks, or automatic child moves.
+
+### 2026-09-28: Reconstruction is interchangeable with retained state
+
+Reconstructed state must answer the same requested-key reads that an integrator's retained state answers. The IVM algorithm and output path stay shared. The only reconstruction target is an integrator's accumulated output state, never its input delta stream. No reconstructed relation is assumed to fit in memory.
+
+### 2026-09-28: No multi-versioning or expiration policies
+
+The prototype adds no multi-versioning and no record or file expiration policy. Snapshots are temporary read handles over existing immutable batches.
+
+### 2026-10-08: Slide-deck directions
+
+These directions apply to the 2026-10-08 advisor deck; they do not set research scope.
+
+- Introduce DBSP briefly, then derive physical behavior from code.
+- Explain an already-loaded primary-key table before IVM mechanics; call its spine an LSM-like trace.
+- Use Orders–Lineitem first for the explanatory program, but describe the experiment's Orders–Customer-first circuit as it actually is.
+- Make no measured-savings, update-cost, or comparative performance claims.
 
 ### 2026-10-12: One DBSP worker
 
@@ -18,12 +60,6 @@ Maintenance and initial loading both use one DBSP worker. No multiworker extensi
 ### 2026-10-12: Secondary storage only
 
 The merged index is secondary storage, maintained beside Feldera's own base-table state. Clustered primary storage, in which the merged index would replace the base tables, is deferred.
-
-### 2026-10-12: The compiler hook is the current approach
-
-The `--q3-merged-index` compiler option is endorsed for now. It pattern-matches the exact Q3 circuit and emits the reconstructed joins. This supersedes the 2026-09-28 preference for hand-composed circuits (see [Superseded](#superseded-and-withdrawn)). *The hand-written circuit replaced the hook on 2026-11-10, and the hook was removed on 2026-11-13.*
-
-An open question remains; see [Open questions](#open-questions).
 
 ### 2026-10-12: No folded-key uniqueness validator
 
@@ -34,10 +70,6 @@ Folded keys are unique because the base tables have primary keys:
 - **Future workloads.** A workload with upserts must derive the merged-index rows from the base tables' net delta.
 
 This supersedes the 2026-09-28 requirement of a transaction-level uniqueness check (see [Superseded](#superseded-and-withdrawn)).
-
-### 2026-10-12: Drop the R1 measurement table
-
-The R1 table in `q3-ivm-baseline/RESULTS.md` has no raw artifact behind it, and its results are not actionable. It is removed.
 
 ### 2026-10-12: "Residual execution" is an acceptable term
 
@@ -143,53 +175,6 @@ The emitter rejects a spec whose derived Rust names collide (for example, domain
 
 The hand-written `unfold` says "unknown placement id"; the generated one says "unknown index id", following the `INDEX_ID_` naming.
 
-### 2026-10-21: Pin and retire the typed and rkyv value measurements
-
-At roadmap Step 5, record the final typed (`SourcePayload`) and rkyv value-level bytes in [col-storage.md](col-storage.md), then retire those parts of `layout_tests.rs`. Only the packed measurement remains. Generated types keep plain derives. This replaces the last sentence of the 2026-10-20 plain-derives entry.
-
-Summing spine run bytes instead (`layer_file_block_bytes` per spine file, as `q3-ivm-baseline/src/diagnostics.rs` does) was considered and does not help. It changes how bytes are counted, not what is stored, so the typed and rkyv encodings would still need their rkyv and DBData derives.
-
-### 2026-10-21: COL re-exports its generated module and keeps only `build_batch`
-
-At roadmap Step 5, `merged-index-col/src/lib.rs` re-exports the generated module at the crate root, so callers write `merged_index_col::Key`. The stateless wrapper `CustomerOrdersLineitemIndex` is dropped, because its methods only delegated. `build_batch` is a free function and the only hand-written storage code.
-
-### 2026-10-21: Retire the generated-versus-hand-written tests
-
-`generated_tests.rs` is retired with the hand-written definition it compared against. The golden-byte tests in `tests.rs`, whose expected bytes the switch left unchanged, are the regression guard for the byte format.
-
-### 2026-10-22: The Linux measurement A/B tests key front coding
-
-The Linux R5 measurement includes an A/B test of `--front-code-byte-keys`: runs with key front coding and runs without it, all else equal. Both the pilot and the campaign run both arms. The arms alternate per workload (clustered A, clustered B, scattered A, scattered B). Arm B keeps `--elide-value-headers`, so the arms differ in the key encoding alone. (Setup compaction was also kept in both arms until 2026-11-09; see [The Linux campaign runs without setup compaction](#2026-11-09-the-linux-campaign-runs-without-setup-compaction).) The arms and their cost are in [measurement.md](measurement.md#pending-linux-campaign).
-
-### 2026-09-28: Maintained views exclude selection predicates
-
-The maintained view is the unfiltered, unaggregated join `V = Customer ⋈ Orders ⋈ Lineitem`, carrying the fields that the consuming query needs. That query applies the segment and date filters, the revenue aggregation, ordering, and limit. Source records are stored before Q3's predicates, because unchanged Orders and Lineitems are still needed when a customer changes segment.
-
-### 2026-09-28: Merged-index keys are folded byte strings in flat key-value storage
-
-Merged-index keys are opaque byte strings, folded differently for each record type. Each key ends in the record's own identifier. Each value holds one payload; a payload list is never packed into one value. Feldera's LSM machinery (spines of immutable sorted runs) remains the backend: the merged index changes representation and comparison rules, not run management.
-
-### 2026-09-28: Before/after read handles, not stored status bits
-
-The user chose Feldera's existing operator wiring and removed any old/new or base/pending bit from storage. The index appends the transaction delta before view maintenance. Operators hold separate handles to the delta and to the accumulated state before and after the append. Completion releases those handles and never appends the delta a second time. Storage adds no parent-lookup records, relational-consistency checks, or automatic child moves.
-
-### 2026-09-28: Reconstruction is interchangeable with retained state
-
-Reconstructed state must answer the same requested-key reads that an integrator's retained state answers. The IVM algorithm and output path stay shared. The only reconstruction target is an integrator's accumulated output state, never its input delta stream. No reconstructed relation is assumed to fit in memory.
-
-### 2026-09-28: No multi-versioning or expiration policies
-
-The prototype adds no multi-versioning and no record or file expiration policy. Snapshots are temporary read handles over existing immutable batches.
-
-### 2026-10-08: Slide-deck directions
-
-These directions apply to the 2026-10-08 advisor deck; they do not set research scope.
-
-- Introduce DBSP briefly, then derive physical behavior from code.
-- Explain an already-loaded primary-key table before IVM mechanics; call its spine an LSM-like trace.
-- Use Orders–Lineitem first for the explanatory program, but describe the experiment's Orders–Customer-first circuit as it actually is.
-- Make no measured-savings, update-cost, or comparative performance claims.
-
 ### 2026-10-23: Separate base-table maintenance from IVM
 
 Time base-table maintenance and view maintenance directly and apart, without subtracting one figure from another. The R5 driver runs two chained circuits in separate runtimes: a base circuit of the keyed tables, and a view circuit of keyless tables plus V that consumes the base circuit's net delta. The merged index is fed from the same net delta. This is measurement version 3.
@@ -199,17 +184,6 @@ The agent chose three settings, which are not yet confirmed: `--cache-bytes` is 
 Amended on 2026-10-26: the user confirmed the even cache split and the same memory target. The user rejected the `ManualIndex` binding; see "Merged-index maintenance in the base phase".
 
 Amended on 2026-11-05: the two circuits no longer run in separate runtimes, and the even cache split and per-runtime memory target are retired; see "One runtime for the base and view circuits". The two circuits, the net-delta chaining, and the measurement of the phases stand.
-
-### 2026-10-23: Linux campaign refresh selection
-
-The user decided how `prepare_inputs.py` chooses refreshes:
-
-- RF1 inserts and RF2 deletes are chosen independently and never deliberately correlated.
-- Clustered RF1 draws each new Order's Customer from a Zipf distribution over a seeded random permutation of the Customer keys. The skew is in popularity, with no custkey locality. The exponent is `--zipf-exponent`, default 1.0, which the user confirmed on 2026-10-26. *Superseded on 2026-11-17: clustered draws TPC-C's NURand in sessions ([the entry](#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order)).*
-- Clustered RF2 takes the Orders of the lowest-keyed Customers, as many as needed, with each pair taking the next block. *Superseded on 2026-11-04: both workloads delete the lowest Order keys.*
-- Scattered RF1 is uniform over all Customer keys, including keys with no Orders. Scattered RF2 is a seeded uniform sample of existing Orders. *Superseded on 2026-11-04, as above. Superseded on 2026-11-17 for RF1: only Customers whose key is not a multiple of 3, as TPC-H specifies.*
-
-`prepare_inputs.py` implements this.
 
 ### 2026-10-26: Logical views and physical merged indexes
 
@@ -228,15 +202,9 @@ Reporting rule: results always report the base and IVM phases side by side. An I
 
 This supersedes the choice in "Separate base-table maintenance from IVM" that `ManualIndex` binds to the view runtime.
 
-### 2026-10-26: Feldera's buffer cache stays warm at window start
-
-*Superseded on 2026-11-17 for runs started from an image: their window starts with the cache empty, or warmed by `--warm-up` ([the entry](#2026-11-17-load-once-into-an-image-each-refresh-run-is-a-new-process-from-a-copy-of-it)). It still holds for the single-process driver.*
-
-The harness does not clear Feldera's buffer cache after loading and setup compaction. The occupancy at window start is recorded (`cache_occupancy_at_window_start_bytes` in the `main.rs` report). Before 2026-11-05 it was recorded per runtime, under both the base and the view runtime; there is now one runtime and one cache. Clearing the cache would need a new DBSP API: `BufferCache` in `crates/dbsp/src/storage/buffer_cache` offers only a per-file `evict`, and that acts only under the `eager_evict` developer tweak.
-
 ### 2026-10-29: Shared-traversal IVM uses a hand-written view circuit
 
-For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. (Amended on 2026-11-09: selective execution is deferred, so buffered execution applies.) The compiler hook stays for the existing reconstructed mode. *Amended on 2026-11-10: the hand-written circuit replaces the generated reconstructed circuit (see [the entry](#2026-11-10-the-hand-written-view-circuit-replaces-the-generated-one)); the hook stays in Java, unused.* (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
+For the scan session of [shared-traversal.md](shared-traversal.md), the IVM circuit is written by hand so that it fits the key trie: every join is keyed by a trie key (`J` by `(custkey)`, `V` by `(custkey, orderkey)`), which gives (A1). The author must show (A3) for the circuit before selective execution runs it; otherwise buffered execution applies. (Amended on 2026-11-09: selective execution is deferred, so buffered execution applies.) The compiler hook stays for the existing reconstructed mode. *Amended on 2026-11-10: the hand-written circuit replaces the generated reconstructed circuit (see [the entry](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#2026-11-10-the-hand-written-view-circuit-replaces-the-generated-one)); the hook stays in Java, unused.* (Reworded on 2026-11-03 to the assumption names of the write-up's Chapter 3.)
 
 ### 2026-10-29: Merged-index deltas come from the base transaction
 
@@ -250,17 +218,9 @@ The joins whose partner reads share one traversal run inside one scan session pe
 
 The roadmap of [shared-traversal.md](shared-traversal.md) builds the buffered-execution session first: one collection per touched customer, with the delta rules evaluated over its buffers. It is exact under (A1) and (A2), gives the baseline that selective execution is checked against, and stays the fallback for circuits for which (A3) has not been shown. (Amended on 2026-11-09: the write-up now has buffered execution only, so there is no selective execution to build first; see "2026-11-09: The doc follows the buffered-only write-up".)
 
-### 2026-11-03: Counters measure Feldera's costs as well as the write-up's
-
-The counters count per-run seeks, key reads, and value reads in storage, besides the write-up's logical seeks and payload decodes. In Feldera a logical seek costs one seek per run, and a key move on a file batch reads a value, so the write-up's units alone do not show the cost.
-
 ### 2026-11-03: Write-up fixes go to the thesis BUFFER.md first
 
 Fixes found by auditing the write-up against the code are recorded as dated entries in the thesis repository's `BUFFER.md`, not edited into the `.tex`, until the user has audited the chapter.
-
-### 2026-11-03: Counters live at two levels
-
-The scan session counts the write-up's units: cursor opens, logical seeks, and payload decodes. DBSP's run cursors count the storage costs. Both the in-memory cursor (`VecIndexedWSetCursor`) and the file cursor (`FileIndexedWSetCursor`) count per-run seeks. Only the file cursor counts key reads and value reads, since only file runs deserialize. The generic `Cursor` trait gains no counters. (Amended on 2026-11-03: per-run seeks were first counted in the file cursor only, and the logical counters were first placed in an instance-node cursor. Amended on 2026-11-09: in-memory runs also count key, value, and weight accesses, in fields apart from file decodes; see "2026-11-09: In-memory runs count their accesses".)
 
 ### 2026-11-03: One scan session serves both executions
 
@@ -270,25 +230,9 @@ The execution passes its readers to the session. Each reader fixes its kind, ver
 
 *Superseded in part on 2026-11-09.* The requests, readers with queues, the group reader, selective execution's use of the session, and the passing of unread domains are withdrawn; see "2026-11-09: Maintain takes an `on_group` callback" and "2026-11-09: The session does not seek past unread domains". What stands: one session owns the cursors over `Old` and `Dlt`, the logical overlay builds no merged run, and the run counters are always on.
 
-### 2026-11-04: Run reads are attributed by a read scope
-
-Run reads are attributed to a component through a read scope, `with_read_owner`, the read-side mirror of `with_write_owner`, rather than through an owner stored on each batch. The merged index's readers set the scope around their index scans, so index reads are counted apart from every other run the thread reads.
-
 ### 2026-11-04: Path reads and subtree roots probe exact keys
 
 Reads that take one exact index entry probe it with `seek_key_exact`, so that each run's filters answer before any seek, as in a native join's probe. Today these are the path reads `C⁺` and `J⁺`. In the scan session, buffered execution seeks only the root of each touched customer's subtree: it probes the root's exact key, then reads the subtree by a range scan of every run, since a run that lacks the root can still hold entries below it. Range reads keep prefix seeks. A prefix filter is not worth building for this. (Amended on 2026-11-09: the root probe is now the `ProbeThenRange` mode of the `GroupStart` knob, an A/B against `PrefixSeek`, not a fixed rule. Path reads keep their exact probes. Amended again on 2026-11-09: the group-read probe is dropped altogether; see "2026-11-09: Group reads use no exact probe".)
-
-### 2026-11-04: Native joins read through run cursors
-
-R5 runs the native join with DBSP's default read path, `fetch_join` off. With it on, as R5 had it since the driver was written, the native join batch-fetched each delta's keys from every file run into in-memory copies: an access style unlike the reconstructed readers' per-key cursor seeks, and one that the run counters do not see. With it off, both modes read their partner state through the counted run cursors. The fetch path stays uncounted. Reconstructed mode's counts do not depend on the setting.
-
-### 2026-11-04: RF2 deletes the oldest Orders
-
-In both workloads, RF2 deletes the lowest base Order keys, as an analytical database ages out its oldest history. Pair K takes the next block, as large as its RF1. The two workloads then share their RF2 sets and differ only in RF1 (Zipf against uniform Customers). This replaces the RF2 rules of 2026-10-23; the RF1 rules stand.
-
-### 2026-11-04: Run counters count decodes
-
-`RunReads`' `key_reads`, `value_reads`, and `weight_reads` are renamed `key_decodes`, `value_decodes`, and `weight_decodes`. They count entries deserialized from file runs, which usually come from the buffer cache, not disk reads. Storage traffic is reported by the backend read counters beside them.
 
 ### 2026-11-05: One runtime for the base and view circuits
 
@@ -332,17 +276,6 @@ The session infers the touched customers from `Dlt`: a group is the first `1 + r
 
 `Maintain` takes `on_group: (group, buffers) -> ()`, and this is the permanent interface, not a stopgap. The session drives the traversal and hands each group's buffers to the execution; it then releases them. In roadmap step 2 the callbacks are tests. In roadmap step 5 the buffered-execution operator supplies the callback that evaluates `ΔJ` and `ΔV` over the buffers and emits rows.
 
-### 2026-11-09: No setup compaction is the default workload
-
-No compaction before the refreshes is the more realistic workload, so it is the default. `--setup-full-compaction` stays as a flag, to isolate the fragmentation effect: it starts both modes from one run per Spine, which removes where each Spine stands against the compaction threshold from the comparison. The flag was added by an agent on 2026-10-14 without a decision entry; this entry confirms its role.
-
-Results so far (versions 4 to 6) ran with the flag, and each recorded result keeps its settings as run. `main.rs` and `measure.py` already take the flag as opt-in. The standard R5 commands in [WORKFLOW.md](WORKFLOW.md) drop it.
-
-### 2026-11-09: The Linux campaign runs without setup compaction
-
-The Linux pilot and campaign drop `--setup-full-compaction` in both front-coding arms, as the default workload of 2026-11-09 does. The arms still differ in the key encoding alone: both keep `--elide-value-headers`, and arm B drops only `--front-code-byte-keys`. This amends 2026-10-22, which kept the flag in both arms.
-
-
 ### 2026-11-09: One buffer cache, enforced
 
 Everything in the harness uses the runtime's one buffer cache. `ManualIndex`'s thread checks at start that its cache is the runtime's foreground cache (`Arc::ptr_eq`), and `ManualIndex::new` returns an error if it is not, so no run can proceed with the index on another cache. The unbound thread exists only in tests, as the control that shows the check fires.
@@ -360,12 +293,6 @@ The user's decision: "give each circuit its own module". The generated crate hol
 The harness's `runtime_config` (`q3-ivm-baseline/src/main.rs`) has set `min_storage_bytes: Some(0)` since commit `5ac3a8769` (2026-10-01, "Add native Q3 incremental join baseline experiment"). No decision recorded it. The setting is the merge threshold (`Runtime::min_merge_storage_bytes`; default 10 MiB at low memory pressure, 0 at Moderate and above), so every merge output went to a file, however small. Inserted runs follow `min_insert_storage_bytes` (memory at low pressure; `min_storage_bytes.unwrap_or(10 MiB)` at Moderate; 0 at High), so they stayed in memory at low pressure. No deployment would choose this combination.
 
 The user decided to use DBSP's default placement in both modes. Memory pressure, from the cgroup and RSS targets, decides what reaches disk. The harness drops the override and reports the resolved defaults; the measurement version is bumped when the code changes. [native-run-placement.md](native-run-placement.md#the-harnesss-override) records the override and its planned removal.
-
-### 2026-11-09: In-memory runs count their accesses
-
-In-memory runs count key, value, and weight accesses in fields of their own, `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads`, apart from the file decodes. A memory access is never counted as a deserialization. This amends "2026-11-03: Counters live at two levels", which let memory runs count only seeks because they deserialize nothing.
-
-Why: seeks alone hide the key, value, and weight accesses of native traces, of the index's memory runs, and of `Dlt`, so a comparison across layouts would favor whichever mode keeps more state in memory.
 
 ### 2026-11-09: Group reads use no exact probe
 
@@ -397,26 +324,6 @@ The Java `MergedIndexValidator` checks every rule of the key trie, and `MergedIn
 
 `MergedIndexDefinition::decode_payload(stream_id, bytes)` takes the stream id, which is the folded key's last byte (the placement id), not the unfolded key. The stream id selects the payload type, so decoding needs no `unfold` (user confirmation of 2026-11-10, of the choice in "2026-11-09: The session is bound to its index definition").
 
-### 2026-11-10: Choices of the memory-run counters and the native comparison
-
-The user confirmed on 2026-11-10:
-
-- The field names `memory_key_reads`, `memory_value_reads`, and `memory_weight_reads` (see "2026-11-09: In-memory runs count their accesses").
-- A memory run's value counts once per position, mirroring the file cursor's laziness: a `Cell<bool>` that every key move clears and every value move sets.
-- The native comparison's file arm forces high memory pressure through a tiny memory target, since placement follows memory pressure, not cache size. The test waits until the runtime reports high pressure before it loads. *Amended on 2026-11-10 (see the entry below):* the arm is now the pressured arm of both sides, and no test asserts that files exist or where a run is; each reports its layout.
-- `Runtime::DEFAULT_MIN_STORAGE_BYTES` (10 MiB) is a public constant, so that the harness can report the resolved default (see "2026-11-09: DBSP's default placement in both modes").
-- The driving deltas that the readers walk through `requested_keys` count their memory reads under the caller's owner, not the index's.
-- The native worked-transaction test runs in the harness's native build, not under the `merged-index` feature, because the generated view circuit of the `merged-index` build reads the index. The session's side of the comparison is in COL.
-
-### 2026-11-10: The step-3 publication of `(Old, Dlt)`
-
-The user confirmed on 2026-11-10:
-
-- The publication change shares measurement version 7 with the default run placement, since no run at version 7 had been measured.
-- `index_layout` keeps its `before` and `after` keys; `after` is the layout of `Old`'s runs plus `Dlt`, the view that the after reads take.
-- An empty `Dlt` adds no run to the after view.
-- The after reads take `Dlt` from memory, never from a file the spine spilled, so their counts can move from file decodes to `memory_*` reads. *Amended on 2026-11-10 (see the next entry):* `Dlt` follows step placement, so at Critical memory pressure it is a file.
-
 ### 2026-11-10: One memory-pressure mechanism for both sides of the worked-transaction comparison
 
 The user decided on 2026-11-10:
@@ -436,18 +343,6 @@ The user confirmed on 2026-11-10:
 - The shared helper is named `run_load_and_transaction`.
 
 The user called the RF1/RF2 limit self-imposed on 2026-11-10 and handed lifting it to roadmap step 4. Step 4 lifted it (see [General deltas](#2026-11-10-general-deltas-with-an-orphan-side-store)), and the session's worked transaction now also runs the view circuit.
-
-### 2026-11-10: The hand-written view circuit replaces the generated one
-
-The user decided on 2026-11-10 (roadmap step 4). The hook that this entry keeps was removed on 2026-11-13 (user decision; see that day's entry):
-
-- The hand-written circuit (`q3-ivm-baseline/q3-trie-view-circuit`) replaces the generated reconstructed circuit in the `merged-index` build. This amends 2026-10-29's "the compiler hook stays": the hook (`--q3-merged-index`, `Q3MergedIndexBinding.java`) stayed in Java, unused, until its removal on 2026-11-13.
-- Both modes now build the view circuit from different sources: native from `q3.sql`, reconstructed from the committed crate. `generate.sh` takes no option, and `verify.sh` no longer regenerates for the reconstructed run.
-- The circuit meets (A1) and (A2): `J` joins on `(custkey)` and keeps `(custkey, orderkey)`, `V` joins on `(custkey, orderkey)`, and the inputs are keyed by their full trie paths.
-
-### 2026-11-10: Inputs through typed handles fed from `Dlt`
-
-The hand-written circuit's inputs arrive through typed input handles (`ZSetHandle`). The harness collects the touched groups with `Q3State::collect`, then pushes the driving deltas (the buffers' `Dlt` halves) with `Q3State::push_driving_deltas`. The view side no longer reads the SQL net delta.
 
 ### 2026-11-10: General deltas with an orphan side store
 
@@ -473,22 +368,6 @@ The user decided on 2026-11-11, for roadmap step 5:
 - **One typed buffer per reader, filled at collection.** A reader declares one stream and a projection into its join's typed rows. When the session collects a group, each entry is routed to the readers of its stream and projected once (`merged_index::reader`). A reader's buffer is its records, two batches of the join's type (`Old`'s and `Dlt`'s), not references into a shared buffer. This departs from the write-up's buffer per stream (`def:session`): an entry that two readers take is stored twice. Index reads are unchanged.
 - **`J⁺` from two one-stream readers, per request.** `J` is not stored, so `J⁺` is `J`'s join re-evaluated on each requested `(custkey, orderkey)` path, over the after reads of the customers reader and of an orders reader keyed by `(custkey, orderkey)`. Building it at collection would join every order of each touched customer.
 - **The driving deltas come from the readers, through DBSP's `Input` operator.** The view circuit takes them as native mode does, through `Input`, in its value form (`add_input_stream`): before the transaction the driver hands each reader's `Dlt` batch to its handle, booked in `forward_ms` like native's feed. `ΔO` and `ΔL` are moved out of their readers; `ΔC` is cloned, since its batch is also half of `C⁺`. The `TransactionGenerator` sources that step 5 first used, which cloned all three inside the transaction, are withdrawn. This is measurement version 10.
-
-### 2026-11-11: The session-pass knob shares measurement version 10
-
-The driver's `--session-pass seek|step` (default `seek`) selects the scan session's `Pass` in reconstructed mode, and the report records it as `configuration.session_pass` (`null` in native mode). It shares measurement version 10, since no version 10 run had been recorded, as the publication change shared version 7 on 2026-11-10.
-
-### 2026-11-11: The Linux campaign crosses prefix truncation with the session pass
-
-The Linux pilot and campaign run four arms, a full 2×2: prefix truncation on (A) or off (B), crossed with the scan session's pass, `seek` or `step`. The arms are `A-seek`, `A-step`, `B-seek`, and `B-step`. All keep `--elide-value-headers` and drop `--setup-full-compaction`. Native runs in every arm, though neither factor changes it, and must match across the four. This amends the two-arm design of 2026-10-22 and 2026-11-09. The user calls the key encoding of `--front-code-byte-keys` prefix truncation from 2026-11-11. *Amended on 2026-11-16: the full campaign runs on the SSD, and the hard disk gets only the eight pilots as a probe (see [the entry](#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)). The four arms stand.*
-
-### 2026-11-11: One set of inputs, read in place; every run starts cold
-
-Every run of every campaign reads one set of TPC-H input files in place; no run copies them. Each run starts in a new process, with the inputs evicted from the page cache, or after a fixed warm-up routine; it never starts warm from an earlier run. `measure.py` checks each input's size and modification time against the campaign's hash record and evicts the inputs inside the run's cgroup before the driver starts. A run whose inputs were not evicted does not qualify. The runner has no warm-up routine; none is used.
-
-### 2026-11-11: The macOS smoke runs at the current defaults
-
-The version 10 macOS smoke run uses the current default workload, with no setup compaction, and otherwise the settings of the version 6 smoke run.
 
 ### 2026-11-12: Each reader holds its driving delta's requests and keeps only the rows it drives
 
@@ -518,21 +397,6 @@ The user also decided the read owners and the IVM window on 2026-11-12:
 - **Relation to selective execution.** This design revives selective execution's requests, kept path, and ready pairs inside one touched group, but not `Visit` ([deferred.md](deferred.md#status-on-2026-11-12-requests-apply-at-routing-skipping-stays-deferred)).
 
 The whole-group over-read that remains, a key read per position of a touched group, is deferred ([deferred.md](deferred.md#whole-group-over-read-for-narrow-requests)).
-
-### 2026-11-12: Preparing the view's transaction delta is view work, in `delta_ms`
-
-The user decided on 2026-11-12 that preparing the view circuit's transaction delta is view maintenance in both modes, timed inside the IVM window as a new sub-phase, `delta_ms` (measurement version 11, shared with the reader redesign).
-
-- **Native:** the conversion of the net delta into the view circuit's input rows (`net_delta.apply_optional` into the input handles).
-- **Reconstructed:** building the driving deltas from `Dlt` and handing them to the input handles (phase A, timed inside `Q3State::collect`, which returns it, then `Pipeline::build_view_delta`). The scan of `Old` (phase B) stays in `q3_ms`.
-- **`forward_ms`** keeps only the net-delta read (`workload::net_delta`), the same operation in both modes.
-- **`ivm_ms = delta_ms + q3_ms`.** `q3_ms` stays the view circuit's transaction, plus the scan session's collection in reconstructed mode. The report shows `delta_ms` beside `ivm_ms`, so a reader can compare the modes with and without it: the two operations are not identical.
-
-This revises the 2026-11-11 rule that the boundary copy lies outside the IVM window (measurement version 9).
-
-### 2026-11-10: Pipelining types take the suffix `Vector`
-
-The reader's type aliases are renamed `*Batch` to `*Vector` (`CustomerByCustkeyVector`, `OrdersByCustkeyVector`, `JoinedByCustkeyOrderkeyVector`, `LineitemByCustkeyOrderkeyVector`). Rationale: "batch" suggests a run of an LSM spine, which stores records, but these types hold no index state. They are the unit DBSP hands from one operator to the next: a weighted, key-sorted set of rows per step, or per output chunk at the flush. A Volcano iterator hands over one row; DBSP hands over a set of rows, as MonetDB/X100 hands over a vector. The same types also carry a reader's partner rows into the snapshot-reader join; the records themselves live in the scan session's buffers. (Since 2026-11-12 there are no buffers: the records live in the readers' requested slices.)
 
 ### 2026-11-13: Minor implementation choices confirmed
 
@@ -567,72 +431,38 @@ Confirmed in the second pass the same day:
 - **Circuits stay hand-written.** The generic reader work declares readers and joins by hand; neither the view circuit nor the reader definitions are generated by compiler passes.
 - **`ERROR_VIEW` is deferred and left open** ([deferred.md](deferred.md#error_view-in-the-hand-written-circuit-open)).
 
-### 2026-11-16: The SSD runs the campaign; the hard disk only a pilot probe
+### 2026-11-17: Directory CLAUDE.md files are short; long reference goes to sibling files
 
-The user decided on 2026-11-16:
+The user decided on 2026-11-17 that each directory's `CLAUDE.md` stays short (about 50 to 150 lines): purpose, contracts, a map of files and symbols, commands, and test filters. Claude Code loads a directory's `CLAUDE.md` when it works there, so longer reference material goes into sibling `.md` files in the same directory, linked from the `CLAUDE.md`.
 
-- **The full four-arm campaign runs on the SSD.** The eight pilots run there first (16 runs), then the campaign (48 runs).
-- **The hard disk gets only the eight pilots, as a probe (16 runs),** with `--storage-path` on it. An HDD campaign is decided after the probe, so the probe is evidence only. The TPC-H inputs and the build stay on the SSD in both cases.
-- **`measure.py` stores the storage device in the manifest** (`storage_device`) and takes an optional `--device-label ssd|hdd`, which must not contradict the device's `rotational` flag.
+### 2026-11-17: An onboarding guide for a new merged index
 
-The probe comes first so that an HDD campaign is decided on evidence. This adds a device to the pilot and campaign of the 2026-11-11 four-arm entry and leaves its arms unchanged.
+The user decided on 2026-11-17 that [new-merged-index.md](new-merged-index.md) is the guide for building a new merged index and its IVM programs (the MI_P work). It links each step to the `CLAUDE.md` of the directory that owns it.
 
-### 2026-11-16: `measure.py` gates on layout fallbacks
+### 2026-11-17: Superseded material is folded into history.md
 
-A run is rejected when `front_coding.layout_fallbacks` is not 0 with prefix truncation on, or `value_header_elision.layout_fallbacks` is not 0 with elision on. A layout fallback is an eligible block that the encoder did not understand, so it was written unencoded and the arm would not measure the encoding it names. `size_fallbacks` (blocks that the encoding would not have shrunk by a sector) stay unchecked, since they are legitimate.
+The user decided on 2026-11-17 that superseded and completed material (retired plans, roadmaps, dated smoke results, stale names) is folded into [history.md](history.md), not kept beside the current docs. This log keeps its own table of superseded decisions.
 
-### 2026-11-16: One full block expansion per cache miss is accepted for now
+### 2026-11-17: Decisions are split by owner, and rules for any index or harness sit one level up
 
-A block written with prefix truncation (or with elided value headers) is rebuilt in full when its read misses the buffer cache, and a seek expands at most one block per column ([col-storage.md](col-storage.md#prefix-truncation-on-the-read-path)). The user accepts this cost for now and requires it to be documented as suboptimal. Only reconstructed mode pays it: native runs with the same flags, but its typed rows never qualify for either encoding (`front_codable_key`, `elidable_value_headers` in the storage file writer), so it saves no disk and expands no block. The encodings are part of the merged index's design, since only its byte-string keys and values qualify (user decision of 2026-11-16). The session-pass arms pay it equally; arm A expands key and value blocks, arm B value blocks only. Alternatives that search the encoded block are deferred ([deferred.md](deferred.md#search-a-prefix-truncated-block-without-expanding-it)). The rebuild is called a block expansion and is counted apart from item decodes, from measurement version 12.
-
-### 2026-11-17: Load once into an image; each refresh run is a new process from a copy of it
-
-Loading is not measured, so it runs once, with no cgroup limit and no DBSP memory target, and writes a reusable image: one DBSP checkpoint of the base and the view circuit (and, in reconstructed mode, the merged index and its orphan lines), with `image.json` beside it (`measure.py --build-images`, the driver's `--write-image`). Every measured run starts a new process from its own full copy of the matching image (`measure.py --images`, the driver's `--from-image`), under the cgroup limit from the start and with the DBSP memory target, and runs only the refreshes. Whatever the refreshes need besides the loaded state is the refresh program's own work (the republish transaction, the catalogs, `Q3State`). The image is per mode and per prefix-truncation arm (`native-A`, `native-B`, `merged-index-A`, `merged-index-B`), because the refresh program reopens only an image written with its own storage settings. The first Linux pilot prompted this: it loaded SF 10 under the 1 GiB limit for 96 minutes and timed out in the background merges before any refresh ran. Measurement version 13.
-
-- **Cache at the window's start:** cold by default, since every run starts from the same image in a new process. Optionally (`--warm-up`, user answer "both"), one RF1/RF2 pair from an extra dbgen update set, untimed and unreported, runs before the window in both modes. This supersedes the 2026-10-26 rule that the window starts with the cache warm from loading.
-- **Every restored run is a file:** the restore reopens each batch from its file, so the window starts with no in-memory run.
-- **One runtime still hosts both circuits** (2026-10-23, 2026-11-05). DBSP now checkpoints a runtime with several circuits as one checkpoint: each circuit's persistent ids carry its index (`-c0-`, `-c1-`), the handles share one checkpointer, and the checkpoint's fingerprint combines the circuits' in order (`DBSPHandle::checkpoint_circuits`).
-
-### 2026-11-17: The load program uses its own cache and 1,000,000-row load transactions
-
-Loading is unmeasured, so its settings serve speed, not the campaign. `measure.py --build-images` defaults to a 16 GiB buffer cache per load (four loads at once), 1,000,000-row load transactions, and a 3600 s merge wait (`LOAD_CACHE_BYTES`, `LOAD_BATCH`, `LOAD_COMPACTION_TIMEOUT_SECS`). None reaches a refresh run, which takes the campaign's `--cache-bytes`; `ImageSettings` holds only the mode, the workers, and the two storage encodings. No full compaction runs after loading (user answer of 2026-11-17, keeping 2026-11-09), so the batch size shapes each image's runs, and all four images are loaded with the same settings.
-
-The first SF 10 build, with the campaign's 128 MiB cache and 10,000-row transactions, loaded native in 84 to 95 minutes and reconstructed at 0.35% of `lineitem.tbl` per minute (about 5 hours). A profile put about 68% of the reconstructed load's main thread in the view phase's scan session (`Q3State::collect`): the loader reads orders in `orderkey` order, the index clusters by customer, and storage files bypass the page cache (`O_DIRECT`), so the scattered group reads missed a small buffer cache and read the SSD. With the new settings, both modes read about 2% per minute and nothing from the device in the first 15 minutes. Rejected for now: sorting the load input by customer, which needs a loader change and costs native's `orderkey`-keyed join its locality.
-
-### 2026-11-17: Transaction size is a dimension, small transactions first
-
-The TPC-H refresh functions are batch loads: at SF 10 one RF1 is a single transaction of 15,000 Orders and about 60,000 Lineitems, the ETL pattern that incremental view maintenance exists to avoid. The campaign measures small transactions first, closer to a hybrid transactional and analytical database: about 10, 100, and 1,000 rows per transaction (`prepare_inputs.py --transaction-rows`), with the TPC-H batch kept as a later ETL reference point. A transaction holds whole Orders, an Order counting 1 + its Lineitems. Inserts and deletes stay in groups: pair by pair, all of RF1 K as consecutive small transactions, then all of RF2 K, since interleaving them would mix the two operations within the size being measured. Each transaction is timed on its own (`transaction_latency`, measurement version 14), and percentiles, not only sums, are reported per phase.
-
-### 2026-11-17: Clustered RF1 draws TPC-C's NURand in sessions; only eligible Customers order
-
-- **Eligible Customers.** As TPC-H specifies, RF1 Orders go only to Customers whose key is not a multiple of 3, in both workloads (1,000,000 of 1,500,000 at SF 10). Scattered draws them uniformly.
-- **Popularity.** Clustered replaces the Zipf draw of 2026-10-23 with TPC-C's customer NURand(1023, 1, 3000) (clause 2.1.6), with one seeded constant C. TPC-H has no districts, so consecutive blocks of 3,000 eligible Customers stand in for them (user choice among three synthetic scalings: these blocks, one NURand over all eligible Customers, or nations); a block is chosen in proportion to its size. Real districts arrive with CH-benCHmark.
-- **Locality within a transaction.** Independent draws make the Customers a transaction spans a function of popularity and size, and a Zipf steep enough to put 10 Orders on 2 or 3 Customers would hand most Orders to one Customer. So locality is its own parameter: each transaction of n Orders draws ceil(n / m) Customers and gives them its Orders m at a time (`--orders-per-session`, m = 4), which keeps each Customer's expected Order count while bunching it. At about 10 rows a transaction is one Customer's session, as a TPC-C New-Order is.
-- **Unchanged.** Deletes stay oldest-first in both workloads; dbgen's Order keys stay (the order-key dimension is deferred, [deferred.md](deferred.md#order-key-assignment-as-a-dimension)).
+The user decided on 2026-11-17 to split this log by owner. Generic design and process decisions stay here. Q3-harness and measurement decisions moved, unchanged and dated, to [DECISIONS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md) in `q3-ivm-baseline/`. Rules that apply to any merged index or IVM harness sit one level up, in the root `CLAUDE.md` or `sql-to-dbsp-compiler/experiments/CLAUDE.md`, and are not restated in the Q3 directories, which hold only Q3-specific instances.
 
 ### 2026-11-17: The goal is CH-benCHmark
 
-The user's goal is to implement CH-benCHmark eventually: TPC-C's transactions against a combined schema, with TPC-H's analytical queries adapted to it, including a Q3 analog over Customer, New-Order, Orders, and Order-Line. Its hierarchical keys (warehouse > district > customer > order > order line) suit a merged index, and its New-Order transaction is small by design. Until then, the TPC-H schema stays, and its workloads borrow TPC-C's shape: small transactions, NURand Customers, and sessions.
+The user's goal is to implement CH-benCHmark eventually (owner: a future harness beside `q3-ivm-baseline`): TPC-C's transactions against a combined schema, with TPC-H's analytical queries adapted to it, including a Q3 analog over Customer, New-Order, Orders, and Order-Line. Its hierarchical keys (warehouse > district > customer > order > order line) suit a merged index, and its New-Order transaction is small by design. Until then, the TPC-H schema stays, and its workloads borrow TPC-C's shape: small transactions, NURand Customers, and sessions.
 
 ## Superseded and withdrawn
+
+Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).
 
 | Date | Earlier position | Replaced by |
 | --- | --- | --- |
 | 2026-11-09 | Roadmap step 5: one operator drives the scan session, and its `on_group` callback evaluates `ΔJ` and `ΔV` per group and releases each group on return, in place of DBSP's two joins. | 2026-11-11: DBSP's operators stay; the partner reads become typed readers filled at collection. |
 | 2026-11-09 | Selective execution's requests are withdrawn (deferred with `Visit`). | 2026-11-12, in part: requests, the kept path, and ready pairs apply at routing inside a touched group; `Visit` stays deferred. |
-| 2026-11-11 | The boundary copy of the driving deltas into the view circuit's input handles is outside the IVM window in both modes, in `forward_ms` (measurement version 9, kept in version 10). | 2026-11-12: preparing the view's transaction delta is view work, timed in `delta_ms` inside `ivm_ms` (measurement version 11). `forward_ms` keeps only the net-delta read. |
-| 2026-11-11 | The driving deltas are pushed row by row into the view circuit's `ZSetHandle`s (measurement version 9). | 2026-11-11: the readers' `Dlt` batches are handed whole to `add_input_stream` handles (measurement version 10). |
 | 2026-11-11 | `J⁺` is `J`'s join re-evaluated per requested path over the after reads of two whole-group readers; the joins probe whole touched-group batches. | 2026-11-12: each reader holds its driving delta's requests and keeps only the rows it drives; `ΔJ` and `J⁺` are computed at routing. |
-| 2026-11-11 | Three `TransactionGenerator` sources emit the readers' `Dlt` batches at the commit flush, cloning all three. | 2026-11-11: DBSP's `Input` operator, as native mode uses; `ΔO` and `ΔL` moved, `ΔC` cloned. |
 | 2026-10-12 | Placement map from the same transaction's Orders rows; changes outside RF1/RF2 are unsupported by design. | 2026-11-10: general deltas; `prepare` gives each order owners and orphan lines wait in a side store. |
-| 2026-10-29 | The compiler hook generates the reconstructed circuit. | 2026-11-10: the hand-written `q3-trie-view-circuit` replaces it. |
 | 2026-11-09 | `GroupStart::{PrefixSeek, ProbeThenRange}` A/B-tests the root probe; the 2026-11-04 root probe applies to buffered group reads. | 2026-11-09: group reads use no exact probe; path reads keep `seek_key_exact`. |
-| 2026-10-01 | `min_storage_bytes: Some(0)` in the harness's `runtime_config` (never recorded as a decision). | 2026-11-09: DBSP's default placement in both modes. |
 | 2026-11-03 | One scan session serves both executions, through readers with request queues, a group reader for buffered execution, and passing of unread domains by seeking. | 2026-11-09: buffered execution only; groups inferred from `Dlt`; `on_group` callback; no seeking past unread domains. |
-| 2026-10-22 and 2026-11-09 | The Linux campaign has two arms, with and without prefix truncation (then called front coding). | 2026-11-11: four arms, prefix truncation crossed with the session pass. |
-| 2026-11-11 | The pilot (16 runs) and the campaign (48 runs) of the four arms run on one machine's storage with no device choice. | 2026-11-16: the campaign runs on the SSD; the hard disk gets the eight pilots (16 runs) as a probe. |
-| Before 2026-11-11 | Each run copies every input into its own directory inside its cgroup (`private_inputs`). | 2026-11-11: one set of inputs, read in place; each run evicts it from the page cache and starts cold. |
-| 2026-10-22 | Keep `--setup-full-compaction` in both arms of the Linux front-coding A/B. | 2026-11-09: the campaign runs without setup compaction. |
 | 2026-10-23 | Run the base and view circuits in separate runtimes, splitting the cache evenly. | 2026-11-05: one runtime and one cache for both circuits. |
 | 2026-10-14 | Leave the record-size gap open; schedule no encoding work. | 2026-10-16: typed values and front-coded byte-string keys. |
 | 2026-10-16 | Store the typed `SourcePayload` enum as the value. | 2026-10-19: packed, untagged bytes per placement. |

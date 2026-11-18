@@ -1,0 +1,81 @@
+# CLAUDE.md: Q3 IVM harness
+
+This harness maintains `V = Customer ⋈ Orders ⋈ Lineitem` (TPC-H Q3 without its predicates) in two modes, native and reconstructed from the COL merged index. It is the one harness that implements the rules in [../CLAUDE.md](../CLAUDE.md), which holds the two-circuit, accounting, transaction, placement, and general-delta rules for any merged index; the research-wide rules are in the root `CLAUDE.md`. This file holds only the Q3 names. Landing page: [README.md](README.md). Siblings: [MEASUREMENT.md](MEASUREMENT.md), [LINUX-HANDOFF.md](LINUX-HANDOFF.md), [CIRCUIT.md](CIRCUIT.md), [DECISIONS.md](DECISIONS.md).
+
+## Files
+
+| Piece | Location |
+| --- | --- |
+| Base circuit: primary-key tables, no view (generated, git-ignored) | `base.sql`, crate `q3-base-circuit` |
+| Native view circuit: keyless Z-set tables plus `V` (generated, git-ignored); `query.sql` is the logical definition | `q3.sql`, crate `q3-view-circuit` |
+| Reconstructed view circuit, hand-written and tracked: `J` on `(custkey)` keeping `(custkey, orderkey)`; `V` on `(custkey, orderkey)`; inputs keyed by full trie path; no `ERROR_VIEW`. Its inputs are three `add_input_stream` handles (`TrieInputs`) that take whole driving-delta batches and reach the harness through `Arc<OnceLock<TrieInputs>>` (user decision of 2026-11-11) | `q3-trie-view-circuit/` (tests: `deltas_beyond_rf1_rf2_match_the_brute_force_join`) |
+| Driver: `Pipeline` holds both circuits; `Reference` is the tests' in-memory oracle; `storage_options` sets the run placement | `src/main.rs` |
+| `BaseState` (snapshots of the base tables before a transaction), `BaseState::validate`, `workload::enable_net_delta`, `workload::net_delta`, the `.tbl` parser | `src/workload.rs`, `src/data.rs` |
+| `ManualIndex` (auxiliary thread), `reconstruction::prepare`, `OrphanLines` (`Pipeline.orphans`) | `src/reconstruction.rs` |
+| R4 tests of both modes; R5 report and runner | `src/verification.rs`; `src/measurement.rs`, `measure.py`, `summarize.py`, `prepare_inputs.py` |
+
+The Cargo feature `merged-index` builds the reconstructed mode (`q3-trie-view-circuit` in place of `q3-view-circuit`). The COL library is [../merged-index-col/CLAUDE.md](../merged-index-col/CLAUDE.md).
+
+## Q3 instances of the shared rules
+
+- **Phases.** The accounting rule is in [../CLAUDE.md](../CLAUDE.md). Q3 names: `delta_ms` is, natively, the net delta's conversion into input rows, and, reconstructed, phase A of `Q3State::collect` plus the hand-off to the input handles (`Pipeline::build_view_delta`). `block_expansions` counts storage-level block rebuilds apart from item decodes. Definitions are in [MEASUREMENT.md](MEASUREMENT.md).
+- **One worker.** `main.rs` rejects any other count in reconstructed mode and in R5 runs (user decision of 2026-10-12); the driver defaults to `--workers 1`.
+- **Cache binding.** `ManualIndex::new` errors ("merged-index thread is not on the runtime's buffer cache") if its thread's cache is not `Runtime::foreground_buffer_cache(0)`. The control `manual_index_refuses_a_thread_off_the_runtimes_cache` builds the thread unbound (`ManualIndex::without_cache_binding`, test-only). `index_file_runs_land_in_the_view_workers_cache` (reconstructed feature): a memory target far below the process's size makes `ManualIndex`'s thread spill its run to a file; the test asserts `Runtime::buffer_cache()` is one object (`Arc::ptr_eq`) on that thread and on the view worker, that every block (`Batch::file_block_locations`) is in the worker's cache by direct `BufferCache::get`, and that the cache is below capacity. Neither counts hits or misses.
+- **Owners and the orphan store.** `reconstruction::prepare` gives every changed order a before owner `cb` and an after owner `ca` (a `custkey` or none) from the net delta, else from the pre-transaction `Orders` state: `BaseState` in the driver (found by `seek_key_exact` on `Orders`; the reads count under `BaseRelation`), `Reference` in tests. `Old` cannot answer: it is keyed customer first (user decision of 2026-11-13). Lines before are `L⁻`, read from `Old` at `(cb, order)` or, with no owner, from `OrphanLines`; lines after are `L⁺ = L⁻ + ΔL`. Customers and orders fold from the net delta alone. Native accepts orphan lines and never joins them. `prepare` rejects only a net delta that contradicts the state.
+- **Validation.** `BaseState::validate` stays an RF1/RF2 check of the CLI drivers' inputs, not where support is decided. A request outside a reader's requests errors, and the join's `expect` in `merged-index-col/src/q3.rs` panics the worker.
+- **Placement override (history).** `runtime_config` set `min_storage_bytes: Some(0)` through measurement version 6. It dates from commit `5ac3a8769` (2026-10-01) and was not recorded as a decision until 2026-11-09. It set the merge threshold to 0, so every merge output went to a file, however small, while inserted runs followed `min_insert_storage_bytes` and stayed in memory at low pressure; default DBSP never produces that placement at low pressure. The user decided on 2026-11-09 to use the default in both modes. Version 7 drops the override: `storage_options` leaves `min_storage_bytes` and `min_step_storage_bytes` unset, and the report gives `configuration.min_storage_bytes` (`Runtime::DEFAULT_MIN_STORAGE_BYTES`, 10 MiB), `min_storage_bytes_source`, and `run_placement`. At smoke scale no merge output reaches 10 MiB, so low pressure keeps every run in memory; tests that need file runs force memory pressure. `merged-index-col/src/storage_tests.rs` keeps its own setting.
+
+## Measurement versions 11 to 14
+
+- **11** (2026-11-12): readers keep only the rows they request; `view_run_reads` gains `requested_slice` and `partner_trace`; `delta_ms` is booked inside `ivm_ms` (user decision of 2026-11-12).
+- **12** (2026-11-16): adds `block_expansions` and `storage_device`; no timing field changes.
+- **13** (2026-11-17): loading is separate from the measured runs (user decision of 2026-11-17). `measure.py --build-images DIR` loads once per mode and prefix-truncation arm into `native-A`, `native-B`, `merged-index-A`, `merged-index-B` (`ImageManifest`, `ImageSettings`; `Pipeline::write_checkpoint` saves both circuits, the index, and `OrphanLines`). `measure.py --images DIR` copies the matching image into each run and starts the refresh program (`--from-image`, `Pipeline::reopen`, `republish`) under the cgroup limit. The window starts with an empty buffer cache, and every restored run is a file. `an_image_reopens_where_its_writer_stopped` (`verification.rs`) checks, in both modes, that a transcript split by an image and a new runtime equals the single runtime's. A campaign reopens an image only with the executable that wrote it (`image_executable_problems`, by SHA-256), so a change to the driver, its circuits, or DBSP needs new images, and each completed run's copy is deleted (`--keep-run-storage` keeps it). The load program has its own defaults (`LOAD_CACHE_BYTES` 16 GiB per load, `LOAD_BATCH` 1,000,000 rows, a 3600 s merge wait; decision of 2026-11-17): storage files use `O_DIRECT`, so the buffer cache, not the memory target, decides whether the reconstructed load's scattered group reads hit the device. Do not pass the campaign's 128 MiB cache or 10,000-row batch to `--build-images`.
+- **14** (2026-11-17): every transaction is timed. A refresh may be cut into transactions (`transaction_orders`, from `prepare_inputs.py --transaction-rows`; `PreparedRefresh::read` reads each file once and splits it), and each refresh reports `transactions` and `transaction_latency` (per-transaction `total_ms`, `base_ms`, `ivm_ms` with nearest-rank percentiles); the resource and pressure samples stay around the refresh. The campaign measures about 10, 100, and 1,000 rows per transaction, in RF1 and RF2 groups (decisions of 2026-11-17). `prepare_inputs.py` gives RF1 Orders only to Customers whose key is not a multiple of 3; clustered draws TPC-C's NURand over blocks of 3,000 of them in sessions of 4 Orders (`--orders-per-session`). Tests: `a_refresh_cut_into_transactions_*` in `main.rs`.
+
+## General deltas (reconstructed mode)
+
+| Case | `Dlt` line rows | Side store |
+| --- | --- | --- |
+| same owner `c` | `ΔL` at `c` | unchanged |
+| the order moves | `−L⁻` at `cb`, `+L⁺` at `ca` | unchanged |
+| the order is deleted, lines kept | `−L⁻` at `cb` | order ↦ `L⁺` |
+| the order arrives for orphan lines | `+L⁺` at `ca` | remove the order |
+| orphan lines only | none | order ↦ `L⁺` |
+
+One test per row, plus the rejection, in `src/reconstruction.rs`: `lines_of_an_order_with_one_owner_fold_from_the_delta_alone`, `a_moved_order_takes_its_old_and_new_lines_with_it`, `a_deleted_order_leaves_its_kept_lines_in_the_side_store`, `an_arriving_order_takes_the_orphan_lines`, `a_net_delta_that_contradicts_the_state_is_rejected`.
+
+## Verification (R3, R4)
+
+`verification::rf1_rf2_transcript` and `verification::general_transcript` run deterministic loading and transactions in both modes with one worker and a splitter chunk size of eight records (groups of 13, 11, and nine lines cross batch boundaries). Three transactions use explicit start/step/commit; one is empty. The first covers RF1/RF2 (customers load first); the second covers customer updates, lines added to existing orders, orders that change customer, deleted orders with kept lines, and orphans. Each checks that every committed delta and materialized `V` equals the difference of `Reference::evaluate` before and after (an independent full join over primary-key maps), and, in reconstructed mode, that the four reader outputs equal rows computed from the logical records without index reads (`check_readers`). Customer-first loading leaves `orders_before` empty; the COL weighted-reader tests cover it. Each JSON transcript holds transaction names and sorted weighted rows, with no timings.
+
+| Transaction | Emitted `ΔV` | `V` rows | Transaction | Emitted `ΔV` | `V` rows |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Customers | 0 | 0 | RF2 A | −14 | 18 |
+| Load A | +15 | 15 | RF1 B | +9 | 27 |
+| Load B | +4 | 19 | RF2 B, multi-step | −13 | 14 |
+| Empty after load | 0 | 19 | Empty between cycles | 0 | 14 |
+| Empty multi-step | 0 | 19 | RF1 C | +3 | 17 |
+| RF1 A, multi-step | +13 | 32 | RF2 C | −11 | 6 |
+| | | | Empty final | 0 | 6 |
+
+The data has three customers, four loaded orders, five RF1 orders, 44 inserted lines, and six RF2 orders with 38 deleted lines. R4 transactions give one candidate customer per order, so R4 alone does not establish broader support. The run of 2026-10-06 passed all 10 native, seven reconstructed, and 21 COL tests; the 13 transcripts matched byte for byte (97,718 bytes each, SHA-256 `826d6d3fe047f95752e42cdc88f3633def2ee83033fd24a548a08fb3aa3d67bc`, in the ignored `target/r4-verification/20261006T222308Z-60261/`). Rerun `verify.sh` for current results. Not covered: more than one worker. Checkpoints of a runtime with several circuits are covered by `an_image_reopens_where_its_writer_stopped` and DBSP's `init_circuits_restore_each_circuit_from_one_checkpoint`.
+
+Other tests: `supplied_snapshot_join_matches_native_signed_updates` (`join.rs`); `readers_match_a_brute_force` (`merged_index::reader`, and `merged-index-col/src/q3/tests.rs`); `rf1_rf2_match_full_join`, `native_deltas_match_full_join_across_updates`, `random_general_changes_match_the_reference_join` (`main.rs`); `four_readers_preserve_weighted_before_after_relations`, `publication_collection_and_release_follow_one_order` (COL).
+
+The worked-transaction comparison runs both sides under one memory-pressure mechanism and config (`worked_transaction::Arm`, user decision of 2026-11-10): `native_worked_transaction_tests` (native build) and `session_worked_transaction_tests` (`--features merged-index`), each with `*_default_arm` and `*_pressured_arm`. It shares rows, arms, and config; the session test runs the transaction on the base circuit and the index, then the view circuit on the driving deltas. No layout is asserted; `cargo +1.96.1 test --offline --locked worked_transaction -- --nocapture` prints pressure, files, layout, and reads. The pressure is sampled, so repeat the run when changing them.
+
+## Commands
+
+Run from this directory with JDK 21 (`export JAVA_HOME=/opt/homebrew/opt/openjdk@21`) and the compiler built (`./build.sh` in `sql-to-dbsp-compiler`). Cargo is `cargo +1.96.1` with `--offline --locked`.
+
+```bash
+./generate.sh                  # native pair only; stops on a stale src/lib.rs or src/stubs.rs (move it to TRASH/)
+cargo +1.96.1 test --offline --locked
+cargo +1.96.1 test --offline --locked --features merged-index
+./verify.sh                    # fmt, both modes, clippy, transcript cmp (RF1/RF2, general), COL, Python tests
+python3 measure.py --help      # R5 runner
+```
+
+- **Gate.** `verify.sh` regenerates the COL module and fails on a stale `generated.rs` (`col-generated-fresh`). It exits nonzero at the first failing stage and names its log in `target/r4-verification/<run>/`; run `./verify.sh > log; echo $?` for the real code. Code under `cfg(target_os = "linux")` is first built on Linux (2026-11-17: strict Clippy rejected `evict_inputs(&[path.clone()])` in `src/window_memory.rs`; `MERGE_DEADLINE` in `merged-index-col/src/storage_tests.rs` is now 300 s, since the debug COL test took 198 s on a 2.2 GHz Xeon).
+- **Driver.** `cargo +1.96.1 run --release --offline --locked -- --customer C --orders O --lineitem L --rf1-orders O.u1 --rf1-lines L.u1 --rf2 delete.1 --workers 1`. Defaults: 10,000 records per load transaction (`--batch`), three runs, full verification, memory-backed state; `--storage-path DIR` selects files. `--no-verify` skips the full-join checks and the partner-read contract check (`enable_contract_check`). `--session-pass seek|step` selects the scan session's `Pass` (default `seek`). `--write-image DIR` loads and writes `DIR/storage` and `DIR/image.json` (`--runs 1`, no refresh); `--from-image DIR` reopens a copy and runs only the refreshes (`--no-verify`, `--runs 1`, no base files, same storage settings; `--warm-up LIST` applies a refresh list untimed). `--r5` (set by the runner) needs one worker, `--runs 1`, `--storage-path`, `--cache-bytes` (whole MiB), `--memory-target-bytes`, and `--report`. Loading takes complete Order and Lineitem groups in ascending Order key. The CLI accepts RF1 and RF2 only; reconstructed mode accepts general deltas, which only tests exercise.
+- **Runner.** `measure.py --customer … --refresh-list refreshes.json --report R --storage-path DIR --batch 512 --cache-bytes 33554432 --memory-target-bytes 536870912 --runs 3 --no-verify --front-code-byte-keys --elide-value-headers` (new destinations; inputs from `prepare_inputs.py` at `-s 0.01`, never the early smoke inputs whose RF2 deletes RF1's orders). Version 13 adds `--build-images DIR`, `--images DIR`, `--warm-up`, `--keep-run-storage`; also `--session-pass`, `--setup-full-compaction`, `--diagnostics`, `--cgroup-root`, `--total-memory-bytes`, `--device-label`. `report_problems` rejects a report whose write owners do not sum, whose `delta_ms` is missing or exceeds `ivm_ms`, whose read owners contradict the mode, or whose `block_expansions` or fallbacks break the checks in [MEASUREMENT.md](MEASUREMENT.md). Linux: [LINUX-HANDOFF.md](LINUX-HANDOFF.md).

@@ -16,7 +16,7 @@ the before-state and after-state snapshots as reference arrows to shared runs;
 only the after-state references the new transaction's run. Slide 10 merges the
 first level: the head's references move to the merged run, while both
 snapshots keep the faded L0 runs alive. Slide 11 tabulates how process RSS
-steers run location; [native-run-placement.md](../native-run-placement.md)
+steers run location; [dbsp-background.md](../dbsp-background.md#native-run-building-levels-placement-and-memory-pressure)
 records the verified details. Appendix E
 reveals key-to-value row traversal over four advances. Each topic retains its
 slide number across advances.
@@ -79,7 +79,7 @@ Native file “columns” describe nested file trees, not SQL attribute columns.
 The construction diagram shows key 43 selecting value rows `[2,4)`, ordered
 by value. Builders consume globally ordered, consolidated `(K,V)` pairs;
 they cannot insert out of order or reopen a closed key group. The parent
-[native run guide](../native-run-placement.md#building-a-run) explains the
+[native run guide](../dbsp-background.md#building-a-run) explains the
 interleaving-loop example and the choice between sorting unordered output,
 merging sorted streams, and constructing separate runs.
 
@@ -143,3 +143,56 @@ each supports. Appendix D
 shows the actual experiment program. Appendix E follows key 43 through
 boundaries `[2,4)`, branch child 1, and the selected leaf's item-offset map,
 iterating `(8,+1)` and `(15,+1)` and stopping before row 4.
+
+## Answers from the 2026-10-12 slide review
+
+These answer points raised while revising the deck. Each answer follows from
+the native-run sections of [dbsp-background.md](../dbsp-background.md#native-run-building-levels-placement-and-memory-pressure).
+
+- **An inserted run does not have to fit in memory as one sorted unit.**
+  Operators sort in memory in chunks of about 10,000 records and emit one run
+  per chunk; merges do the rest of the sorting. The builder's spill to a file
+  is an emergency valve, off by default, not a sizing rule.
+- **The builder's spill is for output that never passes through a sort.**
+  Many operators stream already sorted inputs, possibly file runs, into a
+  builder. `filter_map` walks its input with a cursor
+  (`operator/dynamic/filter_map.rs`). `distinct` walks the delta and the
+  integral trace together (`operator/dynamic/distinct.rs`). Such output can
+  exceed memory, and the builder holds its only in-memory copy. Operators that
+  do sort, such as joins through a batcher (`trace/ord/merge_batcher.rs`),
+  sort in memory with no explicit budget. Only chunking bounds the sort; the
+  RSS controller reacts afterwards. Merges choose memory or file before they
+  start (`pick_merge_destination`) and do not use the threshold builder.
+- **"Building" and "inserting" are separate steps.** Building means appending
+  sorted records to a builder. Inserting means handing the finished run to a
+  trace, which may copy a memory run to a file.
+- **An inserted run can start below L0.** It enters the level its record count
+  dictates; a run with five million records starts in L3.
+- **A merge output can stay in its input level.** It rejoins that level as a
+  loose run and is merged again later.
+- **A merge output can stay in memory at any level,** provided its inputs
+  total under 10 MiB and pressure is Low. In practice deep levels are files:
+  L4 runs hold at least ten million records, far above 10 MiB.
+- **No boundary separates memory levels from disk levels.** Record count sets
+  the level (the spine's per-level slots); byte size and pressure at creation
+  set the location. A diagram should not tie location to level.
+- **DBSP's "L0" does not mean "in memory".** In DBSP, L0 means up to 14,999
+  records, and any level can hold memory runs. In the standard LSM numbering
+  the deck uses, L0 is the in-memory memtables and L1 is the first on-disk
+  level. RocksDB and LevelDB instead number their first on-disk level L0.
+- **Memory pressure affects four things:** inserted-run placement, merge-output
+  placement, early merges, and building directly to files at Critical.
+- **An early merge** starts a merge in a level holding a memory run without
+  waiting for the level's usual minimum run count.
+- **"Memory if inputs < 10 MiB" and "file if ≥ 10 MiB"** are byte thresholds on
+  a run's size. They decide whether a merge output or an inserted run is
+  written to a file.
+- **A run referenced by a snapshot is held whole only if it is a memory run.**
+  A file run costs only the blocks read through the block cache, plus filters
+  and metadata.
+- **RSS** is the physical memory the operating system currently maps to the
+  process. The metric is generic; DBSP's peculiarity is using it to choose
+  where runs go.
+- **Base tables, traces, and views are not memory categories.** Each is a trace
+  with the same components listed above. Connector buffers, thread stacks, and
+  allocator overhead are ordinary process memory, not LSM memory.

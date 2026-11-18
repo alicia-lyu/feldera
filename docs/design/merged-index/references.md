@@ -44,7 +44,7 @@ All links pin `alicia-lyu/leanstore` at `305ad0a98b147d048a37a1eba3787b35b1181b8
 
 These files are in this repository. The links pin revision
 `f3c06614f53b1c01e0f6b8745d690ad6a2bcac7c`, so line numbers describe that revision.
-Prefer the current files and their symbol names.
+Prefer the current files and their symbol names. All rows below were checked on 2026-11-17: each file still exists.
 
 | Source (under `crates/dbsp/src/`) | Role |
 | --- | --- |
