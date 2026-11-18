@@ -243,6 +243,136 @@ pub fn write_snapshot() -> WriteSnapshot {
     }
 }
 
+/// The kind of thread that issued a device read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadThread {
+    /// A circuit worker thread.
+    Foreground,
+    /// A merger thread.
+    Background,
+    /// Any other thread, such as a client's own thread or an auxiliary thread
+    /// that a runtime spawned.
+    Other,
+}
+
+impl ReadThread {
+    pub const ALL: [ReadThread; 3] = [
+        ReadThread::Foreground,
+        ReadThread::Background,
+        ReadThread::Other,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The kind of the calling thread.
+    pub(crate) fn current() -> Self {
+        match crate::circuit::runtime::current_thread_type() {
+            Some(feldera_buffer_cache::ThreadType::Foreground) => Self::Foreground,
+            Some(feldera_buffer_cache::ThreadType::Background) => Self::Background,
+            None => Self::Other,
+        }
+    }
+}
+
+/// Who a device read is charged to: the reading thread's kind, its read owner
+/// (`with_read_owner`), and its write owner (`with_write_owner`), all taken
+/// when the read is issued. A merger thread runs under its spine's write
+/// owner, so its reads split by spine owner; a foreground read splits by the
+/// read owner of the cursor that caused it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadCharge {
+    thread: ReadThread,
+    read_owner: Component,
+    write_owner: Component,
+}
+
+impl ReadCharge {
+    /// The calling thread's charge.
+    pub(crate) fn current() -> Self {
+        Self {
+            thread: ReadThread::current(),
+            read_owner: crate::trace::cursor::run_reads::current_read_owner(),
+            write_owner: current_write_owner(),
+        }
+    }
+
+    /// Counts one device read of `bytes` bytes.
+    pub(crate) fn record(self, bytes: usize) {
+        let thread = self.thread.index();
+        for (counts, owner) in [
+            (&READS_BY_READ_OWNER, self.read_owner),
+            (&READS_BY_WRITE_OWNER, self.write_owner),
+        ] {
+            let slot = &counts[thread][owner.index()];
+            slot.0.fetch_add(1, Ordering::Relaxed);
+            slot.1.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+type ReadSlots = [[(AtomicU64, AtomicU64); Component::ALL.len()]; ReadThread::ALL.len()];
+
+static READS_BY_READ_OWNER: ReadSlots =
+    [const { [const { (AtomicU64::new(0), AtomicU64::new(0)) }; Component::ALL.len()] };
+        ReadThread::ALL.len()];
+static READS_BY_WRITE_OWNER: ReadSlots =
+    [const { [const { (AtomicU64::new(0), AtomicU64::new(0)) }; Component::ALL.len()] };
+        ReadThread::ALL.len()];
+
+/// Device reads counted by [`read_snapshot`]: operations and bytes.
+pub type ReadCounts = WriteCounts;
+
+/// Device reads since process start, per reading thread kind, split once by
+/// read owner and once by write owner. Each split sums to the reads of that
+/// thread kind. The counts are process-wide and are not read atomically
+/// together, so a snapshot taken during concurrent reads can be off by the
+/// reads in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReadSnapshot {
+    /// `[thread][read owner]`, threads in [`ReadThread::ALL`] order and owners
+    /// in [`Component::ALL`] order.
+    pub by_read_owner: [[ReadCounts; Component::ALL.len()]; ReadThread::ALL.len()],
+    /// `[thread][write owner]`, in the same orders.
+    pub by_write_owner: [[ReadCounts; Component::ALL.len()]; ReadThread::ALL.len()],
+}
+
+impl ReadSnapshot {
+    /// The reads issued since `earlier`.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let diff = |now: &[[ReadCounts; 5]; 3], then: &[[ReadCounts; 5]; 3]| {
+            std::array::from_fn(|thread| {
+                std::array::from_fn(|owner| ReadCounts {
+                    operations: now[thread][owner].operations - then[thread][owner].operations,
+                    bytes: now[thread][owner].bytes - then[thread][owner].bytes,
+                })
+            })
+        };
+        Self {
+            by_read_owner: diff(&self.by_read_owner, &earlier.by_read_owner),
+            by_write_owner: diff(&self.by_write_owner, &earlier.by_write_owner),
+        }
+    }
+}
+
+/// Reads the device read counters.
+pub fn read_snapshot() -> ReadSnapshot {
+    let load = |slots: &ReadSlots| {
+        std::array::from_fn(|thread| {
+            std::array::from_fn(|owner| ReadCounts {
+                operations: slots[thread][owner].0.load(Ordering::Relaxed),
+                bytes: slots[thread][owner].1.load(Ordering::Relaxed),
+            })
+        })
+    };
+    ReadSnapshot {
+        by_read_owner: load(&READS_BY_READ_OWNER),
+        by_write_owner: load(&READS_BY_WRITE_OWNER),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

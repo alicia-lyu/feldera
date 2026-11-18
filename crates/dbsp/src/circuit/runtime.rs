@@ -28,7 +28,9 @@ use feldera_buffer_cache::ThreadType;
 use feldera_samply::{LongSpanBuilder, Span};
 use feldera_storage::fbuf::FBuf;
 use feldera_storage::fbuf::slab::{FBufSlabs, FBufSlabsStats, set_thread_slab_pool};
-use feldera_types::config::{DevTweaks, StorageCompression, StorageConfig, StorageOptions};
+use feldera_types::config::{
+    DevTweaks, FilterResidency, StorageCompression, StorageConfig, StorageOptions,
+};
 use feldera_types::memory_pressure::{
     CRITICAL_MEMORY_PRESSURE_THRESHOLD, HIGH_MEMORY_PRESSURE_THRESHOLD,
     MODERATE_MEMORY_PRESSURE_THRESHOLD, MemoryPressure,
@@ -1272,6 +1274,28 @@ impl Runtime {
                 .bloom_false_positive_rate
         });
         from_storage.unwrap_or_else(|| Self::with_dev_tweaks(|dt| dt.bloom_false_positive_rate()))
+    }
+
+    /// Returns where new batches keep their Bloom filters
+    /// (`storage.filter_residency`).
+    ///
+    /// Off a runtime thread, or on a runtime without storage, this is
+    /// [`FilterResidency::Memory`]: a storage-resident filter is read through
+    /// the runtime's buffer cache, which such a thread does not have.
+    pub fn filter_residency() -> FilterResidency {
+        RUNTIME
+            .with(|rt| {
+                Some(
+                    rt.borrow()
+                        .as_ref()?
+                        .inner()
+                        .storage
+                        .as_ref()?
+                        .options
+                        .filter_residency,
+                )
+            })
+            .unwrap_or(FilterResidency::Memory)
     }
 
     pub fn get_mode(&self) -> Mode {

@@ -174,7 +174,8 @@ mod tests {
             FilterStats {
                 size_byte: 0,
                 hits: 0,
-                misses: 0
+                misses: 0,
+                ..FilterStats::default()
             }
         );
     }
@@ -185,16 +186,19 @@ mod tests {
             size_byte: 123,
             hits: 456,
             misses: 789,
+            ..FilterStats::default()
         };
         let stats2 = FilterStats {
             size_byte: 100,
             hits: 200,
             misses: 300,
+            ..FilterStats::default()
         };
         let stats3 = FilterStats {
             size_byte: 223,
             hits: 656,
             misses: 1089,
+            ..FilterStats::default()
         };
         assert_eq!(stats1 + stats2, stats3);
         assert_eq!(

@@ -3,6 +3,7 @@ mod diagnostics;
 mod measurement;
 #[cfg(feature = "merged-index")]
 mod reconstruction;
+mod run_counts;
 #[cfg(test)]
 mod verification;
 mod window_memory;
@@ -2466,6 +2467,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let (mut order_count, mut line_count, mut absent) = (0, 0, 0);
         let mut phase = "rf1";
         let mut latencies = TransactionLatencies::with_capacity(transactions.len());
+        let mut run_counts = run_counts::RunCountSampler::start(transactions.len());
         for prepared in transactions {
             let transaction_started = Instant::now();
             let (base_before, ivm_before, verification_before) = (
@@ -2507,6 +2509,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 measurement.base_phase() - base_before,
                 measurement.ivm_phase() - ivm_before,
             );
+            // After the transaction's latency is taken; its time leaves the refresh's below.
+            run_counts.sample();
         }
         let customer_count = customers.len();
         let maximum_fanout = fanout.values().max().copied().unwrap_or(0);
@@ -2517,7 +2521,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let phase_finished = Instant::now();
         measurement.foreground = phase_finished
             .duration_since(phase_started)
-            .saturating_sub(measurement.verification);
+            .saturating_sub(measurement.verification)
+            .saturating_sub(run_counts.sampling);
         verification_time += measurement.verification;
         foreground_total += measurement.foreground;
         sequence_finished = phase_finished;
@@ -2534,6 +2539,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "after": memory_pressure_after,
         });
         report["transaction_latency"] = latencies.json();
+        report["run_counts_sampling_ms"] = json!(milliseconds(run_counts.sampling));
+        report["run_counts"] = run_counts.json();
         report["absent_orders"] = json!(absent);
         report["affected_customers"] = json!(customer_count);
         report["affected_orders"] = json!(order_count);
@@ -2672,7 +2679,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 14,
+        "measurement_version": 15,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2686,6 +2693,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 "note": "One runtime hosts the base and the view circuit, with one storage directory and one buffer cache of cache_bytes. The phases are told apart by transaction boundaries (base commits before the view transaction starts), with the CPU profiler's per-circuit step CPU time as a cross-check.",
             },
             "cache": "feldera_cache", "compression": "none",
+            "filter_residency": match storage_options(config).filter_residency {
+                feldera_types::config::FilterResidency::Storage => "storage",
+                feldera_types::config::FilterResidency::Memory => "memory",
+            },
             "min_storage_bytes": resolved_min_storage_bytes(&storage_options(config)),
             "min_storage_bytes_source": "DBSP default; the harness sets no value",
             "min_step_storage_bytes": "default (unlimited; memory-pressure spill remains enabled)",
@@ -3995,7 +4006,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 14);
+        assert_eq!(output["measurement_version"], 15);
         // The original image is untouched by the refreshes of its copy.
         assert_eq!(
             ImageManifest::read(&image)?.checkpoint.uuid,
@@ -4134,7 +4145,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 14);
+        assert_eq!(output["measurement_version"], 15);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");

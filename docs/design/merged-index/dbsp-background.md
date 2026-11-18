@@ -277,6 +277,14 @@ A file builder (`FileIndexedWSetBuilder` over `Writer2` in
   (Bloom or roaring bitmap, the one structure that grows with the run), and
   the trailer. Each data block also enters the buffer cache as it is written
   (`from_raw_with_cache`), so a new file run starts warm.
+- Since 2026-11-18 (fork), a Bloom filter is storage-resident by default
+  (`StorageOptions::filter_residency`): it is written as 4 KiB partitions and
+  the new run keeps only a handle (`StoredPartitionedBloom`). A probe reads
+  the one partition its key's hash picks through the buffer cache. Unlike data
+  blocks, partitions do not enter the cache when written, so a filter that
+  nothing probes never occupies it. A filter that fits in one partition
+  stays memory-resident. With `memory`, the whole filter stays in memory as
+  before.
 
 The threshold is `min_step_storage_bytes`, read through
 `Runtime::min_step_storage_bytes` (`circuit/runtime.rs`). It defaults to
@@ -415,7 +423,10 @@ The memory that runs use is the same kind any LSM tree uses:
   blocks through it, so a snapshot that pins a file run pins the file, not its
   bytes in memory.
 - **Key filters and index metadata** for file runs (`storage/file/reader.rs`).
-  Modular Bloom filters can be partly resident.
+  Roaring filters and memory-resident Bloom filters stay in memory for the
+  run's life, and modular ones can be partly resident. A storage-resident
+  Bloom filter (the fork's default since 2026-11-18) keeps only a handle in
+  memory; its partitions are read into the block cache on demand.
 
 The difference from a standard LSM is the absence of a fixed memtable budget,
 not a different set of components. RocksDB, for example, bounds its memory

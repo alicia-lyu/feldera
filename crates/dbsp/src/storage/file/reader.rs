@@ -2,13 +2,19 @@
 //!
 //! [`Reader`] is the top-level interface for reading layer files.
 
-use super::filter::{bloom_false_positive_rate, rate_can_evict, resident_modules};
-use super::format::MODULAR_BLOOM_FILTER_BLOCK_MAGIC;
+use super::filter::{
+    bloom_false_positive_rate, modules_for_rate, rate_can_evict, resident_modules,
+};
 use super::format::{
     BloomFilterBlock, Compression, ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC,
     FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer, ModularBloomFilterHeader, RoaringBitmapFilterBlock,
 };
+use super::format::{
+    MODULAR_BLOOM_FILTER_BLOCK_MAGIC, PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC,
+    PartitionedBloomFilterHeader,
+};
 use super::{AnyFactories, BatchKeyFilter, Deserializer, Factories};
+use super::{PARTITION_BYTES, PartitionedBloomShape, StoredPartitionedBloom};
 use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::CacheAccess;
 use crate::storage::{
@@ -1704,10 +1710,11 @@ fn whole_block(
 /// Returns `None` when the current false positive rate asks for no Bloom filter
 /// at all, in which case the block is read but nothing is kept resident.
 fn read_filter_block(
-    file_handle: &dyn FileReader,
+    file: &ImmutableFileRef,
     location: BlockLocation,
     roaring_min: Option<&DynData>,
 ) -> Result<Option<BatchKeyFilter>, Error> {
+    let file_handle = &*file.file_handle;
     // Reading the header before the modules only pays off when the configured
     // rate can drop some of them. When it cannot, that first read would be
     // spent learning there is nothing to skip, and every byte gets read
@@ -1822,6 +1829,45 @@ fn read_filter_block(
                         inner: e.to_string(),
                     })
                 })
+        }
+        PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC => {
+            // Only the header is read: the partitions stay on storage and are
+            // read one at a time, when a probe needs one.
+            let header: PartitionedBloomFilterHeader =
+                parse_filter_block(&head, location, "partitioned bloom filter")?;
+            let bad = |inner: String| {
+                Error::Corruption(CorruptionError::InvalidFilterEncoding {
+                    location,
+                    kind: "partitioned bloom",
+                    inner,
+                })
+            };
+            if header.partition_bytes as usize != PARTITION_BYTES {
+                return Err(bad(format!(
+                    "partitions of {} bytes, this build reads {PARTITION_BYTES}",
+                    header.partition_bytes
+                )));
+            }
+            if header.n_partitions == 0 || header.hashes == 0 {
+                return Err(bad(format!(
+                    "{} partitions with {} hashes",
+                    header.n_partitions, header.hashes
+                )));
+            }
+            if modules_for_rate(rate) == 0 {
+                return Ok(None);
+            }
+            Ok(Some(BatchKeyFilter::PartitionedStored(
+                StoredPartitionedBloom::new(
+                    PartitionedBloomShape {
+                        n_partitions: header.n_partitions,
+                        hashes: header.hashes,
+                    },
+                    header.first_partition_offset,
+                    file.file_handle.clone(),
+                    file.cache,
+                ),
+            )))
         }
         magic => Err(Error::Corruption(
             CorruptionError::UnknownFilterBlockMagic { location, magic },
@@ -2129,7 +2175,7 @@ where
         let key_range = self.key_range()?;
         let roaring_min = key_range.as_ref().map(|(min, _)| min.as_ref().as_data());
         self.membership_filter_location
-            .map(|location| read_filter_block(&*self.file.file_handle, location, roaring_min))
+            .map(|location| read_filter_block(&self.file, location, roaring_min))
             .transpose()
             .map(Option::flatten)
     }

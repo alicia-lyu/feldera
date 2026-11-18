@@ -135,6 +135,13 @@ pub const ROARING_BITMAP_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFFR";
 /// readable by binaries that predate modular filters.
 pub const MODULAR_BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFMB";
 
+/// Magic number for the header block of a partitioned Bloom filter
+/// ([`PartitionedBloomFilterHeader`]).
+pub const PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFPH";
+
+/// Magic number for one partition block of a partitioned Bloom filter.
+pub const PARTITIONED_BLOOM_PARTITION_MAGIC: [u8; 4] = *b"LFPP";
+
 /// 8-byte header at the beginning of each block.
 ///
 /// A block does not identify its own size, so any reference to a block must
@@ -317,7 +324,8 @@ impl FileTrailer {
             & !INCOMPATIBLE_FEATURE_ROARING_FILTERS
             & !INCOMPATIBLE_FEATURE_MODULAR_FILTERS
             & !INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS
-            & !INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS;
+            & !INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS
+            & !INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS;
         if unknown_incompatible_features != 0 {
             Some(unknown_incompatible_features)
         } else {
@@ -359,6 +367,12 @@ pub const INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS: u64 = 1 << 2;
 /// data blocks with elided value headers
 /// ([`ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC`]).
 pub const INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS: u64 = 1 << 3;
+
+/// Bit set to 1 in [FileTrailer::incompatible_features] if the file's
+/// membership filter is a partitioned Bloom filter
+/// ([`PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC`]), which stays on storage and is
+/// read one partition at a time through the buffer cache.
+pub const INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS: u64 = 1 << 4;
 
 /// Information about a column.
 ///
@@ -711,6 +725,36 @@ pub struct BloomFilterBlockRef<'a> {
 
     /// Bloom filter contents.
     pub data: &'a [u64],
+}
+
+/// The header block of a partitioned Bloom filter.
+///
+/// The trailer's filter location points here. The `n_partitions` partition
+/// blocks, each [`PARTITION_BYTES`](super::filter::PARTITION_BYTES) long,
+/// start at `first_partition_offset` and lie back to back. Each begins with a
+/// [`BlockHeader`] with [`PARTITIONED_BLOOM_PARTITION_MAGIC`] and holds the
+/// partition's bits as little-endian `u64` words.
+#[binrw]
+#[derive(Clone, Debug)]
+pub struct PartitionedBloomFilterHeader {
+    /// Block header with "LFPH" magic.
+    #[brw(assert(
+        header.magic == PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC,
+        "partitioned bloom filter block has bad magic"
+    ))]
+    pub header: BlockHeader,
+
+    /// Number of partitions, at least 1.
+    pub n_partitions: u32,
+
+    /// Size of each partition block in bytes.
+    pub partition_bytes: u32,
+
+    /// Bit positions set per key within its partition.
+    pub hashes: u32,
+
+    /// File offset of partition 0.
+    pub first_partition_offset: u64,
 }
 
 /// The fixed-size front of a modular Bloom filter block.

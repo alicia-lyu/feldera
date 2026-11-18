@@ -8,7 +8,7 @@ use crate::Runtime;
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED, FILES_SYNCED};
 use crate::profile::{BlockingFor, ParkReason};
 use crate::storage::attribution::{
-    Component, current_write_owner, record_write_bytes, record_write_operation,
+    Component, ReadCharge, current_write_owner, record_write_bytes, record_write_operation,
 };
 use crate::storage::diagnostics::{self, FlushRecord};
 use crate::storage::{buffer_cache::FBuf, init};
@@ -557,6 +557,7 @@ impl FileReader for PosixReader {
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
         READ_BLOCKS_BYTES.record(location.size);
+        ReadCharge::current().record(location.size);
         READ_LATENCY_MICROSECONDS.record_callback(|| {
             let mut buffer = FBuf::with_capacity(location.size);
 
@@ -579,6 +580,8 @@ impl FileReader for PosixReader {
         callback: Box<dyn FnOnce(Vec<Result<Arc<FBuf>, StorageError>>) + Send>,
     ) {
         if self.async_threads {
+            // The blocks are read on another thread, so take the charge here.
+            let charge = ReadCharge::current();
             let file = self.file.clone();
             let ioop_delay = self.ioop_delay;
             let start = Instant::now();
@@ -589,6 +592,7 @@ impl FileReader for PosixReader {
                     .into_iter()
                     .map(|location| {
                         READ_BLOCKS_BYTES.record(location.size);
+                        charge.record(location.size);
                         let mut buffer = FBuf::with_capacity(location.size);
                         match buffer.read_exact_at(&file, location.offset, location.size) {
                             Ok(()) => Ok(Arc::new(buffer)),

@@ -72,6 +72,38 @@ source emits at the flush).
 - `PackedField`, `PayloadEncoder`, and `PayloadDecoder` for merged-index payloads (see the
   merged-index CLAUDE.md).
 
+## Storage-resident Bloom filters
+
+`StorageOptions::filter_residency` (`feldera-types`), default `storage`, read through
+`Runtime::filter_residency` (memory off a runtime thread):
+
+- The writer builds a `PartitionedBloomBuilder` (`storage/file/filter/partitioned.rs`): a blocked
+  Bloom filter whose block is one 4 KiB partition, chosen by the key hash's high bits. `close`
+  writes the partitions back to back, then a `PartitionedBloomFilterHeader` block
+  (`INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS`), and hands the batch a `StoredPartitionedBloom`.
+- A probe reads one partition through the thread's buffer cache (`FilterPartition` entries), so
+  an unprobed filter costs no memory. An unreadable partition answers "might be present".
+- A filter that fits in one partition (fewer than about 1,700 keys at the default rate) stays a
+  memory-resident modular filter (`BatchKeyFilter::new_bloom`): storing it would cost a 4 KiB
+  write per small run to save at most 4 KiB.
+- `memory` keeps the modular filters. Roaring filters are always memory-resident. Files of either
+  form load under either setting.
+- `FilterStats` gained `stored_byte`, `partition_loads`, `partition_cache_hits`; the spine profile
+  reports `bloom_filter_stored_bytes` and the partition counts.
+- Tests: `storage::file::test::storage_resident*`, `corrupt_partition_admits_every_key`,
+  `memory_resident_file_loads_under_storage_residency`, `partitioned`, and the four
+  `trace::test::file_*_filter_follows_the_rate` (memory ladder plus a storage reload). A test of
+  the cache must use one whose 256 shards exceed a partition: `test_buffer_cache`'s 4 KiB shards
+  keep none.
+
+## Compaction counters
+
+- `diagnostics::spine_run_counts()`: every live spine's runs per level (loose and merging), file
+  runs, completed merges and merge time, read under the spine's lock without touching storage.
+  Every spine registers (`register_run_counter`), whether or not diagnostics are on.
+- `attribution::read_snapshot()`: device reads by reading thread (foreground, background, other),
+  split once by read owner and once by write owner (`ReadCharge`, recorded in `PosixReader`).
+
 ## Test filters
 
 From the repository root, `cargo +1.96.1 test --offline -p dbsp --lib <filter>`:

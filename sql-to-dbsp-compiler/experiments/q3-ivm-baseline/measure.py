@@ -42,8 +42,10 @@ SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_step
 # How the reconstructed build's scan session passes untouched groups (`--session-pass`).
 SESSION_PASSES = ("seek", "step")
 # The version of the driver report that this runner and `summarize.py` understand. Version 12
-# adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses).
-MEASUREMENT_VERSION = 14
+# adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses). Version
+# 15 writes Bloom filters storage-resident (`configuration.filter_residency`) and adds each
+# refresh's `run_counts` (runs per spine after each transaction, merges, device reads by owner).
+MEASUREMENT_VERSION = 15
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.

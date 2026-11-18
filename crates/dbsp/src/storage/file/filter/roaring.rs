@@ -382,6 +382,7 @@ mod tests {
                 size_byte: filter.stats().size_byte,
                 hits: 1,
                 misses: 1,
+                ..FilterStats::default()
             }
         );
     }
@@ -485,6 +486,7 @@ mod tests {
                 size_byte: restored.stats().size_byte,
                 hits: 0,
                 misses: 0,
+                ..FilterStats::default()
             }
         );
 

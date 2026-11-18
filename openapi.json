@@ -10939,6 +10939,14 @@
           }
         }
       },
+      "FilterResidency": {
+        "type": "string",
+        "description": "Where the Bloom filters of batches on storage are kept. See\n[`StorageOptions::filter_residency`].",
+        "enum": [
+          "storage",
+          "memory"
+        ]
+      },
       "FormatConfig": {
         "type": "object",
         "description": "Data format specification used to parse raw data received from the\nendpoint or to encode data sent to the endpoint.",
@@ -15934,6 +15942,14 @@
             "description": "Compression level, for compression algorithms that have one.\n\nOnly `StorageCompression::Zstd` uses this. Higher levels compress\nharder and more slowly; decompression speed is largely unaffected, so\nthe tradeoff is write throughput against stored size. Zstd accepts\nroughly 1 to 22, and a value outside the range its build supports is\nclamped into it.\n\nThis is provided for fine-tuning and should ordinarily be left unset,\nwhich selects the algorithm's own default.",
             "default": null,
             "nullable": true
+          },
+          "filter_residency": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FilterResidency"
+              }
+            ],
+            "default": "storage"
           },
           "min_step_storage_bytes": {
             "type": "integer",

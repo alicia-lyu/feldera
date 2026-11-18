@@ -396,6 +396,34 @@ pub struct StorageOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::serde_via_value::deserialize")]
     pub bloom_false_positive_rate: Option<f64>,
+
+    /// Where the Bloom filters of batches on storage are kept.
+    ///
+    /// With `storage`, the default, a new batch's Bloom filter is written as
+    /// partitions that stay on storage. A lookup reads only the one partition
+    /// its key hashes to, through the storage cache (`cache_mib`), where it
+    /// competes with data blocks and is evicted like them. A filter that no
+    /// lookup consults is never read into memory.
+    ///
+    /// With `memory`, each batch's whole Bloom filter is read into memory when
+    /// the batch is opened and stays there until the batch is dropped.
+    ///
+    /// The setting decides how new batches are written. A batch written under
+    /// the other setting keeps the form it was written in.
+    pub filter_residency: FilterResidency,
+}
+
+/// Where the Bloom filters of batches on storage are kept. See
+/// [`StorageOptions::filter_residency`].
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterResidency {
+    /// On storage, read one partition at a time through the storage cache.
+    #[default]
+    Storage,
+
+    /// In memory, read whole when the batch is opened.
+    Memory,
 }
 
 // `f64` does not implement `Eq`, but `bloom_false_positive_rate` is always

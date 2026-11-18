@@ -12,13 +12,15 @@ use crate::{
         ElapsedTime, max_level0_batch_size_records,
         metadata::{
             BLOOM_FILTER_BITS_PER_KEY, BLOOM_FILTER_HIT_RATE_PERCENT, BLOOM_FILTER_HITS_COUNT,
-            BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_SIZE_BYTES, COMPACTION_STATE, COMPLETED_MERGES,
-            LOOSE_BATCHES_COUNT, LOOSE_MEMORY_RECORDS_COUNT, LOOSE_STORAGE_RECORDS_COUNT,
-            MERGE_BACKPRESSURE_WAIT_TIME_SECONDS, MERGE_REDUCTION_PERCENT, MERGING_BATCHES_COUNT,
-            MERGING_MEMORY_RECORDS_COUNT, MERGING_SIZE_BYTES, MERGING_STORAGE_RECORDS_COUNT,
-            MetaItem, MetricId, MetricReading, NEGATIVE_WEIGHT_COUNT, OperatorMeta,
-            RANGE_FILTER_HIT_RATE_PERCENT, RANGE_FILTER_HITS_COUNT, RANGE_FILTER_MISSES_COUNT,
-            RANGE_FILTER_SIZE_BYTES, ROARING_FILTER_HIT_RATE_PERCENT, ROARING_FILTER_HITS_COUNT,
+            BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_PARTITION_CACHE_HITS_COUNT,
+            BLOOM_FILTER_PARTITION_LOADS_COUNT, BLOOM_FILTER_SIZE_BYTES, BLOOM_FILTER_STORED_BYTES,
+            COMPACTION_STATE, COMPLETED_MERGES, LOOSE_BATCHES_COUNT, LOOSE_MEMORY_RECORDS_COUNT,
+            LOOSE_STORAGE_RECORDS_COUNT, MERGE_BACKPRESSURE_WAIT_TIME_SECONDS,
+            MERGE_REDUCTION_PERCENT, MERGING_BATCHES_COUNT, MERGING_MEMORY_RECORDS_COUNT,
+            MERGING_SIZE_BYTES, MERGING_STORAGE_RECORDS_COUNT, MetaItem, MetricId, MetricReading,
+            NEGATIVE_WEIGHT_COUNT, OperatorMeta, RANGE_FILTER_HIT_RATE_PERCENT,
+            RANGE_FILTER_HITS_COUNT, RANGE_FILTER_MISSES_COUNT, RANGE_FILTER_SIZE_BYTES,
+            ROARING_FILTER_HIT_RATE_PERCENT, ROARING_FILTER_HITS_COUNT,
             ROARING_FILTER_MISSES_COUNT, ROARING_FILTER_SIZE_BYTES, SPINE_BATCHES_COUNT,
             SPINE_STORAGE_SIZE_BYTES,
         },
@@ -889,6 +891,37 @@ where
 
     /// Lets [diagnostics::spine_contents] report this spine until it is
     /// dropped.
+    /// Lets [diagnostics::spine_run_counts] report this spine until it is
+    /// dropped.
+    fn register_run_counter(&self) {
+        let state = Arc::downgrade(&self.state);
+        let owner = self.write_owner();
+        diagnostics::register_run_counter(Box::new(move || {
+            let state = state.upgrade()?;
+            let state = state.lock().unwrap();
+            let mut counts = diagnostics::SpineRunCounts {
+                owner,
+                name: state.name.to_string(),
+                ..Default::default()
+            };
+            for slot in &state.slots {
+                counts.loose_by_level.push(slot.loose_batches.len());
+                let merging = slot.merging_batches.as_deref().unwrap_or_default();
+                counts.merging_by_level.push(merging.len());
+                counts.storage_runs += slot
+                    .loose_batches
+                    .iter()
+                    .chain(merging)
+                    .filter(|batch| batch.location() == BatchLocation::Storage)
+                    .count();
+                counts.completed_merges += slot.n_merged;
+                counts.merge_real_micros += slot.elapsed.real.as_micros() as u64;
+                counts.merge_cpu_micros += slot.elapsed.cpu.as_micros() as u64;
+            }
+            Some(counts)
+        }));
+    }
+
     fn register_for_diagnostics(&self) {
         let state = Arc::downgrade(&self.state);
         let write_owner = self.write_owner();
@@ -1219,7 +1252,8 @@ where
 
         if bloom_filter_records > 0 {
             let bits_per_key =
-                bloom_filter_stats.size_byte as f64 * 8.0 / bloom_filter_records as f64;
+                (bloom_filter_stats.size_byte + bloom_filter_stats.stored_byte) as f64 * 8.0
+                    / bloom_filter_records as f64;
             let bits_per_key = bits_per_key as usize;
             meta.extend(metadata! {
                 BLOOM_FILTER_BITS_PER_KEY => MetaItem::Int(bits_per_key)
@@ -1257,6 +1291,21 @@ where
                 BLOOM_FILTER_SIZE_BYTES,
                 Vec::new(),
                 MetaItem::bytes(bloom_filter_stats.size_byte),
+            ),
+            MetricReading::new(
+                BLOOM_FILTER_STORED_BYTES,
+                Vec::new(),
+                MetaItem::bytes(bloom_filter_stats.stored_byte),
+            ),
+            MetricReading::new(
+                BLOOM_FILTER_PARTITION_LOADS_COUNT,
+                Vec::new(),
+                MetaItem::Count(bloom_filter_stats.partition_loads),
+            ),
+            MetricReading::new(
+                BLOOM_FILTER_PARTITION_CACHE_HITS_COUNT,
+                Vec::new(),
+                MetaItem::Count(bloom_filter_stats.partition_cache_hits),
             ),
             MetricReading::new(
                 BLOOM_FILTER_HITS_COUNT,
@@ -2656,6 +2705,7 @@ where
         role: TraceRole,
     ) -> Self {
         let merger = AsyncMerger::new(runtime, worker_index, factories, name, role);
+        merger.register_run_counter();
         if diagnostics::enabled() {
             merger.register_for_diagnostics();
         }

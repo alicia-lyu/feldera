@@ -10,16 +10,17 @@ use crate::storage::{
     backend::{BlockLocation, FileReader, FileWriter, StorageBackend, StorageError},
     buffer_cache::{BufferCache, FBuf, FBufSerializer, LimitExceeded},
     file::{
-        SerializerInner,
+        PARTITION_BYTES, SerializerInner, StoredPartitionedBloom,
         format::{
             BatchMetadata, BlockHeader, BloomFilterBlockRef, COMPATIBLE_FEATURE_FILTER64,
             COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT, DATA_BLOCK_MAGIC, DataBlockHeader,
             FILE_TRAILER_BLOCK_MAGIC, FileTrailer, FileTrailerColumn, FixedLen,
             INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
-            INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_ROARING_FILTERS,
-            INDEX_BLOCK_MAGIC, IndexBlockHeader, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
-            ModularBloomFilterBlockRef, NodeType, ROARING_BITMAP_FILTER_BLOCK_MAGIC,
-            RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
+            INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS,
+            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader,
+            MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ModularBloomFilterBlockRef, NodeType,
+            PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC, PartitionedBloomFilterHeader,
+            ROARING_BITMAP_FILTER_BLOCK_MAGIC, RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
         },
         reader::TreeNode,
     },
@@ -1453,6 +1454,7 @@ impl Writer {
 
         // Write the batch key filter.
         let mut incompatible_features = 0;
+        let mut partitioned_first_offset = None;
         let filter_location = if let Some(key_filter) = &self.key_filter {
             match key_filter {
                 BatchKeyFilter::Bloom(filter) => {
@@ -1494,6 +1496,34 @@ impl Writer {
                             .write_block(filter_block.into_block(estimated_block_size), None)?
                             .1
                     }
+                }
+                BatchKeyFilter::PartitionedBuilding(filter) => {
+                    incompatible_features |= INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS;
+                    let shape = *filter.shape();
+                    let mut first_partition_offset = None;
+                    for (index, block) in filter.partition_blocks().enumerate() {
+                        let (_, location) = self.writer.write_block(block, None)?;
+                        let first = *first_partition_offset.get_or_insert(location.offset);
+                        // Readers find partition `index` by arithmetic, so the
+                        // partitions must lie back to back.
+                        assert_eq!(
+                            (location.offset, location.size),
+                            (first + (index * PARTITION_BYTES) as u64, PARTITION_BYTES)
+                        );
+                    }
+                    partitioned_first_offset = first_partition_offset;
+                    let header = PartitionedBloomFilterHeader {
+                        header: BlockHeader::new(&PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC),
+                        n_partitions: shape.n_partitions,
+                        partition_bytes: PARTITION_BYTES as u32,
+                        hashes: shape.hashes,
+                        first_partition_offset: first_partition_offset
+                            .expect("a partitioned filter has at least one partition"),
+                    };
+                    self.writer.write_block(header.into_block(512), None)?.1
+                }
+                BatchKeyFilter::PartitionedStored(_) => {
+                    panic!("a writer's filter cannot already be stored")
                 }
                 BatchKeyFilter::RoaringU32(filter) => {
                     incompatible_features |= INCOMPATIBLE_FEATURE_ROARING_FILTERS;
@@ -1556,7 +1586,21 @@ impl Writer {
         self.writer
             .insert_cache_entry(location, Arc::new(file_trailer));
 
-        Ok((self.writer.complete()?, self.key_filter))
+        let file = self.writer.complete()?;
+        // A storage-resident filter leaves memory with the writer: the new
+        // batch probes it through the buffer cache, like any reader.
+        let key_filter = match self.key_filter {
+            Some(BatchKeyFilter::PartitionedBuilding(filter)) => Some(
+                BatchKeyFilter::PartitionedStored(StoredPartitionedBloom::new(
+                    *filter.shape(),
+                    partitioned_first_offset.expect("the partitions were written above"),
+                    file.clone(),
+                    self.cache,
+                )),
+            ),
+            other => other,
+        };
+        Ok((file, key_filter))
     }
 
     pub fn n_columns(&self) -> usize {

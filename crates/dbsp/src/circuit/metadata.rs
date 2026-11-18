@@ -137,6 +137,12 @@ pub const BLOOM_FILTER_MISSES_COUNT: MetricId =
 pub const BLOOM_FILTER_HIT_RATE_PERCENT: MetricId =
     MetricId(Cow::Borrowed("bloom_filter_hit_rate_percent"));
 pub const BLOOM_FILTER_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("bloom_filter_size_bytes"));
+pub const BLOOM_FILTER_STORED_BYTES: MetricId =
+    MetricId(Cow::Borrowed("bloom_filter_stored_bytes"));
+pub const BLOOM_FILTER_PARTITION_LOADS_COUNT: MetricId =
+    MetricId(Cow::Borrowed("bloom_filter_partition_loads_count"));
+pub const BLOOM_FILTER_PARTITION_CACHE_HITS_COUNT: MetricId =
+    MetricId(Cow::Borrowed("bloom_filter_partition_cache_hits_count"));
 pub const ROARING_FILTER_HITS_COUNT: MetricId =
     MetricId(Cow::Borrowed("roaring_filter_hits_count"));
 pub const ROARING_FILTER_MISSES_COUNT: MetricId =
@@ -189,7 +195,7 @@ pub const PREFIX_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("prefix_batche
 pub const INPUT_INTEGRAL_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("input_integral_records_count"));
 
-pub const CIRCUIT_METRICS: [CircuitMetric; 79] = [
+pub const CIRCUIT_METRICS: [CircuitMetric; 82] = [
     // State
     CircuitMetric {
         name: USED_MEMORY_BYTES,
@@ -297,7 +303,25 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 79] = [
         name: BLOOM_FILTER_SIZE_BYTES,
         category: CircuitMetricCategory::State,
         advanced: false,
-        description: "Size of the Bloom filter in bytes.",
+        description: "Bytes of the Bloom filters held in memory. A storage-resident filter counts only its small handle; its partitions are in bloom_filter_stored_bytes.",
+    },
+    CircuitMetric {
+        name: BLOOM_FILTER_STORED_BYTES,
+        category: CircuitMetricCategory::State,
+        advanced: true,
+        description: "Bytes of storage-resident Bloom filters, kept on storage and read one partition at a time through the storage cache.",
+    },
+    CircuitMetric {
+        name: BLOOM_FILTER_PARTITION_LOADS_COUNT,
+        category: CircuitMetricCategory::State,
+        advanced: true,
+        description: "Partitions of storage-resident Bloom filters read from storage because the storage cache did not hold them, summed across the spine's batches.",
+    },
+    CircuitMetric {
+        name: BLOOM_FILTER_PARTITION_CACHE_HITS_COUNT,
+        category: CircuitMetricCategory::State,
+        advanced: true,
+        description: "Partitions of storage-resident Bloom filters found in the storage cache, summed across the spine's batches.",
     },
     CircuitMetric {
         name: BLOOM_FILTER_HITS_COUNT,

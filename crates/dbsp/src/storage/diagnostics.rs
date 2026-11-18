@@ -195,3 +195,73 @@ pub fn spine_contents() -> Vec<SpineContents> {
     *registry = alive;
     contents
 }
+
+/// The runs of one spine at one instant, cheap to take: counts only, read
+/// under the spine's lock without touching storage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SpineRunCounts {
+    /// The owner the spine captured when it was created.
+    pub owner: Component,
+    /// The spine's name.
+    pub name: String,
+    /// Runs waiting at each level (not being merged), level 0 first.
+    pub loose_by_level: Vec<usize>,
+    /// Runs being merged at each level, level 0 first.
+    pub merging_by_level: Vec<usize>,
+    /// Runs on storage, loose or merging.
+    pub storage_runs: usize,
+    /// Merges completed since the spine was created, over all levels.
+    pub completed_merges: usize,
+    /// Real time the spine's merges have run, over all levels, in
+    /// microseconds.
+    pub merge_real_micros: u64,
+    /// CPU time the spine's merges have used, over all levels, in
+    /// microseconds.
+    pub merge_cpu_micros: u64,
+}
+
+impl SpineRunCounts {
+    /// All runs, loose and merging.
+    pub fn runs(&self) -> usize {
+        self.loose_by_level.iter().sum::<usize>() + self.merging_by_level.iter().sum::<usize>()
+    }
+}
+
+type RunCounter = Box<dyn Fn() -> Option<SpineRunCounts> + Send + Sync>;
+
+/// Every live spine's counter. Unlike [`SPINES`], spines register here
+/// whether or not diagnostics are on, since a counter costs a lock and a few
+/// integers per call and nothing until it is called.
+static RUN_COUNTERS: Mutex<Vec<RunCounter>> = Mutex::new(Vec::new());
+
+/// Registrations since the dead counters were last dropped.
+static RUN_COUNTER_REGISTRATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers a spine so that [`spine_run_counts`] reports it. `count` returns
+/// `None` once the spine has been dropped.
+pub(crate) fn register_run_counter(count: RunCounter) {
+    let mut counters = RUN_COUNTERS.lock().unwrap();
+    counters.push(count);
+    // A process that never asks for the counts would otherwise keep a closure
+    // per spine it ever created, so the dead ones are dropped now and then.
+    let registrations =
+        RUN_COUNTER_REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if registrations.is_multiple_of(1024) {
+        counters.retain(|count| count().is_some());
+    }
+}
+
+/// The run counts of every live spine, in the order the spines were created.
+pub fn spine_run_counts() -> Vec<SpineRunCounts> {
+    let mut counters = RUN_COUNTERS.lock().unwrap();
+    let mut counts = Vec::with_capacity(counters.len());
+    counters.retain(|count| match count() {
+        Some(spine) => {
+            counts.push(spine);
+            true
+        }
+        None => false,
+    });
+    counts
+}

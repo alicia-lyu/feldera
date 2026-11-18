@@ -141,7 +141,7 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
         refresh["block_expansions"] = block_expansions(mode, refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 14, "os": "linux",
+        "measurement_version": 15, "os": "linux",
         "configuration": {"front_code_byte_keys": True, "elide_value_headers": True},
         "front_coding": {"blocks": 5, "layout_fallbacks": 0, "size_fallbacks": 1},
         "value_header_elision": {"blocks": 6, "layout_fallbacks": 0, "size_fallbacks": 0},
@@ -442,17 +442,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 14")
+        self.failing(content, "native run 1: measurement_version is 2, not 15")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 14")
+        self.failing(content, "native run 1: measurement_version is 3, not 15")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 14")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 15")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 14")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 15")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")

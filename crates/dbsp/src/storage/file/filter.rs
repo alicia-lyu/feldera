@@ -1,4 +1,5 @@
 mod bloom;
+mod partitioned;
 mod roaring;
 mod stats;
 
@@ -8,6 +9,7 @@ use crate::{
 };
 use dyn_clone::clone_box;
 use feldera_modular_bloom::{ModuleDensity, ModuleLayout};
+use feldera_types::config::FilterResidency;
 use std::io;
 use std::ops::Not;
 use std::sync::Once;
@@ -18,7 +20,10 @@ pub(crate) use roaring::TouchedWindowCounter;
 pub use roaring::TrackingRoaringBitmap;
 pub use stats::{FilterKind, FilterStats, TrackingFilterStats};
 
-pub(crate) use bloom::{rate_can_evict, resident_modules};
+pub(crate) use bloom::{modules_for_rate, rate_can_evict, resident_modules};
+pub use partitioned::{
+    PARTITION_BYTES, PartitionedBloomBuilder, PartitionedBloomShape, StoredPartitionedBloom,
+};
 
 /// The configured false positive rate, which decides both how new filters are
 /// written and how many modules an existing filter keeps resident.
@@ -45,10 +50,35 @@ pub enum BatchKeyFilter {
 
     /// Exact roaring bitmap for key types whose batch's range fits in `u32`.
     RoaringU32(TrackingRoaringBitmap),
+
+    /// A storage-resident Bloom filter that a writer is building in memory.
+    /// Writing the file turns it into [`Self::PartitionedStored`].
+    PartitionedBuilding(PartitionedBloomBuilder),
+
+    /// A storage-resident Bloom filter, probed one partition at a time
+    /// through the buffer cache.
+    PartitionedStored(StoredPartitionedBloom),
 }
 
 impl BatchKeyFilter {
+    /// Creates an empty Bloom filter for a batch about to be written.
+    ///
+    /// Under [`FilterResidency::Storage`] a filter that needs more than one
+    /// partition is partitioned and storage-resident. A smaller one stays a
+    /// memory-resident modular filter, as under [`FilterResidency::Memory`]:
+    /// storing it would cost a partition's write for every small run while
+    /// saving at most a partition's memory, and small runs are the most
+    /// numerous.
     pub(crate) fn new_bloom(estimated_keys: usize, bloom_false_positive_rate: f64) -> Option<Self> {
+        if Runtime::filter_residency() == FilterResidency::Storage
+            && let Some(shape) =
+                PartitionedBloomShape::for_keys(estimated_keys as u64, bloom_false_positive_rate)
+            && shape.n_partitions > 1
+        {
+            return Some(Self::PartitionedBuilding(PartitionedBloomBuilder::new(
+                shape,
+            )));
+        }
         bloom::new_bloom_filter(estimated_keys, bloom_false_positive_rate).map(Self::Bloom)
     }
 
@@ -107,12 +137,19 @@ impl BatchKeyFilter {
             Self::RoaringU32(filter) => {
                 filter.push_key(key);
             }
+            Self::PartitionedBuilding(filter) => {
+                filter.insert_hash(key.default_hash());
+            }
+            Self::PartitionedStored(_) => {
+                panic!("cannot insert into a stored partitioned Bloom filter")
+            }
         }
     }
     pub(crate) fn finalize(&mut self) {
         match self {
             Self::Bloom(filter) => filter.finalize(),
             Self::RoaringU32(filter) => filter.finalize(),
+            Self::PartitionedBuilding(_) | Self::PartitionedStored(_) => (),
         }
     }
 }
@@ -479,7 +516,7 @@ mod tests {
 
             assert!(matches!(
                 FilterPlan::decide_filter(Some(&filter_plan), 50_000),
-                Some(BatchKeyFilter::Bloom(_))
+                Some(BatchKeyFilter::Bloom(_) | BatchKeyFilter::PartitionedBuilding(_))
             ));
         });
     }
@@ -522,7 +559,7 @@ mod tests {
                     Some(&span_only_plan),
                     batch1.key_count() + batch2.key_count()
                 ),
-                Some(BatchKeyFilter::Bloom(_))
+                Some(BatchKeyFilter::Bloom(_) | BatchKeyFilter::PartitionedBuilding(_))
             ));
 
             let filter_plan = FilterPlan::from_batches([&batch1, &batch2])

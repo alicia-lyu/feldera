@@ -7,8 +7,8 @@ use crate::{
     dynamic::{DataTrait, DynVec},
     storage::{
         file::{
-            BatchKeyFilter, FilterKind, FilterStats, TrackingFilterStats, TrackingRoaringBitmap,
-            reader::FilteredKeys,
+            BatchKeyFilter, FilterKind, FilterStats, StoredPartitionedBloom, TrackingFilterStats,
+            TrackingRoaringBitmap, reader::FilteredKeys,
         },
         tracking_bloom_filter::TrackingBloomFilter,
     },
@@ -275,6 +275,24 @@ where
     }
 }
 
+impl<K> BatchFilter<K> for StoredPartitionedBloom
+where
+    K: DataTrait + ?Sized,
+{
+    fn maybe_contains_key(&self, key: &K, hash: &mut Option<u64>) -> bool {
+        let hash = hash.get_or_insert_with(|| key.default_hash());
+        self.contains_hash(*hash)
+    }
+
+    fn kind(&self) -> FilterKind {
+        FilterKind::Bloom
+    }
+
+    fn stats(&self) -> FilterStats {
+        StoredPartitionedBloom::stats(self)
+    }
+}
+
 impl<K> From<BatchKeyFilter> for Arc<dyn BatchFilter<K>>
 where
     K: DataTrait + ?Sized,
@@ -283,6 +301,10 @@ where
         match filter {
             BatchKeyFilter::Bloom(filter) => Arc::new(filter),
             BatchKeyFilter::RoaringU32(filter) => Arc::new(filter),
+            BatchKeyFilter::PartitionedStored(filter) => Arc::new(filter),
+            BatchKeyFilter::PartitionedBuilding(_) => {
+                panic!("a partitioned Bloom filter must be written before it is probed")
+            }
         }
     }
 }
@@ -311,6 +333,7 @@ mod tests {
                 size_byte: stats.size_byte,
                 hits: 1,
                 misses: 1,
+                ..FilterStats::default()
             }
         );
     }

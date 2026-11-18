@@ -16,12 +16,13 @@ use crate::{
         backend::{BlockLocation, StorageBackend},
         buffer_cache::BufferCache,
         file::{
-            TouchedWindowCount,
+            BatchKeyFilter, PARTITION_BYTES, TouchedWindowCount,
             format::{
                 BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, DATA_BLOCK_MAGIC,
                 ELIDED_VALUE_HEADERS_DATA_BLOCK_MAGIC, FRONT_CODED_DATA_BLOCK_MAGIC, FileTrailer,
                 INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
-                INCOMPATIBLE_FEATURE_MODULAR_FILTERS, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
+                INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS,
+                MODULAR_BLOOM_FILTER_BLOCK_MAGIC, PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC,
                 ROARING_BITMAP_FILTER_BLOCK_MAGIC,
             },
             reader::{BulkRows, FilteredKeys, Reader},
@@ -51,7 +52,7 @@ use crate::{
 use binrw::BinRead;
 use feldera_storage::file::FileId;
 use feldera_storage::{FileCommitter, FileReader, FileRw, StoragePath};
-use feldera_types::config::{StorageConfig, StorageOptions};
+use feldera_types::config::{FilterResidency, StorageConfig, StorageOptions};
 use proptest::prelude::*;
 use rand::{Rng, seq::SliceRandom, thread_rng};
 use tempfile::tempdir;
@@ -241,7 +242,18 @@ where
 /// The rate goes through the storage options rather than the deprecated dev
 /// tweak, so the tests drive the same path production does. The circuit's own
 /// storage is unused: `f` reaches its batch files through its own backend.
+/// Runs `f` in a runtime with Bloom filter rate `rate` and memory-resident
+/// filters, the form the modular-filter tests examine.
 fn with_false_positive_rate<F>(rate: f64, f: F)
+where
+    F: FnOnce() + Clone + Send + 'static,
+{
+    with_filter_options(rate, FilterResidency::Memory, f)
+}
+
+/// Runs `f` in a runtime with Bloom filter rate `rate` and filter residency
+/// `residency`.
+fn with_filter_options<F>(rate: f64, residency: FilterResidency, f: F)
 where
     F: FnOnce() + Clone + Send + 'static,
 {
@@ -254,6 +266,7 @@ where
             },
             StorageOptions {
                 bloom_false_positive_rate: Some(rate),
+                filter_residency: residency,
                 ..StorageOptions::default()
             },
         )
@@ -2009,12 +2022,22 @@ fn write_u32_batch(dir: &str, keys: &[u32]) -> StoragePath {
 /// - the magic of the filter block on disk, or `None` when it has no filter;
 /// - the file's incompatible feature bits.
 fn open_u32_batch(dir: &str, path: &StoragePath) -> (BatchFilters<DynData>, Option<[u8; 4]>, u64) {
+    open_u32_batch_with_cache(dir, path, test_buffer_cache)
+}
+
+/// Like [`open_u32_batch`], reading through `cache`, which a storage-resident
+/// filter also reads its partitions through.
+fn open_u32_batch_with_cache(
+    dir: &str,
+    path: &StoragePath,
+    cache: fn() -> Option<Arc<BufferCache>>,
+) -> (BatchFilters<DynData>, Option<[u8; 4]>, u64) {
     let factories = Factories::<DynData, DynData>::new::<u32, ()>();
     let storage_backend = backend_at(dir);
     let (reader, membership_filter): (Reader<(&'static DynData, &'static DynData, ())>, _) =
         Reader::open_with_filter(
             &[&factories.any_factories()],
-            test_buffer_cache,
+            cache,
             &*storage_backend,
             path,
         )
@@ -3231,4 +3254,220 @@ fn a_file_mixing_encoded_and_fallback_blocks_reads_back() {
         swappable_cache,
         drop_swappable_cache,
     );
+}
+
+/// Writes `keys` as a batch with a storage-resident filter and returns the
+/// batch's path and the filter the writer handed back.
+fn write_u32_batch_with_filter(dir: &str, keys: &[u32]) -> (StoragePath, Option<BatchKeyFilter>) {
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let storage_backend = backend_at(dir);
+    let mut writer = Writer1::new(
+        &factories,
+        test_buffer_cache,
+        &*storage_backend,
+        Parameters::default(),
+        FilterPlan::<DynData>::decide_filter(None, keys.len()),
+    )
+    .unwrap();
+    for key in keys {
+        writer.write0((key, &())).unwrap();
+    }
+    let tmp_path = writer.path().clone();
+    let (_file_handle, filter, _bounds) = writer.close(BatchMetadata::default()).unwrap();
+    let stable_path = StoragePath::from("batch.feldera".to_string());
+    let content = storage_backend.read(&tmp_path).unwrap();
+    storage_backend
+        .write(&stable_path, (*content).clone())
+        .unwrap();
+    (stable_path, filter)
+}
+
+/// A 64 MiB cache: its 256 shards of 256 KiB each hold a filter partition
+/// with room to spare. ([`test_buffer_cache`]'s shards are 4 KiB, smaller than
+/// a partition with its bookkeeping, so it never keeps one.)
+fn large_test_buffer_cache() -> Option<Arc<BufferCache>> {
+    thread_local! {
+        static BUFFER_CACHE: Arc<BufferCache> = Arc::new(BufferCache::new(64 * 1024 * 1024));
+    }
+    Some(BUFFER_CACHE.with(|cache| cache.clone()))
+}
+
+/// A 2 MiB cache: shards of 8 KiB, one partition each.
+fn small_test_buffer_cache() -> Option<Arc<BufferCache>> {
+    thread_local! {
+        static BUFFER_CACHE: Arc<BufferCache> = Arc::new(BufferCache::new(2 * 1024 * 1024));
+    }
+    Some(BUFFER_CACHE.with(|cache| cache.clone()))
+}
+
+/// The even keys `0, 2, ..., 2 * (n - 1)`: every odd key in between is in
+/// range but absent, so only the membership filter can reject it.
+fn even_keys(n: u32) -> Vec<u32> {
+    (0..n).map(|k| k * 2).collect()
+}
+
+/// A storage-resident filter is written as partitions, read back as a handle
+/// with nothing loaded, and loads exactly one partition per probe that misses
+/// the cache.
+#[test]
+fn storage_resident_filter_reads_one_partition_per_probe() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    with_filter_options(1e-4, FilterResidency::Storage, move || {
+        let keys = even_keys(20_000);
+        let (path, written) = write_u32_batch_with_filter(&dir, &keys);
+        assert!(
+            matches!(written, Some(BatchKeyFilter::PartitionedStored(_))),
+            "the writer hands the new batch a stored filter, not its bits"
+        );
+
+        let (filters, magic, features) =
+            open_u32_batch_with_cache(&dir, &path, large_test_buffer_cache);
+        assert_eq!(magic, Some(PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC));
+        assert_ne!(features & INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS, 0);
+        assert_eq!(filters.membership_filter_kind(), FilterKind::Bloom);
+
+        let before = filters.stats().membership_filter;
+        assert!(
+            before.size_byte < 1024,
+            "{} bytes memory-resident",
+            before.size_byte
+        );
+        assert!(before.stored_byte >= PARTITION_BYTES);
+        assert_eq!(before.partition_loads + before.partition_cache_hits, 0);
+
+        for key in &keys {
+            assert!(filters.maybe_contains_key(key as &DynData, None));
+        }
+        // The odd keys below the largest stored key: in range, so the range
+        // filter passes them on to the membership filter.
+        let absent: Vec<u32> = keys[..keys.len() - 1].iter().map(|key| key + 1).collect();
+        let rejected = absent
+            .iter()
+            .filter(|key| !filters.maybe_contains_key(*key as &DynData, None))
+            .count();
+        assert!(
+            rejected * 100 >= absent.len() * 99,
+            "only {rejected} of {} absent keys rejected",
+            absent.len()
+        );
+
+        let after = filters.stats().membership_filter;
+        let probes = after.hits + after.misses;
+        assert_eq!(probes, keys.len() + absent.len());
+        assert_eq!(after.partition_loads + after.partition_cache_hits, probes);
+        // The whole filter fits the test cache, so each partition is read once.
+        assert_eq!(after.partition_loads, after.stored_byte / PARTITION_BYTES);
+    });
+}
+
+/// A filter larger than the cache has its partitions evicted, and a probe
+/// reads an evicted partition again and answers as before.
+#[test]
+fn storage_resident_filter_survives_eviction() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    with_filter_options(1e-4, FilterResidency::Storage, move || {
+        // About 3.6 MB of filter, against a 2 MiB cache.
+        let keys = even_keys(1_500_000);
+        let (path, _) = write_u32_batch_with_filter(&dir, &keys);
+        let (filters, _, _) = open_u32_batch_with_cache(&dir, &path, small_test_buffer_cache);
+        let partitions = filters.stats().membership_filter.stored_byte / PARTITION_BYTES;
+        assert!(partitions * PARTITION_BYTES > 2 * 1024 * 1024);
+        // A tenth of the keys, in order: they hash to partitions at random, so
+        // the probes keep evicting partitions and reading them back.
+        for key in keys.iter().step_by(10) {
+            assert!(filters.maybe_contains_key(key as &DynData, None));
+        }
+        let stats = filters.stats().membership_filter;
+        assert!(
+            stats.partition_cache_hits > 0,
+            "the cache kept no partition"
+        );
+        assert!(
+            stats.partition_loads > partitions,
+            "{} loads of {partitions} partitions: nothing was evicted and reread",
+            stats.partition_loads
+        );
+    });
+}
+
+/// A file written with a memory-resident filter still loads it whole under
+/// storage residency: the setting decides how new files are written.
+#[test]
+fn memory_resident_file_loads_under_storage_residency() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    let keys = even_keys(2_000);
+    {
+        let (dir, keys) = (dir.clone(), keys.clone());
+        with_filter_options(1e-4, FilterResidency::Memory, move || {
+            write_u32_batch(&dir, &keys);
+        });
+    }
+    with_filter_options(1e-4, FilterResidency::Storage, move || {
+        let path = StoragePath::from("batch.feldera".to_string());
+        let (filters, magic, _) = open_u32_batch(&dir, &path);
+        assert_eq!(magic, Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC));
+        let stats = filters.stats().membership_filter;
+        assert!(stats.size_byte > 2_000);
+        assert_eq!(stats.stored_byte, 0);
+        for key in &keys {
+            assert!(filters.maybe_contains_key(key as &DynData, None));
+        }
+    });
+}
+
+/// A partition that fails its checksum makes the filter answer "might be
+/// present", so a corrupt filter can cost a lookup but never lose a key.
+#[test]
+fn corrupt_partition_admits_every_key() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    with_filter_options(1e-4, FilterResidency::Storage, move || {
+        let keys = even_keys(2_000);
+        let (path, _) = write_u32_batch_with_filter(&dir, &keys);
+        let backend = backend_at(&dir);
+        let mut content = (*backend.read(&path).unwrap()).clone();
+        // The first partition starts at the first sector after the data, so
+        // corrupt every partition by flipping a bit in each 4 KiB block that
+        // carries the partition magic.
+        let mut corrupted = 0;
+        let mut offset = 0;
+        while offset + PARTITION_BYTES <= content.len() {
+            if content[offset + 4..offset + 8] == *b"LFPP" {
+                content[offset + 100] ^= 1;
+                corrupted += 1;
+                offset += PARTITION_BYTES;
+            } else {
+                offset += 512;
+            }
+        }
+        assert!(corrupted > 0);
+        backend.write(&path, content).unwrap();
+        let (filters, _, _) = open_u32_batch(&dir, &path);
+        // In-range absent keys, which only the membership filter could reject.
+        for key in &keys[..keys.len() - 1] {
+            assert!(filters.maybe_contains_key(&(*key + 1) as &DynData, None));
+        }
+    });
+}
+
+/// A rate of one writes no filter under storage residency either.
+#[test]
+fn storage_residency_with_a_rate_of_one_writes_no_filter() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    with_filter_options(1.0, FilterResidency::Storage, move || {
+        let (path, written) = write_u32_batch_with_filter(&dir, &even_keys(100));
+        assert!(written.is_none());
+        let (filters, magic, _) = open_u32_batch(&dir, &path);
+        assert_eq!(magic, None);
+        assert_eq!(filters.membership_filter_kind(), FilterKind::None);
+    });
 }

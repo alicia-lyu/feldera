@@ -31,12 +31,20 @@ pub enum FilterKind {
     derive_more::Sum,
 )]
 pub struct FilterStats {
-    /// Filter size in bytes.
+    /// Bytes of the filter held in memory.
     pub size_byte: usize,
+    /// Bytes of the filter kept on storage and read through the buffer cache
+    /// (a storage-resident filter's partitions); zero for a memory-resident
+    /// filter.
+    pub stored_byte: usize,
     /// Number of hits.
     pub hits: usize,
     /// Number of misses.
     pub misses: usize,
+    /// Partitions of a storage-resident filter read from storage.
+    pub partition_loads: usize,
+    /// Partitions of a storage-resident filter found in the buffer cache.
+    pub partition_cache_hits: usize,
 }
 
 /// Shared hit/miss accounting for key filters.
@@ -70,6 +78,7 @@ impl TrackingFilterStats {
             size_byte: self.size_byte,
             hits: self.counts.hits.load(Ordering::Relaxed),
             misses: self.counts.misses.load(Ordering::Relaxed),
+            ..FilterStats::default()
         }
     }
 

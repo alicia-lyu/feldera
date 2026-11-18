@@ -162,6 +162,18 @@ The TPC-H refresh functions are batch loads: at SF 10 one RF1 is a single transa
 
 The pilot and the campaign run two arms, `A-seek` and `B-seek`: prefix truncation on or off, with the scan session's `seek` pass. Under the `step` pass a small transaction walks the index from the session's start to its touched groups, about half the index per transaction ([LINUX-HANDOFF.md](LINUX-HANDOFF.md#known-limits)); the reconstructed run of `A-step` clustered at K = 10 was stopped after 49 minutes. `Pass::Step` and `--session-pass` stay in the code. This amends the four arms of 2026-11-11.
 
+### 2026-11-18: Bloom filters are storage-resident, read through the buffer cache
+
+The K = 10 pilots showed every file run's filter held in memory for the run's life: 305 MiB native and 461 MiB reconstructed after restore. Two of them, the merged index's (175 MiB) and `V`'s materialized trace's (137.5 MiB), were never probed. The user chose a generic budget over a per-spine opt-out, after RocksDB's filter blocks in the block cache with partitioned filters. DBSP now writes each new run's Bloom filter as partitions that stay on storage, and a probe reads one partition through the buffer cache, where it is evicted like a data block (`StorageOptions::filter_residency`, default `storage`, in DBSP and in the experiment). An unprobed filter costs no memory. A filter small enough for one partition stays in memory, because the per-transaction runs of small transactions would otherwise each write a 4 KiB partition to save a few dozen bytes. Measurement version 15.
+
+### 2026-11-18: The refresh runs' buffer cache is 256 MiB
+
+Filter partitions now share the buffer cache with data blocks, so the cache grows from 128 MiB to 256 MiB in both modes (user answer). The 512 MiB memory target and the 1 GiB cgroup limit are unchanged.
+
+### 2026-11-18: Compaction is deferred; its options are documented with measurements
+
+Small transactions leave many small runs (14 to 75 in the merged index at the ends of the K = 10 refreshes), and each group read seeks every run. The user deferred any compaction change and asked for a document that sets the options against measurements, respecting the current spine design and aiming at a good layout for every spine, not only the merged index: [compaction.md](../../../docs/design/merged-index/compaction.md). Measurement version 15 adds the counters it needs (`run_counts`).
+
 ## Superseded and withdrawn
 
 Rows that apply to any index or harness are in the [generic log](../../../docs/design/merged-index/decisions.md#superseded-and-withdrawn).

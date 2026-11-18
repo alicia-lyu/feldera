@@ -243,7 +243,7 @@ host's `MemAvailable`, split evenly among the loads that run at once (all four b
 budget), with 1,000,000-row load transactions and a 3600 s wait for the background merges.
 `images.json` records the cache used (`configuration.cache_bytes`, `concurrent_loads`,
 `mem_available_bytes`). Flags override them, but do not pass the campaign's
-`--cache-bytes 134217728` or `--batch 10000` here. None of
+`--cache-bytes 268435456` or `--batch 10000` here. None of
 them reaches a refresh run, which uses the campaign's flags, and neither the cache nor the batch is
 part of `ImageSettings`. All four images must use the same batch, though: no full compaction runs
 after loading (decision of 2026-11-09), so the batch shapes each image's runs.
@@ -430,7 +430,7 @@ python3 measure.py \
   --storage-path "$R5_OUT/pilot-A-seek-clustered/runs" \
   --cgroup-root /sys/fs/cgroup/r5 \
   --total-memory-bytes 1073741824 \
-  --cache-bytes 134217728 \
+  --cache-bytes 268435456 \
   --memory-target-bytes 536870912 \
   --runs 1 \
   --no-verify \
@@ -454,7 +454,7 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
   workload's own warm-up pair) to run one unmeasured RF1/RF2 pair before it instead. Run the
   pilots without `--warm-up` unless the user asks for the warm arm.
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.
-- `--cache-bytes 134217728`: the 128 MiB worker cache (a whole number of MiB).
+- `--cache-bytes 268435456`: the 256 MiB worker cache (a whole number of MiB), which since measurement version 15 also holds Bloom filter partitions (decision of 2026-11-18).
 - `--memory-target-bytes 536870912`: the 512 MiB runtime memory-pressure target.
 - `--runs 1`: one repetition per mode for the pilot. The campaign uses `--runs 3`.
 - `--no-verify`: required for qualification (`qualification` rejects a verified run).

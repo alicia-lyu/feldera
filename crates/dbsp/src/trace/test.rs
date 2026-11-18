@@ -2375,14 +2375,97 @@ proptest! {
     }
 }
 
-/// Sets the false positive rate `config`'s circuit will report.
+/// Sets the false positive rate `config`'s circuit will report, with
+/// memory-resident filters: the rate ladder sheds modules of a filter held in
+/// memory.
 fn set_false_positive_rate(config: &mut CircuitConfig, rate: f64) {
-    config
+    let options = &mut config
         .storage
         .as_mut()
         .expect("config must be storage-backed")
-        .options
-        .bloom_false_positive_rate = Some(rate);
+        .options;
+    options.bloom_false_positive_rate = Some(rate);
+    options.filter_residency = feldera_types::config::FilterResidency::Memory;
+}
+
+/// Keys for the storage-resident check: enough that the filter needs more
+/// than one partition (smaller filters stay memory-resident), spread over the
+/// `u32` range so the Bloom path is taken.
+fn residency_keys() -> Vec<u32> {
+    (0..5_000u32).map(|i| i * 797_003).collect()
+}
+
+/// Runs the rate ladder ([`assert_rate_ladder`]) with memory-resident
+/// filters, then checks the batch type with a storage-resident filter: written
+/// and reopened through its own `from_path`, it holds its filter on storage,
+/// reads partitions only when probed, and finds every key.
+fn assert_filter_residencies<B>(
+    label: &str,
+    dir: &std::path::Path,
+    factories: fn() -> B::Factories,
+    build: fn(&B::Factories, &[u32]) -> B,
+    keys: &'static [u32],
+) where
+    B: Batch<Key = DynData> + Send + 'static,
+    B::Factories: Send + 'static,
+{
+    assert_rate_ladder::<B>(label, &dir.join("memory"), factories, build, keys);
+
+    let dir = dir.join("storage");
+    let stash = dir.join("stashed-batch.feldera");
+    let write_dir = dir.join("write");
+    std::fs::create_dir_all(&write_dir).unwrap();
+    {
+        let (stash, write_dir) = (stash.clone(), write_dir.clone());
+        let label = label.to_string();
+        run_in_circuit_with_storage_config(mkconfig(&write_dir), move || {
+            let batch = build(&factories(), &residency_keys());
+            let stats = batch.membership_filter_stats();
+            assert!(
+                stats.stored_byte > 0,
+                "{label}: new batch's filter is not on storage"
+            );
+            let file = batch
+                .file_reader()
+                .expect("batch under test must be file backed");
+            let source = file.path().to_string();
+            std::fs::copy(write_dir.join(source.trim_start_matches('/')), &stash).unwrap();
+        });
+    }
+    let read_dir = dir.join("read");
+    std::fs::create_dir_all(&read_dir).unwrap();
+    std::fs::copy(&stash, read_dir.join("residency-batch.feldera")).unwrap();
+    let label = label.to_string();
+    run_in_circuit_with_storage_config(mkconfig(&read_dir), move || {
+        let path = StoragePath::from("residency-batch.feldera".to_string());
+        let batch = B::from_path(&factories(), &path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(batch.membership_filter_kind(), FilterKind::Bloom);
+        let before = batch.membership_filter_stats();
+        assert!(
+            before.stored_byte > 0,
+            "{label}: reopened filter is not on storage"
+        );
+        assert!(
+            before.size_byte < 1024,
+            "{label}: {} bytes in memory",
+            before.size_byte
+        );
+        assert_eq!(before.partition_loads + before.partition_cache_hits, 0);
+        let keys = residency_keys();
+        for key in &keys {
+            let mut cursor = batch.cursor();
+            assert!(
+                cursor.seek_key_exact(key.erase(), None),
+                "{label}: lost key {key}"
+            );
+        }
+        let after = batch.membership_filter_stats();
+        assert_eq!(
+            after.partition_loads + after.partition_cache_hits,
+            keys.len()
+        );
+        assert!(after.partition_loads >= 1);
+    });
 }
 
 /// Builds a file batch at the most accurate rate, then reloads it at each
@@ -2395,7 +2478,7 @@ fn assert_rate_ladder<B>(
     label: &str,
     dir: &std::path::Path,
     factories: fn() -> B::Factories,
-    build: fn(&B::Factories) -> B,
+    build: fn(&B::Factories, &[u32]) -> B,
     keys: &'static [u32],
 ) where
     B: Batch<Key = DynData> + Send + 'static,
@@ -2413,7 +2496,7 @@ fn assert_rate_ladder<B>(
         set_false_positive_rate(&mut config, 1e-4);
         let (name, stash, write_dir) = (name.clone(), stash.clone(), write_dir.clone());
         run_in_circuit_with_storage_config(config, move || {
-            let batch = build(&factories());
+            let batch = build(&factories(), keys);
             let file = batch
                 .file_reader()
                 .expect("batch under test must be file backed");
@@ -2494,14 +2577,17 @@ const LADDER_KEYS: &[u32] = &[
 #[test]
 fn file_wset_filter_follows_the_rate() {
     let temp_dir = tempdir().expect("Can't create temp dir for storage");
-    assert_rate_ladder::<FileWSet<DynData, DynZWeight>>(
+    assert_filter_residencies::<FileWSet<DynData, DynZWeight>>(
         "FileWSet",
         temp_dir.path(),
         <FileWSetFactories<DynData, DynZWeight>>::new::<u32, (), ZWeight>,
-        |factories| {
-            let mut builder =
-                <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(factories, 8, 0);
-            for key in LADDER_KEYS {
+        |factories, keys| {
+            let mut builder = <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(
+                factories,
+                keys.len(),
+                0,
+            );
+            for key in keys {
                 let weight: ZWeight = 1;
                 builder.push_time_diff(&(), weight.erase());
                 builder.push_key(key.erase());
@@ -2515,16 +2601,18 @@ fn file_wset_filter_follows_the_rate() {
 #[test]
 fn file_indexed_wset_filter_follows_the_rate() {
     let temp_dir = tempdir().expect("Can't create temp dir for storage");
-    assert_rate_ladder::<FileIndexedWSet<DynData, DynData, DynZWeight>>(
+    assert_filter_residencies::<FileIndexedWSet<DynData, DynData, DynZWeight>>(
         "FileIndexedWSet",
         temp_dir.path(),
         <FileIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<u32, u32, ZWeight>,
-        |factories| {
+        |factories, keys| {
             let mut builder =
                 <FileIndexedWSet<DynData, DynData, DynZWeight> as Batch>::Builder::with_capacity(
-                    factories, 8, 0,
+                    factories,
+                    keys.len(),
+                    0,
                 );
-            for key in LADDER_KEYS {
+            for key in keys {
                 let weight: ZWeight = 1;
                 builder.push_time_diff(&(), weight.erase());
                 builder.push_val(7u32.erase());
@@ -2539,16 +2627,18 @@ fn file_indexed_wset_filter_follows_the_rate() {
 #[test]
 fn file_key_batch_filter_follows_the_rate() {
     let temp_dir = tempdir().expect("Can't create temp dir for storage");
-    assert_rate_ladder::<FileKeyBatch<DynData, u32, DynZWeight>>(
+    assert_filter_residencies::<FileKeyBatch<DynData, u32, DynZWeight>>(
         "FileKeyBatch",
         temp_dir.path(),
         <FileKeyBatchFactories<DynData, u32, DynZWeight>>::new::<u32, (), ZWeight>,
-        |factories| {
+        |factories, keys| {
             let mut builder =
                 <FileKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
-                    factories, 8, 0,
+                    factories,
+                    keys.len(),
+                    0,
                 );
-            for key in LADDER_KEYS {
+            for key in keys {
                 let weight: ZWeight = 1;
                 builder.push_time_diff(&0u32, weight.erase());
                 builder.push_val(().erase());
@@ -2563,16 +2653,18 @@ fn file_key_batch_filter_follows_the_rate() {
 #[test]
 fn file_val_batch_filter_follows_the_rate() {
     let temp_dir = tempdir().expect("Can't create temp dir for storage");
-    assert_rate_ladder::<FileValBatch<DynData, DynData, u32, DynZWeight>>(
+    assert_filter_residencies::<FileValBatch<DynData, DynData, u32, DynZWeight>>(
         "FileValBatch",
         temp_dir.path(),
         <FileValBatchFactories<DynData, DynData, u32, DynZWeight>>::new::<u32, u32, ZWeight>,
-        |factories| {
+        |factories, keys| {
             let mut builder =
                 <FileValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
-                    factories, 8, 0,
+                    factories,
+                    keys.len(),
+                    0,
                 );
-            for key in LADDER_KEYS {
+            for key in keys {
                 let weight: ZWeight = 1;
                 builder.push_time_diff(&0u32, weight.erase());
                 builder.push_val(7u32.erase());
