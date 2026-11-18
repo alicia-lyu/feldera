@@ -208,6 +208,33 @@ On Linux, storage files open with `O_DIRECT`, while input reads go through the p
 - The `.tbl` inputs are read with `BufReader` over `File` (`main.rs`, `workload.rs`), so they use the page cache. The runner evicts the shared inputs inside the run's cgroup, so the driver's reads fault their pages again and are charged to that cgroup.
 - `FBuf::ALIGNMENT` is 512 (`crates/storage/src/fbuf.rs`). A filesystem that needs larger direct-I/O alignment (a 4Kn disk) or that rejects `O_DIRECT` (tmpfs, some overlay filesystems) may fail; whether this build then fails is not tested here. Put the storage path on a local ext4 or xfs filesystem.
 
+## Linux pilots at K = 10 (2026-11-18)
+
+The first SSD pilots, one repetition each, on the first Linux host (Xeon Silver 4114, kernel 6.8, turbo off), from the SF 10 images of revision `da074ff7e` (measurement version 14). Workloads: `prepare_inputs.py --transaction-rows 10 --seed 1 --pairs 3` (about 12.5 rows per transaction; 18,041 RF1 and 18,129 RF2 transactions per window; clustered draws one Customer per transaction). Settings: cgroup `memory.max` 1 GiB, cache 128 MiB, DBSP memory target 512 MiB, cold start, no warm-up. These are pilot figures, not campaign results: one repetition, and no claim of cost or saving.
+
+Per-transaction medians (p50, milliseconds) over all transactions of each phase:
+
+| Pilot | Mode | RF1 base | RF1 IVM | RF2 base | RF2 IVM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A-seek clustered | native | 1.11 | 3.77 | 1.20 | 4.63 |
+| A-seek clustered | reconstructed | 1.44 | 4.51 | 1.94 | 3.07 |
+| B-seek clustered | native | 1.06 | 3.59 | 1.16 | 4.65 |
+| B-seek clustered | reconstructed | 1.62 | 5.55 | 2.26 | 3.61 |
+| A-seek scattered | native | 1.03 | 4.30 | 1.13 | 4.44 |
+| A-seek scattered | reconstructed | 1.37 | 8.06 | 1.93 | 3.14 |
+| B-seek scattered | native | 1.11 | 4.51 | 1.18 | 4.56 |
+| B-seek scattered | reconstructed | 1.33 | 8.82 | 1.96 | 3.27 |
+
+What the pilots show, and what they do not:
+
+- **Qualification.** Every completed run is `qualifying`: the loaded state (17 to 20 GB) exceeds the enforced limit, the copy was evicted, and the cgroup was verified.
+- **Which limit binds.** The cgroup limit never did: `memory.events` shows `max 0` and `oom 0` in every run, and `memory.peak` was 605 to 652 MiB (native) and 777 to 784 MiB (reconstructed). DBSP's runtime pressure was `critical` in every refresh, since the window's peak RSS (521 to 563 MiB native, 689 to 693 MiB reconstructed) exceeds the 512 MiB target. The pressure in these pilots is DBSP's, not the kernel's.
+- **`total_ms` includes harness instrumentation.** The run-read and block-expansion counters and the CPU profiler are read around every view transaction, outside the phase timers, about 4 ms per transaction at this size (native RF1: 9.5 ms foreground against 5.0 ms of named phases). Compare `base_ms` and `ivm_ms`; `total_ms` is not a latency figure at K = 10 until that instrumentation is sampled less often.
+- **Native agrees across arms**, as it should, since neither factor changes it: RF1 IVM p50 3.6 to 3.8 ms clustered, 4.3 to 4.5 ms scattered.
+- **The step arms did not run.** `A-step` clustered's native run completed (RF1 IVM p50 3.57 ms), and its reconstructed run was stopped after 49 minutes: under `Pass::Step` a small transaction walks the index from its first key ([LINUX-HANDOFF.md](LINUX-HANDOFF.md#known-limits)). `A-step` scattered and both `B-step` pilots were not started.
+
+Artifacts (local to the host): `/mnt/ssd/r5-out/pilot-<arm>-<workload>-k10/manifest.json` and its `runs/run-1-<mode>/driver.json`.
+
 ## Pending: pressure evidence
 
 The instrumentation is implemented (Linux paths unrun and untested on Linux; macOS records `null`) but has produced no Linux data. Implemented:
