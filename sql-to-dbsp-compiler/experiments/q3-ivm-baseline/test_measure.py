@@ -48,6 +48,16 @@ class MeasureTest(unittest.TestCase):
         self.refresh.write_text('[{"rf1_orders":"rf1_orders"}]')
         with self.assertRaisesRegex(ValueError, "RF1 paths"):
             measure.refresh_inputs(self.refresh)
+        # A refresh cut into transactions keeps its Order counts, which are not paths.
+        self.refresh.write_text('[{"rf2":"rf2","transaction_orders":[2,1]}]')
+        refreshes, files = measure.refresh_inputs(self.refresh)
+        self.assertEqual(refreshes[0]["transaction_orders"], [2, 1])
+        self.assertEqual(list(files), ["refresh_0_rf2"])
+        for bad in ("[]", "[0]", "[1.5]", "[true]", '"2"'):
+            self.refresh.write_text(f'[{{"rf2":"rf2","transaction_orders":{bad}}}]')
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError,
+                                                                "transaction_orders"):
+                measure.refresh_inputs(self.refresh)
 
     def test_failure_records_manifest_and_restores_native_generation(self) -> None:
         calls = []

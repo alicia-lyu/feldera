@@ -88,19 +88,32 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def refresh_inputs(path: Path) -> tuple[list[dict[str, str]], dict[str, Path]]:
+def refresh_inputs(path: Path) -> tuple[list[dict[str, Any]], dict[str, Path]]:
+    """The refreshes of a refresh list with their paths resolved, and every input file. A
+    refresh may carry `transaction_orders` (`prepare_inputs.py --transaction-rows`): the
+    Order count of each consecutive transaction it is cut into, which must cover its rows."""
     entries = json.loads(path.read_text())
     if not isinstance(entries, list):
         raise ValueError("refresh list must be a JSON array")
-    resolved: list[dict[str, str]] = []
+    resolved: list[dict[str, Any]] = []
     inputs: dict[str, Path] = {}
     for number, entry in enumerate(entries):
-        if not isinstance(entry, dict) or set(entry) not in (
+        if not isinstance(entry, dict) or set(entry) - {"transaction_orders"} not in (
             {"rf1_orders", "rf1_lines"}, {"rf2"}
         ):
             raise ValueError(f"refresh {number} must contain RF1 paths or one RF2 path")
-        item: dict[str, str] = {}
+        item: dict[str, Any] = {}
+        if "transaction_orders" in entry:
+            counts = entry["transaction_orders"]
+            if not isinstance(counts, list) or not counts or not all(
+                    isinstance(count, int) and not isinstance(count, bool) and count > 0
+                    for count in counts):
+                raise ValueError(f"refresh {number} transaction_orders must be a non-empty "
+                                 "list of positive integers")
+            item["transaction_orders"] = counts
         for field, raw in entry.items():
+            if field == "transaction_orders":
+                continue
             if not isinstance(raw, str) or not raw:
                 raise ValueError(f"refresh {number} {field} must be a path")
             source = (path.parent / raw).resolve()
