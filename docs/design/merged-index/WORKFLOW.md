@@ -466,8 +466,17 @@ next to the refresh files it names. Both workloads share the base files in `$DBG
 `q3-ivm-baseline`:
 
 ```bash
-python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS" --seed 1 --pairs 3 --warm-up
+for rows in 10 100 1000; do
+  python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS/k$rows" \
+    --seed 1 --pairs 3 --warm-up --transaction-rows "$rows"
+done
 ```
+
+`--transaction-rows K` cuts every RF1 and RF2 set into consecutive transactions of about K rows
+(whole Orders; an Order counts 1 + its Lineitems), and each refresh of `refreshes.json` then carries
+`transaction_orders`, the Order count of each transaction. The window applies all of RF1 1 as small
+transactions, then all of RF2 1, and so on (decision of 2026-11-17). Without the option each set is
+one transaction, the TPC-H batch. Each size gets its own `--out`; the images serve every size.
 
 `--warm-up` also writes `<workload>/warm-up/` (pair 4, from update set 4, with its own
 `refreshes.json`) for the refresh program's optional warm-up. The measured pairs are the same with
@@ -477,7 +486,10 @@ It writes, for each of `clustered/` and `scattered/`, the files `rf1-orders-K.tb
 `rf1-lines-K.tbl`, and `rf2-delete-K.tbl` for each pair K, and a `refreshes.json` ordered RF1 1,
 RF2 1, RF1 2, and so on. `$R5_INPUTS/prepare-manifest.json` records the seed, the base and per-pair
 counts, each pair's distinct Customers and the Order counts of its top 1, 10, and 100 Customers, and the SHA-256 of every input and output. The script refuses
-an `--out` that already holds either workload. Clustered RF1 draws Customers from a Zipf distribution (`--zipf-exponent`, default 1.0) independent of the RF2 sets. The selection rules are in its module docstring and
+an `--out` that already holds either workload. Only Customers whose key is not a multiple of 3
+receive RF1 Orders, as TPC-H specifies. Scattered draws them uniformly; clustered draws TPC-C's
+NURand(1023, 1, 3000) over blocks of 3,000 eligible Customers, in sessions of
+`--orders-per-session` (default 4) Orders per Customer per transaction, independent of the RF2 sets. The selection rules are in its module docstring and
 summarized in [measurement.md](measurement.md#pending-linux-campaign). The whole path (dbgen,
 `prepare_inputs.py`, `measure.py`, `summarize.py`) ran end to end on macOS at SF 0.01. At SF 10 the
 command above took about 100 seconds and wrote 15,000 RF1 Orders and 15,000 RF2 deletes per pair in
@@ -678,7 +690,7 @@ compiler built and `JAVA_HOME` set, from a shell inside the cgroup tree above. U
 ```bash
 python3 measure.py \
   --images "$R5_OUT/images" \
-  --refresh-list "$R5_INPUTS/clustered/refreshes.json" \
+  --refresh-list "$R5_INPUTS/k10/clustered/refreshes.json" \
   --report "$R5_OUT/pilot-A-seek-clustered/manifest.json" \
   --storage-path "$R5_OUT/pilot-A-seek-clustered/runs" \
   --cgroup-root /sys/fs/cgroup/r5 \
@@ -702,7 +714,7 @@ Give each pilot its own `--report` and `--storage-path`, named by arm and worklo
 
 - `--images`: start each run from a copy of its mode's and arm's image ("Build the images"),
   in a new process that runs only the refreshes (the driver's `--from-image`). The window starts
-  with the buffer cache empty; add `--warm-up "$R5_INPUTS/clustered/warm-up/refreshes.json"` (the
+  with the buffer cache empty; add `--warm-up "$R5_INPUTS/k10/clustered/warm-up/refreshes.json"` (the
   workload's own warm-up pair) to run one unmeasured RF1/RF2 pair before it instead. Run the
   pilots without `--warm-up` unless the user asks for the warm arm.
 - `--cgroup-root`, `--total-memory-bytes`: enforce a 1 GiB `memory.max` with no swap, per run.

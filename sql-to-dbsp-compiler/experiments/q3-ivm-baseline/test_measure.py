@@ -1104,7 +1104,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 13,
+        return {"mode": mode, "measurement_version": 14,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1183,13 +1183,35 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("prefix_truncated_expanded_bytes is below prefix_truncated_encoded_bytes",
                       measure.block_expansion_problems(shrunk)[0])
 
-    def test_report_problems_require_measurement_version_13(self) -> None:
+    def test_transaction_latency_problems_check_counts_values_and_maximum(self) -> None:
+        def report(values: list, transactions: int = 2, maximum: object = None) -> dict:
+            phase = {"values": values, "max": max(values) if maximum is None else maximum}
+            return {"refreshes": [{"transactions": transactions, "transaction_latency": {
+                "transactions": transactions,
+                **{part: dict(phase) for part in measure.LATENCY_PHASES}}}]}
+
+        self.assertEqual(measure.transaction_latency_problems(report([1.0, 2.5])), [])
+        self.assertIn("must hold 2", measure.transaction_latency_problems(report([1.0]))[0])
+        self.assertIn("must hold 2",
+                      measure.transaction_latency_problems(report([1.0, -1.0]))[0])
+        self.assertIn("must hold 2",
+                      measure.transaction_latency_problems(report([1.0, True]))[0])
+        self.assertIn("not the largest",
+                      measure.transaction_latency_problems(report([1.0, 2.0], maximum=1.0))[0])
+        mismatched = report([1.0, 2.0])
+        mismatched["refreshes"][0]["transactions"] = 3
+        self.assertIn("counts 2 transactions, the refresh 3",
+                      measure.transaction_latency_problems(mismatched)[0])
+        self.assertIn("transaction_latency is None",
+                      measure.transaction_latency_problems({"refreshes": [{}]})[0])
+
+    def test_report_problems_require_measurement_version_14(self) -> None:
         report = self.expansion_report()
         report.update(self.gate_report())
         self.assertEqual(measure.measurement_version_problems(report), [])
-        report["measurement_version"] = 12
+        report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 12, expected 13"])
+                         ["measurement_version is 13, expected 14"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

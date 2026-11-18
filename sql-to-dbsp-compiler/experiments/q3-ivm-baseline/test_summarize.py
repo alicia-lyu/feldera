@@ -104,12 +104,25 @@ LAYOUT = {snapshot: {"file": {"runs": 1, "bytes": 10}, "memory": {"runs": 1, "by
           for snapshot in ("before", "after")}
 
 
+def transaction_latency(scale: float) -> dict:
+    """Two transactions' latencies, the second three times the first."""
+    def phase(first: float) -> dict:
+        values = [first * scale, 3 * first * scale]
+        return {"p50": values[0], "p95": values[1], "p99": values[1], "max": values[1],
+                "mean": sum(values) / 2, "values": values}
+    return {"transactions": 2, "total_ms": phase(2.0), "base_ms": phase(1.0),
+            "ivm_ms": phase(0.5)}
+
+
 def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2, 0)) -> dict:
     """A driver report with two refreshes; `scale` multiplies every timing, and, in the
     merged-index mode, refresh `n` makes `n * scale` index seeks per reader."""
     split = owners(*writes)
     native = mode == "native"
-    refreshes = [{"refresh": number, "foreground_ms": 10.0 * scale * number,
+    refreshes = [{"refresh": number, "phase": "rf1" if number == 1 else "rf2",
+                  "transactions": 2,
+                  "transaction_latency": transaction_latency(scale * number),
+                  "foreground_ms": 10.0 * scale * number,
                   "base_ms": 4.0 * scale * number, "forward_ms": 0.5 * scale * number,
                   "index_ms": 1.0 * scale * number, "delta_ms": 0.25 * scale * number, "q3_ms": 1.75 * scale * number,
                   "ivm_ms": 2.0 * scale * number,
@@ -128,7 +141,7 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
         refresh["block_expansions"] = block_expansions(mode, refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 13, "os": "linux",
+        "measurement_version": 14, "os": "linux",
         "configuration": {"front_code_byte_keys": True, "elide_value_headers": True},
         "front_coding": {"blocks": 5, "layout_fallbacks": 0, "size_fallbacks": 1},
         "value_header_elision": {"blocks": 6, "layout_fallbacks": 0, "size_fallbacks": 0},
@@ -171,6 +184,31 @@ class SummarizeTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(content))
         return path
+
+    def test_transaction_latency_percentiles_pool_each_phase(self) -> None:
+        refreshes = [
+            {"phase": "rf1", "transaction_latency": {"transactions": 4, **{
+                part: {"values": [4.0, 1.0, 3.0, 2.0]} for part in summarize.LATENCY_PHASES}}},
+            {"phase": "rf2", "transaction_latency": {"transactions": 1, **{
+                part: {"values": [9.0]} for part in summarize.LATENCY_PHASES}}},
+            {"phase": "rf1", "transaction_latency": {"transactions": 1, **{
+                part: {"values": [100.0]} for part in summarize.LATENCY_PHASES}}},
+        ]
+        metrics = summarize.transaction_latency_metrics(refreshes)
+        self.assertEqual((metrics["rf1_transactions"], metrics["rf2_transactions"]), (5, 1))
+        # rf1 pools [1, 2, 3, 4, 100]: nearest rank 50% is the 3rd, 95% and 99% the 5th.
+        self.assertEqual((metrics["rf1_total_ms_p50"], metrics["rf1_total_ms_p95"],
+                          metrics["rf1_total_ms_p99"], metrics["rf1_total_ms_max"]),
+                         (3.0, 100.0, 100.0, 100.0))
+        self.assertEqual(metrics["rf2_ivm_ms_p50"], 9.0)
+        self.assertEqual(summarize.nearest_rank([1.0, 2.0], 50), 1.0)
+        self.assertEqual(summarize.nearest_rank([1.0, 2.0], 51), 2.0)
+
+    def test_malformed_transaction_latency_is_an_error(self) -> None:
+        content = manifest({"native": [1.0], "merged-index": [1.0]})
+        content["runs"][0]["driver"]["refreshes"][0]["transaction_latency"]["base_ms"][
+            "values"].append(1.0)
+        self.failing(content, "transaction_latency.base_ms.values must hold 2")
 
     def test_golden_path_medians_extremes_and_files(self) -> None:
         clustered = self.write_manifest("clustered", manifest(
@@ -404,17 +442,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 13")
+        self.failing(content, "native run 1: measurement_version is 2, not 14")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 13")
+        self.failing(content, "native run 1: measurement_version is 3, not 14")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 13")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 14")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 13")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 14")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")

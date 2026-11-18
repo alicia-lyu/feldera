@@ -43,7 +43,7 @@ SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_step
 SESSION_PASSES = ("seek", "step")
 # The version of the driver report that this runner and `summarize.py` understand. Version 12
 # adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses).
-MEASUREMENT_VERSION = 13
+MEASUREMENT_VERSION = 14
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -390,9 +390,41 @@ def block_expansion_problems(report: dict[str, Any]) -> list[str]:
     return problems
 
 
+LATENCY_PHASES = ("total_ms", "base_ms", "ivm_ms")
+
+
+def transaction_latency_problems(report: dict[str, Any]) -> list[str]:
+    """List where a report's per-transaction latencies (measurement version 14) are malformed:
+    each refresh's `transaction_latency` gives, for `total_ms`, `base_ms` and `ivm_ms`, one
+    finite non-negative value per transaction of the refresh, and `max` is their largest."""
+    problems = []
+    for number, refresh in enumerate(report.get("refreshes", []), start=1):
+        latency = refresh.get("transaction_latency")
+        transactions = refresh.get("transactions")
+        if not isinstance(latency, dict):
+            problems.append(f"refresh {number}: transaction_latency is {latency!r}")
+            continue
+        if latency.get("transactions") != transactions:
+            problems.append(f"refresh {number}: transaction_latency counts "
+                            f"{latency.get('transactions')!r} transactions, the refresh "
+                            f"{transactions!r}")
+        for phase in LATENCY_PHASES:
+            values = (latency.get(phase) or {}).get("values")
+            if not isinstance(values, list) or len(values) != transactions or not all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0 for value in values):
+                problems.append(f"refresh {number}: transaction_latency.{phase}.values must "
+                                f"hold {transactions!r} finite non-negative values")
+            elif values and latency[phase].get("max") != max(values):
+                problems.append(f"refresh {number}: transaction_latency.{phase}.max is not the "
+                                "largest value")
+    return problems
+
+
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """Every consistency check of one driver report."""
     return (measurement_version_problems(report) + layout_fallback_problems(report)
+            + transaction_latency_problems(report)
             + block_expansion_problems(report)
             + owner_write_problems(report) + index_read_problems(report)
             + view_read_problems(report) + driver_read_problems(report)

@@ -1502,6 +1502,11 @@ struct Refresh {
     rf1_orders: Option<PathBuf>,
     rf1_lines: Option<PathBuf>,
     rf2: Option<PathBuf>,
+    /// The Order count of each consecutive transaction that this refresh is cut into, in file
+    /// order (`prepare_inputs.py --transaction-rows`; measurement version 14). Absent: the
+    /// whole refresh is one transaction.
+    #[serde(default)]
+    transaction_orders: Option<Vec<usize>>,
 }
 
 impl Refresh {
@@ -1525,42 +1530,147 @@ enum PreparedRefresh {
 }
 
 impl PreparedRefresh {
-    fn read(refresh: &Refresh) -> Result<Self> {
+    /// The transactions of `refresh`, in order: one, or one per entry of its
+    /// `transaction_orders`. Each file is read once.
+    fn read(refresh: &Refresh) -> Result<Vec<Self>> {
         if let Some(path) = &refresh.rf2 {
-            return Ok(Self::Rf2(
-                rows(path, data::delete_order_key)?.into_iter().collect(),
-            ));
+            let keys = rows(path, data::delete_order_key)?;
+            let counts = transaction_counts(refresh, keys.len())?;
+            let mut keys = keys.into_iter();
+            return Ok(counts
+                .into_iter()
+                .map(|count| Self::Rf2(keys.by_ref().take(count).collect()))
+                .collect());
         }
-        let orders = refresh
+        let orders_path = refresh
             .rf1_orders
             .as_deref()
             .context("RF1 Orders required")?;
-        let lines = refresh
+        let lines_path = refresh
             .rf1_lines
             .as_deref()
             .context("RF1 Lineitem required")?;
-        Ok(Self::Rf1(Change {
-            orders: rows(orders, Order::parse)?
-                .into_iter()
-                .map(|row| (row, true))
-                .collect(),
-            lines: rows(lines, Line::parse)?
-                .into_iter()
-                .map(|row| (row, true))
-                .collect(),
-            ..Change::default()
-        }))
+        let orders = rows(orders_path, Order::parse)?;
+        let lines = rows(lines_path, Line::parse)?;
+        if refresh.transaction_orders.is_none() {
+            return Ok(vec![Self::Rf1(Change {
+                orders: orders.into_iter().map(|row| (row, true)).collect(),
+                lines: lines.into_iter().map(|row| (row, true)).collect(),
+                ..Change::default()
+            })]);
+        }
+        // Each Lineitem goes to the transaction of its Order, which must be in this refresh.
+        let counts = transaction_counts(refresh, orders.len())?;
+        let mut transaction_of = HashMap::with_capacity(orders.len());
+        let mut changes = Vec::with_capacity(counts.len());
+        let mut orders = orders.into_iter();
+        for (index, count) in counts.into_iter().enumerate() {
+            let mut change = Change::default();
+            for order in orders.by_ref().take(count) {
+                transaction_of.insert(order.key, index);
+                change.orders.push((order, true));
+            }
+            changes.push(change);
+        }
+        for line in lines {
+            let index = *transaction_of.get(&line.order_key).with_context(|| {
+                format!(
+                    "{}: Lineitem of Order {} has no Order in {}, so it belongs to no transaction",
+                    lines_path.display(),
+                    line.order_key,
+                    orders_path.display()
+                )
+            })?;
+            changes[index].lines.push((line, true));
+        }
+        Ok(changes.into_iter().map(Self::Rf1).collect())
     }
 
-    /// The row counts of this refresh's input, for the report.
-    fn summary(&self, number: usize) -> Value {
-        match self {
-            Self::Rf1(change) => json!({
-                "refresh": number, "phase": "rf1",
-                "orders": change.orders.len(), "lines": change.lines.len(),
-            }),
-            Self::Rf2(keys) => json!({"refresh": number, "phase": "rf2", "order_keys": keys.len()}),
+    /// The row counts of a refresh's input, for the report.
+    fn summary(transactions: &[Self], number: usize) -> Value {
+        let (mut orders, mut lines, mut keys) = (0, 0, 0);
+        for transaction in transactions {
+            match transaction {
+                Self::Rf1(change) => {
+                    orders += change.orders.len();
+                    lines += change.lines.len();
+                }
+                Self::Rf2(order_keys) => keys += order_keys.len(),
+            }
         }
+        match transactions.first() {
+            Some(Self::Rf2(_)) => json!({"refresh": number, "phase": "rf2", "order_keys": keys,
+                "transactions": transactions.len()}),
+            _ => json!({"refresh": number, "phase": "rf1", "orders": orders, "lines": lines,
+                "transactions": transactions.len()}),
+        }
+    }
+}
+
+/// The Order count of each transaction of `refresh`, which holds `orders` Orders: its
+/// `transaction_orders`, which must be positive and cover them exactly, or one transaction.
+fn transaction_counts(refresh: &Refresh, orders: usize) -> Result<Vec<usize>> {
+    let Some(counts) = &refresh.transaction_orders else {
+        return Ok(vec![orders]);
+    };
+    if counts.is_empty() || counts.contains(&0) {
+        bail!("transaction_orders must be a non-empty list of positive counts");
+    }
+    let covered: usize = counts.iter().sum();
+    if covered != orders {
+        bail!("transaction_orders cover {covered} Orders, but the refresh holds {orders}");
+    }
+    Ok(counts.clone())
+}
+
+/// Each transaction's latency in a refresh (measurement version 14): the foreground wall time
+/// (`total`, the per-transaction counterpart of a refresh's `foreground_ms`), and its base and
+/// IVM phases (`base_ms` and `ivm_ms` of one transaction).
+struct TransactionLatencies {
+    total: Vec<Duration>,
+    base: Vec<Duration>,
+    ivm: Vec<Duration>,
+}
+
+impl TransactionLatencies {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            total: Vec::with_capacity(capacity),
+            base: Vec::with_capacity(capacity),
+            ivm: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, total: Duration, base: Duration, ivm: Duration) {
+        self.total.push(total);
+        self.base.push(base);
+        self.ivm.push(ivm);
+    }
+
+    /// Percentiles (nearest rank) and the per-transaction values, in milliseconds.
+    fn json(&self) -> Value {
+        let measure = |values: &[Duration]| {
+            let milliseconds: Vec<f64> = values.iter().copied().map(milliseconds).collect();
+            let mut sorted = milliseconds.clone();
+            sorted.sort_by(f64::total_cmp);
+            let rank = |percent: usize| {
+                sorted
+                    .get((sorted.len() * percent).div_ceil(100).saturating_sub(1))
+                    .copied()
+            };
+            json!({
+                "p50": rank(50), "p95": rank(95), "p99": rank(99), "max": sorted.last(),
+                "mean": (!sorted.is_empty()).then(|| sorted.iter().sum::<f64>() / sorted.len() as f64),
+                "values": milliseconds,
+            })
+        };
+        json!({
+            "transactions": self.total.len(),
+            "total_ms": measure(&self.total),
+            "base_ms": measure(&self.base),
+            "ivm_ms": measure(&self.ivm),
+            "note": "One entry per transaction of this refresh, in order. total_ms is the transaction's foreground wall time (discovery, the base and view transactions, cleanup; validation excluded), so the refresh's foreground_ms is their sum plus the refresh's own bookkeeping. base_ms and ivm_ms are the transaction's base_ms and ivm_ms. Percentiles are nearest-rank.",
+        })
     }
 }
 
@@ -1638,6 +1748,7 @@ fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
                 rf1_orders: config.rf1_orders.clone(),
                 rf1_lines: config.rf1_lines.clone(),
                 rf2: None,
+                transaction_orders: None,
             });
         }
         if config.rf2.is_some() {
@@ -1645,6 +1756,7 @@ fn refreshes(config: &Config) -> Result<Vec<Refresh>> {
                 rf1_orders: None,
                 rf1_lines: None,
                 rf2: config.rf2.clone(),
+                transaction_orders: None,
             });
         }
         list
@@ -2270,9 +2382,11 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             let started = Instant::now();
             let refreshes = refresh_list_at(list)?;
             for refresh in &refreshes {
-                let (change, ..) = refresh_change(&pipeline, &base, PreparedRefresh::read(refresh)?)?;
-                transact_inner(&mut pipeline, None, change, Some((&base, false)), &mut Measurements::default())?;
-                base = workload::BaseState::new(&pipeline.base.catalog)?;
+                for prepared in PreparedRefresh::read(refresh)? {
+                    let (change, ..) = refresh_change(&pipeline, &base, prepared)?;
+                    transact_inner(&mut pipeline, None, change, Some((&base, false)), &mut Measurements::default())?;
+                    base = workload::BaseState::new(&pipeline.base.catalog)?;
+                }
             }
             json!({"refresh_list": list, "refreshes": refreshes.len(), "elapsed_ms": milliseconds(started.elapsed())})
         }
@@ -2290,7 +2404,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         "per_refresh": prepared_refreshes
             .iter()
             .enumerate()
-            .map(|(index, prepared)| prepared.summary(index + 1))
+            .map(|(index, prepared)| PreparedRefresh::summary(prepared, index + 1))
             .collect::<Vec<_>>(),
         "vm_rss_before_pre_read_bytes": rss_before_pre_read,
         "vm_rss_after_pre_read_bytes": window_memory::current_rss_bytes(),
@@ -2340,43 +2454,65 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     let mut sequence_driver_expansions = [BlockExpansions::default(); Component::ALL.len()];
     #[cfg(feature = "merged-index")]
     let mut sequence_upkeep_expansions = BlockExpansions::default();
-    for (number, prepared) in prepared_refreshes.into_iter().enumerate() {
+    for (number, transactions) in prepared_refreshes.into_iter().enumerate() {
+        // The resource, pressure and window-evidence samples are taken around the refresh, not
+        // around each of its transactions, so a refresh cut into small transactions does not
+        // pay them per transaction (measurement version 14).
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let phase_started = Instant::now();
         let mut measurement = Measurements::default();
-        // Discovery is the RF2 lookup alone: the keys were read before the window.
-        let (change, absent, phase, discovered) = refresh_change(&pipeline, &base, prepared)?;
-        if discovered {
-            measurement.discovery += phase_started.elapsed();
-        }
-        let workload_stats_started = Instant::now();
-        let customers: HashSet<_> = change
-            .orders
-            .iter()
-            .map(|(order, _)| order.customer_key)
-            .collect();
-        let order_count = change.orders.len();
+        let mut customers = HashSet::new();
         let mut fanout = HashMap::<i64, usize>::new();
-        for (line, _) in &change.lines {
-            *fanout.entry(line.order_key).or_default() += 1;
+        let (mut order_count, mut line_count, mut absent) = (0, 0, 0);
+        let mut phase = "rf1";
+        let mut latencies = TransactionLatencies::with_capacity(transactions.len());
+        for prepared in transactions {
+            let transaction_started = Instant::now();
+            let (base_before, ivm_before, verification_before) = (
+                measurement.base_phase(),
+                measurement.ivm_phase(),
+                measurement.verification,
+            );
+            // Discovery is the RF2 lookup alone: the keys were read before the window.
+            let (change, transaction_absent, transaction_phase, discovered) =
+                refresh_change(&pipeline, &base, prepared)?;
+            if discovered {
+                measurement.discovery += transaction_started.elapsed();
+            }
+            let workload_stats_started = Instant::now();
+            customers.extend(change.orders.iter().map(|(order, _)| order.customer_key));
+            order_count += change.orders.len();
+            for (line, _) in &change.lines {
+                *fanout.entry(line.order_key).or_default() += 1;
+            }
+            line_count += change.lines.len();
+            measurement.preparation += workload_stats_started.elapsed();
+            transact_inner(
+                &mut pipeline,
+                state.as_mut(),
+                change,
+                Some((&base, discovered)),
+                &mut measurement,
+            )?;
+            let cleanup_started = Instant::now();
+            base = workload::BaseState::new(&pipeline.base.catalog)?;
+            measurement.publication_cleanup += cleanup_started.elapsed();
+            absent += transaction_absent;
+            phase = transaction_phase;
+            // A transaction's latency is its foreground wall time, as a whole refresh's is.
+            latencies.push(
+                transaction_started
+                    .elapsed()
+                    .saturating_sub(measurement.verification - verification_before),
+                measurement.base_phase() - base_before,
+                measurement.ivm_phase() - ivm_before,
+            );
         }
-        let line_count = change.lines.len();
         let customer_count = customers.len();
         let maximum_fanout = fanout.values().max().copied().unwrap_or(0);
-        measurement.preparation += workload_stats_started.elapsed();
-        transact_inner(
-            &mut pipeline,
-            state.as_mut(),
-            change,
-            Some((&base, discovered)),
-            &mut measurement,
-        )?;
-        let cleanup_started = Instant::now();
-        base = workload::BaseState::new(&pipeline.base.catalog)?;
         drop(customers);
         drop(fanout);
-        measurement.publication_cleanup += cleanup_started.elapsed();
-        // Wall time covers discovery, the transaction and all foreground cleanup; the refresh
+        // Wall time covers discovery, the transactions and all foreground cleanup; the refresh
         // files were read before the window.
         let phase_finished = Instant::now();
         measurement.foreground = phase_finished
@@ -2397,6 +2533,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "before": std::mem::replace(&mut memory_pressure_before, memory_pressure_after.clone()),
             "after": memory_pressure_after,
         });
+        report["transaction_latency"] = latencies.json();
         report["absent_orders"] = json!(absent);
         report["affected_customers"] = json!(customer_count);
         report["affected_orders"] = json!(order_count);
@@ -2535,7 +2672,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 13,
+        "measurement_version": 14,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -3570,6 +3707,193 @@ mod measurement_tests {
     /// reports the same refreshes as the single-process driver on the same inputs. A refresh
     /// program with other storage settings refuses the image.
     #[test]
+    fn a_refresh_cut_into_transactions_reads_each_file_once_and_keeps_orders_whole() -> Result<()> {
+        let directory = directory()?;
+        let order = |key: i64| format!("{key}|1|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n");
+        let line = |key: i64, number: i64| {
+            format!(
+                "{key}|2|3|{number}|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n"
+            )
+        };
+        std::fs::write(
+            directory.join("orders.tbl"),
+            [101, 102, 103].map(order).concat(),
+        )?;
+        std::fs::write(
+            directory.join("lines.tbl"),
+            [line(101, 1), line(102, 1), line(102, 2), line(103, 1)].concat(),
+        )?;
+        std::fs::write(directory.join("delete.tbl"), "7|\n8|\n9|\n")?;
+        let refresh = |counts: Option<Vec<usize>>| Refresh {
+            rf1_orders: Some(directory.join("orders.tbl")),
+            rf1_lines: Some(directory.join("lines.tbl")),
+            rf2: None,
+            transaction_orders: counts,
+        };
+        let sizes = |prepared: Vec<PreparedRefresh>| -> Vec<(Vec<i64>, Vec<i64>)> {
+            prepared
+                .into_iter()
+                .map(|transaction| match transaction {
+                    PreparedRefresh::Rf1(change) => (
+                        change.orders.iter().map(|(order, _)| order.key).collect(),
+                        change
+                            .lines
+                            .iter()
+                            .map(|(line, _)| line.order_key)
+                            .collect(),
+                    ),
+                    PreparedRefresh::Rf2(_) => panic!("an RF1 refresh gave an RF2 transaction"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            sizes(PreparedRefresh::read(&refresh(Some(vec![2, 1])))?),
+            vec![
+                (vec![101, 102], vec![101, 102, 102]),
+                (vec![103], vec![103])
+            ]
+        );
+        assert_eq!(
+            sizes(PreparedRefresh::read(&refresh(None))?),
+            vec![(vec![101, 102, 103], vec![101, 102, 102, 103])]
+        );
+        for counts in [vec![2], vec![2, 2], vec![3, 0], vec![]] {
+            let error = PreparedRefresh::read(&refresh(Some(counts.clone())))
+                .err()
+                .with_context(|| format!("{counts:?} was accepted"))?;
+            assert!(error.to_string().contains("transaction_orders"), "{error}");
+        }
+        // A Lineitem whose Order is not in the cut refresh belongs to no transaction.
+        std::fs::write(
+            directory.join("lines.tbl"),
+            [line(101, 1), line(104, 1)].concat(),
+        )?;
+        let error = PreparedRefresh::read(&refresh(Some(vec![3])))
+            .err()
+            .context("an orphan Lineitem was accepted")?;
+        assert!(
+            error.to_string().contains("belongs to no transaction"),
+            "{error}"
+        );
+        let rf2 = Refresh {
+            rf1_orders: None,
+            rf1_lines: None,
+            rf2: Some(directory.join("delete.tbl")),
+            transaction_orders: Some(vec![1, 2]),
+        };
+        let keys: Vec<Vec<i64>> = PreparedRefresh::read(&rf2)?
+            .into_iter()
+            .map(|transaction| match transaction {
+                PreparedRefresh::Rf2(keys) => {
+                    let mut keys: Vec<i64> = keys.into_iter().collect();
+                    keys.sort();
+                    keys
+                }
+                PreparedRefresh::Rf1(_) => panic!("an RF2 refresh gave an RF1 transaction"),
+            })
+            .collect();
+        assert_eq!(keys, vec![vec![7], vec![8, 9]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_cut_into_transactions_is_verified_after_each_one_and_timed_per_transaction(
+    ) -> Result<()> {
+        let directory = directory()?;
+        let customers = directory.join("customer.tbl");
+        let orders = directory.join("orders.tbl");
+        let lines = directory.join("lineitem.tbl");
+        std::fs::write(
+            &customers,
+            "1|n|a|1|p|1.00|BUILDING|comment|\n2|n|a|1|p|1.00|BUILDING|comment|\n",
+        )?;
+        let order = |key: i64, customer: i64| {
+            format!("{key}|{customer}|O|1.00|1996-02-29|5-LOW|Clerk|0|c|\n")
+        };
+        let line = |key: i64, number: i64| {
+            format!(
+                "{key}|2|3|{number}|5|1.00|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|i|m|c|\n"
+            )
+        };
+        let keys: Vec<i64> = (1..=20).collect();
+        std::fs::write(
+            &orders,
+            keys.iter()
+                .map(|&key| order(key, 1 + key % 2))
+                .collect::<String>(),
+        )?;
+        std::fs::write(
+            &lines,
+            keys.iter().map(|&key| line(key, 1)).collect::<String>(),
+        )?;
+        std::fs::write(
+            directory.join("insert-orders.tbl"),
+            (101..=105)
+                .map(|key| order(key, 1 + key % 2))
+                .collect::<String>(),
+        )?;
+        std::fs::write(
+            directory.join("insert-lines.tbl"),
+            (101..=105)
+                .flat_map(|key| (1..=1 + key % 2).map(move |number| line(key, number)))
+                .collect::<String>(),
+        )?;
+        std::fs::write(directory.join("delete.tbl"), "2|\n3|\n4|\n5|\n")?;
+        let list = directory.join("refreshes.json");
+        std::fs::write(
+            &list,
+            serde_json::to_vec(&json!([
+                {"rf1_orders": "insert-orders.tbl", "rf1_lines": "insert-lines.tbl",
+                 "transaction_orders": [2, 1, 2]},
+                {"rf2": "delete.tbl", "transaction_orders": [3, 1]}
+            ]))?,
+        )?;
+        let report = directory.join("report.json");
+        // Independent validation checks V's delta against the reference after every transaction.
+        run(
+            &Config {
+                customer: Some(customers),
+                orders: Some(orders),
+                lineitem: Some(lines),
+                refresh_list: Some(list),
+                report: Some(report.clone()),
+                storage_path: Some(directory.join("storage")),
+                workers: 1,
+                runs: 1,
+                batch: 8,
+                cache_bytes: Some(8 * 1024 * 1024),
+                compaction_timeout_secs: 30.0,
+                verify: true,
+                ..Config::default()
+            },
+            1,
+        )?;
+        let output: Value = serde_json::from_reader(File::open(&report)?)?;
+        let refreshes = output["refreshes"].as_array().context("refreshes")?;
+        for (refresh, phase, transactions) in [(&refreshes[0], "rf1", 3), (&refreshes[1], "rf2", 2)]
+        {
+            assert_eq!(refresh["phase"], phase);
+            assert_eq!(refresh["transactions"], transactions);
+            let latency = &refresh["transaction_latency"];
+            assert_eq!(latency["transactions"], transactions);
+            for field in ["total_ms", "base_ms", "ivm_ms"] {
+                let values = latency[field]["values"].as_array().context("values")?;
+                assert_eq!(values.len(), transactions, "{field}");
+                let max = latency[field]["max"].as_f64().context("max")?;
+                assert!(
+                    values.iter().all(|value| value.as_f64().unwrap() <= max),
+                    "{field}"
+                );
+                assert!(latency[field]["p50"].as_f64().unwrap() <= max, "{field}");
+            }
+        }
+        assert_eq!(refreshes[0]["affected_orders"], 5);
+        assert_eq!(refreshes[1]["affected_orders"], 4);
+        assert_eq!(refreshes[1]["absent_orders"], 0);
+        Ok(())
+    }
+
+    #[test]
     fn a_refresh_program_from_an_image_matches_the_single_process_driver() -> Result<()> {
         let directory = directory()?;
         let customers = directory.join("customer.tbl");
@@ -3671,7 +3995,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 13);
+        assert_eq!(output["measurement_version"], 14);
         // The original image is untouched by the refreshes of its copy.
         assert_eq!(
             ImageManifest::read(&image)?.checkpoint.uuid,
@@ -3810,7 +4134,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 13);
+        assert_eq!(output["measurement_version"], 14);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
