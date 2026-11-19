@@ -15,6 +15,7 @@ use feldera_types::program_schema::SqlIdentifier;
 use serde_json::Value;
 
 use crate::data::{Line, Order};
+#[cfg(test)]
 use crate::workload::{parse_customer, parse_line, parse_order, weighted_rows};
 #[cfg(test)]
 use crate::Reference;

@@ -2,6 +2,7 @@
 //! `measure.py`'s `IMAGE_SOURCE_PATHS`); the base tables' state for the refreshes is in
 //! `base_state`.
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Lines};
