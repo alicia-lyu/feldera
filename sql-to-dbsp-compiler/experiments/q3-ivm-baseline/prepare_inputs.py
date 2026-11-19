@@ -73,6 +73,31 @@ distinct RF1 Customers (`rf1_distinct_customers`), the number of RF1 Orders held
 by the 1, 10 and 100 most popular Customers of that pair
 (`rf1_top_customer_orders`), and the transactions' sizes.
 
+Order keys (`--order-keys`, decision of 2026-11-19). The selection above always
+works on dbgen's keys: RF2 takes the oldest Orders, which are the lowest dbgen
+keys, and RF1 Orders arrive in their update set's file order. The scheme then
+decides which key each Order carries in the files written:
+
+- dbgen (default): dbgen's keys, unchanged. RF1 keys fill the gaps of the low
+  range that RF2 deletes from (dbgen's `mk_sparse`).
+- sequence: a database sequence. Base Orders get 1..N in key order, so the
+  oldest Orders keep the lowest keys, and RF1 Orders get N+1, N+2, ... in
+  arrival order (update set 1 first, then 2, ...).
+- uuid: a random key per Order, as with UUIDv4 primary keys (CockroachDB,
+  Spanner, PostgreSQL's `gen_random_uuid()`), but kept to a positive BIGINT so
+  both modes keep 8-byte keys. Keys are drawn from
+  `random.Random(f"{seed}:uuid-keys")`, base Orders first in file order, then RF1
+  in arrival order; a key already drawn is redrawn, as a unique index would reject
+  it and the client retry, and the manifest counts the redraws.
+
+With sequence and uuid the base tables change too, so `<out>/base/` gets the
+re-keyed `orders.tbl` and `lineitem.tbl` (sorted by the new key, as the loader
+requires; uuid sorts with the system `sort`) and a copy of `customer.tbl`. Load
+the images from those files. RF1 and RF2 files keep their order: RF1 in arrival
+order, RF2 oldest first, so uuid files are not sorted by key. The manifest's
+`refresh_base` gives the base files the refreshes belong to, which
+`measure.py --images` checks against the images.
+
 Equal seeds and inputs give byte-identical outputs on one Python version.
 """
 
@@ -83,7 +108,10 @@ from collections import Counter
 from itertools import islice
 from pathlib import Path
 import json
+import os
 import random
+import shutil
+import subprocess
 import sys
 from typing import Any, Callable, Iterable, Iterator
 
@@ -97,6 +125,9 @@ NURAND_A = 1023
 NURAND_BLOCK = 3000
 DEFAULT_ORDERS_PER_SESSION = 4
 BASE_FILES = {"customer": "customer.tbl", "orders": "orders.tbl", "lineitem": "lineitem.tbl"}
+ORDER_KEY_SCHEMES = ("dbgen", "sequence", "uuid")
+# The largest positive BIGINT: random keys keep the schema's 8-byte o_orderkey.
+RANDOM_KEY_LIMIT = 2**63 - 1
 
 
 class InputError(ValueError):
@@ -132,6 +163,127 @@ def order_customer(row: bytes, path: Path) -> int:
 def with_customer(order_row: bytes, customer_key: int) -> bytes:
     key, _, rest = order_row.split(b"|", 2)
     return b"|".join((key, str(customer_key).encode(), rest))
+
+
+def with_order_key(row: bytes, key: int) -> bytes:
+    """`row` (an Order or a Lineitem) with its first field, the Order key, replaced."""
+    _, rest = row.split(b"|", 1)
+    return str(key).encode() + b"|" + rest
+
+
+def draw_random_key(generator: random.Random) -> int:
+    """One uuid-scheme key: uniform over the positive BIGINTs."""
+    return generator.randint(1, RANDOM_KEY_LIMIT)
+
+
+class OrderKeys:
+    """The key each dbgen Order key becomes under one scheme of `ORDER_KEY_SCHEMES`.
+
+    `mapping` covers every key the refreshes use (all keys for uuid); `None` is the
+    identity. Base files are rewritten by `write_rekeyed_base`.
+    """
+
+    def __init__(self, scheme: str, mapping: dict[int, int] | None, redraws: int = 0) -> None:
+        self.scheme = scheme
+        self.mapping = mapping
+        self.redraws = redraws
+
+    def __call__(self, key: int) -> int:
+        return key if self.mapping is None else self.mapping[key]
+
+
+def assign_order_keys(scheme: str, base_orders: Path, order_count: int,
+                      oldest_keys: list[int], rf1_arrival: list[int], seed: int) -> OrderKeys:
+    """Build the key assignment of `scheme` for the base Orders and the RF1 Orders.
+
+    `oldest_keys` are the RF2 candidates (the lowest dbgen keys, ascending) and
+    `rf1_arrival` every RF1 key in arrival order.
+    """
+    if scheme == "dbgen":
+        return OrderKeys(scheme, None)
+    if scheme == "sequence":
+        # The oldest Orders are the file's first rows, so their rank is their position.
+        mapping = {key: rank for rank, key in enumerate(oldest_keys, start=1)}
+        mapping.update({key: order_count + rank for rank, key in enumerate(rf1_arrival, start=1)})
+        return OrderKeys(scheme, mapping)
+    if scheme != "uuid":
+        raise InputError(f"unknown --order-keys {scheme!r}; choose one of {ORDER_KEY_SCHEMES}")
+    generator = random.Random(f"{seed}:uuid-keys")
+    mapping, used, redraws = {}, set(), 0
+
+    def draw() -> int:
+        nonlocal redraws
+        key = draw_random_key(generator)
+        while key in used:
+            redraws += 1
+            key = draw_random_key(generator)
+        used.add(key)
+        return key
+
+    for row in tbl_rows(base_orders):
+        mapping[order_key(row, base_orders)] = draw()
+    for key in rf1_arrival:
+        mapping[key] = draw()
+    return OrderKeys(scheme, mapping, redraws)
+
+
+def sort_by_order_key(source: Path, target: Path, scratch: Path) -> None:
+    """Sort a `.tbl` file numerically by its first field with the system `sort`, keeping the
+    file order of rows with equal keys (a Lineitem group stays in its order)."""
+    command = ["sort", "-s", "-t", "|", "-k1,1n", "-T", str(scratch), "-o", str(target)]
+    version = subprocess.run(["sort", "--version"], capture_output=True, text=True)
+    if "GNU" in version.stdout:
+        command[1:1] = ["-S", "25%"]
+    subprocess.run([*command, str(source)], check=True, env={**os.environ, "LC_ALL": "C"})
+
+
+def check_grouped_ascending(path: Path) -> None:
+    """Fail unless the Order keys of `path` ascend, with equal keys contiguous."""
+    previous = None
+    for row in tbl_rows(path):
+        key = order_key(row, path)
+        if previous is not None and key < previous:
+            raise InputError(f"{path}: re-keyed rows do not ascend (at {key})")
+        previous = key
+
+
+def write_rekeyed_base(base_paths: dict[str, Path], keys: OrderKeys, target: Path
+                       ) -> dict[str, Path]:
+    """Write the base tables under `keys` into `target`; return their paths."""
+    target.mkdir(parents=True)
+    paths = {name: target / file for name, file in BASE_FILES.items()}
+    shutil.copyfile(base_paths["customer"], paths["customer"])
+    orders_in, lines_in = base_paths["orders"], base_paths["lineitem"]
+    if keys.scheme == "sequence":
+        # Ranks preserve order, so the rows keep their order and need no sort. Lineitems are
+        # grouped in ascending Order key, so walking the Orders alongside gives each its rank.
+        write_rows(paths["orders"], (with_order_key(row, rank)
+                                     for rank, row in enumerate(tbl_rows(orders_in), start=1)))
+
+        def ranked_lines() -> Iterator[bytes]:
+            orders = (order_key(row, orders_in) for row in tbl_rows(orders_in))
+            current, rank = None, 0
+            for row in tbl_rows(lines_in):
+                key = order_key(row, lines_in)
+                while current != key:
+                    current = next(orders, None)
+                    rank += 1
+                    if current is None or current > key:
+                        raise InputError(f"{lines_in}: Lineitem of Order {key} is out of "
+                                         f"order or has no base Order")
+                yield with_order_key(row, rank)
+
+        write_rows(paths["lineitem"], ranked_lines())
+    else:
+        for name, source in (("orders", orders_in), ("lineitem", lines_in)):
+            unsorted = target / f"{BASE_FILES[name]}.unsorted"
+            write_rows(unsorted, (with_order_key(row, keys(order_key(row, source)))
+                                  for row in tbl_rows(source)))
+            sort_by_order_key(unsorted, paths[name], target)
+            unsorted.unlink()
+    for name in ("orders", "lineitem"):
+        check_grouped_ascending(paths[name])
+    return paths
 
 
 def read_update_set(updates: Path, number: int) -> tuple[list[bytes], list[bytes]]:
@@ -299,8 +451,10 @@ def top_customer_orders(customers: list[int], tops: tuple[int, ...] = (1, 10, 10
     return {str(n): sum(counts[:n]) for n in tops}
 
 
-def write_workload(directory: Path, pairs: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Write one workload's files and refreshes.json; return the refresh list."""
+def write_workload(directory: Path, pairs: list[dict[str, Any]],
+                   keys: OrderKeys) -> list[dict[str, str]]:
+    """Write one workload's files and refreshes.json, with Order keys under `keys`; return the
+    refresh list. RF2 keys are written oldest first, the order their transactions take."""
     directory.mkdir(parents=True, exist_ok=False)
     refreshes: list[dict[str, str]] = []
     for pair in pairs:
@@ -309,11 +463,11 @@ def write_workload(directory: Path, pairs: list[dict[str, Any]]) -> list[dict[st
         lines_file = f"rf1-lines-{number}.tbl"
         delete_file = f"rf2-delete-{number}.tbl"
         write_rows(directory / orders_file,
-                   (with_customer(row, customer)
+                   (with_customer(with_order_key(row, keys(order_key(row, directory))), customer)
                     for row, customer in zip(pair["orders"], pair["rf1_customers"])))
-        write_rows(directory / lines_file, pair["lines"])
-        write_rows(directory / delete_file,
-                   (str(key).encode() for key in sorted(pair["rf2_keys"])))
+        write_rows(directory / lines_file,
+                   (with_order_key(row, keys(order_key(row, directory))) for row in pair["lines"]))
+        write_rows(directory / delete_file, (str(keys(key)).encode() for key in pair["rf2_keys"]))
         rf1: dict[str, Any] = {"rf1_orders": orders_file, "rf1_lines": lines_file}
         rf2: dict[str, Any] = {"rf2": delete_file}
         if pair["cut"]:
@@ -359,31 +513,37 @@ def describe_pair(pair: dict[str, Any]) -> dict[str, Any]:
 
 def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
             warm_up: bool = False, transaction_rows: int | None = None,
-            orders_per_session: int = DEFAULT_ORDERS_PER_SESSION) -> dict[str, Any]:
+            orders_per_session: int = DEFAULT_ORDERS_PER_SESSION,
+            order_keys: str = "dbgen") -> dict[str, Any]:
     if pair_count < 1:
         raise InputError("--pairs must be at least 1")
     if transaction_rows is not None and transaction_rows < 1:
         raise InputError(f"--transaction-rows must be positive, got {transaction_rows}")
     if orders_per_session < 1:
         raise InputError(f"--orders-per-session must be positive, got {orders_per_session}")
+    if order_keys not in ORDER_KEY_SCHEMES:
+        raise InputError(f"unknown --order-keys {order_keys!r}; choose one of {ORDER_KEY_SCHEMES}")
     base_paths = {name: base / file for name, file in BASE_FILES.items()}
     for path in base_paths.values():
         if not path.is_file():
             raise InputError(f"missing dbgen base file {path}")
-    for workload in WORKLOADS:
-        if (out / workload).exists():
-            raise InputError(f"{out / workload} already exists; use a fresh --out")
+    for directory in (*WORKLOADS, "base"):
+        if (out / directory).exists():
+            raise InputError(f"{out / directory} already exists; use a fresh --out")
 
     # The warm-up pair, if any, is one more pair after the measured ones, so the measured
     # pairs do not depend on it.
     set_count = pair_count + (1 if warm_up else 0)
     update_sets = [read_update_set(updates, number) for number in range(1, set_count + 1)]
     rf1_keys: set[int] = set()
+    rf1_arrival: list[int] = []
     for number, (orders, _) in enumerate(update_sets, start=1):
-        keys = {order_key(row, updates / f"orders.tbl.u{number}") for row in orders}
+        arrival = [order_key(row, updates / f"orders.tbl.u{number}") for row in orders]
+        keys = set(arrival)
         if keys & rf1_keys:
             raise InputError(f"update set {number} repeats an Order key of an earlier set")
         rf1_keys |= keys
+        rf1_arrival.extend(arrival)
     sizes = [len(orders) for orders, _ in update_sets]
     needed = sum(sizes)
 
@@ -395,6 +555,8 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
 
     oldest = oldest_orders(base_paths["orders"], needed)
     deleted_lines = base_line_counts(base_paths["lineitem"], [key for _, key in oldest])
+    keys = assign_order_keys(order_keys, base_paths["orders"], order_count,
+                             [key for _, key in oldest], rf1_arrival, seed)
 
     eligible = eligible_customers(customers)
     nurand_c = random.Random(f"{seed}:clustered-nurand-c").randint(0, NURAND_A)
@@ -435,6 +597,17 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     }
     for name, path in base_paths.items():
         manifest["inputs"][name] = {"path": str(path), **file_record(path)}
+    refresh_base = base_paths if keys.mapping is None else write_rekeyed_base(
+        base_paths, keys, out / "base")
+    manifest["refresh_base"] = {name: {"path": str(path), **file_record(path)}
+                                for name, path in refresh_base.items()}
+    rf1_new = [keys(key) for key in rf1_arrival]
+    rf2_new = [keys(key) for _, key in oldest]
+    manifest["order_keys"] = {
+        "scheme": order_keys, "redraws": keys.redraws,
+        "rf1_key_min": min(rf1_new), "rf1_key_max": max(rf1_new),
+        "rf2_key_min": min(rf2_new), "rf2_key_max": max(rf2_new),
+    }
     for number in range(1, set_count + 1):
         for table in ("orders", "lineitem"):
             path = updates / f"{table}.tbl.u{number}"
@@ -442,14 +615,14 @@ def prepare(base: Path, updates: Path, out: Path, seed: int, pair_count: int,
     for name in WORKLOADS:
         directory = out / name
         measured, warming = workloads[name][:pair_count], workloads[name][pair_count:]
-        write_workload(directory, measured)
+        write_workload(directory, measured, keys)
         manifest["workloads"][name] = {
             "pairs": [describe_pair(pair) for pair in measured],
             "files": {path.name: file_record(path)
                       for path in sorted(directory.iterdir()) if path.is_file()},
         }
         if warming:
-            write_workload(directory / "warm-up", warming)
+            write_workload(directory / "warm-up", warming, keys)
             manifest["workloads"][name]["warm_up"] = {
                 "pairs": [describe_pair(pair) for pair in warming],
                 "files": {path.name: file_record(path)
@@ -468,7 +641,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", type=Path, required=True,
                         help="new directory for clustered/, scattered/ and prepare-manifest.json")
     parser.add_argument("--seed", type=int, required=True,
-                        help="seed of the scattered RF2 sample and of both RF1 remappings")
+                        help="seed of both RF1 Customer remappings and of the uuid keys")
     parser.add_argument("--pairs", type=int, default=3, help="RF1/RF2 pairs per workload")
     parser.add_argument("--transaction-rows", type=int,
                         help="cut every RF1 and RF2 set into transactions of about this many "
@@ -477,6 +650,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--orders-per-session", type=int, default=DEFAULT_ORDERS_PER_SESSION,
                         help="clustered: Orders each drawn Customer gets within a transaction "
                              f"(default {DEFAULT_ORDERS_PER_SESSION})")
+    parser.add_argument("--order-keys", choices=ORDER_KEY_SCHEMES, default="dbgen",
+                        help="the Order keys the files carry (default dbgen): dbgen's own, a "
+                             "dense sequence, or random uuid-like keys; sequence and uuid also "
+                             "write re-keyed base tables into <out>/base/")
     parser.add_argument("--warm-up", action="store_true",
                         help="also write one warm-up pair per workload, from update set "
                              "pairs + 1, into <workload>/warm-up/")
@@ -487,7 +664,8 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         manifest = prepare(args.base, args.updates, args.out, args.seed, args.pairs,
-                           args.warm_up, args.transaction_rows, args.orders_per_session)
+                           args.warm_up, args.transaction_rows, args.orders_per_session,
+                           args.order_keys)
     except (InputError, OSError) as error:
         print(f"prepare_inputs: {error}", file=sys.stderr)
         return 1

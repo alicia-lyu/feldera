@@ -1437,5 +1437,49 @@ class MeasureTest(unittest.TestCase):
         self.assertTrue(any("front_coding.layout_fallbacks is 1" in p for p in problems))
 
 
+class RefreshBaseTest(unittest.TestCase):
+    """`--images` refuses refreshes prepared for other base tables (`refresh_base_problems`)."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.out = Path(self.temporary.name) / "inputs"
+        (self.out / "clustered" / "warm-up").mkdir(parents=True)
+        self.refreshes = self.out / "clustered" / "refreshes.json"
+        self.warm_up = self.out / "clustered" / "warm-up" / "refreshes.json"
+        for path in (self.refreshes, self.warm_up):
+            path.write_text("[]")
+
+    @staticmethod
+    def files(digest: str) -> dict[str, dict[str, str]]:
+        return {name: {"path": f"/base/{name}.tbl", "sha256": f"{digest}-{name}"}
+                for name in ("customer", "orders", "lineitem")}
+
+    def write_manifest(self, **fields: object) -> None:
+        (self.out / measure.PREPARE_MANIFEST).write_text(json.dumps(fields))
+
+    def test_refreshes_of_the_images_base_pass_from_the_list_and_the_warm_up(self) -> None:
+        self.write_manifest(inputs=self.files("dbgen"), refresh_base=self.files("uuid"))
+        for refresh_list in (self.refreshes, self.warm_up):
+            self.assertEqual(measure.refresh_base_problems(refresh_list, self.files("uuid")), [])
+            self.assertEqual(measure.prepare_manifest_for(refresh_list),
+                             (self.out / measure.PREPARE_MANIFEST).resolve())
+
+    def test_refreshes_of_another_base_are_refused(self) -> None:
+        self.write_manifest(inputs=self.files("dbgen"), refresh_base=self.files("uuid"))
+        problems = measure.refresh_base_problems(self.refreshes, self.files("dbgen"))
+        self.assertEqual(len(problems), 3)
+        self.assertIn("orders", " ".join(problems))
+
+    def test_a_manifest_without_refresh_base_names_its_dbgen_inputs(self) -> None:
+        self.write_manifest(inputs=self.files("dbgen"))
+        self.assertEqual(measure.refresh_base_problems(self.refreshes, self.files("dbgen")), [])
+        self.assertTrue(measure.refresh_base_problems(self.refreshes, self.files("uuid")))
+
+    def test_a_hand_made_list_has_no_manifest_to_check(self) -> None:
+        self.assertIsNone(measure.prepare_manifest_for(self.refreshes))
+        self.assertEqual(measure.refresh_base_problems(self.refreshes, self.files("dbgen")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

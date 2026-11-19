@@ -195,6 +195,18 @@ done
 transactions, then all of RF2 1, and so on (decision of 2026-11-17). Without the option each set is
 one transaction, the TPC-H batch. Each size gets its own `--out`; the images serve every size.
 
+`--order-keys dbgen|sequence|uuid` (default `dbgen`) chooses the Order keys the files carry (decision
+of 2026-11-19). `sequence` and `uuid` also write re-keyed base tables into `<out>/base/`; build that
+arm's images from them (`--customer`, `--orders`, `--lineitem` pointing there), and give each arm its
+own images directory. `uuid` sorts the base files with the system `sort` (GNU `sort -S 25%`), so
+`<out>` needs room for about twice `lineitem.tbl`. A campaign with `--images` refuses refreshes
+prepared for other base files. One arm at one transaction size:
+
+```bash
+python3 prepare_inputs.py --base "$DBGEN_OUT" --updates "$DBGEN_OUT" --out "$R5_INPUTS/uuid-k10" \
+  --seed 1 --pairs 3 --warm-up --transaction-rows 10 --order-keys uuid
+```
+
 `--warm-up` also writes `<workload>/warm-up/` (pair 4, from update set 4, with its own
 `refreshes.json`) for the refresh program's optional warm-up. The measured pairs are the same with
 or without it.

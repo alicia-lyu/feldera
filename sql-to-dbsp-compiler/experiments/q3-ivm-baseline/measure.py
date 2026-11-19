@@ -1290,6 +1290,36 @@ def read_images(root: Path) -> dict[str, Any]:
     return manifest
 
 
+PREPARE_MANIFEST = "prepare-manifest.json"
+
+
+def prepare_manifest_for(refresh_list: Path) -> Path | None:
+    """The `prepare_inputs.py` manifest of a refresh list: `<out>/<workload>/refreshes.json` or
+    `<out>/<workload>/warm-up/refreshes.json` has it at `<out>`. None for a hand-made list."""
+    for directory in list(refresh_list.resolve().parents)[:3]:
+        if (directory / PREPARE_MANIFEST).is_file():
+            return directory / PREPARE_MANIFEST
+    return None
+
+
+def refresh_base_problems(refresh_list: Path, image_inputs: dict[str, Any]) -> list[str]:
+    """Why the refreshes in `refresh_list` do not belong to the base tables the images loaded.
+
+    The refreshes of one `--order-keys` scheme carry keys that exist only in that scheme's base
+    tables, so they must not run against images loaded from another. A manifest written before
+    `refresh_base` existed (dbgen keys only) names its base files under `inputs`.
+    """
+    path = prepare_manifest_for(refresh_list)
+    if path is None:
+        return []
+    prepared = json.loads(path.read_text())
+    base = prepared.get("refresh_base") or prepared["inputs"]
+    return [f"{refresh_list} was prepared for {base[name]['path']}, but the images loaded "
+            f"{image_inputs[name]['path']} (SHA-256 differs)"
+            for name in ("customer", "orders", "lineitem")
+            if base[name]["sha256"] != image_inputs[name]["sha256"]]
+
+
 # The sources that define what an image holds (decision of 2026-11-18, replacing the
 # byte-identical executable rule of 2026-11-17): DBSP's storage format, its batches, the merged
 # index, the spine's merging and save/restore, the checkpointer, the circuits, the COL index, and
@@ -1459,6 +1489,15 @@ def run(argv: list[str]) -> int:
                 "directory": str(args.images.resolve()),
                 "manifest_sha256": sha256(args.images.resolve() / IMAGES_MANIFEST),
                 "inputs": images["inputs"], "images": images["images"]}
+        if images:
+            lists = [args.refresh_list] + ([args.warm_up] if args.warm_up else [])
+            problems = [problem for refresh_list in lists
+                        for problem in refresh_base_problems(refresh_list, images["inputs"])]
+            if problems:
+                raise ValueError("; ".join(problems))
+            manifest["images"]["refresh_base_checked"] = [
+                str(prepare_manifest_for(refresh_list)) for refresh_list in lists
+                if prepare_manifest_for(refresh_list) is not None]
         refreshes, refresh_paths = refresh_inputs(args.refresh_list.resolve())
         inputs = {} if images else {name: Path(getattr(args, name)).resolve()
                                     for name in ("customer", "orders", "lineitem")}

@@ -156,7 +156,7 @@ The TPC-H refresh functions are batch loads: at SF 10 one RF1 is a single transa
 - **Eligible Customers.** As TPC-H specifies, RF1 Orders go only to Customers whose key is not a multiple of 3, in both workloads (1,000,000 of 1,500,000 at SF 10). Scattered draws them uniformly.
 - **Popularity.** Clustered replaces the Zipf draw of 2026-10-23 with TPC-C's customer NURand(1023, 1, 3000) (clause 2.1.6), with one seeded constant C. TPC-H has no districts, so consecutive blocks of 3,000 eligible Customers stand in for them (user choice among three synthetic scalings: these blocks, one NURand over all eligible Customers, or nations); a block is chosen in proportion to its size. Real districts arrive with CH-benCHmark.
 - **Locality within a transaction.** Independent draws make the Customers a transaction spans a function of popularity and size, and a Zipf steep enough to put 10 Orders on 2 or 3 Customers would hand most Orders to one Customer. So locality is its own parameter: each transaction of n Orders draws ceil(n / m) Customers and gives them its Orders m at a time (`--orders-per-session`, m = 4), which keeps each Customer's expected Order count while bunching it. At about 10 rows a transaction is one Customer's session, as a TPC-C New-Order is.
-- **Unchanged.** Deletes stay oldest-first in both workloads; dbgen's Order keys stay (the order-key dimension is deferred, [deferred.md](deferred.md#order-key-assignment-as-a-dimension)).
+- **Unchanged.** Deletes stay oldest-first in both workloads; dbgen's Order keys stay (the order-key dimension was deferred, [deferred.md](deferred.md#order-key-assignment-as-a-dimension); it is an arm since 2026-11-19).
 
 ### 2026-11-18: The step arms are dropped
 
@@ -189,6 +189,15 @@ A campaign used to reopen an image only with the byte-identical executable that 
 ### 2026-11-18: Base-table blocks leave the cache after each base transaction
 
 Report the view circuit (user direction): the base circuit's cost, merged-index upkeep included, is assumed amortized over the views an index serves (two indexes cover 18 of the 22 TPC-H queries), and its side effects on the view are mitigated ad hoc in both modes. Neither view reads the base tables, but in the version 15 pilot the base tables and the merged index evicted each other's blocks from the one cache. Keeping base blocks out of the cache altogether was rejected, since it would also starve their compaction. So the base circuit uses the cache normally, and when its transaction commits the driver evicts its tables' blocks before the view phase (measurement version 16). Later, one base circuit will feed several chained view circuits on the same index.
+
+### 2026-11-19: Order keys are a dimension: dbgen, sequence, uuid
+
+- **Arms** (`prepare_inputs.py --order-keys`). The selection is the same in every arm: RF2 deletes the oldest Orders and RF1 Orders arrive in dbgen's file order; only the keys the files carry differ.
+  - `dbgen` (the default, as before): RF1 keys fill the gaps of the low range RF2 deletes from.
+  - `sequence`: a database sequence, so dense keys. Base Orders get 1..N, which keeps their order, and RF1 Orders get N+1, N+2, … in arrival order. The base keys are dense too (user, 2026-11-19), not dbgen's sparse ones: roaring filters are on by default and `FilterPlan::decide_filter` chooses them by key density, so sparse base keys would get another filter than a real sequence.
+  - `uuid`: random keys, as with UUIDv4 primary keys (CockroachDB and Spanner recommend them to spread inserts; PostgreSQL's `gen_random_uuid()`). Every key, base and RF alike, is a random positive BIGINT, so both modes keep 8-byte keys; a 16-byte key is a separate dimension. A key drawn twice is redrawn, as a unique index rejects a clash and the client retries; the manifest counts redraws. RF2 still deletes the oldest Orders, now scattered over the key space, and the RF2 files list them oldest first.
+- **Dropped:** timestamp IDs (Snowflake-style: time, node, counter; MySQL's `UUID()`, MongoDB's ObjectId). With one writer they order keys as a sequence does, with gaps that DBSP does not see (user, 2026-11-19).
+- **Base tables and images.** `sequence` and `uuid` re-key the base tables into `<out>/base/`, so each needs its own images. `measure.py --images` refuses refreshes prepared for other base files (`refresh_base_problems`, against `refresh_base` in `prepare-manifest.json`).
 
 ### 2026-11-18: One memory budget: the cache about equals the memory target
 

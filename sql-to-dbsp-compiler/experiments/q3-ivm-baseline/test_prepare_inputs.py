@@ -19,6 +19,8 @@ CUSTOMERS = 40
 BASE_ORDERS = 160
 UPDATE_ORDERS = 6
 PAIRS = 3
+# Pairs measured where a warm-up pair is also written: the fixture has PAIRS update sets.
+MEASURED = PAIRS - 1
 
 
 def customer_row(key: int) -> str:
@@ -427,6 +429,157 @@ class PrepareInputsTest(unittest.TestCase):
                 argv[:-4] + ["--out", str(self.root / "cli-bad"), "--seed", "3",
                              "--transaction-rows", "0"]), 1)
         self.assertIn("transaction-rows", stderr.getvalue())
+
+
+def key_of(row: str) -> int:
+    return int(row.split("|", 1)[0])
+
+
+def rest_of(row: str) -> str:
+    return row.split("|", 1)[1]
+
+
+class OrderKeySchemeTest(unittest.TestCase):
+    """`--order-keys`: the same selection as dbgen, with every Order key re-assigned."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.base, self.updates = make_dbgen_fixture(self.root)
+        self.dbgen = self.root / "dbgen"
+        prepare_inputs.prepare(self.base, self.updates, self.dbgen, 11, MEASURED, warm_up=True,
+                               transaction_rows=4)
+
+    def prepare(self, scheme: str, name: str | None = None, seed: int = 11) -> tuple[Path, dict]:
+        out = self.root / (name or scheme)
+        manifest = prepare_inputs.prepare(self.base, self.updates, out, seed, MEASURED,
+                                          warm_up=True, transaction_rows=4, order_keys=scheme)
+        return out, manifest
+
+    def mapping(self, out: Path) -> dict[int, int]:
+        """dbgen key -> new key, from the RF files and the base Orders (rows in file order)."""
+        pairs: dict[int, int] = {}
+        for workload in prepare_inputs.WORKLOADS:
+            for directory in (workload, f"{workload}/warm-up"):
+                for old in sorted((self.dbgen / directory).glob("rf*.tbl")):
+                    new = out / directory / old.name
+                    for a, b in zip(old.read_text().splitlines(), new.read_text().splitlines()):
+                        self.assertEqual(rest_of(a) if "|" in a else "", rest_of(b) if "|" in b else "")
+                        old_key, new_key = key_of(a), key_of(b)
+                        self.assertEqual(pairs.setdefault(old_key, new_key), new_key)
+        return pairs
+
+    def assert_same_selection(self, out: Path) -> None:
+        """Every RF file has dbgen's rows in dbgen's order, keys aside; refreshes.json is equal."""
+        for workload in prepare_inputs.WORKLOADS:
+            for directory in (workload, f"{workload}/warm-up"):
+                self.assertEqual((self.dbgen / directory / "refreshes.json").read_text(),
+                                 (out / directory / "refreshes.json").read_text())
+        self.mapping(out)
+
+    def assert_base_follows(self, out: Path, keys: dict[int, int]) -> None:
+        """The re-keyed base holds dbgen's rows under `keys`, sorted, Lineitems grouped."""
+        self.assertEqual((self.base / "customer.tbl").read_bytes(),
+                         (out / "base" / "customer.tbl").read_bytes())
+        for table in ("orders", "lineitem"):
+            old = (self.base / f"{table}.tbl").read_text().splitlines()
+            new = (out / "base" / f"{table}.tbl").read_text().splitlines()
+            expected = sorted((f"{keys[key_of(row)]}|{rest_of(row)}" for row in old),
+                              key=key_of)
+            self.assertEqual(sorted(new), sorted(expected), table)
+            new_keys = [key_of(row) for row in new]
+            self.assertEqual(new_keys, sorted(new_keys), table)
+        # A Lineitem group keeps dbgen's line order.
+        groups: dict[int, list[str]] = collections.defaultdict(list)
+        for row in (out / "base" / "lineitem.tbl").read_text().splitlines():
+            groups[key_of(row)].append(rest_of(row))
+        old_groups: dict[int, list[str]] = collections.defaultdict(list)
+        for row in (self.base / "lineitem.tbl").read_text().splitlines():
+            old_groups[keys[key_of(row)]].append(rest_of(row))
+        self.assertEqual(groups, old_groups)
+
+    def base_order_keys(self) -> list[int]:
+        return read_keys(self.base / "orders.tbl")
+
+    def test_dbgen_writes_no_base_and_records_the_dbgen_files(self) -> None:
+        manifest = json.loads((self.dbgen / "prepare-manifest.json").read_text())
+        self.assertFalse((self.dbgen / "base").exists())
+        self.assertEqual(manifest["order_keys"]["scheme"], "dbgen")
+        for name, record in manifest["refresh_base"].items():
+            self.assertEqual(record, manifest["inputs"][name])
+
+    def test_sequence_keys_are_dense_ranks_and_rf1_continues_in_arrival_order(self) -> None:
+        out, manifest = self.prepare("sequence")
+        self.assert_same_selection(out)
+        base = self.base_order_keys()
+        rank = {key: index for index, key in enumerate(base, start=1)}
+        arrival = [key for n in range(1, PAIRS + 1)
+                   for key in read_keys(self.updates / f"orders.tbl.u{n}")]
+        expected = {**rank, **{key: len(base) + i for i, key in enumerate(arrival, start=1)}}
+        for old, new in self.mapping(out).items():
+            self.assertEqual(new, expected[old], old)
+        self.assertEqual(read_keys(out / "base" / "orders.tbl"), list(range(1, len(base) + 1)))
+        self.assert_base_follows(out, expected)
+        # RF2 deletes the oldest Orders, which keep the lowest keys.
+        deleted = sorted(key for n in range(1, MEASURED + 1)
+                         for key in read_keys(out / "clustered" / f"rf2-delete-{n}.tbl"))
+        self.assertEqual(deleted, list(range(1, len(deleted) + 1)))
+        self.assertEqual(manifest["order_keys"]["rf1_key_min"], len(base) + 1)
+        self.assertEqual(manifest["refresh_base"]["orders"]["sha256"],
+                         prepare_inputs.sha256(out / "base" / "orders.tbl"))
+
+    def test_uuid_keys_are_a_bijection_and_rf2_keeps_the_oldest_orders(self) -> None:
+        out, manifest = self.prepare("uuid")
+        self.assert_same_selection(out)
+        base = self.base_order_keys()
+        new_base = read_keys(out / "base" / "orders.tbl")
+        self.assertEqual(len(set(new_base)), len(base))
+        self.assertTrue(all(0 < key <= prepare_inputs.RANDOM_KEY_LIMIT for key in new_base))
+        mapping = self.mapping(out)
+        rf1_new = {mapping[key] for n in range(1, PAIRS + 1)
+                   for key in read_keys(self.updates / f"orders.tbl.u{n}")}
+        self.assertFalse(rf1_new & set(new_base))
+        # The uuid map of the base Orders is recovered from row order: draws follow file order.
+        keys = prepare_inputs.assign_order_keys(
+            "uuid", self.base / "orders.tbl", len(base), [], [
+                key for n in range(1, PAIRS + 1)
+                for key in read_keys(self.updates / f"orders.tbl.u{n}")], 11)
+        for old, new in mapping.items():
+            self.assertEqual(keys(old), new)
+        self.assert_base_follows(out, keys.mapping)
+        # RF2 holds the oldest Orders (dbgen's lowest keys), oldest first: not sorted by new key.
+        oldest = base[:sum(len(read_keys(self.dbgen / "clustered" / f"rf2-delete-{n}.tbl"))
+                           for n in range(1, MEASURED + 1))]
+        deleted = [key for n in range(1, MEASURED + 1)
+                   for key in read_keys(out / "clustered" / f"rf2-delete-{n}.tbl")]
+        self.assertEqual(deleted, [keys(key) for key in oldest])
+        self.assertEqual(manifest["order_keys"]["redraws"], 0)
+
+    def test_uuid_redraws_a_clash_and_counts_it(self) -> None:
+        draws = iter([5, 5, 5, *range(6, 10_000)])
+        real = prepare_inputs.draw_random_key
+        prepare_inputs.draw_random_key = lambda generator: next(draws)
+        self.addCleanup(setattr, prepare_inputs, "draw_random_key", real)
+        out, manifest = self.prepare("uuid")
+        self.assertEqual(manifest["order_keys"]["redraws"], 2)
+        new_base = read_keys(out / "base" / "orders.tbl")
+        self.assertEqual(len(set(new_base)), len(new_base))
+
+    def test_uuid_bytes_follow_the_seed(self) -> None:
+        first, _ = self.prepare("uuid", "first")
+        again, _ = self.prepare("uuid", "again")
+        other, _ = self.prepare("uuid", "other", seed=12)
+        name = "base/orders.tbl"
+        self.assertEqual((first / name).read_bytes(), (again / name).read_bytes())
+        self.assertNotEqual((first / name).read_bytes(), (other / name).read_bytes())
+        self.assertEqual((first / "clustered" / "rf1-orders-1.tbl").read_bytes(),
+                         (again / "clustered" / "rf1-orders-1.tbl").read_bytes())
+
+    def test_unknown_scheme_is_refused(self) -> None:
+        with self.assertRaises(prepare_inputs.InputError):
+            prepare_inputs.prepare(self.base, self.updates, self.root / "bad", 11, MEASURED,
+                                   order_keys="ulid")
 
 
 if __name__ == "__main__":
