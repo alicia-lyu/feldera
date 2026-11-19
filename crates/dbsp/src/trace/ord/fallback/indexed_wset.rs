@@ -400,6 +400,13 @@ where
         }
     }
 
+    fn maybe_contains_prefix(&self, probe: &K, spec: &crate::storage::file::PrefixSpec<K>) -> bool {
+        match &self.inner {
+            Inner::File(file) => file.maybe_contains_prefix(probe, spec),
+            Inner::Vec(vec) => vec.maybe_contains_prefix(probe, spec),
+        }
+    }
+
     fn negative_weight_count(&self) -> Option<u64> {
         match &self.inner {
             Inner::File(file) => file.negative_weight_count(),

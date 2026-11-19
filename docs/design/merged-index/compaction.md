@@ -1,6 +1,8 @@
 # Compaction options for small transactions
 
-> **Status:** documentation only. The user deferred any compaction change on 2026-11-18 and asked for the options set against measurements, respecting the current spine design and aiming at a good layout for every spine, not only the merged index ([DECISIONS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#2026-11-18-compaction-is-deferred-its-options-are-documented-with-measurements)). Nothing here is decided. The figures are from the K = 10 pilots of 2026-11-18 (measurement version 14, one repetition, SF 10, about 12.5 rows per transaction), at DBSP's `critical` memory pressure throughout. The measurement version 15 counters (`run_counts`) will fill in the rows marked *pending*.
+> **Status (2026-11-19):** option 3, prefix filters, is built as an A/B arm, off by default ([decisions.md](decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter)); a memtable that supersedes option 1 is designed in [memtable.md](memtable.md). The rest stays documentation only.
+>
+> **Earlier status:** documentation only. The user deferred any compaction change on 2026-11-18 and asked for the options set against measurements, respecting the current spine design and aiming at a good layout for every spine, not only the merged index ([DECISIONS.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#2026-11-18-compaction-is-deferred-its-options-are-documented-with-measurements)). Nothing here is decided. The figures are from the K = 10 pilots of 2026-11-18 (measurement version 14, one repetition, SF 10, about 12.5 rows per transaction), at DBSP's `critical` memory pressure throughout. The measurement version 15 counters (`run_counts`) will fill in the rows marked *pending*.
 
 ## The current policy, from the code
 

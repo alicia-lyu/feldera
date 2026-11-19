@@ -14,6 +14,9 @@ pub enum FilterKind {
     Roaring,
     /// Min/max range filter.
     Range,
+    /// Prefix filter: a membership filter over key prefixes, which
+    /// group-scoped seeks consult.
+    Prefix,
 }
 /// Statistics about an in-memory key filter.
 ///

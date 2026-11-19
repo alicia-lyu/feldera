@@ -1040,6 +1040,24 @@ where
     /// Returns `None` for empty batches.
     fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)>;
 
+    /// Returns `false` only when no key of this batch carries the prefix of
+    /// `probe`, as `spec` defines it: the question a group-scoped seek asks
+    /// before seeking the batch.
+    ///
+    /// By default the batch's key bounds answer: a prefix below the smallest
+    /// key's or above the largest key's is absent. A file batch whose files
+    /// carry a prefix filter for `spec`'s prefix also consults that filter
+    /// (see [`FilterSpec`](crate::storage::file::FilterSpec)).
+    fn maybe_contains_prefix(
+        &self,
+        probe: &Self::Key,
+        spec: &crate::storage::file::PrefixSpec<Self::Key>,
+    ) -> bool {
+        self.key_bounds().is_some_and(|(min, max)| {
+            !spec.cmp(probe, min).is_lt() && !spec.cmp(probe, max).is_gt()
+        })
+    }
+
     /// Exact number of 16-bit roaring windows touched by the batch, relative
     /// to the batch minimum.
     ///

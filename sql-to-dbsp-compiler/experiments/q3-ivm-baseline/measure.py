@@ -34,7 +34,8 @@ READ_ONLY_OWNERS = ("requested_slice", "partner_trace")
 INDEX_READERS = ("session",)
 # `filtered_probes`: exact probes that a file run's filters (key range, then Roaring bitmap or
 # Bloom filter) answer with no seek.
-RUN_READ_FIELDS = ("seeks", "filtered_probes", "key_decodes", "value_decodes", "weight_decodes",
+RUN_READ_FIELDS = ("seeks", "filtered_probes", "filtered_prefix_probes", "key_decodes",
+                   "value_decodes", "weight_decodes",
                    "memory_key_reads", "memory_value_reads", "memory_weight_reads")
 # The scan session's moves per transaction (`SessionCounts`, measurement version 8).
 SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_steps", "positions",
@@ -49,7 +50,7 @@ SESSION_PASSES = ("seek",)
 # refresh's `run_counts` (runs per spine after each transaction, merges, device reads by owner).
 # 16 evicts the base tables' blocks from the cache after each base transaction (`base_eviction_ms`,
 # `base_evicted_bytes`, `configuration.evict_base_after_transaction`).
-MEASUREMENT_VERSION = 16
+MEASUREMENT_VERSION = 17
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -426,6 +427,18 @@ def transaction_latency_problems(report: dict[str, Any]) -> list[str]:
                 problems.append(f"refresh {number}: transaction_latency.{phase}.max is not the "
                                 "largest value")
     return problems
+
+
+def index_prefix_filter_problems(report: dict[str, Any], asked: bool) -> list[str]:
+    """List a mismatch between the prefix-filter arm the runner asked for and the one the driver
+    reports. Native runs report it too, though they have no index to apply it to. A report that
+    names neither mode is not checked here."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    reported = report.get("configuration", {}).get("index_prefix_filter")
+    if reported is not asked:
+        return [f"configuration.index_prefix_filter is {reported!r}, expected {asked!r}"]
+    return []
 
 
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
@@ -848,6 +861,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.append("--front-code-byte-keys")
     if args.get("elide_value_headers"):
         command.append("--elide-value-headers")
+    if args.get("index_prefix_filter"):
+        command.append("--index-prefix-filter")
     command.extend(["--session-pass", args.get("session_pass", "seek")])
     return command
 
@@ -1002,6 +1017,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="drop the redundant 16-byte header of every byte-string value in "
                              "storage files, and rebuild it on read (the merged index's value "
                              "level); native runs have no such values")
+    parser.add_argument("--index-prefix-filter", action="store_true",
+                        help="give the merged index's files a prefix filter over the customer "
+                             "group instead of the whole-key filter, so that group seeks skip "
+                             "the runs it rules out (an A/B arm, measurement version 17); "
+                             "images record it, so each arm needs its own images; native runs "
+                             "ignore it")
     parser.add_argument("--session-pass", choices=SESSION_PASSES, default="seek",
                         help="how the reconstructed build's scan session passes the untouched "
                              "groups (default seek); native runs have no scan session")
@@ -1112,6 +1133,8 @@ def load_image(root: Path, binaries: dict[str, Path], inputs: dict[str, Path], m
         command.append("--front-code-byte-keys")
     if args.elide_value_headers:
         command.append("--elide-value-headers")
+    if args.index_prefix_filter:
+        command.append("--index-prefix-filter")
     started = time.monotonic()
     completed = subprocess.run(command, cwd=EXPERIMENT, capture_output=True, text=True)
     (root / f"{name}.stdout.log").write_text(completed.stdout)
@@ -1224,6 +1247,7 @@ def build_images(args: argparse.Namespace) -> int:
                           "compaction_timeout_secs": args.compaction_timeout_secs,
                           "setup_full_compaction": args.setup_full_compaction,
                           "elide_value_headers": args.elide_value_headers,
+                          "index_prefix_filter": args.index_prefix_filter,
                           "memory_target_bytes": None, "cgroup": None},
         "inputs": {}, "executables": {}, "images": {}, "errors": [],
     }
@@ -1473,6 +1497,7 @@ def run(argv: list[str]) -> int:
                           "setup_full_compaction": args.setup_full_compaction,
                           "front_code_byte_keys": args.front_code_byte_keys,
                           "elide_value_headers": args.elide_value_headers,
+                          "index_prefix_filter": args.index_prefix_filter,
                           "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None,
@@ -1543,6 +1568,7 @@ def run(argv: list[str]) -> int:
                                  "setup_full_compaction": args.setup_full_compaction,
                                  "front_code_byte_keys": args.front_code_byte_keys,
                                  "elide_value_headers": args.elide_value_headers,
+                                 "index_prefix_filter": args.index_prefix_filter,
                                  "session_pass": args.session_pass,
                                  "warm_up": str(args.warm_up.resolve()) if args.warm_up else None}}
                 if images:
@@ -1585,7 +1611,8 @@ def run(argv: list[str]) -> int:
                 record["driver"] = raw
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
-                problems = report_problems(raw, args.session_pass)
+                problems = (report_problems(raw, args.session_pass)
+                            + index_prefix_filter_problems(raw, args.index_prefix_filter))
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

@@ -382,7 +382,10 @@ impl Pipeline {
     }
 
     /// Builds both circuits in one runtime, base first. The CPU profiler is enabled in both.
-    fn new(config: CircuitConfig) -> Result<Self> {
+    /// `index_prefix_filter` gives the merged index's files a prefix filter over the customer
+    /// group in place of the whole-key filter (`--index-prefix-filter`); native mode ignores it.
+    #[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
+    fn new(config: CircuitConfig, index_prefix_filter: bool) -> Result<Self> {
         #[cfg(feature = "merged-index")]
         let q3_state = Q3State::default();
         let base_constructor = CircuitConstructor::new(|circuit: &mut RootCircuit| {
@@ -433,7 +436,7 @@ impl Pipeline {
         // (its thread binds the runtime's buffer cache). The view circuit reads it only through
         // the snapshots that `Q3State` publishes.
         #[cfg(feature = "merged-index")]
-        let index = ManualIndex::new(base.circuit.runtime())?;
+        let index = ManualIndex::new(base.circuit.runtime(), index_prefix_filter)?;
         #[cfg(feature = "merged-index")]
         let view_inputs = view_input_slot
             .get()
@@ -484,14 +487,18 @@ impl Pipeline {
     /// Builds both circuits from the checkpoint `image` of the storage directory in `config`,
     /// and in reconstructed mode restores the merged index from it. Like a freshly loaded
     /// pipeline, it needs [`republish`] before its first refresh.
-    fn reopen(mut config: CircuitConfig, image: &CheckpointMetadata) -> Result<Self> {
+    fn reopen(
+        mut config: CircuitConfig,
+        image: &CheckpointMetadata,
+        index_prefix_filter: bool,
+    ) -> Result<Self> {
         config
             .storage
             .as_mut()
             .context("reopening an image needs file storage")?
             .init_checkpoint = Some(image.uuid);
         #[cfg_attr(not(feature = "merged-index"), allow(unused_mut))]
-        let mut pipeline = Self::new(config)?;
+        let mut pipeline = Self::new(config, index_prefix_filter)?;
         #[cfg(feature = "merged-index")]
         {
             let directory = Checkpointer::checkpoint_dir(image.uuid);
@@ -542,7 +549,7 @@ impl Pipeline {
     /// Both circuits with `workers` workers and memory-backed state.
     #[cfg(test)]
     fn with_workers(workers: usize) -> Result<Self> {
-        Self::new(CircuitConfig::with_workers(workers))
+        Self::new(CircuitConfig::with_workers(workers), false)
     }
 }
 
@@ -1250,6 +1257,11 @@ struct Config {
     /// storage files (the merged index's value level); see the DBSP dev
     /// tweak of the same name.
     elide_value_headers: bool,
+    /// Give the merged index's files a prefix filter over the customer group, in place of the
+    /// whole-key filter, and let group seeks skip the runs it rules out
+    /// (`--index-prefix-filter`, measurement version 17; an A/B arm, off by default). Native
+    /// mode has no index and ignores it.
+    index_prefix_filter: bool,
     /// How the reconstructed build's scan session passes untouched groups
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
@@ -1334,6 +1346,7 @@ impl Config {
                 "--setup-full-compaction" => config.setup_full_compaction = true,
                 "--front-code-byte-keys" => config.front_code_byte_keys = true,
                 "--elide-value-headers" => config.elide_value_headers = true,
+                "--index-prefix-filter" => config.index_prefix_filter = true,
                 "--session-pass" => {
                     config.session_pass = Some(parse_pass(
                         &args.next().context("--session-pass needs seek or step")?,
@@ -1477,6 +1490,10 @@ struct ImageSettings {
     workers: usize,
     front_code_byte_keys: bool,
     elide_value_headers: bool,
+    /// Whether the merged index's files carry prefix filters; images written before the option
+    /// existed have none.
+    #[serde(default)]
+    index_prefix_filter: bool,
 }
 
 impl ImageSettings {
@@ -1486,6 +1503,7 @@ impl ImageSettings {
             workers: config.workers,
             front_code_byte_keys: config.front_code_byte_keys,
             elide_value_headers: config.elide_value_headers,
+            index_prefix_filter: config.index_prefix_filter,
         }
     }
 }
@@ -2338,8 +2356,12 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         })
         .transpose()?;
     let mut pipeline = match &image {
-        Some(image) => Pipeline::reopen(pipeline_config, &image.checkpoint)?,
-        None => Pipeline::new(pipeline_config)?,
+        Some(image) => Pipeline::reopen(
+            pipeline_config,
+            &image.checkpoint,
+            config.index_prefix_filter,
+        )?,
+        None => Pipeline::new(pipeline_config, config.index_prefix_filter)?,
     };
     if config.verify {
         pipeline.enable_contract_check();
@@ -2741,7 +2763,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 16,
+        "measurement_version": 17,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2773,6 +2795,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "setup_full_compaction": config.setup_full_compaction,
             "front_code_byte_keys": config.front_code_byte_keys,
             "elide_value_headers": config.elide_value_headers,
+            "index_prefix_filter": config.index_prefix_filter,
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
@@ -3641,7 +3664,7 @@ mod reconstructed_tests {
             memory_target_bytes: Some(1024 * 1024),
             ..Config::default()
         };
-        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?)?;
+        let mut pipeline = Pipeline::new(runtime_config(&config, Some(&storage))?, false)?;
         pipeline.enable_contract_check();
         measurement::drain_until(Duration::from_secs(30), || {
             Ok(pipeline.runtime().current_memory_pressure() >= MemoryPressure::High)
@@ -4081,7 +4104,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 16);
+        assert_eq!(output["measurement_version"], 17);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4248,7 +4271,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 16);
+        assert_eq!(output["measurement_version"], 17);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -4330,6 +4353,7 @@ mod measurement_tests {
         let reads_fields = [
             "seeks",
             "filtered_probes",
+            "filtered_prefix_probes",
             "key_decodes",
             "value_decodes",
             "weight_decodes",
@@ -4914,7 +4938,7 @@ mod worked_transaction {
                 },
                 arm.name()
             ));
-        let pipeline = Pipeline::new(runtime_config(&arm.config(), Some(&storage))?)?;
+        let pipeline = Pipeline::new(runtime_config(&arm.config(), Some(&storage))?, false)?;
         pipeline.enable_contract_check();
         if matches!(arm, Arm::Pressured) {
             measurement::drain_until(Duration::from_secs(30), || {

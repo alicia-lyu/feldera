@@ -180,6 +180,19 @@ impl KeyTrie {
     ///
     /// Panics unless the trie has one top-level node whose domain is declared.
     /// The compiler's validator rejects any other trie.
+    /// The prefix that defines a key's group: its first `1 + root_width()`
+    /// bytes. A spine of this index's runs builds its prefix filter over it
+    /// ([`batch::index_factories`](super::batch::index_factories)), and a
+    /// group read probes it ([`RunMerge::seek_group`](super::RunMerge::seek_group)).
+    ///
+    /// # Panics
+    ///
+    /// As [`root_width`](Self::root_width) does, and if the group prefix is
+    /// longer than 64 bytes.
+    pub fn root_prefix_spec(&self) -> crate::storage::file::PrefixSpec<crate::dynamic::DynData> {
+        crate::storage::file::PrefixSpec::bytes_of_length(1 + self.root_width())
+    }
+
     pub fn root_width(&self) -> usize {
         let [root] = self.children else {
             panic!(

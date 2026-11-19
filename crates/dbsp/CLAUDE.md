@@ -96,6 +96,31 @@ source emits at the flush).
   the cache must use one whose 256 shards exceed a partition: `test_buffer_cache`'s 4 KiB shards
   keep none.
 
+## Prefix filters
+
+A file can carry a filter over the distinct prefixes of its keys (`storage/file/filter/prefix.rs`,
+decision of 2026-11-19 in `docs/design/merged-index/decisions.md`):
+
+- **The spec.** `FilterSpec { whole_key, prefix }` lives in `FileIndexedWSetFactories`
+  (`with_filter_spec`; the default is whole-key only, as before), so a spine's builds, merges,
+  and `from_path` reloads all use it. `PrefixSpec::bytes::<N>()` (byte keys; `bytes_of_length`
+  at run time) and `PrefixSpec::fields::<TupN, K>()` (`TuplePrefix`, Tup1 to Tup4) carry the
+  prefix hash and comparison. Only indexed W-sets write prefix filters so far.
+- **The file.** `Writer2::with_prefix_filter` collects one hash per distinct prefix (keys are
+  sorted). `close` writes an `LFXH` header (`PrefixBloomFilterHeader`): at most
+  `INLINE_PREFIXES` (120) hashes inline, kept in memory; above that a partitioned Bloom filter
+  sized by the exact prefix count, read through the buffer cache. Its location is in
+  `BatchMetadata::prefix_filter_offset`/`_size`, flagged by `INCOMPATIBLE_FEATURE_PREFIX_FILTERS`.
+  `Reader::prefix_filter(kind)` refuses a file whose prefix differs from the spec's.
+- **The probe.** `Batch::maybe_contains_prefix(probe, spec)`: key bounds by prefix, then the
+  prefix filter (file runs count a rejection in `RunReads::filtered_prefix_probes`). The
+  merged index's `RunMerge::seek_group` parks the runs that cannot hold the group;
+  `SpineSnapshot::retain_prefix` keeps only the runs that may hold a prefix, for any spine.
+- Tests: filters `prefix` (unit tests), `run_merge` (`group_seeks_with_prefix_filters_*`,
+  `a_run_without_the_group_is_parked_and_counted`,
+  `a_partitioned_prefix_filter_reloads_and_refuses_another_prefix`), and `prefix_tests`
+  (native tuple keys with both filters).
+
 ## Evicting a set of files from the buffer cache
 
 `BufferCache::evict_files(&HashSet<FileId>)` removes every entry of those files (blocks, trailers,

@@ -4,6 +4,7 @@ use crate::{
     DBData, DynZWeight,
     algebra::ZWeight,
     dynamic::{DynData, Erase},
+    storage::file::FilterSpec,
     trace::{
         BatchReader, BatchReaderFactories, Builder,
         cursor::CursorList,
@@ -11,7 +12,19 @@ use crate::{
     },
 };
 
-use super::FoldedKey;
+use super::{FoldedKey, KeyTrie};
+
+/// The factories of an index's runs, whose payload type is `P`: files get a
+/// prefix filter over the trie's group prefix and no whole-key filter, since a
+/// group read seeks by prefix and the index makes no exact probe. Use the same
+/// factories for the index's spine and for the batches inserted into it, so
+/// that every run, merged or restored, has the filter.
+pub fn index_factories<P: DBData>(
+    trie: &KeyTrie,
+) -> OrdIndexedWSetFactories<DynData, DynData, DynZWeight> {
+    OrdIndexedWSetFactories::new::<Vec<u8>, P, ZWeight>()
+        .with_filter_spec(FilterSpec::prefix_only(trie.root_prefix_spec()))
+}
 
 /// Folded byte keys with typed payloads. The payload type is erased here;
 /// [`build_batch`] and [`batch_cursor`] name it.
@@ -19,8 +32,18 @@ pub type MergedIndexBatch = OrdIndexedWSet<DynData, DynData, DynZWeight>;
 type BatchCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 
 /// Sorts and consolidates contributions within one immutable initial batch.
-/// A zero net weight has no stored row.
+/// A zero net weight has no stored row. Files get DBSP's default filters; an
+/// index's own batches use [`build_batch_in`] with [`index_factories`].
 pub fn build_batch<P: DBData>(
+    rows: impl IntoIterator<Item = (FoldedKey, P, ZWeight)>,
+) -> Result<MergedIndexBatch, String> {
+    build_batch_in(&OrdIndexedWSetFactories::new::<Vec<u8>, P, ZWeight>(), rows)
+}
+
+/// [`build_batch`] with `factories`, which must have been made for payload
+/// type `P`.
+pub fn build_batch_in<P: DBData>(
+    factories: &OrdIndexedWSetFactories<DynData, DynData, DynZWeight>,
     rows: impl IntoIterator<Item = (FoldedKey, P, ZWeight)>,
 ) -> Result<MergedIndexBatch, String> {
     let mut rows: Vec<_> = rows.into_iter().collect();
@@ -40,12 +63,11 @@ pub fn build_batch<P: DBData>(
         consolidated.push((key, payload, weight));
     }
 
-    let factories = OrdIndexedWSetFactories::new::<Vec<u8>, P, ZWeight>();
     // No fixed location: the batch is placed as an operator's output is, by the runtime's step
     // storage threshold (`min_step_storage_bytes`; zero at Critical memory pressure). Outside a
     // runtime with storage, or without a threshold, it is built in memory.
     let mut builder = <MergedIndexBatch as crate::trace::Batch>::Builder::with_capacity_in_location(
-        &factories,
+        factories,
         consolidated.len(),
         consolidated.len(),
         None,

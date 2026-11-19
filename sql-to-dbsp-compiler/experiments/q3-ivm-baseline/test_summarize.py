@@ -27,7 +27,8 @@ def index_reads(seeks: int) -> dict[str, dict[str, int]]:
     """The scan session with `seeks` seeks and twice as many key, value and weight decodes, and
     as many memory reads. `filtered_probes` counts exact probes that a file run's filters (key
     range, then Roaring bitmap or Bloom filter) answer with no seek."""
-    return {reader: {"seeks": seeks, "filtered_probes": 0, "key_decodes": 2 * seeks,
+    return {reader: {"seeks": seeks, "filtered_probes": 0, "filtered_prefix_probes": 0,
+                     "key_decodes": 2 * seeks,
                      "value_decodes": 2 * seeks, "weight_decodes": 2 * seeks,
                      "memory_key_reads": seeks, "memory_value_reads": seeks,
                      "memory_weight_reads": seeks}
@@ -141,7 +142,7 @@ def driver_report(mode: str, scale: float, writes: tuple[int, int, int] = (1, 2,
         refresh["block_expansions"] = block_expansions(mode, refresh["refresh"])
     return {
         "status": "complete", "mode": "native" if mode == "native" else "reconstructed",
-        "measurement_version": 16, "os": "linux",
+        "measurement_version": 17, "os": "linux",
         "configuration": {"front_code_byte_keys": True, "elide_value_headers": True},
         "front_coding": {"blocks": 5, "layout_fallbacks": 0, "size_fallbacks": 1},
         "value_header_elision": {"blocks": 6, "layout_fallbacks": 0, "size_fallbacks": 0},
@@ -442,17 +443,17 @@ class SummarizeTest(unittest.TestCase):
         # index in combined_maintenance_ms and not in base_ms.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 2
-        self.failing(content, "native run 1: measurement_version is 2, not 16")
+        self.failing(content, "native run 1: measurement_version is 2, not 17")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][0]["driver"]["measurement_version"] = 3
-        self.failing(content, "native run 1: measurement_version is 3, not 16")
+        self.failing(content, "native run 1: measurement_version is 3, not 17")
         # Version 4 has no merged-index run reads.
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         content["runs"][1]["driver"]["measurement_version"] = 4
-        self.failing(content, "merged-index run 1: measurement_version is 4, not 16")
+        self.failing(content, "merged-index run 1: measurement_version is 4, not 17")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][1]["driver"]["measurement_version"]
-        self.failing(content, "merged-index run 1: measurement_version is None, not 16")
+        self.failing(content, "merged-index run 1: measurement_version is None, not 17")
         content = manifest({"native": [1.0], "merged-index": [1.0]})
         del content["runs"][0]["driver"]["refreshes"][0]["base_ms"]
         self.failing(content, "native run 1 refresh 1: missing field base_ms")

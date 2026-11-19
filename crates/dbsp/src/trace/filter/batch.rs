@@ -7,8 +7,9 @@ use crate::{
     dynamic::{DataTrait, DynVec},
     storage::{
         file::{
-            BatchKeyFilter, FilterKind, FilterStats, StoredPartitionedBloom, TrackingFilterStats,
-            TrackingRoaringBitmap, reader::FilteredKeys,
+            BatchKeyFilter, FilterKind, FilterStats, PrefixFilter, PrefixSpec,
+            StoredPartitionedBloom, TrackingFilterStats, TrackingRoaringBitmap,
+            reader::FilteredKeys,
         },
         tracking_bloom_filter::TrackingBloomFilter,
     },
@@ -52,6 +53,9 @@ where
 {
     range_filter: Arc<TrackedRangeFilter<K>>,
     membership_filter: Option<Arc<dyn BatchFilter<K>>>,
+    /// The prefix filter and the spec it was built with, which also hashes
+    /// probes.
+    prefix_filter: Option<(PrefixSpec<K>, Arc<PrefixFilter>)>,
 }
 
 /// Runtime statistics for the range and membership filters inside
@@ -60,6 +64,7 @@ where
 pub struct BatchFilterStats {
     pub range_filter: FilterStats,
     pub membership_filter: FilterStats,
+    pub prefix_filter: FilterStats,
 }
 
 /// A range filter with statistics.
@@ -104,6 +109,42 @@ where
         Self {
             range_filter: Arc::new(TrackedRangeFilter::new(range_filter)),
             membership_filter,
+            prefix_filter: None,
+        }
+    }
+
+    /// Adds a prefix filter, with the spec it was built with.
+    pub(crate) fn with_prefix_filter(
+        mut self,
+        prefix_filter: Option<(PrefixSpec<K>, PrefixFilter)>,
+    ) -> Self {
+        self.prefix_filter = prefix_filter.map(|(spec, filter)| (spec, Arc::new(filter)));
+        self
+    }
+
+    /// The spec of the prefix filter, if the batch has one.
+    pub fn prefix_spec(&self) -> Option<PrefixSpec<K>> {
+        self.prefix_filter.as_ref().map(|(spec, _)| *spec)
+    }
+
+    /// Returns `false` only when no key of the batch carries `probe`'s prefix.
+    ///
+    /// The key range answers first: a prefix below the smallest key's or above
+    /// the largest key's is absent. Then the prefix filter, if the batch has
+    /// one; without one, every prefix inside the range might be present.
+    /// `spec` is the prefix asked about; a batch whose filter covers another
+    /// prefix answers from its key range alone.
+    pub fn maybe_contains_prefix(&self, probe: &K, spec: &PrefixSpec<K>) -> bool {
+        if let Some((min, max)) = self.key_bounds()
+            && (spec.cmp(probe, min).is_lt() || spec.cmp(probe, max).is_gt())
+        {
+            return false;
+        }
+        match &self.prefix_filter {
+            Some((own, filter)) if own.kind() == spec.kind() => {
+                filter.contains_hash(spec.hash(probe))
+            }
+            _ => true,
         }
     }
 
@@ -140,6 +181,11 @@ where
                 .membership_filter
                 .as_ref()
                 .map(|filter| filter.stats())
+                .unwrap_or_default(),
+            prefix_filter: self
+                .prefix_filter
+                .as_ref()
+                .map(|(_, filter)| filter.stats())
                 .unwrap_or_default(),
         }
     }
@@ -202,6 +248,7 @@ where
         Self {
             range_filter: self.range_filter.clone(),
             membership_filter: self.membership_filter.clone(),
+            prefix_filter: self.prefix_filter.clone(),
         }
     }
 }
@@ -216,6 +263,12 @@ where
             self.membership_filter
                 .as_ref()
                 .map(|filter| filter.stats().size_byte)
+                .unwrap_or_default(),
+        );
+        context.add(
+            self.prefix_filter
+                .as_ref()
+                .map(|(_, filter)| filter.stats().size_byte)
                 .unwrap_or_default(),
         );
     }
