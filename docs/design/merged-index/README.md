@@ -115,6 +115,7 @@ circuit and its state reads). Human landing pages:
   built, leveled, and placed, memory pressure, and snapshot, fetch, and join-wait behavior.
 - [deferred.md](deferred.md): designs not implemented, such as shared scan sessions and generic readers.
 - [compaction.md](compaction.md): compaction options for small transactions, against the K = 10 measurements (documentation only; deferred on 2026-11-18).
+- [memtable.md](memtable.md): a memtable built from the layer file's own data blocks, under its own budget (design only, 2026-11-19).
 - [references.md](references.md): sibling-repository sources and their roles.
 - [history.md](history.md): dated, non-authoritative records of superseded measurements, gaps, and plans.
 - [slides-oct-8/](slides-oct-8/README.md): the 2026-10-08 advisor deck.
