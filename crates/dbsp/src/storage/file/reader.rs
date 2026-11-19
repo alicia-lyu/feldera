@@ -14,7 +14,10 @@ use super::format::{
     PartitionedBloomFilterHeader,
 };
 use super::{AnyFactories, BatchKeyFilter, Deserializer, Factories};
-use super::{PARTITION_BYTES, PartitionedBloomShape, StoredPartitionedBloom};
+use super::{
+    PARTITION_BYTES, PartitionedBloomShape, PrefixFilter, PrefixKind, StoredPartitionedBloom,
+    format::{PREFIX_BLOOM_FILTER_BLOCK_MAGIC, PrefixBloomFilterHeader},
+};
 use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::CacheAccess;
 use crate::storage::{
@@ -2158,6 +2161,76 @@ where
     /// Returns additional metadata added to the file by the writer.
     pub fn metadata(&self) -> &BatchMetadata {
         &self.metadata
+    }
+
+    /// Reads the file's prefix filter, which must cover the prefix `kind`.
+    ///
+    /// Returns `None` for a file without one. A filter of inline hashes is
+    /// read into memory; a partitioned one is a handle whose partitions stay
+    /// on storage, or `None` when the configured false positive rate asks for
+    /// no Bloom filter.
+    pub fn prefix_filter(&self, kind: PrefixKind) -> Result<Option<PrefixFilter>, Error> {
+        if self.metadata.prefix_filter_size == 0 {
+            return Ok(None);
+        }
+        let location = BlockLocation::new(
+            self.metadata.prefix_filter_offset,
+            self.metadata.prefix_filter_size as usize,
+        )
+        .map_err(|error: InvalidBlockLocation| {
+            Error::Corruption(CorruptionError::InvalidFilterLocation(error))
+        })?;
+        let bad = |inner: String| {
+            Error::Corruption(CorruptionError::InvalidFilterEncoding {
+                location,
+                kind: "prefix bloom",
+                inner,
+            })
+        };
+        let block = self.file.file_handle.read_block(location)?;
+        if block.len() < 8 {
+            return Err(bad(format!("block too short: {} bytes", block.len())));
+        }
+        let checksum = u32::from_le_bytes(block[..4].try_into().unwrap());
+        let computed = crc32c(&block[4..]);
+        if checksum != computed {
+            return Err(bad(format!(
+                "checksum {checksum:#x}, computed {computed:#x}"
+            )));
+        }
+        if block[4..8] != PREFIX_BLOOM_FILTER_BLOCK_MAGIC {
+            return Err(bad(format!("magic {:?}", &block[4..8])));
+        }
+        let header: PrefixBloomFilterHeader =
+            parse_filter_block(&block, location, "prefix bloom filter")?;
+        let written = PrefixKind::from_raw(header.kind, header.length)
+            .ok_or_else(|| bad(format!("unknown prefix kind {}", header.kind)))?;
+        if written != kind {
+            return Err(bad(format!(
+                "the file's prefix filter covers {written:?}, the batch asks for {kind:?}"
+            )));
+        }
+        if header.n_partitions == 0 {
+            return Ok(Some(PrefixFilter::inline(header.inline)));
+        }
+        if header.partition_bytes as usize != PARTITION_BYTES || header.hashes == 0 {
+            return Err(bad(format!(
+                "{} partitions of {} bytes with {} hashes",
+                header.n_partitions, header.partition_bytes, header.hashes
+            )));
+        }
+        if modules_for_rate(bloom_false_positive_rate()) == 0 {
+            return Ok(None);
+        }
+        Ok(Some(PrefixFilter::Stored(StoredPartitionedBloom::new(
+            PartitionedBloomShape {
+                n_partitions: header.n_partitions,
+                hashes: header.hashes,
+            },
+            header.first_partition_offset,
+            self.file.file_handle.clone(),
+            self.file.cache,
+        ))))
     }
 }
 

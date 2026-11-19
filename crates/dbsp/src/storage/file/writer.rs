@@ -10,16 +10,19 @@ use crate::storage::{
     backend::{BlockLocation, FileReader, FileWriter, StorageBackend, StorageError},
     buffer_cache::{BufferCache, FBuf, FBufSerializer, LimitExceeded},
     file::{
-        PARTITION_BYTES, SerializerInner, StoredPartitionedBloom,
+        INLINE_PREFIXES, PARTITION_BYTES, PartitionedBloomBuilder, PartitionedBloomShape,
+        PrefixCollector, PrefixFilter, PrefixKind, PrefixSpec, SerializerInner,
+        StoredPartitionedBloom,
         format::{
             BatchMetadata, BlockHeader, BloomFilterBlockRef, COMPATIBLE_FEATURE_FILTER64,
             COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT, DATA_BLOCK_MAGIC, DataBlockHeader,
             FILE_TRAILER_BLOCK_MAGIC, FileTrailer, FileTrailerColumn, FixedLen,
             INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS, INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS,
             INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS,
-            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader,
-            MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ModularBloomFilterBlockRef, NodeType,
-            PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC, PartitionedBloomFilterHeader,
+            INCOMPATIBLE_FEATURE_PREFIX_FILTERS, INCOMPATIBLE_FEATURE_ROARING_FILTERS,
+            INDEX_BLOCK_MAGIC, IndexBlockHeader, MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
+            ModularBloomFilterBlockRef, NodeType, PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC,
+            PREFIX_BLOOM_FILTER_BLOCK_MAGIC, PartitionedBloomFilterHeader, PrefixBloomFilterHeader,
             ROARING_BITMAP_FILTER_BLOCK_MAGIC, RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
         },
         reader::TreeNode,
@@ -1361,9 +1364,19 @@ struct Writer {
     cache: fn() -> Option<Arc<BufferCache>>,
     writer: BlockWriter,
     key_filter: Option<BatchKeyFilter>,
+    /// The kind and the distinct prefix hashes of a prefix filter to store, set
+    /// by [`Writer1`] or [`Writer2`] just before [`close`](Self::close).
+    prefix: Option<(PrefixKind, Vec<u64>)>,
     cws: Vec<ColumnWriter>,
     finished_columns: Vec<FileTrailerColumn>,
     serializer: SerializerInner,
+}
+
+/// Where a writer put a file's partitioned prefix filter, so that it can hand
+/// the new batch a handle on it once the file is complete.
+struct StoredPrefixPartitions {
+    shape: PartitionedBloomShape,
+    first_partition_offset: u64,
 }
 
 impl Writer {
@@ -1392,6 +1405,7 @@ impl Writer {
                 parameters.compression_level,
             ),
             key_filter,
+            prefix: None,
             cws,
             finished_columns,
             serializer: SerializerInner::new(),
@@ -1442,10 +1456,93 @@ impl Writer {
         Ok(key_bounds)
     }
 
+    /// Writes the prefix filter of `hashes`, the distinct prefix hashes of the
+    /// file's keys, and records its location in `metadata`.
+    ///
+    /// Returns the filter as the new batch probes it: inline hashes, or the
+    /// location of stored partitions, whose handle needs the completed file.
+    /// Returns `None` when the false positive rate asks for no Bloom filter
+    /// and the hashes are too many to store inline.
+    fn write_prefix_filter(
+        &mut self,
+        kind: PrefixKind,
+        hashes: Vec<u64>,
+        metadata: &mut BatchMetadata,
+    ) -> Result<Option<Result<PrefixFilter, StoredPrefixPartitions>>, StorageError> {
+        let (tag, length) = kind.to_raw();
+        let mut header = PrefixBloomFilterHeader {
+            header: BlockHeader::new(&PREFIX_BLOOM_FILTER_BLOCK_MAGIC),
+            kind: tag,
+            length,
+            prefixes: hashes.len() as u64,
+            n_partitions: 0,
+            partition_bytes: 0,
+            hashes: 0,
+            first_partition_offset: 0,
+            n_inline: 0,
+            inline: Vec::new(),
+        };
+        let filter = if hashes.len() <= INLINE_PREFIXES {
+            let filter = PrefixFilter::inline(hashes);
+            let PrefixFilter::Inline { hashes, .. } = &filter else {
+                unreachable!("PrefixFilter::inline builds an inline filter")
+            };
+            header.n_inline = hashes.len() as u32;
+            header.inline = hashes.to_vec();
+            Ok(filter)
+        } else {
+            let Some(shape) = PartitionedBloomShape::for_keys(
+                hashes.len() as u64,
+                Runtime::bloom_false_positive_rate(),
+            ) else {
+                return Ok(None);
+            };
+            let mut builder = PartitionedBloomBuilder::new(shape);
+            for hash in hashes {
+                builder.insert_hash(hash);
+            }
+            let mut first_partition_offset = None;
+            for (index, block) in builder.partition_blocks().enumerate() {
+                let (_, location) = self.writer.write_block(block, None)?;
+                let first = *first_partition_offset.get_or_insert(location.offset);
+                // Readers find partition `index` by arithmetic, so the
+                // partitions must lie back to back.
+                assert_eq!(
+                    (location.offset, location.size),
+                    (first + (index * PARTITION_BYTES) as u64, PARTITION_BYTES)
+                );
+            }
+            let first_partition_offset =
+                first_partition_offset.expect("a partitioned filter has at least one partition");
+            header.n_partitions = shape.n_partitions;
+            header.partition_bytes = PARTITION_BYTES as u32;
+            header.hashes = shape.hashes;
+            header.first_partition_offset = first_partition_offset;
+            Err(StoredPrefixPartitions {
+                shape,
+                first_partition_offset,
+            })
+        };
+        let block_bytes = (64 + header.inline.len() * size_of::<u64>()).next_multiple_of(512);
+        let (_, location) = self
+            .writer
+            .write_block(header.into_block(block_bytes), None)?;
+        metadata.prefix_filter_offset = location.offset;
+        metadata.prefix_filter_size = location.size as u64;
+        Ok(Some(filter))
+    }
+
     pub fn close(
         mut self,
-        metadata: BatchMetadata,
-    ) -> Result<(Arc<dyn FileReader>, Option<BatchKeyFilter>), StorageError> {
+        mut metadata: BatchMetadata,
+    ) -> Result<
+        (
+            Arc<dyn FileReader>,
+            Option<BatchKeyFilter>,
+            Option<PrefixFilter>,
+        ),
+        StorageError,
+    > {
         debug_assert_eq!(self.cws.len(), self.finished_columns.len());
 
         if let Some(key_filter) = &mut self.key_filter {
@@ -1547,6 +1644,17 @@ impl Writer {
             BlockLocation { offset: 0, size: 0 }
         };
 
+        let prefix_filter = match self.prefix.take() {
+            Some((kind, hashes)) => {
+                let filter = self.write_prefix_filter(kind, hashes, &mut metadata)?;
+                if filter.is_some() {
+                    incompatible_features |= INCOMPATIBLE_FEATURE_PREFIX_FILTERS;
+                }
+                filter
+            }
+            None => None,
+        };
+
         // Write the file trailer block.
 
         if self.writer.wrote_front_coded {
@@ -1600,7 +1708,17 @@ impl Writer {
             ),
             other => other,
         };
-        Ok((file, key_filter))
+        let prefix_filter = prefix_filter.map(|filter| {
+            filter.unwrap_or_else(|stored| {
+                PrefixFilter::Stored(StoredPartitionedBloom::new(
+                    stored.shape,
+                    stored.first_partition_offset,
+                    file.clone(),
+                    self.cache,
+                ))
+            })
+        });
+        Ok((file, key_filter, prefix_filter))
     }
 
     pub fn n_columns(&self) -> usize {
@@ -1662,6 +1780,7 @@ where
 {
     inner: Writer,
     pub(crate) factories: Factories<K0, A0>,
+    prefix: Option<PrefixCollector<K0>>,
     _phantom: PhantomData<fn(&K0, &A0)>,
     #[cfg(debug_assertions)]
     prev0: Option<Box<K0>>,
@@ -1690,6 +1809,7 @@ where
                 1,
                 key_filter,
             )?,
+            prefix: None,
             _phantom: PhantomData,
             #[cfg(debug_assertions)]
             prev0: None,
@@ -1709,6 +1829,9 @@ where
             }
             self.prev0 = Some(clone_box(key0));
         }
+        if let Some(prefix) = &mut self.prefix {
+            prefix.push_key(item.0);
+        }
         self.inner.write(0, item)
     }
 
@@ -1724,7 +1847,7 @@ where
     ///
     /// * `metadata` - Batch metadata to include in the trailer.
     pub fn close(
-        mut self,
+        self,
         metadata: BatchMetadata,
     ) -> Result<
         (
@@ -1734,9 +1857,39 @@ where
         ),
         StorageError,
     > {
-        let key_bounds = self.inner.finish_column::<K0, A0>(0)?;
-        let (file_handle, bloom_filter) = self.inner.close(metadata)?;
+        let (file_handle, bloom_filter, _prefix_filter, key_bounds) =
+            self.close_with_prefix(metadata)?;
         Ok((file_handle, bloom_filter, key_bounds))
+    }
+
+    /// Like [`close`](Self::close), also returning the prefix filter.
+    #[allow(clippy::type_complexity)]
+    fn close_with_prefix(
+        mut self,
+        metadata: BatchMetadata,
+    ) -> Result<
+        (
+            Arc<dyn FileReader>,
+            Option<BatchKeyFilter>,
+            Option<PrefixFilter>,
+            Option<(Box<K0>, Box<K0>)>,
+        ),
+        StorageError,
+    > {
+        let key_bounds = self.inner.finish_column::<K0, A0>(0)?;
+        self.inner.prefix = self
+            .prefix
+            .take()
+            .map(|prefix| (prefix.spec().kind(), prefix.into_hashes()));
+        let (file_handle, bloom_filter, prefix_filter) = self.inner.close(metadata)?;
+        Ok((file_handle, bloom_filter, prefix_filter, key_bounds))
+    }
+
+    /// Builds a prefix filter over `spec`'s prefix of the keys written to
+    /// column 0, besides any whole-key filter the writer was given.
+    pub fn with_prefix_filter(mut self, spec: PrefixSpec<K0>) -> Self {
+        self.prefix = Some(PrefixCollector::new(spec));
+        self
     }
 
     /// Returns the path for the file being written.
@@ -1757,13 +1910,16 @@ where
         let any_factories = self.factories.any_factories();
 
         let cache = self.inner.cache;
-        let (file_handle, key_filter, key_bounds) = self.close(metadata)?;
+        let prefix_spec = self.prefix.as_ref().map(PrefixCollector::spec);
+        let (file_handle, key_filter, prefix_filter, key_bounds) =
+            self.close_with_prefix(metadata)?;
         let key_range = key_bounds
             .as_ref()
             .map(|(min, max)| KeyRange::from_refs(min.as_ref(), max.as_ref()));
         let (reader, membership_filter) =
             Reader::new_with_filter(&[&any_factories], cache, file_handle, key_filter)?;
-        let filters = BatchFilters::from_file(key_range, membership_filter);
+        let filters = BatchFilters::from_file(key_range, membership_filter)
+            .with_prefix_filter(prefix_spec.zip(prefix_filter));
         Ok((reader, filters))
     }
 
@@ -1832,6 +1988,7 @@ where
     inner: Writer,
     pub(crate) factories0: Factories<K0, A0>,
     pub(crate) factories1: Factories<K1, A1>,
+    prefix: Option<PrefixCollector<K0>>,
     #[cfg(debug_assertions)]
     prev0: Option<Box<K0>>,
     #[cfg(debug_assertions)]
@@ -1870,6 +2027,7 @@ where
             prev0: None,
             #[cfg(debug_assertions)]
             prev1: None,
+            prefix: None,
             _phantom: PhantomData,
         })
     }
@@ -1893,6 +2051,9 @@ where
             self.prev1 = None;
         }
 
+        if let Some(prefix) = &mut self.prefix {
+            prefix.push_key(item.0);
+        }
         self.inner.write(0, item)
     }
 
@@ -1930,7 +2091,7 @@ where
     ///
     /// * `metadata` - Batch metadata to include in the trailer.
     pub fn close(
-        mut self,
+        self,
         metadata: BatchMetadata,
     ) -> Result<
         (
@@ -1940,10 +2101,40 @@ where
         ),
         StorageError,
     > {
+        let (file_handle, bloom_filter, _prefix_filter, key_bounds) =
+            self.close_with_prefix(metadata)?;
+        Ok((file_handle, bloom_filter, key_bounds))
+    }
+
+    /// Like [`close`](Self::close), also returning the prefix filter.
+    #[allow(clippy::type_complexity)]
+    fn close_with_prefix(
+        mut self,
+        metadata: BatchMetadata,
+    ) -> Result<
+        (
+            Arc<dyn FileReader>,
+            Option<BatchKeyFilter>,
+            Option<PrefixFilter>,
+            Option<(Box<K0>, Box<K0>)>,
+        ),
+        StorageError,
+    > {
         let key_bounds = self.inner.finish_column::<K0, A0>(0)?;
         let _ = self.inner.finish_column::<K1, A1>(1)?;
-        let (file_handle, bloom_filter) = self.inner.close(metadata)?;
-        Ok((file_handle, bloom_filter, key_bounds))
+        self.inner.prefix = self
+            .prefix
+            .take()
+            .map(|prefix| (prefix.spec().kind(), prefix.into_hashes()));
+        let (file_handle, bloom_filter, prefix_filter) = self.inner.close(metadata)?;
+        Ok((file_handle, bloom_filter, prefix_filter, key_bounds))
+    }
+
+    /// Builds a prefix filter over `spec`'s prefix of the keys written to
+    /// column 0, besides any whole-key filter the writer was given.
+    pub fn with_prefix_filter(mut self, spec: PrefixSpec<K0>) -> Self {
+        self.prefix = Some(PrefixCollector::new(spec));
+        self
     }
 
     /// Returns the storage used for this writer.
@@ -1969,7 +2160,9 @@ where
         let any_factories0 = self.factories0.any_factories();
         let any_factories1 = self.factories1.any_factories();
         let cache = self.inner.cache;
-        let (file_handle, key_filter, key_bounds) = self.close(metadata)?;
+        let prefix_spec = self.prefix.as_ref().map(PrefixCollector::spec);
+        let (file_handle, key_filter, prefix_filter, key_bounds) =
+            self.close_with_prefix(metadata)?;
         let key_range = key_bounds
             .as_ref()
             .map(|(min, max)| KeyRange::from_refs(min.as_ref(), max.as_ref()));
@@ -1979,7 +2172,8 @@ where
             file_handle,
             key_filter,
         )?;
-        let filters = BatchFilters::from_file(key_range, membership_filter);
+        let filters = BatchFilters::from_file(key_range, membership_filter)
+            .with_prefix_filter(prefix_spec.zip(prefix_filter));
         Ok((reader, filters))
     }
 

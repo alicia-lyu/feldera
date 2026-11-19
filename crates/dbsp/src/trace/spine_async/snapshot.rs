@@ -125,6 +125,30 @@ where
         }
     }
 
+    /// The runs of this snapshot that might hold a key with `probe`'s prefix,
+    /// as `spec` defines it ([`Batch::maybe_contains_prefix`]: each run's key
+    /// bounds, then its prefix filter), in their order.
+    ///
+    /// A prefix scan reads this snapshot instead of the whole one, so that it
+    /// opens and seeks no cursor on a run that cannot hold the prefix. Every
+    /// key carrying the prefix is in it; keys without the prefix may be
+    /// missing, so the scan must stop at the first key past the prefix.
+    pub fn retain_prefix(
+        &self,
+        probe: &B::Key,
+        spec: &crate::storage::file::PrefixSpec<B::Key>,
+    ) -> Self {
+        Self {
+            batches: self
+                .batches
+                .iter()
+                .filter(|batch| batch.maybe_contains_prefix(probe, spec))
+                .cloned()
+                .collect(),
+            factories: self.factories.clone(),
+        }
+    }
+
     pub fn extend(&mut self, other: Self) {
         self.batches.extend(other.batches.iter().cloned())
     }
@@ -490,5 +514,118 @@ mod partition_keys_test {
         );
 
         assert_within(&partition(&snapshot, PARTITIONS), 3);
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use crate::{
+        ZWeight,
+        dynamic::{DowncastTrait, DynData, Erase},
+        storage::file::{FilterKind, FilterSpec, PrefixSpec},
+        trace::{
+            Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
+            SpineSnapshot, test::run_in_circuit_with_storage,
+        },
+        typed_batch::DynOrdIndexedZSet,
+        utils::Tup2,
+    };
+    use proptest::{
+        collection::{btree_set, vec},
+        test_runner::{Config, TestRunner},
+    };
+    use std::{collections::BTreeSet, sync::Arc};
+
+    type Run = DynOrdIndexedZSet<DynData, DynData>;
+    type Line = Tup2<i64, i32>;
+
+    /// Keys `(order, line)` with a whole-key filter and a prefix filter over
+    /// the order, as a native Lineitem keyed by its primary key would have.
+    fn factories() -> <Run as BatchReader>::Factories {
+        <Run as BatchReader>::Factories::new::<Line, u8, ZWeight>()
+            .with_filter_spec(FilterSpec::both(PrefixSpec::fields::<Line, 1>()))
+    }
+
+    /// A file run holding lines 1 to 3 of each order in `orders`.
+    fn file_run(orders: &BTreeSet<i64>) -> Run {
+        let mut builder = <Run as Batch>::Builder::with_capacity_in_location(
+            &factories(),
+            orders.len() * 3,
+            orders.len() * 3,
+            Some(BatchLocation::Storage),
+        );
+        for &order in orders {
+            for line in 1..=3 {
+                builder.push_val_diff(7u8.erase(), (1 as ZWeight).erase());
+                builder.push_key(Tup2(order, line).erase());
+            }
+        }
+        builder.done()
+    }
+
+    /// The keys of `snapshot` with order `order`, by a prefix scan of the runs
+    /// that `retain_prefix` keeps.
+    fn scan(snapshot: &SpineSnapshot<Run>, order: i64) -> (Vec<Line>, usize) {
+        let probe = Tup2(order, i32::MIN);
+        let retained = snapshot.retain_prefix(probe.erase(), &PrefixSpec::fields::<Line, 1>());
+        let mut cursor = retained.cursor();
+        cursor.seek_key(probe.erase());
+        let mut lines = Vec::new();
+        while cursor.key_valid() && cursor.key().downcast_checked::<Line>().0 == order {
+            lines.push(*cursor.key().downcast_checked::<Line>());
+            cursor.step_key();
+        }
+        (lines, retained.batches().len())
+    }
+
+    /// A prefix scan over the retained runs finds every key with the prefix,
+    /// and an absent order keeps few runs.
+    #[test]
+    fn a_prefix_scan_of_the_retained_runs_matches_the_brute_force() {
+        run_in_circuit_with_storage(|| {
+            let strategy = vec(btree_set(0i64..400, 1..60), 1..6);
+            let mut runner = TestRunner::new(Config::with_cases(32));
+            runner
+                .run(&strategy, |runs| {
+                    let batches = runs
+                        .iter()
+                        .map(|orders| Arc::new(file_run(orders)))
+                        .collect();
+                    let snapshot = SpineSnapshot::with_batches(&factories(), batches);
+                    let mut kept_for_absent = 0;
+                    let mut absent = 0;
+                    for order in 0..400 {
+                        let holders = runs.iter().filter(|orders| orders.contains(&order)).count();
+                        let (lines, kept) = scan(&snapshot, order);
+                        let expected: Vec<Line> = if holders > 0 {
+                            (1..=3).map(|line| Tup2(order, line)).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        proptest::prop_assert_eq!(lines, expected, "order {}", order);
+                        proptest::prop_assert!(kept >= holders);
+                        if holders == 0 {
+                            absent += 1;
+                            kept_for_absent += kept;
+                        }
+                    }
+                    // The filters have false positives, but few.
+                    proptest::prop_assert!(kept_for_absent * 10 <= absent * runs.len() + 10);
+                    Ok(())
+                })
+                .unwrap_or_else(|failure| panic!("{failure}"));
+        });
+    }
+
+    /// With both filters, exact probes still consult the whole-key filter.
+    #[test]
+    fn both_filters_keep_the_whole_key_filter_for_exact_probes() {
+        run_in_circuit_with_storage(|| {
+            let run = file_run(&BTreeSet::from([5, 9]));
+            assert_ne!(run.membership_filter_kind(), FilterKind::None);
+            let mut cursor = run.cursor();
+            assert!(cursor.seek_key_exact(Tup2(9i64, 2i32).erase(), None));
+            assert!(!cursor.seek_key_exact(Tup2(9i64, 7i32).erase(), None));
+        });
     }
 }

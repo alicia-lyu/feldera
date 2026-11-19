@@ -142,6 +142,10 @@ pub const PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFPH";
 /// Magic number for one partition block of a partitioned Bloom filter.
 pub const PARTITIONED_BLOOM_PARTITION_MAGIC: [u8; 4] = *b"LFPP";
 
+/// Magic number for the header block of a prefix Bloom filter
+/// ([`PrefixBloomFilterHeader`]).
+pub const PREFIX_BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFXH";
+
 /// 8-byte header at the beginning of each block.
 ///
 /// A block does not identify its own size, so any reference to a block must
@@ -215,6 +219,16 @@ pub struct BatchMetadata {
     /// e.g. because its key type is not roaring-compatible or its span exceeds
     /// `u32`.
     pub touched_window_count: TouchedWindowCount,
+
+    /// File offset of the prefix filter's header block
+    /// ([`PrefixBloomFilterHeader`]), or 0 when the file has no prefix filter.
+    ///
+    /// Files written before prefix filters existed read zeros here, from the
+    /// trailer block's padding.
+    pub prefix_filter_offset: u64,
+
+    /// Size in bytes of the prefix filter's header block, or 0.
+    pub prefix_filter_size: u64,
 }
 
 /// File trailer block.
@@ -325,7 +339,8 @@ impl FileTrailer {
             & !INCOMPATIBLE_FEATURE_MODULAR_FILTERS
             & !INCOMPATIBLE_FEATURE_FRONT_CODED_KEYS
             & !INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS
-            & !INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS;
+            & !INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS
+            & !INCOMPATIBLE_FEATURE_PREFIX_FILTERS;
         if unknown_incompatible_features != 0 {
             Some(unknown_incompatible_features)
         } else {
@@ -373,6 +388,11 @@ pub const INCOMPATIBLE_FEATURE_ELIDED_VALUE_HEADERS: u64 = 1 << 3;
 /// ([`PARTITIONED_BLOOM_FILTER_BLOCK_MAGIC`]), which stays on storage and is
 /// read one partition at a time through the buffer cache.
 pub const INCOMPATIBLE_FEATURE_PARTITIONED_FILTERS: u64 = 1 << 4;
+
+/// Bit set to 1 in [FileTrailer::incompatible_features] if the file has a
+/// prefix Bloom filter ([`PREFIX_BLOOM_FILTER_BLOCK_MAGIC`]), located by
+/// [`BatchMetadata::prefix_filter_offset`].
+pub const INCOMPATIBLE_FEATURE_PREFIX_FILTERS: u64 = 1 << 5;
 
 /// Information about a column.
 ///
@@ -755,6 +775,54 @@ pub struct PartitionedBloomFilterHeader {
 
     /// File offset of partition 0.
     pub first_partition_offset: u64,
+}
+
+/// The header block of a prefix Bloom filter: a filter over the distinct key
+/// prefixes of a file's column 0, which a group-scoped seek probes before
+/// seeking the file.
+///
+/// A filter of few prefixes holds their hashes inline, sorted, and is kept in
+/// memory. A larger one is a partitioned Bloom filter whose partitions
+/// ([`PARTITIONED_BLOOM_PARTITION_MAGIC`]) lie back to back from
+/// [`first_partition_offset`](Self::first_partition_offset), probed one
+/// partition at a time through the buffer cache.
+#[binrw]
+#[derive(Clone, Debug)]
+pub struct PrefixBloomFilterHeader {
+    /// Block header with "LFXH" magic.
+    #[brw(assert(
+        header.magic == PREFIX_BLOOM_FILTER_BLOCK_MAGIC,
+        "prefix bloom filter block has bad magic"
+    ))]
+    pub header: BlockHeader,
+
+    /// The prefix kind: 1 for a byte prefix, 2 for a prefix of tuple fields.
+    pub kind: u8,
+
+    /// The prefix length: bytes for kind 1, fields for kind 2.
+    pub length: u32,
+
+    /// Distinct prefix hashes inserted.
+    pub prefixes: u64,
+
+    /// Number of partitions; 0 when the hashes are inline.
+    pub n_partitions: u32,
+
+    /// Size of each partition block in bytes (0 when inline).
+    pub partition_bytes: u32,
+
+    /// Bit positions set per prefix within its partition (0 when inline).
+    pub hashes: u32,
+
+    /// File offset of partition 0 (0 when inline).
+    pub first_partition_offset: u64,
+
+    /// Number of inline hashes.
+    pub n_inline: u32,
+
+    /// The inline hashes, sorted and distinct.
+    #[br(count = n_inline)]
+    pub inline: Vec<u64>,
 }
 
 /// The fixed-size front of a modular Bloom filter block.

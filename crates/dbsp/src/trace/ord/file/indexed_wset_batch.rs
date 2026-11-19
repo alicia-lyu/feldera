@@ -1,7 +1,8 @@
 use crate::storage::backend::BlockLocation;
 use crate::storage::file::format::BatchMetadata;
 use crate::storage::file::{
-    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+    BatchKeyFilter, FilterKind, FilterSpec, FilterStats, PrefixSpec, TouchedWindowCount,
+    TouchedWindowCounter, collect_roaring_metadata,
 };
 use crate::{
     DBData, DBWeight, NumEntries, Runtime,
@@ -24,8 +25,8 @@ use crate::{
         cursor::{
             CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor,
             run_reads::{
-                count_filtered_probe, count_key_decode, count_seek, count_value_decode,
-                count_weight_decode,
+                count_filtered_prefix_probe, count_filtered_probe, count_key_decode, count_seek,
+                count_value_decode, count_weight_decode,
             },
         },
         filter::BatchFilters,
@@ -56,6 +57,53 @@ where
     factories1: FileFactories<V, R>,
     opt_key_factory: &'static dyn Factory<DynOpt<K>>,
     pub vec_indexed_wset_factory: VecIndexedWSetFactories<K, V, R>,
+    /// The membership filters that files of these batches get.
+    filter_spec: FilterSpec<K>,
+}
+
+impl<K, V, R> FileIndexedWSetFactories<K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    /// These factories, writing files with the membership filters of `spec`
+    /// (by default a whole-key filter only). Batches built, merged, or read
+    /// back from storage through them use `spec`, so a spine's factories set
+    /// it for every run of the spine.
+    pub fn with_filter_spec(mut self, spec: FilterSpec<K>) -> Self {
+        self.filter_spec = spec;
+        self
+    }
+
+    /// The membership filters that files of these batches get.
+    pub fn filter_spec(&self) -> FilterSpec<K> {
+        self.filter_spec
+    }
+
+    /// A writer for a file of these batches, with `key_filter` as its
+    /// whole-key filter unless the spec turns that off, and a prefix filter if
+    /// the spec asks for one.
+    fn writer(&self, key_filter: Option<BatchKeyFilter>) -> Writer2<K, DynUnit, V, R> {
+        let key_filter = if self.filter_spec.whole_key {
+            key_filter
+        } else {
+            None
+        };
+        let writer = Writer2::new(
+            &self.factories0,
+            &self.factories1,
+            Runtime::buffer_cache,
+            &*Runtime::storage_backend().unwrap_storage(),
+            Runtime::file_writer_parameters(),
+            key_filter,
+        )
+        .unwrap_storage();
+        match self.filter_spec.prefix {
+            Some(spec) => writer.with_prefix_filter(spec),
+            None => writer,
+        }
+    }
 }
 
 impl<K, V, R> Clone for FileIndexedWSetFactories<K, V, R>
@@ -70,6 +118,7 @@ where
             factories1: self.factories1.clone(),
             opt_key_factory: self.opt_key_factory,
             vec_indexed_wset_factory: self.vec_indexed_wset_factory.clone(),
+            filter_spec: self.filter_spec,
         }
     }
 }
@@ -91,6 +140,7 @@ where
             factories1: FileFactories::new::<VType, RType>(),
             opt_key_factory: WithFactory::<Option<KType>>::FACTORY,
             vec_indexed_wset_factory: VecIndexedWSetFactories::new::<KType, VType, RType>(),
+            filter_spec: FilterSpec::default(),
         }
     }
 
@@ -289,15 +339,9 @@ where
 {
     #[inline]
     fn neg_by_ref(&self) -> Self {
-        let mut writer = Writer2::new(
-            &self.factories.factories0,
-            &self.factories.factories1,
-            Runtime::buffer_cache,
-            &*Runtime::storage_backend().unwrap_storage(),
-            Runtime::file_writer_parameters(),
-            FilterPlan::<K>::decide_filter(None, self.key_count()),
-        )
-        .unwrap_storage();
+        let mut writer = self
+            .factories
+            .writer(FilterPlan::<K>::decide_filter(None, self.key_count()));
 
         let mut cursor = self.cursor();
         while cursor.key_valid() {
@@ -314,6 +358,7 @@ where
             negative_weight_count: (self.len() as u64)
                 .saturating_sub(self.metadata().negative_weight_count),
             touched_window_count: self.metadata().touched_window_count,
+            ..BatchMetadata::default()
         };
         let (file, filters) = writer.into_reader(stats).unwrap_storage();
         Self::from_parts(self.factories.clone(), Arc::new(file), filters)
@@ -518,12 +563,27 @@ where
         )?;
         let file = Arc::new(file);
         let key_range = file.key_range()?.map(Into::into);
-        let filters = BatchFilters::from_file(key_range, membership_filter);
+        let prefix_filter = match factories.filter_spec.prefix {
+            Some(spec) => file
+                .prefix_filter(spec.kind())?
+                .map(|filter| (spec, filter)),
+            None => None,
+        };
+        let filters =
+            BatchFilters::from_file(key_range, membership_filter).with_prefix_filter(prefix_filter);
         Ok(Self::from_parts(factories.clone(), file, filters))
     }
 
     fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
         self.filters.key_bounds()
+    }
+
+    fn maybe_contains_prefix(&self, probe: &K, spec: &PrefixSpec<K>) -> bool {
+        let maybe = self.filters.maybe_contains_prefix(probe, spec);
+        if !maybe {
+            count_filtered_prefix_probe();
+        }
+        maybe
     }
 
     fn negative_weight_count(&self) -> Option<u64> {
@@ -1107,15 +1167,7 @@ where
     ) -> Self {
         Self {
             factories: factories.clone(),
-            writer: Writer2::new(
-                &factories.factories0,
-                &factories.factories1,
-                Runtime::buffer_cache,
-                &*Runtime::storage_backend().unwrap_storage(),
-                Runtime::file_writer_parameters(),
-                FilterPlan::<K>::decide_filter(None, key_capacity),
-            )
-            .unwrap_storage(),
+            writer: factories.writer(FilterPlan::<K>::decide_filter(None, key_capacity)),
             weight: factories.weight_factory().default_box(),
             num_tuples: 0,
             stats: BatchMetadata::default(),
@@ -1144,15 +1196,7 @@ where
         };
         Self {
             factories: factories.clone(),
-            writer: Writer2::new(
-                &factories.factories0,
-                &factories.factories1,
-                Runtime::buffer_cache,
-                &*Runtime::storage_backend().unwrap_storage(),
-                Runtime::file_writer_parameters(),
-                key_filter,
-            )
-            .unwrap_storage(),
+            writer: factories.writer(key_filter),
             weight: factories.weight_factory().default_box(),
             num_tuples: 0,
             stats: BatchMetadata::default(),

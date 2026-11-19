@@ -1,5 +1,6 @@
 mod bloom;
 mod partitioned;
+mod prefix;
 mod roaring;
 mod stats;
 
@@ -23,6 +24,9 @@ pub use stats::{FilterKind, FilterStats, TrackingFilterStats};
 pub(crate) use bloom::{modules_for_rate, rate_can_evict, resident_modules};
 pub use partitioned::{
     PARTITION_BYTES, PartitionedBloomBuilder, PartitionedBloomShape, StoredPartitionedBloom,
+};
+pub use prefix::{
+    FilterSpec, INLINE_PREFIXES, PrefixCollector, PrefixFilter, PrefixKind, PrefixSpec, TuplePrefix,
 };
 
 /// The configured false positive rate, which decides both how new filters are

@@ -82,6 +82,13 @@ A merging cursor over the runs of one index snapshot. `step` and `seek` read no 
 `key` is the merged key, already read. `take` sums weights per value and counts the values that
 cancelled. Untouched positions therefore cost a key decode and nothing else.
 
+`seek_group(prefix)` (with `RunMerge::with_group_prefix`) asks each run behind the group whether it
+can hold it (`Batch::maybe_contains_prefix`) and parks those that cannot; `key` then ends at the
+group's end. An index's runs get the prefix filter through `batch::index_factories(&TRIE)`, whose
+spec is `KeyTrie::root_prefix_spec()`; use the same factories for the spine and for
+`batch::build_batch_in`. `ScanSession` seeks every group with `seek_group`, probing the prefix of
+the snapshot's `filter_spec`; a spine without one is sought run by run, as before.
+
 ## `ScanSession<D: MergedIndexDefinition>`
 
 One session per transaction: a cursor over the touched groups of `Old`, schema-independent and bound

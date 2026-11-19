@@ -30,13 +30,27 @@
 //! uncompacted run set. `take` consumes the values of the runs at the key, so
 //! it visits nothing the second time. [`RunMerge::step`] and
 //! [`RunMerge::seek`] reposition the values of the keys they land on.
+//!
+//! # Group-scoped seeks
+//!
+//! [`RunMerge::seek_group`] seeks to a group's prefix, but first asks each run
+//! behind it whether it can hold a key with that prefix
+//! ([`BatchReader::maybe_contains_prefix`]: the run's key bounds, then its
+//! prefix filter). A run that cannot is *parked*: it is not sought, and it takes
+//! no part in the position until the next seek. Its keys behind the position
+//! all lie outside the group, so the position is right for every key in the
+//! group, and only there: once the smallest key leaves the group,
+//! [`RunMerge::key`] returns `None`, since a parked run may hold smaller keys
+//! beyond the group. The next seek moves every run that is behind its target,
+//! the parked ones included.
 
 use std::cmp::Ordering;
 
 use crate::{
     ZWeight,
     dynamic::{DowncastTrait, DynData, Erase},
-    trace::{BatchReader, Cursor, SpineSnapshot},
+    storage::file::PrefixSpec,
+    trace::{Batch, BatchReader, Cursor, SpineSnapshot},
 };
 
 use super::MergedIndexBatch;
@@ -46,6 +60,20 @@ type RunCursor<'a> = <MergedIndexBatch as BatchReader>::Cursor<'a>;
 /// A merging cursor over the runs of a snapshot; see the [module docs](self).
 pub struct RunMerge<'a> {
     runs: Vec<RunCursor<'a>>,
+
+    /// The batch of each run, which answers group-scoped probes.
+    batches: Vec<&'a MergedIndexBatch>,
+
+    /// The prefix that [`RunMerge::seek_group`] probes with; without one it
+    /// seeks every run, as [`RunMerge::seek`] does.
+    group_prefix: Option<PrefixSpec<DynData>>,
+
+    /// The runs that the last [`RunMerge::seek_group`] skipped, by index.
+    parked: Vec<bool>,
+
+    /// The group of the last [`RunMerge::seek_group`] while any run is parked:
+    /// the position is valid only inside it.
+    parked_group: Option<Vec<u8>>,
 
     /// The indexes of the runs at the smallest key, in run order. Empty when
     /// every run is exhausted.
@@ -63,8 +91,24 @@ impl<'a> RunMerge<'a> {
     /// Opens one cursor per run of `snapshot`, and positions on the smallest
     /// first key. A file run decodes its first key and nothing else.
     pub fn new(snapshot: &'a SpineSnapshot<MergedIndexBatch>) -> Self {
+        Self::with_group_prefix(snapshot, None)
+    }
+
+    /// Like [`new`](Self::new), with `group_prefix` as the prefix that
+    /// [`seek_group`](Self::seek_group) probes each run with: an index's
+    /// group prefix ([`KeyTrie::root_prefix_spec`](super::KeyTrie::root_prefix_spec)).
+    pub fn with_group_prefix(
+        snapshot: &'a SpineSnapshot<MergedIndexBatch>,
+        group_prefix: Option<PrefixSpec<DynData>>,
+    ) -> Self {
+        let batches: Vec<&'a MergedIndexBatch> =
+            snapshot.batches().iter().map(|run| &**run).collect();
         let mut merge = Self {
-            runs: snapshot.batches().iter().map(|run| run.cursor()).collect(),
+            runs: batches.iter().map(|run| run.cursor()).collect(),
+            parked: vec![false; batches.len()],
+            batches,
+            group_prefix,
+            parked_group: None,
             at_key: Vec::new(),
             cancelled: 0,
             exhausted: false,
@@ -79,8 +123,19 @@ impl<'a> RunMerge<'a> {
     }
 
     /// The smallest key over the runs, or `None` when every run is exhausted.
+    /// After a [`seek_group`](Self::seek_group) that parked some run, `None`
+    /// also once the smallest key leaves the group.
     pub fn key(&self) -> Option<&[u8]> {
-        self.at_key.first().map(|&run| key_of(&self.runs[run]))
+        let key = self.at_key.first().map(|&run| key_of(&self.runs[run]))?;
+        match &self.parked_group {
+            Some(group) if !key.starts_with(group) => None,
+            _ => Some(key),
+        }
+    }
+
+    /// How many runs the last [`seek_group`](Self::seek_group) parked.
+    pub fn parked_count(&self) -> usize {
+        self.parked.iter().filter(|&&parked| parked).count()
     }
 
     /// How many values [`take`](Self::take) has found to cancel across runs.
@@ -106,6 +161,7 @@ impl<'a> RunMerge<'a> {
             return false;
         }
         let target = target.to_vec();
+        self.unpark();
         let mut moved = false;
         for run in &mut self.runs {
             if run.key_valid() && key_of(run) < target.as_slice() {
@@ -115,6 +171,47 @@ impl<'a> RunMerge<'a> {
         }
         self.find_smallest_key();
         moved
+    }
+
+    /// Seeks to `group`, a group prefix, as [`seek`](Self::seek) does, except
+    /// that a run behind `group` that cannot hold a key with `group`'s prefix
+    /// is parked instead of sought; see the [module docs](self#group-scoped-seeks).
+    /// Returns whether any run moved.
+    ///
+    /// Without a group prefix (see [`with_group_prefix`](Self::with_group_prefix))
+    /// this is [`seek`](Self::seek).
+    pub fn seek_group(&mut self, group: &[u8]) -> bool {
+        let Some(spec) = self.group_prefix else {
+            return self.seek(group);
+        };
+        if self.exhausted {
+            return false;
+        }
+        self.unpark();
+        let probe = group.to_vec();
+        let mut moved = false;
+        for (index, run) in self.runs.iter_mut().enumerate() {
+            if !run.key_valid() || key_of(run) >= group {
+                continue;
+            }
+            if self.batches[index].maybe_contains_prefix(probe.erase(), &spec) {
+                run.seek_key(probe.erase());
+                moved = true;
+            } else {
+                self.parked[index] = true;
+            }
+        }
+        if self.parked.contains(&true) {
+            self.parked_group = Some(probe);
+        }
+        self.find_smallest_key();
+        moved
+    }
+
+    /// Returns every parked run to the position.
+    fn unpark(&mut self) {
+        self.parked.fill(false);
+        self.parked_group = None;
     }
 
     /// Moves past every key, as a seek to a target above all keys would. No
@@ -193,7 +290,7 @@ impl<'a> RunMerge<'a> {
         }
         let mut smallest: Option<&[u8]> = None;
         for (index, run) in self.runs.iter().enumerate() {
-            if !run.key_valid() {
+            if !run.key_valid() || self.parked[index] {
                 continue;
             }
             let key = key_of(run);
@@ -229,10 +326,13 @@ pub(crate) mod tests {
     use crate::{
         DBData, DynZWeight,
         dynamic::DynData,
-        storage::attribution::Component,
+        storage::{attribution::Component, file::FilterSpec},
         trace::{
             Batch, BatchLocation, BatchReaderFactories, Builder, RunReads,
-            merged_index::{FoldedKey, batch::build_batch},
+            merged_index::{
+                FoldedKey,
+                batch::{build_batch, build_batch_in},
+            },
             ord::OrdIndexedWSetFactories,
             test::run_in_circuit_with_storage,
             with_read_owner,
@@ -686,6 +786,173 @@ pub(crate) mod tests {
             });
             let reads = RunReads::current_for(Component::MergedIndex).since(before);
             assert_eq!((reads.key_decodes, reads.value_decodes), (1, 1));
+        });
+    }
+
+    /// The factories of runs whose files get a prefix filter over the first
+    /// `N` key bytes and no whole-key filter.
+    fn prefix_factories<const N: usize>() -> OrdIndexedWSetFactories<DynData, DynData, DynZWeight> {
+        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, u8, ZWeight>()
+            .with_filter_spec(FilterSpec::prefix_only(PrefixSpec::bytes::<N>()))
+    }
+
+    /// A run in a file with a prefix filter over the first `N` key bytes.
+    fn prefix_file_run<const N: usize>(rows: &[Row]) -> MergedIndexBatch {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(key, payload, weight)| (FoldedKey(key.clone()), *payload, *weight))
+            .collect();
+        let run = build_batch_in(&prefix_factories::<N>(), rows.clone()).unwrap();
+        if run.location() == BatchLocation::Storage || run.is_empty() {
+            return run;
+        }
+        // Below the storage threshold the builder keeps the run in memory;
+        // copy it into a file, as `file_run` does, with the same factories.
+        let mut builder = <MergedIndexBatch as Batch>::Builder::with_capacity_in_location(
+            &prefix_factories::<N>(),
+            run.key_count(),
+            run.len(),
+            Some(BatchLocation::Storage),
+        );
+        let mut cursor = run.cursor();
+        while cursor.key_valid() {
+            while cursor.val_valid() {
+                let weight = *cursor.weight().downcast_checked::<ZWeight>();
+                builder.push_val_diff(cursor.val(), weight.erase());
+                cursor.step_val();
+            }
+            builder.push_key(cursor.key());
+            cursor.step_key();
+        }
+        builder.done()
+    }
+
+    /// Rows whose keys are a group byte (0 to 7) and one more byte, so that a
+    /// one-byte prefix names the group.
+    fn grouped_rows() -> impl Strategy<Value = Vec<Row>> {
+        let key = (0u8..8, 0u8..4).prop_map(|(group, rest)| vec![group, rest]);
+        let weight = prop_oneof![-2i64..=-1, 1i64..=2];
+        vec((key, 0u8..3, weight), 0..12)
+    }
+
+    /// Group-scoped seeks over file runs with prefix filters, and over memory
+    /// runs, visit exactly the keys of each requested group, with the same
+    /// sums as the brute force; groups that a run lacks park it.
+    #[test]
+    fn group_seeks_with_prefix_filters_match_the_brute_force() {
+        run_in_circuit_with_storage(|| {
+            let strategy = (
+                vec((grouped_rows(), any::<bool>()), 0..6),
+                proptest::collection::btree_set(0u8..8, 0..8),
+            );
+            let mut runner = TestRunner::new(Config::with_cases(96));
+            runner
+                .run(&strategy, |(runs, groups)| {
+                    let batches: Vec<_> = runs
+                        .iter()
+                        .map(|(rows, in_file)| {
+                            Arc::new(if *in_file {
+                                prefix_file_run::<1>(rows)
+                            } else {
+                                memory_run(rows)
+                            })
+                        })
+                        .collect();
+                    let snapshot = SpineSnapshot::with_batches(&prefix_factories::<1>(), batches);
+                    let mut merge =
+                        RunMerge::with_group_prefix(&snapshot, Some(PrefixSpec::bytes::<1>()));
+                    let expected = brute_force_taken(&runs);
+                    for group in groups {
+                        merge.seek_group(&[group]);
+                        let mut taken = Taken::new();
+                        while let Some(key) = merge.key().map(<[u8]>::to_vec) {
+                            if key[0] != group {
+                                break;
+                            }
+                            taken.insert(key, take_all(&mut merge));
+                            merge.step();
+                        }
+                        let wanted: Taken = expected
+                            .iter()
+                            .filter(|(key, _)| key[0] == group)
+                            .map(|(key, values)| (key.clone(), values.clone()))
+                            .collect();
+                        prop_assert_eq!(taken, wanted, "group {}", group);
+                    }
+                    Ok(())
+                })
+                .unwrap_or_else(|failure| panic!("{failure}"));
+        });
+    }
+
+    /// A run without the group is not sought: it is parked, and the probe that
+    /// skipped it is counted.
+    #[test]
+    fn a_run_without_the_group_is_parked_and_counted() {
+        run_in_circuit_with_storage(|| {
+            let present = prefix_file_run::<1>(&[(vec![1, 0], 1, 1), (vec![3, 0], 1, 1)]);
+            let absent = prefix_file_run::<1>(&[(vec![0, 0], 1, 1), (vec![4, 0], 1, 1)]);
+            let snapshot = SpineSnapshot::with_batches(
+                &prefix_factories::<1>(),
+                vec![Arc::new(present), Arc::new(absent)],
+            );
+            let mut merge = RunMerge::with_group_prefix(&snapshot, Some(PrefixSpec::bytes::<1>()));
+            let before = RunReads::current();
+            assert!(merge.seek_group(&[3]));
+            let reads = RunReads::current().since(before);
+            assert_eq!(merge.parked_count(), 1);
+            assert_eq!(reads.filtered_prefix_probes, 1);
+            assert_eq!(reads.seeks, 1);
+            assert_eq!(merge.key(), Some(&[3u8, 0][..]));
+            merge.step();
+            // The parked run's key [4, 0] lies beyond the group: the position
+            // ends with the group.
+            assert_eq!(merge.key(), None);
+            // The next seek unparks it.
+            merge.seek(&[4]);
+            assert_eq!(merge.parked_count(), 0);
+            assert_eq!(merge.key(), Some(&[4u8, 0][..]));
+        });
+    }
+
+    /// A run of more prefixes than fit inline stores a partitioned filter,
+    /// which has no false negatives, survives a reopen from its path, and
+    /// refuses factories that ask for another prefix.
+    #[test]
+    fn a_partitioned_prefix_filter_reloads_and_refuses_another_prefix() {
+        run_in_circuit_with_storage(|| {
+            let groups = 3 * crate::storage::file::INLINE_PREFIXES as u16;
+            let rows: Vec<Row> = (0..groups)
+                .flat_map(|group| {
+                    let [high, low] = (group * 2).to_be_bytes();
+                    [(vec![high, low, 0], 1, 1), (vec![high, low, 1], 2, 1)]
+                })
+                .collect();
+            let run = prefix_file_run::<2>(&rows);
+            assert_eq!(run.location(), BatchLocation::Storage);
+            let path = run.file_reader().unwrap().path().clone();
+            let reopened =
+                <MergedIndexBatch as Batch>::from_path(&prefix_factories::<2>(), &path).unwrap();
+            let spec = PrefixSpec::bytes::<2>();
+            let mut rejected = 0;
+            for group in 0..2 * groups {
+                let probe = group.to_be_bytes().to_vec();
+                let stored = group % 2 == 0;
+                for batch in [&run, &reopened] {
+                    let maybe = batch.maybe_contains_prefix(probe.erase(), &spec);
+                    assert!(maybe || !stored, "false negative for group {group}");
+                    rejected += usize::from(!maybe);
+                }
+            }
+            // Every absent group lies inside the key range, so only the filter
+            // can reject it: most absent groups, at the default rate.
+            assert!(
+                rejected > 2 * groups as usize * 9 / 10,
+                "rejected {rejected}"
+            );
+            assert!(
+                <MergedIndexBatch as Batch>::from_path(&prefix_factories::<3>(), &path).is_err()
+            );
         });
     }
 }

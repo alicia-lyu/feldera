@@ -83,6 +83,11 @@ pub struct RunReads {
     /// offset; otherwise a Bloom filter, which has no false negatives but some
     /// false positives. In-memory runs have no filters, so they count none.
     pub filtered_probes: u64,
+    /// Group-scoped seeks that skipped a file run because its key range or its
+    /// prefix filter answered that no key carries the prefix
+    /// (`BatchReader::maybe_contains_prefix`). Like `filtered_probes`, they cost
+    /// no seek; in-memory runs have no prefix filter and count none.
+    pub filtered_prefix_probes: u64,
     pub key_decodes: u64,
     pub value_decodes: u64,
     pub weight_decodes: u64,
@@ -98,6 +103,8 @@ thread_local! {
     static CURRENT_READ_OWNER: Cell<Component> = const { Cell::new(Component::Query) };
     static SEEKS: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static FILTERED_PROBES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
+    static FILTERED_PREFIX_PROBES: PerOwner =
+        const { [const { Cell::new(0) }; Component::ALL.len()] };
     static KEY_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static VALUE_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
     static WEIGHT_DECODES: PerOwner = const { [const { Cell::new(0) }; Component::ALL.len()] };
@@ -123,6 +130,7 @@ impl RunReads {
         Self {
             seeks: total(&SEEKS),
             filtered_probes: total(&FILTERED_PROBES),
+            filtered_prefix_probes: total(&FILTERED_PREFIX_PROBES),
             key_decodes: total(&KEY_DECODES),
             value_decodes: total(&VALUE_DECODES),
             weight_decodes: total(&WEIGHT_DECODES),
@@ -139,6 +147,7 @@ impl RunReads {
         Self {
             seeks: self.seeks - earlier.seeks,
             filtered_probes: self.filtered_probes - earlier.filtered_probes,
+            filtered_prefix_probes: self.filtered_prefix_probes - earlier.filtered_prefix_probes,
             key_decodes: self.key_decodes - earlier.key_decodes,
             value_decodes: self.value_decodes - earlier.value_decodes,
             weight_decodes: self.weight_decodes - earlier.weight_decodes,
@@ -158,6 +167,7 @@ impl AddAssign for RunReads {
     fn add_assign(&mut self, other: Self) {
         self.seeks += other.seeks;
         self.filtered_probes += other.filtered_probes;
+        self.filtered_prefix_probes += other.filtered_prefix_probes;
         self.key_decodes += other.key_decodes;
         self.value_decodes += other.value_decodes;
         self.weight_decodes += other.weight_decodes;
@@ -199,6 +209,10 @@ pub(crate) fn count_seek() {
 
 pub(crate) fn count_filtered_probe() {
     increment(&FILTERED_PROBES);
+}
+
+pub(crate) fn count_filtered_prefix_probe() {
+    increment(&FILTERED_PREFIX_PROBES);
 }
 
 pub(crate) fn count_key_decode() {
@@ -251,11 +265,15 @@ mod tests {
         count_memory_value_read();
         count_memory_value_read();
         count_memory_weight_read();
+        for _ in 0..6 {
+            count_filtered_prefix_probe();
+        }
         assert_eq!(
             RunReads::current().since(earlier),
             RunReads {
                 seeks: 1,
                 filtered_probes: 4,
+                filtered_prefix_probes: 6,
                 key_decodes: 2,
                 value_decodes: 1,
                 weight_decodes: 3,
@@ -271,6 +289,7 @@ mod tests {
         let mut sum = RunReads {
             seeks: 1,
             filtered_probes: 5,
+            filtered_prefix_probes: 9,
             key_decodes: 2,
             value_decodes: 3,
             weight_decodes: 4,
@@ -281,6 +300,7 @@ mod tests {
         sum += RunReads {
             seeks: 10,
             filtered_probes: 50,
+            filtered_prefix_probes: 90,
             key_decodes: 20,
             value_decodes: 30,
             weight_decodes: 40,
@@ -293,6 +313,7 @@ mod tests {
             RunReads {
                 seeks: 11,
                 filtered_probes: 55,
+                filtered_prefix_probes: 99,
                 key_decodes: 22,
                 value_decodes: 33,
                 weight_decodes: 44,
@@ -313,6 +334,7 @@ mod tests {
     const ONE_SEEK: RunReads = RunReads {
         seeks: 1,
         filtered_probes: 0,
+        filtered_prefix_probes: 0,
         key_decodes: 0,
         value_decodes: 0,
         weight_decodes: 0,

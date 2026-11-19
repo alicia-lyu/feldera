@@ -248,6 +248,11 @@ four times at once, writing `native-A`, `native-B`, `merged-index-A`, and `merge
 settings (`ImageSettings` in `src/main.rs`). Every load finishes before a failure is reported, and
 each image that loaded is kept.
 
+The prefix-filter arm (`--index-prefix-filter`, measurement version 17, an A/B arm off by default)
+is a storage setting too: add the flag to `--build-images` for a separate images directory (for
+example `$R5_OUT/images-v17-pf`), and to every campaign that reopens it. The runner rejects a
+report of the other arm.
+
 **Completing an image directory.** `measure.py --complete-images "$R5_OUT/images" --customer ...
 --orders ... --lineitem ... --elide-value-headers` loads, all at once, the images that
 `images.json` lacks, with the executables recorded there (so every image comes from the same

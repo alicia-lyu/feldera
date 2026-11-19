@@ -51,7 +51,11 @@ use std::{marker::PhantomData, ops::AddAssign};
 
 use serde::Serialize;
 
-use crate::{ZWeight, dynamic::DowncastTrait, trace::SpineSnapshot};
+use crate::{
+    ZWeight,
+    dynamic::DowncastTrait,
+    trace::{BatchReader, SpineSnapshot},
+};
 
 use super::{INDEX_TAG, MergedIndexBatch, MergedIndexDefinition, RunMerge};
 
@@ -136,7 +140,9 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
             touched.windows(2).all(|pair| pair[0] < pair[1]),
             "touched groups must be strictly ascending"
         );
-        let old = RunMerge::new(old);
+        // Group seeks probe the prefix the index's spine builds its filters over
+        // (`batch::index_factories`); a spine without one is sought run by run.
+        let old = RunMerge::with_group_prefix(old, old.factories().filter_spec().prefix);
         let mut counts = SessionCounts {
             cursor_opens: 1,
             ..SessionCounts::default()
@@ -216,9 +222,11 @@ impl<'a, D: MergedIndexDefinition> ScanSession<'a, D> {
         self.counts.positions += u64::from(self.old.key().is_some());
     }
 
-    /// Seeks `Old` to `target`, counting only a seek that moves some run.
+    /// Seeks `Old` to the group `target`, skipping the runs that cannot hold
+    /// it (`RunMerge::seek_group`), and counting only a seek that moves some
+    /// run.
     fn seek_old(&mut self, target: &[u8]) {
-        if self.old.seek(target) {
+        if self.old.seek_group(target) {
             self.counts.logical_seeks += 1;
             self.counts.positions += u64::from(self.old.key().is_some());
         }

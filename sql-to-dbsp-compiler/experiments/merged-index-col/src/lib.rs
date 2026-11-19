@@ -15,13 +15,34 @@ use dbsp::trace::merged_index::{MergedIndexBatch, MergedIndexDefinition};
 /// together with the row's folded key.
 pub type StoredPayload = Vec<u8>;
 
+/// The factories of the index's batches: folded byte keys, [`StoredPayload`] values.
+pub type IndexFactories = <MergedIndexBatch as dbsp::trace::BatchReader>::Factories;
+
 /// Folds each row's key, packs its payload, and builds one consolidated
-/// batch. Rejects a payload that does not belong to its key's placement.
+/// batch, with DBSP's default filters. Rejects a payload that does not belong
+/// to its key's placement.
 pub fn build_batch(
     rows: impl IntoIterator<Item = (Key, Payload, i64)>,
 ) -> Result<MergedIndexBatch, String> {
-    let folded = rows
-        .into_iter()
+    dbsp::trace::merged_index::batch::build_batch(fold_rows(rows)?)
+}
+
+/// Like [`build_batch`], with `factories`, which must have been made for
+/// [`StoredPayload`] values: for example
+/// `batch::index_factories::<StoredPayload>(&TRIE)`, whose files get a prefix
+/// filter over the customer group.
+pub fn build_batch_in(
+    factories: &IndexFactories,
+    rows: impl IntoIterator<Item = (Key, Payload, i64)>,
+) -> Result<MergedIndexBatch, String> {
+    dbsp::trace::merged_index::batch::build_batch_in(factories, fold_rows(rows)?)
+}
+
+/// Folds each row's key and packs its payload.
+fn fold_rows(
+    rows: impl IntoIterator<Item = (Key, Payload, i64)>,
+) -> Result<Vec<(dbsp::trace::merged_index::FoldedKey, StoredPayload, i64)>, String> {
+    rows.into_iter()
         .map(|(key, payload, weight)| {
             if !payload.matches(&key) {
                 return Err("payload does not match source key".into());
@@ -32,8 +53,7 @@ pub fn build_batch(
                 weight,
             ))
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    dbsp::trace::merged_index::batch::build_batch(folded)
+        .collect()
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use dbsp::dynamic::{DowncastTrait, DynData, Erase};
 use dbsp::storage::attribution::{with_write_owner, Component};
 #[cfg(test)]
 use dbsp::storage::buffer_cache::BufferCache;
-use dbsp::trace::merged_index::MergedIndexDefinition;
+use dbsp::trace::merged_index::{batch::index_factories, MergedIndexDefinition};
 use dbsp::trace::{
     BatchLocation, BatchReader, BatchReaderFactories, Cursor, OrdIndexedWSetFactories, Spine,
     SpineSnapshot, Trace, TraceRole, WithSnapshot,
@@ -19,8 +19,8 @@ use dbsp::{DynZWeight, Runtime, ZWeight};
 use feldera_sqllib::{Date, SqlDecimal};
 use feldera_storage::StoragePath;
 use merged_index_col::{
-    build_batch, decode_payload, prefix_custkey_orderkey_then_linenumber, CustomerByCustkeyKey,
-    CustomerByCustkeyPayload, CustomerOrdersLineitemDefinition, Key,
+    build_batch, build_batch_in, decode_payload, prefix_custkey_orderkey_then_linenumber,
+    CustomerByCustkeyKey, CustomerByCustkeyPayload, CustomerOrdersLineitemDefinition, Key,
     LineitemByCustkeyOrderkeyLinenumberKey, LineitemByCustkeyOrderkeyLinenumberPayload,
     OrdersByCustkeyOrderkeyKey, OrdersByCustkeyOrderkeyPayload, Payload,
 };
@@ -65,8 +65,11 @@ impl ManualIndex {
     ///
     /// Fails if the thread turns out not to be on the runtime's buffer cache: everything in the
     /// harness uses that one cache, so the index must not run on another.
-    pub(crate) fn new(runtime: &Runtime) -> Result<Self> {
-        Self::spawn(runtime, Some(runtime.clone()))
+    ///
+    /// With `prefix_filter`, the index's files carry a prefix filter over the customer group and
+    /// no whole-key filter (`batch::index_factories`); otherwise DBSP's default filters.
+    pub(crate) fn new(runtime: &Runtime, prefix_filter: bool) -> Result<Self> {
+        Self::spawn(runtime, Some(runtime.clone()), prefix_filter)
     }
 
     /// Like `new`, but leaves the thread's buffer cache unbound, so that it falls back to the
@@ -74,12 +77,12 @@ impl ManualIndex {
     /// `new` refuses such a thread: production has no unbound path.
     #[cfg(test)]
     pub(crate) fn without_cache_binding(runtime: &Runtime) -> Result<Self> {
-        Self::spawn(runtime, None)
+        Self::spawn(runtime, None, false)
     }
 
     /// Starts the owner thread in `runtime`. The thread binds the foreground cache of
     /// `cache_owner`, when there is one, and then checks that it is on the runtime's own cache.
-    fn spawn(runtime: &Runtime, cache_owner: Option<Runtime>) -> Result<Self> {
+    fn spawn(runtime: &Runtime, cache_owner: Option<Runtime>, prefix_filter: bool) -> Result<Self> {
         let (requests, incoming) = mpsc::channel();
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
@@ -97,12 +100,18 @@ impl ManualIndex {
                     if refused {
                         return;
                     }
-                    // Folded byte keys; packed payload bytes.
-                    let factories = OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
-                        Vec<u8>,
-                        Vec<u8>,
-                        ZWeight,
-                    >();
+                    // Folded byte keys; packed payload bytes. With the prefix filter, every
+                    // file run gets a filter over the customer group, which the scan session's
+                    // group seeks probe, and no whole-key filter (measurement version 17).
+                    let factories = if prefix_filter {
+                        index_factories::<Vec<u8>>(&CustomerOrdersLineitemDefinition::TRIE)
+                    } else {
+                        OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<
+                            Vec<u8>,
+                            Vec<u8>,
+                            ZWeight,
+                        >()
+                    };
                     let mut trace = Spine::<IndexBatch>::new(
                         &factories,
                         Arc::new("q3_manual_merged_index".to_owned()),
@@ -153,7 +162,7 @@ impl ManualIndex {
                                 let _ = reply.send(trace.ro_snapshot());
                             }
                             Ok(Request::Append(rows, reply)) => {
-                                let result = build_batch(rows).map(|batch| {
+                                let result = build_batch_in(&factories, rows).map(|batch| {
                                     let dlt = Arc::new(batch);
                                     feldera_storage::tokio::TOKIO
                                         .block_on(trace.insert(dlt.clone()));
@@ -547,7 +556,13 @@ pub(crate) fn lines(snapshot: &Snapshot, order: &Order) -> Result<Vec<Line>> {
 /// Seeks the range below `(customer_key, order_key)` and decodes the line items in it.
 fn lines_below(snapshot: &Snapshot, customer_key: i64, order_key: i64) -> Result<Vec<Line>> {
     let prefix = prefix_custkey_orderkey_then_linenumber(customer_key, order_key);
-    let mut cursor = snapshot.cursor();
+    // With the index's prefix filter, only the runs that may hold the customer's group: the
+    // prefix begins with it. Without it, every run, as before measurement version 17.
+    let retained = match snapshot.factories().filter_spec().prefix {
+        Some(spec) => snapshot.retain_prefix(prefix.erase(), &spec),
+        None => snapshot.clone(),
+    };
+    let mut cursor = retained.cursor();
     cursor.seek_key(prefix.erase());
     let mut rows = Vec::new();
     while cursor.key_valid() {

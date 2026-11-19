@@ -118,6 +118,9 @@ pub use filter::FilterPlan;
 pub use filter::TrackingRoaringBitmap;
 pub use filter::{FilterKind, FilterStats, TrackingFilterStats};
 pub use filter::{
+    FilterSpec, INLINE_PREFIXES, PrefixCollector, PrefixFilter, PrefixKind, PrefixSpec, TuplePrefix,
+};
+pub use filter::{
     PARTITION_BYTES, PartitionedBloomBuilder, PartitionedBloomShape, StoredPartitionedBloom,
 };
 pub(crate) use filter::{TouchedWindowCounter, collect_roaring_metadata};

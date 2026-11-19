@@ -763,7 +763,8 @@ class MeasureTest(unittest.TestCase):
             resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
             resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
         resources.update(changes)
-        return {"mode": mode, "sequence": {"resources": resources},
+        return {"mode": mode, "configuration": {"index_prefix_filter": False},
+                "sequence": {"resources": resources},
                 "refreshes": [{"refresh": 1, "resources": resources}]}
 
     @staticmethod
@@ -1061,6 +1062,29 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("expected None",
                       measure.session_pass_problems(report("native", "seek"), "seek")[0])
 
+    def test_reported_index_prefix_filter_must_be_the_requested_arm(self) -> None:
+        def report(mode: str, reported: object) -> dict:
+            return {"mode": mode, "configuration": {"index_prefix_filter": reported}}
+        for mode in ("native", "reconstructed"):
+            self.assertEqual(measure.index_prefix_filter_problems(report(mode, True), True), [])
+            self.assertEqual(measure.index_prefix_filter_problems(report(mode, False), False), [])
+            self.assertIn("expected True",
+                          measure.index_prefix_filter_problems(report(mode, False), True)[0])
+            self.assertIn("is None",
+                          measure.index_prefix_filter_problems(report(mode, None), False)[0])
+        self.assertEqual(measure.index_prefix_filter_problems({}, True), [])
+
+    def test_index_prefix_filter_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "index_prefix_filter": True}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        self.assertIn("--index-prefix-filter", measure.driver_command(spec, inputs))
+        spec["args"]["index_prefix_filter"] = False
+        self.assertNotIn("--index-prefix-filter", measure.driver_command(spec, inputs))
+        self.assertFalse(measure.parse_args(self.args).index_prefix_filter)
+
     def test_session_pass_flag_reaches_the_driver(self) -> None:
         spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
@@ -1319,7 +1343,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 16,
+        return {"mode": mode, "measurement_version": 17,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1426,7 +1450,7 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure.measurement_version_problems(report), [])
         report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 13, expected 16"])
+                         ["measurement_version is 13, expected 17"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

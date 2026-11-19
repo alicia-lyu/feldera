@@ -421,7 +421,7 @@ type Fixture = (&'static str, Change, bool);
 /// `session_pass` is the reconstructed build's scan-session pass; the native build has no
 /// session.
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
-    replay_with_image(fixtures, session_pass, None)
+    replay_with_image(fixtures, session_pass, None, false)
 }
 
 /// A scratch storage directory for one test, removed when dropped.
@@ -449,13 +449,17 @@ impl Drop for ScratchStorage {
 /// fixtures, and runs the rest on a pipeline reopened from that image in a new runtime, as a
 /// refresh process does (`Pipeline::reopen`, then `republish`).
 #[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
+///
+/// `index_prefix_filter` gives the merged index's files prefix filters (`--index-prefix-filter`).
 fn replay_with_image(
     fixtures: Vec<Fixture>,
     session_pass: Pass,
     image_after: Option<usize>,
+    index_prefix_filter: bool,
 ) -> Result<Vec<Value>> {
     let storage = image_after
-        .map(|_| ScratchStorage::new(&format!("{session_pass:?}")))
+        // Tests run concurrently in one process: name the directory by every parameter.
+        .map(|_| ScratchStorage::new(&format!("{session_pass:?}-prefix-{index_prefix_filter}")))
         .transpose()?;
     let config = || -> Result<CircuitConfig> {
         let config = CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
@@ -477,7 +481,7 @@ fn replay_with_image(
             pipeline.session_pass = session_pass;
         }
     };
-    let mut pipeline = Pipeline::new(config()?)?;
+    let mut pipeline = Pipeline::new(config()?, index_prefix_filter)?;
     prepare(&mut pipeline);
     let mut state = Reference::default();
     let mut transcript = Vec::new();
@@ -486,7 +490,7 @@ fn replay_with_image(
         if image_after == Some(position) {
             let image = pipeline.write_checkpoint()?;
             drop(pipeline);
-            pipeline = Pipeline::reopen(config()?, &image)?;
+            pipeline = Pipeline::reopen(config()?, &image, index_prefix_filter)?;
             prepare(&mut pipeline);
             let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
             republish(&mut pipeline, &mut base)?;
@@ -559,11 +563,35 @@ fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
     for fixtures in [rf1_rf2_fixtures, general_fixtures] {
         let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
         for split in [1, fixtures().len() / 2, fixtures().len() - 1] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split))?;
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false)?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
                 "an image after {split} fixtures"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The merged index's prefix filter (measurement version 17) leaves every transcript unchanged,
+/// whole and across an image. Reopened from an image, every run is a file with a prefix filter,
+/// so the group seeks after the split probe the filters and park the runs without the group.
+#[cfg(feature = "merged-index")]
+#[test]
+fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
+        assert_eq!(
+            serde_json::to_vec(&replay_with_image(fixtures(), Pass::Seek, None, true)?)?,
+            whole
+        );
+        for split in [1, fixtures().len() / 2] {
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), true)?;
+            assert_eq!(
+                serde_json::to_vec(&reopened)?,
+                whole,
+                "an image after {split} fixtures, with prefix filters"
             );
         }
     }
