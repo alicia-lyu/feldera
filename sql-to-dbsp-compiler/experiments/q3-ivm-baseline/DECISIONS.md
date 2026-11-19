@@ -178,6 +178,10 @@ Small transactions leave many small runs (14 to 75 in the merged index at the en
 
 The rebuild started sequentially (user direction: as much memory as possible). During native-A the user judged parallel loads with a larger budget for merged-index better, at least for the remaining three. Native-A finished alone with the whole budget; native-B, merged-index-A, and merged-index-B load at once with `measure.py --complete-images`, which splits 75% of `MemAvailable` by mode weight, merged-index twice native (`LOAD_MODE_WEIGHTS`). `images.json` records each image's `cache_bytes`.
 
+### 2026-11-18: Arm B and the step pass are retired
+
+Only arm `A-seek` runs: prefix truncation and value-header elision on, with the `seek` pass. Arm B (no prefix truncation) and every step setting are retired (user decisions). `measure.py` builds only the A images (`IMAGE_ARMS`) and offers only `--session-pass seek` (`SESSION_PASSES`). The driver keeps `--session-pass step` and DBSP keeps `Pass::Step`, so that the version 15 executables, and with them the images, stay valid; nothing in the campaign selects them. This amends the two arms of the morning's entry and the arms of 2026-11-11.
+
 ## Superseded and withdrawn
 
 Rows that apply to any index or harness are in the [generic log](../../../docs/design/merged-index/decisions.md#superseded-and-withdrawn).

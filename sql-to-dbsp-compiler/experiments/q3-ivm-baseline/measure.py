@@ -39,8 +39,10 @@ RUN_READ_FIELDS = ("seeks", "filtered_probes", "key_decodes", "value_decodes", "
 # The scan session's moves per transaction (`SessionCounts`, measurement version 8).
 SESSION_COUNT_FIELDS = ("groups", "cursor_opens", "logical_seeks", "logical_steps", "positions",
                         "payload_decodes_old", "payload_decodes_dlt", "cancelled")
-# How the reconstructed build's scan session passes untouched groups (`--session-pass`).
-SESSION_PASSES = ("seek", "step")
+# How the reconstructed build's scan session passes untouched groups (`--session-pass`). The
+# step pass was retired on 2026-11-18 (user decisions): a small transaction walks half the index
+# under it. The driver keeps `--session-pass step`; the runner no longer offers it.
+SESSION_PASSES = ("seek",)
 # The version of the driver report that this runner and `summarize.py` understand. Version 12
 # adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses). Version
 # 15 writes Bloom filters storage-resident (`configuration.filter_residency`) and adds each
@@ -67,8 +69,9 @@ STORAGE_DEVICE_FIELDS = ("path", "device", "filesystem", "logical_sector_bytes",
 
 # An image is the loaded state of one mode with one storage format. The refresh program refuses an
 # image whose settings differ from its own, so each mode has an image per prefix-truncation arm:
-# arm A with --front-code-byte-keys, arm B without.
-IMAGE_ARMS = (("A", True), ("B", False))
+# arm A with --front-code-byte-keys, arm B without. Arm B was retired on 2026-11-18 (user
+# decision), so only arm A's images are built; `image_name` still names B for older directories.
+IMAGE_ARMS = (("A", True),)
 IMAGES_MANIFEST = "images.json"
 
 

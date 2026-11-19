@@ -466,13 +466,14 @@ python3 measure.py \
   --device-label ssd
 ```
 
-This is arm `A-seek` for clustered. The two arms differ in one flag ("Campaign and two arms"
-below): A keeps `--front-code-byte-keys` and B drops it. Both use `--session-pass seek`; the step
-arms were dropped on 2026-11-18 ("Known limits").
+This is arm `A-seek` for clustered, the only arm since 2026-11-18: prefix truncation
+(`--front-code-byte-keys`) and value-header elision (`--elide-value-headers`) on, with the `seek`
+pass. Arm B (no prefix truncation) and the step pass are retired ("Campaign", below); `measure.py`
+builds only the A images and offers only `--session-pass seek`.
 Give each pilot its own `--report` and `--storage-path`, named by arm and workload:
 `--report "$R5_OUT/pilot-<arm>-<workload>/manifest.json"` and
-`--storage-path "$R5_OUT/pilot-<arm>-<workload>/runs"`. Run the four pilots in the order `A-seek`,
-`B-seek` for clustered, then the same for scattered. Why each flag:
+`--storage-path "$R5_OUT/pilot-<arm>-<workload>/runs"`. Run the two pilots, clustered then
+scattered. Why each flag:
 
 - `--images`: start each run from a copy of its mode's and arm's image ("Build the images"),
   in a new process that runs only the refreshes (the driver's `--from-image`). The window starts
@@ -552,40 +553,33 @@ the probe as evidence only: no HDD campaign exists, and nothing here supports a 
 devices until the user decides one. Do not summarize `pilot-hdd-*` manifests together with the SSD
 campaign's.
 
-## Campaign and two arms
+## Campaign
 
-Run the campaign on the SSD, only after all four SSD pilots pass and the pressure instrumentation
+Run the campaign on the SSD, only after both SSD pilots pass and the pressure instrumentation
 exists ([MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign)); the hard-disk probe does not
-gate it. It has two arms, prefix truncation on or off with the `seek` pass (decisions of
-2026-11-11 and 2026-11-18), each the pilot command with `--runs 3` and
-fresh `--report` and `--storage-path` values:
+gate it. It has one arm, `A-seek` (decisions of 2026-11-11 and 2026-11-18: the step arms and arm B
+are retired), the pilot command with `--runs 3` and fresh `--report` and `--storage-path` values.
 
-| Arm | `--front-code-byte-keys` | `--session-pass` |
-| --- | --- | --- |
-| `A-seek` | yes | `seek` |
-| `B-seek` | no | `seek` |
-
-Keep every other flag. Run them in the order `A-seek`, `B-seek` for clustered,
-then the same for scattered. Give each run its own directory named by arm and workload, with
+Keep every other flag. Run clustered, then scattered. Give each run its own directory named by
+arm and workload, with
 `--report "$R5_OUT/campaign-A-seek-clustered/manifest.json"` and
 `--storage-path "$R5_OUT/campaign-A-seek-clustered/runs"`, and so on. Then check:
 
-- each manifest's `configuration.front_code_byte_keys` and `configuration.session_pass` against its
-  arm (`measure.py` already rejects a driver report whose `session_pass` is not the one it asked
-  for);
-- that the input hashes match across all four manifests;
-- that native's storage and run reads are equal across the two arms of each workload.
+- each manifest's `configuration.front_code_byte_keys` (true) and `configuration.session_pass`
+  (`seek`; `measure.py` already rejects a driver report whose `session_pass` is not the one it
+  asked for);
+- that the input hashes match across both manifests.
 
-Then summarize the four manifests together:
+Then summarize the manifests together:
 
 ```bash
 python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
 ```
 
 `summarize.py` labels each manifest by its parent directory, which is why each needs its own, and
-its Markdown names each workload's session pass. The two arms double both stages: the pilot is
-2 arms × 2 workloads × 1 repetition × 2 modes = 8 runs per device (the SSD, then the hard-disk
-probe), and the campaign 2 × 2 × 3 × 2 = 24 on the SSD. The inputs are shared, so the disk holds
+its Markdown names each workload's session pass. The pilot is 2 workloads × 1 repetition ×
+2 modes = 4 runs per device (the SSD, then the hard-disk probe), and the campaign 2 × 3 × 2 = 12
+on the SSD, for each transaction size. The inputs are shared, so the disk holds
 them once, plus each run's storage (see "Storage path and disk budget").
 
 ## Report back

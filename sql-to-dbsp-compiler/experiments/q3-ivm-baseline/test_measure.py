@@ -228,7 +228,9 @@ class MeasureTest(unittest.TestCase):
     def test_images_are_named_by_mode_and_prefix_truncation_arm(self) -> None:
         self.assertEqual([measure.image_name(mode, front) for mode in measure.MODES
                           for _, front in measure.IMAGE_ARMS],
-                         ["native-A", "native-B", "merged-index-A", "merged-index-B"])
+                         ["native-A", "merged-index-A"])
+        # Arm B (no prefix truncation) was retired; its directories keep their name.
+        self.assertEqual(measure.image_name("native", False), "native-B")
 
     def test_build_images_and_campaigns_take_disjoint_arguments(self) -> None:
         base = ["--customer", str(self.root / "customer"), "--orders", str(self.root / "orders"),
@@ -325,11 +327,11 @@ class MeasureTest(unittest.TestCase):
             return {int(command[command.index("--cache-bytes") + 1]) for command in commands}
 
         together, commands = build("together", [])
-        self.assertEqual(together["configuration"]["concurrent_loads"], 4)
+        self.assertEqual(together["configuration"]["concurrent_loads"], 2)
         self.assertEqual(together["configuration"]["mem_available_bytes"], 8 * 1024 ** 3)
-        self.assertEqual(caches(commands), {measure.load_cache_bytes(8 * 1024 ** 3, 4)})
+        self.assertEqual(caches(commands), {measure.load_cache_bytes(8 * 1024 ** 3, 2)})
         self.assertEqual(together["configuration"]["cache_bytes"],
-                         measure.load_cache_bytes(8 * 1024 ** 3, 4))
+                         measure.load_cache_bytes(8 * 1024 ** 3, 2))
         alone, commands = build("alone", ["--sequential-loads"])
         self.assertEqual(alone["configuration"]["concurrent_loads"], 1)
         self.assertEqual(caches(commands), {6 * 1024 ** 3})
@@ -375,8 +377,7 @@ class MeasureTest(unittest.TestCase):
         def mkdir_with_placeholders(path: Path, *args: object, **kwargs: object) -> None:
             real_mkdir(path, *args, **kwargs)
             if path == images.resolve():
-                for name in ("native-B", "merged-index-A", "merged-index-B"):
-                    real_mkdir(path / name, exist_ok=True)
+                real_mkdir(path / "merged-index-A", exist_ok=True)
 
         with patch.object(measure, "build_executables", return_value=binaries), \
              patch.object(measure, "memory_available_bytes", return_value=8 * 1024 ** 3), \
@@ -395,15 +396,12 @@ class MeasureTest(unittest.TestCase):
             self.assertEqual(measure.complete_images(args), 0)
         complete = json.loads((images / measure.IMAGES_MANIFEST).read_text())
         self.assertEqual(complete["status"], "complete")
-        self.assertEqual(sorted(complete["images"]),
-                         ["merged-index-A", "merged-index-B", "native-A", "native-B"])
+        self.assertEqual(sorted(complete["images"]), ["merged-index-A", "native-A"])
         loaded = {Path(command[command.index("--write-image") + 1]).name:
                   int(command[command.index("--cache-bytes") + 1]) for command in commands[1:]}
-        expected = measure.weighted_load_cache_bytes(
-            10 * 1024 ** 3, ["native", "merged-index", "merged-index"])
-        self.assertEqual(loaded, dict(zip(["native-B", "merged-index-A", "merged-index-B"],
-                                          expected)))
-        self.assertEqual(complete["configuration"]["completion"]["concurrent_loads"], 3)
+        expected = measure.weighted_load_cache_bytes(10 * 1024 ** 3, ["merged-index"])
+        self.assertEqual(loaded, dict(zip(["merged-index-A"], expected)))
+        self.assertEqual(complete["configuration"]["completion"]["concurrent_loads"], 1)
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             measure.parse_args(base + ["--complete-images", str(images), "--sequential-loads"])
 
@@ -561,10 +559,9 @@ class MeasureTest(unittest.TestCase):
             self.assertEqual(measure.build_images(args), 0)
         manifest = json.loads((images / measure.IMAGES_MANIFEST).read_text())
         self.assertEqual(manifest["status"], "complete")
-        self.assertEqual(sorted(manifest["images"]),
-                         ["merged-index-A", "merged-index-B", "native-A", "native-B"])
+        self.assertEqual(sorted(manifest["images"]), ["merged-index-A", "native-A"])
         self.assertEqual(manifest["images"]["native-A"]["size_bytes"], 5)
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 2)
         for command in commands:
             # Loading has no memory target and no cgroup: it is not measured.
             self.assertNotIn("--memory-target-bytes", command)
@@ -583,7 +580,7 @@ class MeasureTest(unittest.TestCase):
             if "--write-image" not in command:  # git, generate.sh, uname
                 return subprocess.CompletedProcess(command, 0, stdout="rev\n", stderr="")
             directory = Path(command[command.index("--write-image") + 1])
-            if directory.name == "merged-index-B":
+            if directory.name == "merged-index-A":
                 return subprocess.CompletedProcess(command, 101, stdout="", stderr="boom")
             (directory / "storage").mkdir(parents=True)
             (directory / "image.json").write_text(json.dumps({
@@ -602,10 +599,10 @@ class MeasureTest(unittest.TestCase):
             self.assertNotEqual(measure.build_images(args), 0)
         manifest = json.loads((images / measure.IMAGES_MANIFEST).read_text())
         self.assertEqual(manifest["status"], "failed")
-        self.assertEqual(sorted(manifest["images"]), ["merged-index-A", "native-A", "native-B"])
+        self.assertEqual(sorted(manifest["images"]), ["native-A"])
         self.assertEqual(len(manifest["errors"]), 1)
-        self.assertIn("merged-index-B exited 101", manifest["errors"][0])
-        self.assertIn("boom", (images / "merged-index-B.stderr.log").read_text())
+        self.assertIn("merged-index-A exited 101", manifest["errors"][0])
+        self.assertIn("boom", (images / "merged-index-A.stderr.log").read_text())
 
     def test_cgroup_child_starts_cold_by_evicting_the_shared_inputs(self) -> None:
         group = self.root / "cgroup-evict"
@@ -998,8 +995,9 @@ class MeasureTest(unittest.TestCase):
         command = measure.driver_command(spec, inputs)
         self.assertEqual(command[command.index("--session-pass") + 1], "seek")
         self.assertEqual(measure.parse_args(self.args).session_pass, "seek")
-        self.assertEqual(
-            measure.parse_args([*self.args, "--session-pass", "step"]).session_pass, "step")
+        # The step pass was retired: the runner no longer offers it.
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            measure.parse_args([*self.args, "--session-pass", "step"])
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             measure.parse_args([*self.args, "--session-pass", "Seek"])
 
