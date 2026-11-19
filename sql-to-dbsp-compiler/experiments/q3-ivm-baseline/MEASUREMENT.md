@@ -279,7 +279,24 @@ Both runs qualify, and the cgroup's `memory.events max` is 0. View circuit first
 - **So the cost is the write.** Each spill is a file creation and its writes, mostly on the transaction's thread. For a temporary run, the file is gone at the end of the step.
 - **The alternative.** A write-back design would keep small runs unwritten under the cache's budget and write a run only when the cache evicted it. Short-lived runs (tiny inserts merged away soon, temporary in-step runs) would then never reach the disk. That is the one-budget idea in its full form, and a stronger form of the spill floor in [compaction.md](../../../docs/design/merged-index/compaction.md). DBSP does not do it.
 
-Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512/manifest.json`.
+**Which writes they are** (diagnostics rerun of the same pilot, `--diagnostics`):
+- **Setup.** Same images and budgets, but the cgroup was raised to 2 GiB, because the diagnostics logs are held in memory and the run at 1 GiB was OOM-killed. Both runs qualify. Pressure reached `critical` from refresh 3 (native) and refresh 2 (merged-index). Its latencies are not comparable to the table above and are not reported.
+- **Method.** Every file flushed in the window is classed from `compaction-log.jsonl`: a merge output (`background_compaction`), an insert spill (`insert_spill`), or else a file built straight to storage during a step. The logs cannot tell that last class apart: it holds both inserted runs that were files from the start and temporary in-step runs. The window covers all six refreshes, 36,170 transactions, the low-pressure refreshes included.
+
+Per transaction, view-state owners (`query`, `merged_index`):
+
+| | native files | native KiB | merged-index files | merged-index KiB |
+| --- | ---: | ---: | ---: | ---: |
+| merge outputs | 0.47 | 287.4 | 0.24 | 165.2 |
+| insert spills | 1.65 | 3.8 | 3.36 | 7.6 |
+| built during a step | 6.59 | 14.0 | 4.20 | 9.3 |
+| total | 8.71 | 305.2 | 7.80 | 182.1 |
+
+- **Most writes are tiny files.** Insert spills and step-built files average 2.1 to 2.3 KiB each, and they are 95% of native's view files and 97% of merged-index's, but only 6% and 9% of the bytes. The merge outputs, a few hundred KiB each, carry the rest.
+- **What a lazy spill could save.** Keeping runs below a floor in memory, or in a write-back cache, would remove about 8 of native's 9 view writes per transaction and about 7.6 of merged-index's 7.8, and those files hold about 18 KiB (native) and 17 KiB (merged-index) per transaction. This counts files, not time: the cost of each file creation on the transaction's thread was not measured.
+- **Base (amortized).** The base tables wrote 0.23 to 0.24 merge outputs per transaction (about 115 KiB) and almost no spills.
+
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512/manifest.json`; diagnostics `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512-diag/runs/run-1-<mode>/diagnostics/`.
 
 ## Pending: pressure evidence
 
