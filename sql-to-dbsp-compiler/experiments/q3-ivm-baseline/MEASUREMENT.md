@@ -245,6 +245,42 @@ What the pilots show, and what they do not:
 
 Artifacts (local to the host): `/mnt/ssd/r5-out/pilot-<arm>-<workload>-k10/manifest.json` and its `runs/run-1-<mode>/driver.json`.
 
+## One budget at 512 MiB, base tables evicted (2026-11-19)
+
+Pilot A-seek clustered, K = 10, from the measurement version 16 images (revision `727c76c52`), one repetition. Settings:
+- memory target 512 MiB, buffer cache 512 MiB (one budget, [decision of 2026-11-18](DECISIONS.md#2026-11-18-one-memory-budget-the-cache-about-equals-the-memory-target)); cgroup 1 GiB;
+- base-table blocks evicted after each base transaction.
+
+Both runs qualify, and the cgroup's `memory.events max` is 0. View circuit first (user direction), refreshes 2 to 6, per transaction:
+
+| | RF1 native | RF1 merged-index | RF2 native | RF2 merged-index |
+| --- | ---: | ---: | ---: | ---: |
+| `ivm_ms` p50 / p95 / p99 | 3.88 / 7.00 / 8.93 | 4.31 / 7.24 / 9.23 | 4.46 / 7.84 / 10.04 | 3.38 / 5.67 / 7.23 |
+| view circuit CPU (profiler, ms) | 3.05 | 2.05 | 3.13 | 1.97 |
+| partner reads | 3.5 seeks, plus 48.0 probes the filters answer | 9.8 index seeks | 11.1 seeks, plus 39.8 filter-answered | 26.7 index seeks |
+| view-side device reads | 1.52 | 6.40 | 3.07 | 1.34 |
+| view-state writes (`query`, `merged_index`) | 10.6 | 9.4 | 10.3 | 8.9 |
+
+- **Pressure.** It went `critical` in both modes from refresh 3, once the cache filled. Peak RSS was about 720 MiB, against the 512 MiB target, in both modes. The cache counts in RSS, and the program, the refresh inputs, and the in-memory runs add about 200 MiB to it. A cache as large as the target therefore reaches `critical` once it is full.
+- **RF2 (deletes).** Merged-index's IVM is 24% lower than native's at the median and 28% lower at p99. Its index seeks are more numerous, but they stay in the cache: 1.34 device reads against 3.07.
+- **RF1 (inserts).** Merged-index's IVM is 11% higher at the median. Each transaction lands on a new customer's group, so its reads are first touches: 6.40 device reads against 1.52. Its view circuit takes less CPU.
+- **Against the version 15 pilot** (cache 256 MiB, target 512 MiB, pressure `low`): both modes are slower under `critical` pressure (native about 1.1 to 4 ms, merged-index about 2 to 3.4 to 4.3 ms), and both write about 10 spilled runs per transaction.
+- **Base (amortized; reported last).** `base_ms` p50 was 3.4 (RF1) and 8.0 (RF2) native, 3.8 and 15.5 merged-index. The eviction took 5.5 to 6 ms per transaction (one pass over the 512 MiB cache, about 690 KiB freed), in neither phase but in `total_ms`.
+
+**What spills at `critical` pressure** (`circuit/runtime.rs`):
+- **An inserted run.** Every run a transaction inserts into a spine becomes a file at once: from `high`, `min_insert_storage_bytes` is 0. That covers the base tables, native's join traces and `V`, and merged-index's `Dlt` run and `V`.
+- **A merge output.** From `moderate`, `min_merge_storage_bytes` is 0.
+- **A run passed between operators within a step.** Only at `critical` (`min_step_storage_bytes` is 0). It is built straight into a file from its first row, and it is dropped, with its file, at the end of the step.
+
+**Why they do not wait in the buffer cache.**
+- **The cache holds only file blocks.** It is a cache of clean, immutable blocks of files that already exist. Eviction drops a block, and a miss rereads it from its file. There is no dirty or write-back state, so a run must be written before any of its blocks can be cached.
+- **A run not yet written has no cache budget.** It is a heap batch, counted in RSS, under neither the cache's budget nor its eviction policy.
+- **Spilled runs are cached anyway.** The writer puts every data and index block in the cache as it writes (`from_raw_with_cache` in `storage/file/writer.rs`), so a recently spilled run reads as a cache hit.
+- **So the cost is the write.** Each spill is a file creation and its writes, mostly on the transaction's thread. For a temporary run, the file is gone at the end of the step.
+- **The alternative.** A write-back design would keep small runs unwritten under the cache's budget and write a run only when the cache evicted it. Short-lived runs (tiny inserts merged away soon, temporary in-step runs) would then never reach the disk. That is the one-budget idea in its full form, and a stronger form of the spill floor in [compaction.md](../../../docs/design/merged-index/compaction.md). DBSP does not do it.
+
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512/manifest.json`.
+
 ## Pending: pressure evidence
 
 The instrumentation is implemented (Linux paths unrun and untested on Linux; macOS records `null`) but has produced no Linux data. Implemented:
