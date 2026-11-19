@@ -360,6 +360,11 @@ pub trait SerBatch: SerBatchReader {
 
     /// Convert batch into a trace with identical contents.
     fn into_trace(self: Arc<Self>) -> Box<dyn SerTrace>;
+
+    /// The file that holds this batch, if it is on storage.
+    fn file_reader(&self) -> Option<Arc<dyn dbsp::storage::backend::FileReader>> {
+        None
+    }
 }
 
 /// A type-erased `Trace`.

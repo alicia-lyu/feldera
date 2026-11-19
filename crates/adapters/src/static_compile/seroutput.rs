@@ -564,6 +564,10 @@ where
         self.batch.inner().location()
     }
 
+    fn file_reader(&self) -> Option<Arc<dyn dbsp::storage::backend::FileReader>> {
+        dbsp::trace::Batch::file_reader(self.batch.inner())
+    }
+
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send> {
         self
     }

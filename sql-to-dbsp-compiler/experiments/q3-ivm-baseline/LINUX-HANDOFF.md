@@ -313,11 +313,17 @@ large cache too, not only a merged-index one: `native-B` with 27.7 GiB took 20 m
 and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
 settings, the checkpoint, and the load record. The checkpoint writes every in-memory batch to a
-file (`Spine::save`), so an image holds file runs only. A campaign reopens an image only with the
-executable that wrote it, byte for byte (`image_executable_problems`): it stops before any run if
-the executables it builds differ. A commit that leaves the driver's sources alone (docs,
-`measure.py`) rebuilds the same executables and keeps the images usable; a change to the driver,
-its circuits, or DBSP needs new images.
+file (`Spine::save`), so an image holds file runs only. A campaign reopens an image only when the
+sources that define an image's content are unchanged (`image_sources_problems`, decision of
+2026-11-18): `images.json` records `image_sources_sha256`, a digest of the files in
+`IMAGE_SOURCE_PATHS` (DBSP's storage format, batches, merged index, spine and checkpointer, the
+three circuits, `merged-index-col`, and the driver's `reconstruction.rs` and `workload.rs`), and
+the campaign stops before any run if the checkout's digest differs. The driver's other code,
+measurement and reporting, can change without new images. Its load and save path is guarded by
+`ImageManifest::FORMAT`, bumped by hand when it changes. DBSP's circuit fingerprint and the
+`ImageSettings` check still apply. Images built before the digest existed take it with
+`python3 measure.py --adopt-image-sources DIR`, which first checks with `git diff` that no image
+source or circuit generator (`IMAGE_GENERATOR_PATHS`) changed since the images' revision.
 
 Pre-build the release executables with `cargo +1.96.1 build --release --offline --locked
 -j"$(nproc)"`, with and without `--features merged-index`: `measure.py` builds with `-j2`, and on

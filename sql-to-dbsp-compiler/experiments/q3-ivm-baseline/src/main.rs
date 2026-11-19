@@ -1,3 +1,4 @@
+mod base_state;
 mod data;
 mod diagnostics;
 mod measurement;
@@ -345,6 +346,12 @@ struct Pipeline {
     view: Stage,
     /// Whether each transaction reads the circuits' CPU profiles (off while loading).
     profile_cpu: bool,
+    /// Whether each transaction evicts the base tables' blocks after the base circuit's
+    /// transaction (`evict_base_blocks`): on for the refreshes and their warm-up, off while
+    /// loading, where it would only slow the load.
+    evict_base: bool,
+    /// The base snapshot that the last transaction's eviction took; see `take_base_state`.
+    evicted_base: Option<workload::BaseState>,
     #[cfg(feature = "merged-index")]
     index: ManualIndex,
     /// Line items whose order is absent, beside the index (base maintenance).
@@ -436,6 +443,8 @@ impl Pipeline {
             base,
             view,
             profile_cpu: false,
+            evict_base: false,
+            evicted_base: None,
             #[cfg(feature = "merged-index")]
             index,
             #[cfg(feature = "merged-index")]
@@ -498,6 +507,30 @@ impl Pipeline {
     /// The runtime that hosts both circuits.
     fn runtime(&self) -> &Runtime {
         self.base.circuit.runtime()
+    }
+
+    /// Takes the transaction's base snapshot, evicts every block of the base tables' current
+    /// files (CUSTOMER, ORDERS, LINEITEM) from the runtime's buffer cache in one pass, and keeps
+    /// the snapshot for the caller's next `BaseState`. Returns the cache cost freed. Both
+    /// circuits and the merged index share that cache.
+    fn evict_base_blocks(&mut self) -> Result<usize> {
+        let base = workload::BaseState::new(&self.base.catalog)?;
+        let freed = self
+            .runtime()
+            .foreground_buffer_cache(0)
+            .evict_files(&base.file_ids());
+        self.evicted_base = Some(base);
+        Ok(freed)
+    }
+
+    /// The base state after the last transaction: the snapshot its eviction took, or else a
+    /// new one. A base snapshot may be taken once per transaction, since reading one consumes
+    /// it.
+    fn take_base_state(&mut self) -> Result<workload::BaseState> {
+        match self.evicted_base.take() {
+            Some(base) => Ok(base),
+            None => workload::BaseState::new(&self.base.catalog),
+        }
     }
 
     /// Runs `f` with the runtime's buffer cache bound to the calling thread, so that the
@@ -637,6 +670,13 @@ struct Measurements {
     /// Reading the base tables' net delta (`workload::net_delta`), the same operation in both
     /// modes. Not part of `ivm_ms`; see `delta`.
     forward: Duration,
+    /// Evicting the base tables' blocks from the buffer cache after the base circuit's
+    /// transaction (measurement version 16; decision of 2026-11-18), in neither `base_ms` nor
+    /// `ivm_ms`: neither view reads the base tables, whose upkeep is assumed amortized over the
+    /// views an index serves.
+    base_eviction: Duration,
+    /// The cache cost those evictions freed.
+    base_evicted_bytes: usize,
     /// Preparing the view circuit's transaction delta, which is view work (measurement version
     /// 11) and a part of `ivm_ms`. Native: converting the net delta into the input handles'
     /// rows. Reconstructed: building the driving deltas from `Dlt` and handing them to the
@@ -763,6 +803,15 @@ fn transact_inner(
     let forward_started = Instant::now();
     let net_delta = workload::net_delta(&pipeline.base.catalog)?;
     stats.forward += forward_started.elapsed();
+
+    // The base circuit used the cache normally, its merges included; now its tables' blocks
+    // leave the cache, so the view phase finds only view state there. Before the index upkeep,
+    // which reads the index, not the base tables.
+    if pipeline.evict_base {
+        let eviction_started = Instant::now();
+        stats.base_evicted_bytes += pipeline.evict_base_blocks()?;
+        stats.base_eviction += eviction_started.elapsed();
+    }
 
     // The index sees the net delta, completed into `Dlt`. Base maintenance does that and the
     // append (`index`, a part of `base_ms`), including its reads of `Old` for the lines of an
@@ -1443,7 +1492,7 @@ impl ImageSettings {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImageManifest {
-    /// 1 for this layout.
+    /// [`ImageManifest::FORMAT`] when written.
     format: u32,
     settings: ImageSettings,
     /// The published runtime checkpoint of both circuits (and the merged index and its orphan
@@ -1456,6 +1505,12 @@ struct ImageManifest {
 }
 
 impl ImageManifest {
+    /// The image format. Bump it by hand whenever driver code outside `measure.py`'s image
+    /// sources digest (`IMAGE_SOURCE_PATHS`) changes what an image holds: the load loop,
+    /// `Pipeline::write_checkpoint`, `Pipeline::reopen`, or `republish`. The digest covers DBSP's
+    /// storage format, the circuits, the merged index, `reconstruction.rs`, and `workload.rs`; a
+    /// change elsewhere in the driver (measurement, reporting) keeps the images valid.
+    const FORMAT: u32 = 1;
     const FILE: &'static str = "image.json";
     const STORAGE: &'static str = "storage";
 
@@ -1465,7 +1520,7 @@ impl ImageManifest {
             &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
         )
         .with_context(|| format!("parsing {}", path.display()))?;
-        if manifest.format != 1 {
+        if manifest.format != Self::FORMAT {
             bail!(
                 "{}: unsupported image format {}",
                 path.display(),
@@ -2020,7 +2075,7 @@ fn republish(pipeline: &mut Pipeline, base: &mut workload::BaseState) -> Result<
     view_transaction?;
     #[cfg(feature = "merged-index")]
     finish?;
-    *base = workload::BaseState::new(&pipeline.base.catalog)?;
+    *base = pipeline.take_base_state()?;
     for (stage, names) in [
         (
             &pipeline.base,
@@ -2061,6 +2116,8 @@ fn phase_json(stats: &Measurements) -> Value {
         "checks_input_preparation_ms": milliseconds(stats.preparation),
         "base_ms": milliseconds(stats.base_phase()),
         "forward_ms": milliseconds(stats.forward),
+        "base_eviction_ms": milliseconds(stats.base_eviction),
+        "base_evicted_bytes": stats.base_evicted_bytes,
         "index_ms": milliseconds(stats.index),
         "delta_ms": milliseconds(stats.delta),
         "q3_ms": milliseconds(stats.view_circuit),
@@ -2292,7 +2349,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     // The driver thread binds the runtime's buffer cache, as the workers do.
     runtime.with_buffer_cache(0, || {
     let mut state = config.verify.then(Reference::default);
-    let mut base = workload::BaseState::new(&pipeline.base.catalog)?;
+    let mut base = pipeline.take_base_state()?;
     // The refresh program reopens a loaded image instead of loading; it only republishes.
     let load_report = if image.is_some() {
         republish(&mut pipeline, &mut base)?;
@@ -2316,7 +2373,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 Some((&base, false)),
                 &mut stats,
             )?;
-            base = workload::BaseState::new(&pipeline.base.catalog)?;
+            base = pipeline.take_base_state()?;
             Ok(())
         },
     )?;
@@ -2350,7 +2407,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     if let Some(directory) = &config.write_image {
         let checkpoint = pipeline.write_checkpoint()?;
         let manifest = ImageManifest {
-            format: 1,
+            format: ImageManifest::FORMAT,
             settings: ImageSettings::of(config),
             checkpoint,
             inputs: [
@@ -2377,6 +2434,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
 
     // An optional warm-up, untimed and unreported, so that the window can start with the
     // buffer cache that these refreshes leave instead of an empty one.
+    // From here on (the warm-up and the window), each transaction evicts the base tables' blocks.
+    pipeline.evict_base = true;
     let warm_up = match &config.warm_up {
         None => Value::Null,
         Some(list) => {
@@ -2386,7 +2445,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 for prepared in PreparedRefresh::read(refresh)? {
                     let (change, ..) = refresh_change(&pipeline, &base, prepared)?;
                     transact_inner(&mut pipeline, None, change, Some((&base, false)), &mut Measurements::default())?;
-                    base = workload::BaseState::new(&pipeline.base.catalog)?;
+                    base = pipeline.take_base_state()?;
                 }
             }
             json!({"refresh_list": list, "refreshes": refreshes.len(), "elapsed_ms": milliseconds(started.elapsed())})
@@ -2497,7 +2556,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 &mut measurement,
             )?;
             let cleanup_started = Instant::now();
-            base = workload::BaseState::new(&pipeline.base.catalog)?;
+            base = pipeline.take_base_state()?;
             measurement.publication_cleanup += cleanup_started.elapsed();
             absent += transaction_absent;
             phase = transaction_phase;
@@ -2679,7 +2738,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 15,
+        "measurement_version": 16,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2693,6 +2752,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
                 "note": "One runtime hosts the base and the view circuit, with one storage directory and one buffer cache of cache_bytes. The phases are told apart by transaction boundaries (base commits before the view transaction starts), with the CPU profiler's per-circuit step CPU time as a cross-check.",
             },
             "cache": "feldera_cache", "compression": "none",
+            "evict_base_after_transaction": true,
             "filter_residency": match storage_options(config).filter_residency {
                 feldera_types::config::FilterResidency::Storage => "storage",
                 feldera_types::config::FilterResidency::Memory => "memory",
@@ -4006,11 +4066,39 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 15);
+        assert_eq!(output["measurement_version"], 16);
+        // The refreshes evicted the base tables' blocks after each base transaction.
+        assert_eq!(
+            output["configuration"]["evict_base_after_transaction"],
+            true
+        );
+        let evicted: u64 = output["refreshes"]
+            .as_array()
+            .context("refreshes")?
+            .iter()
+            .map(|refresh| refresh["base_evicted_bytes"].as_u64().unwrap_or(0))
+            .sum();
+        assert!(evicted > 0, "no base-table block was evicted");
         // The original image is untouched by the refreshes of its copy.
         assert_eq!(
             ImageManifest::read(&image)?.checkpoint.uuid,
             manifest.checkpoint.uuid
+        );
+
+        // An image of another format is refused when it is read.
+        let other_format = directory.join("image-other-format");
+        std::fs::create_dir(&other_format)?;
+        let mut manifest_json: Value =
+            serde_json::from_slice(&std::fs::read(image.join(ImageManifest::FILE))?)?;
+        manifest_json["format"] = json!(ImageManifest::FORMAT + 1);
+        std::fs::write(
+            other_format.join(ImageManifest::FILE),
+            serde_json::to_vec(&manifest_json)?,
+        )?;
+        let error = ImageManifest::read(&other_format).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported image format"),
+            "{error}"
         );
 
         // Other storage settings than the image's are refused before anything runs.
@@ -4145,7 +4233,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 15);
+        assert_eq!(output["measurement_version"], 16);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");

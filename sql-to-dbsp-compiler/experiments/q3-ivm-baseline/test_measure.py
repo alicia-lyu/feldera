@@ -459,18 +459,90 @@ class MeasureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not complete"):
             measure.read_images(images)
 
-    def test_images_reopen_only_with_the_executables_that_wrote_them(self) -> None:
-        images = {"executables": {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}}
-        same = {"native": {"sha256": "n"}, "merged-index": {"sha256": "m"}}
-        self.assertEqual(measure.image_executable_problems(images, same), [])
-        rebuilt = {"native": {"sha256": "n"}, "merged-index": {"sha256": "x"}}
-        problems = measure.image_executable_problems(images, rebuilt)
+    def test_images_reopen_only_with_the_image_sources_that_wrote_them(self) -> None:
+        self.assertEqual(measure.image_sources_problems({"image_sources_sha256": "d"}, "d"), [])
+        problems = measure.image_sources_problems({"image_sources_sha256": "d"}, "e")
         self.assertEqual(len(problems), 1)
-        self.assertIn("merged-index images were written by an executable with sha256 m",
-                      problems[0])
-        self.assertEqual(len(measure.image_executable_problems({}, same)), 2)
+        self.assertIn("rebuild the images", problems[0])
+        self.assertIn("--adopt-image-sources", measure.image_sources_problems({}, "d")[0])
 
-    def image_campaign(self, name: str, written_by: bytes = b"binary",
+    def test_the_image_sources_digest_follows_paths_and_contents(self) -> None:
+        repository = self.root / "repository"
+        (repository / "a" / "target").mkdir(parents=True)
+        (repository / "a" / "target" / "build.o").write_text("ignored")
+        (repository / "a" / ".hidden").write_text("ignored")
+        (repository / "a" / "two.rs").write_text("two")
+        (repository / "a" / "one.rs").write_text("one")
+        (repository / "b.rs").write_text("b")
+        paths = ("a", "b.rs", "absent")
+        self.assertEqual([str(path) for path in measure.image_source_files(repository, paths)],
+                         ["a/one.rs", "a/two.rs", "b.rs"])
+        digest = measure.image_sources_sha256(repository, paths)
+        self.assertEqual(measure.image_sources_sha256(repository, ("b.rs", "a")), digest)
+        (repository / "a" / "target" / "build.o").write_text("still ignored")
+        self.assertEqual(measure.image_sources_sha256(repository, paths), digest)
+        (repository / "a" / "one.rs").write_text("changed")
+        changed = measure.image_sources_sha256(repository, paths)
+        self.assertNotEqual(changed, digest)
+        (repository / "a" / "one.rs").rename(repository / "a" / "renamed.rs")
+        self.assertNotEqual(measure.image_sources_sha256(repository, paths), changed)
+        # The real list names the files that shape an image, and the driver's measurement
+        # code is not among them.
+        self.assertIn("crates/dbsp/src/storage/file", measure.IMAGE_SOURCE_PATHS)
+        self.assertFalse(any(path.endswith("src/main.rs") for path in measure.IMAGE_SOURCE_PATHS))
+
+    def test_status_paths_are_made_repository_relative(self) -> None:
+        self.assertEqual(measure.status_path(" M ../../../crates/dbsp/src/lib.rs"),
+                         "crates/dbsp/src/lib.rs")
+        self.assertEqual(measure.status_path(" M src/main.rs"),
+                         "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/main.rs")
+        self.assertEqual(measure.status_path("R  old.rs -> src/workload.rs"),
+                         "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/workload.rs")
+
+    def test_adopting_image_sources_needs_unchanged_sources(self) -> None:
+        images = self.root / "adopt"
+        images.mkdir()
+        manifest = {"status": "complete", "revision": "c274d00d7", "images": {},
+                    "git_status_short": " M LINUX-HANDOFF.md\n?? ../../../notes.txt\n"}
+
+        def adopt(diff_code: int, status: str | None = None) -> tuple[int, dict]:
+            (images / measure.IMAGES_MANIFEST).write_text(json.dumps(
+                {**manifest, **({"git_status_short": status} if status else {})}))
+            calls = []
+
+            def process(command, **kwargs):
+                calls.append(command)
+                if command[:2] == ["git", "diff"]:
+                    return subprocess.CompletedProcess(command, diff_code)
+                return subprocess.CompletedProcess(command, 0, stdout="now\n", stderr="")
+
+            with patch.object(measure.subprocess, "run", side_effect=process), \
+                 patch.object(measure, "image_sources_sha256", return_value="digest"), \
+                 patch("sys.stderr"), patch("sys.stdout"):
+                code = measure.run(["--adopt-image-sources", str(images)])
+            diff = next(command for command in calls if command[:2] == ["git", "diff"]) \
+                if any(command[:2] == ["git", "diff"] for command in calls) else None
+            if diff:
+                self.assertEqual(diff[2:4], ["--quiet", "c274d00d7"])
+                self.assertIn("crates/dbsp/src/storage/file", diff)
+                self.assertIn("sql-to-dbsp-compiler/SQL-compiler/src", diff)
+            return code, json.loads((images / measure.IMAGES_MANIFEST).read_text())
+
+        code, written = adopt(1)
+        self.assertEqual(code, 1)
+        self.assertNotIn("image_sources_sha256", written)
+        # `git status --short` runs in the experiment directory, so its paths are relative.
+        code, written = adopt(0, status=" M ../../../crates/dbsp/src/trace/spine_async.rs\n")
+        self.assertEqual(code, 1)
+        self.assertNotIn("image_sources_sha256", written)
+        code, written = adopt(0)
+        self.assertEqual(code, 0)
+        self.assertEqual(written["image_sources_sha256"], "digest")
+        self.assertEqual(written["image_sources_adopted"]["images_revision"], "c274d00d7")
+        with patch("sys.stderr"):
+            self.assertEqual(measure.run(["--adopt-image-sources", str(images)]), 2)
+
+    def image_campaign(self, name: str, sources: str | None = "current",
                        extra: list[str] = ()) -> tuple[int, dict, Path]:
         """Runs a campaign over fake images, with drivers that report success."""
         images = self.root / f"{name}-images"
@@ -483,10 +555,12 @@ class MeasureTest(unittest.TestCase):
             (image / "storage").mkdir(parents=True)
             (image / "storage" / "batch.feldera").write_text("batch")
             entries[image.name] = {"directory": str(image), "checkpoint": "u"}
+        # The images were written by other executables: only their sources digest matters.
         (images / measure.IMAGES_MANIFEST).write_text(json.dumps({
             "status": "complete", "revision": "older", "inputs": {}, "images": entries,
-            "executables": {mode: {"sha256": hashlib.sha256(written_by).hexdigest()}
-                            for mode in measure.MODES}}))
+            "executables": {mode: {"sha256": hashlib.sha256(b"older").hexdigest()}
+                            for mode in measure.MODES},
+            **({"image_sources_sha256": sources} if sources else {})}))
         launched = []
 
         def process(command, **kwargs):
@@ -506,16 +580,20 @@ class MeasureTest(unittest.TestCase):
         args = [*self.image_args(images), "--storage-path", str(storage), *extra]
         with patch.object(measure, "build_executables", return_value=binaries), \
              patch.object(measure, "report_problems", return_value=[]), \
+             patch.object(measure, "image_sources_sha256", return_value="current"), \
              patch.object(measure.subprocess, "run", side_effect=process):
             code = measure.run(args)
         return code, json.loads(self.report.read_text()), storage
 
-    def test_a_campaign_refuses_images_written_by_other_executables(self) -> None:
-        code, manifest, storage = self.image_campaign("other", written_by=b"older")
+    def test_a_campaign_refuses_images_written_from_other_sources(self) -> None:
+        code, manifest, storage = self.image_campaign("other", sources="older")
         self.assertEqual(code, 1)
         self.assertIn("rebuild the images", manifest["errors"][0])
         self.assertEqual(manifest["runs"], [])
         self.assertFalse(storage.exists() and any(storage.iterdir()))
+        code, manifest, _ = self.image_campaign("unadopted", sources=None)
+        self.assertEqual(code, 1)
+        self.assertIn("--adopt-image-sources", manifest["errors"][0])
 
     def test_a_completed_run_deletes_its_copy_unless_asked_to_keep_it(self) -> None:
         code, manifest, storage = self.image_campaign("delete")
@@ -1241,7 +1319,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 15,
+        return {"mode": mode, "measurement_version": 16,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1348,7 +1426,7 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure.measurement_version_problems(report), [])
         report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 13, expected 15"])
+                         ["measurement_version is 13, expected 16"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

@@ -96,6 +96,14 @@ source emits at the flush).
   the cache must use one whose 256 shards exceed a partition: `test_buffer_cache`'s 4 KiB shards
   keep none.
 
+## Evicting a set of files from the buffer cache
+
+`BufferCache::evict_files(&HashSet<FileId>)` removes every entry of those files (blocks, trailers,
+filter partitions) in one pass, regardless of the `eager_evict` dev tweak, and returns the cost freed
+(test `evict_files_removes_exactly_the_named_files`). The Q3 driver uses it to evict the base
+tables after each base transaction; `SerBatch::file_reader` (`adapterlib`) gives a catalog batch's
+file.
+
 ## Compaction counters
 
 - `diagnostics::spine_run_counts()`: every live spine's runs per level (loose and merging), file

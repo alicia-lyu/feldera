@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::ops::{Add, AddAssign};
@@ -109,6 +110,23 @@ impl BufferCache {
             let predicate = |key: &CacheKey| key.file_id == file_id;
             self.inner.remove_if(&predicate);
         }
+    }
+
+    /// Removes every cached entry of the files in `files` (data and index
+    /// blocks, trailers, and storage-resident filter partitions) in one pass
+    /// over the cache, whatever the `eager_evict` dev tweak says.
+    ///
+    /// Returns the cache cost freed, measured as the occupancy before less the
+    /// occupancy after; entries other threads insert or evict meanwhile make it
+    /// approximate.
+    pub fn evict_files(&self, files: &HashSet<FileId>) -> usize {
+        if files.is_empty() {
+            return 0;
+        }
+        let before = self.inner.total_charge();
+        let predicate = |key: &CacheKey| files.contains(&key.file_id);
+        self.inner.remove_if(&predicate);
+        before.saturating_sub(self.inner.total_charge())
     }
 
     /// Returns `(cur_cost, max_cost)`, reporting the amount of the cache that
@@ -364,5 +382,43 @@ impl AddAssign for CacheCounts {
         self.count += rhs.count;
         self.bytes += rhs.bytes;
         self.elapsed += rhs.elapsed;
+    }
+}
+
+#[cfg(test)]
+mod evict_files_tests {
+    use super::{BufferCache, CacheKey};
+    use crate::storage::backend::FileId;
+    use feldera_buffer_cache::CacheEntry;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    struct Block(usize);
+
+    impl CacheEntry for Block {
+        fn cost(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// `evict_files` removes the named files' entries, every offset of them, and only those.
+    #[test]
+    fn evict_files_removes_exactly_the_named_files() {
+        let cache = BufferCache::new(64 * 1024 * 1024);
+        let files: Vec<FileId> = (0..3).map(|_| FileId::new()).collect();
+        for file in &files {
+            for offset in [0, 4096, 8192] {
+                cache.insert(*file, offset, Arc::new(Block(1000)));
+            }
+        }
+        let freed = cache.evict_files(&HashSet::from([files[0], files[2]]));
+        assert_eq!(freed, 6000);
+        for (index, file) in files.iter().enumerate() {
+            for offset in [0, 4096, 8192] {
+                let cached = cache.inner.get(CacheKey::new(*file, offset)).is_some();
+                assert_eq!(cached, index == 1, "file {index} offset {offset}");
+            }
+        }
+        assert_eq!(cache.evict_files(&HashSet::new()), 0);
     }
 }

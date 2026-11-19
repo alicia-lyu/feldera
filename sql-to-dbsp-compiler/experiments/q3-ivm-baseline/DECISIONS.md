@@ -182,6 +182,18 @@ The rebuild started sequentially (user direction: as much memory as possible). D
 
 Only arm `A-seek` runs: prefix truncation and value-header elision on, with the `seek` pass. Arm B (no prefix truncation) and every step setting are retired (user decisions). `measure.py` builds only the A images (`IMAGE_ARMS`) and offers only `--session-pass seek` (`SESSION_PASSES`). The driver keeps `--session-pass step` and DBSP keeps `Pass::Step`, so that the version 15 executables, and with them the images, stay valid; nothing in the campaign selects them. This amends the two arms of the morning's entry and the arms of 2026-11-11.
 
+### 2026-11-18: Images are reused while their sources are unchanged
+
+A campaign used to reopen an image only with the byte-identical executable that wrote it (2026-11-17), so any driver change, even a measurement timer, cost a rebuild of 1.5 to 2.5 hours. Now `images.json` records `image_sources_sha256`, a digest of the files that define an image's content (`IMAGE_SOURCE_PATHS` in `measure.py`), and a campaign refuses an image only if the checkout's digest differs. The driver's own load and save path is versioned by hand (`ImageManifest::FORMAT`), and DBSP's circuit fingerprint and `ImageSettings` checks stay. The executables' SHA-256 is still recorded, for provenance. `--adopt-image-sources` gives the digest to images built before it, after `git diff` shows that no image source or circuit generator changed since their revision. This supersedes the executable rule of 2026-11-17.
+
+### 2026-11-18: Base-table blocks leave the cache after each base transaction
+
+Report the view circuit (user direction): the base circuit's cost, merged-index upkeep included, is assumed amortized over the views an index serves (two indexes cover 18 of the 22 TPC-H queries), and its side effects on the view are mitigated ad hoc in both modes. Neither view reads the base tables, but in the version 15 pilot the base tables and the merged index evicted each other's blocks from the one cache. Keeping base blocks out of the cache altogether was rejected, since it would also starve their compaction. So the base circuit uses the cache normally, and when its transaction commits the driver evicts its tables' blocks before the view phase (measurement version 16). Later, one base circuit will feed several chained view circuits on the same index.
+
+### 2026-11-18: One memory budget: the cache about equals the memory target
+
+With Bloom filters storage-resident there is no point in two layers of memory management (user direction). The buffer cache is set equal to the memory target, or nearly, in both modes: the merged index never calls `seek_key_exact`, so its share of memory can all go to cache. First run: target 512 MiB, cache 512 MiB. If that leaves pressure low in both modes, both are halved, and halved again, to gauge performance under memory pressure, the target workload of this work.
+
 ## Superseded and withdrawn
 
 Rows that apply to any index or harness are in the [generic log](../../../docs/design/merged-index/decisions.md#superseded-and-withdrawn).

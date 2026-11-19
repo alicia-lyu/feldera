@@ -47,7 +47,9 @@ SESSION_PASSES = ("seek",)
 # adds `block_expansions` (the blocks rebuilt from their disk encoding on cache misses). Version
 # 15 writes Bloom filters storage-resident (`configuration.filter_residency`) and adds each
 # refresh's `run_counts` (runs per spine after each transaction, merges, device reads by owner).
-MEASUREMENT_VERSION = 15
+# 16 evicts the base tables' blocks from the cache after each base transaction (`base_eviction_ms`,
+# `base_evicted_bytes`, `configuration.evict_base_after_transaction`).
+MEASUREMENT_VERSION = 16
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -940,6 +942,8 @@ CAMPAIGN_COMPACTION_TIMEOUT_SECS = 300.0
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    if argv[:1] == ["--adopt-image-sources"] and len(argv) == 2:
+        return argparse.Namespace(adopt_image_sources=Path(argv[1]))
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("customer", "orders", "lineitem", "refresh-list", "report"):
         parser.add_argument("--" + name, type=Path)
@@ -953,6 +957,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="load the base files once per mode and prefix-truncation arm, "
                              "outside any cgroup and with no memory target, and write the "
                              "images and images.json into this new directory; runs no refresh")
+    parser.add_argument("--adopt-image-sources", type=Path, metavar="IMAGES_DIR",
+                        help="record the image sources digest in an image directory built "
+                             "before it existed, if git shows no image source changed since")
     parser.add_argument("--complete-images", type=Path, metavar="IMAGES_DIR",
                         help="load, all at once, the images that IMAGES_DIR/images.json lacks, "
                              "with the executables that wrote the others; each load's cache is "
@@ -1246,6 +1253,8 @@ def build_images(args: argparse.Namespace) -> int:
         binaries = build_executables(root / "executables")
         manifest["executables"] = {mode: {"path": str(binary), "sha256": sha256(binary)}
                                    for mode, binary in binaries.items()}
+        # Taken after `build_executables`, whose `generate.sh` wrote the native circuits.
+        manifest["image_sources_sha256"] = image_sources_sha256()
         def load(mode: str, front_code: bool) -> dict[str, Any]:
             return load_image(root, binaries, inputs, mode, front_code, cache_bytes, args)
 
@@ -1281,23 +1290,133 @@ def read_images(root: Path) -> dict[str, Any]:
     return manifest
 
 
-def image_executable_problems(images: dict[str, Any],
-                              executables: dict[str, dict[str, Any]]) -> list[str]:
-    """Why the campaign's executables may not reopen the images: an image is reopened only by
-    the executable that wrote it, byte for byte. A commit that leaves the driver's sources alone
-    (docs, `measure.py`) rebuilds the same executables, so it keeps the images usable."""
-    problems = []
-    for mode, executable in executables.items():
-        written_by = images.get("executables", {}).get(mode, {}).get("sha256")
-        if written_by != executable["sha256"]:
-            problems.append(f"the {mode} images were written by an executable with sha256 "
-                            f"{written_by}, but this campaign built {executable['sha256']} "
-                            f"(rebuild the images with --build-images)")
-    return problems
+# The sources that define what an image holds (decision of 2026-11-18, replacing the
+# byte-identical executable rule of 2026-11-17): DBSP's storage format, its batches, the merged
+# index, the spine's merging and save/restore, the checkpointer, the circuits, the COL index, and
+# the driver's reconstruction and workload code. A campaign reopens an image only when these
+# files are unchanged (`image_sources_problems`). The driver's other code (measurement and
+# reporting) may change freely; the driver's `ImageManifest::FORMAT` covers its own load and
+# save path, the circuit fingerprint (DBSP) covers the circuits' shape, and `ImageSettings`
+# covers the storage settings. Paths are relative to the repository root.
+IMAGE_SOURCE_PATHS = (
+    "crates/dbsp/src/storage/file",
+    "crates/dbsp/src/trace/ord",
+    "crates/dbsp/src/trace/merged_index",
+    "crates/dbsp/src/trace/spine_async.rs",
+    "crates/dbsp/src/trace/spine_async",
+    "crates/dbsp/src/circuit/checkpointer.rs",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/q3-base-circuit/src",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/q3-view-circuit/src",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/q3-trie-view-circuit/src",
+    "sql-to-dbsp-compiler/experiments/merged-index-col/col.mi",
+    "sql-to-dbsp-compiler/experiments/merged-index-col/src",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/reconstruction.rs",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/src/workload.rs",
+)
+# What generates the two native circuit crates' untracked `lib.rs` (`generate.sh`): adopting a
+# digest for existing images checks that these did not change either.
+IMAGE_GENERATOR_PATHS = (
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/base.sql",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/q3.sql",
+    "sql-to-dbsp-compiler/experiments/q3-ivm-baseline/generate.sh",
+    "sql-to-dbsp-compiler/SQL-compiler/src",
+)
+REPOSITORY = EXPERIMENT.parents[2]
+
+
+def image_source_files(repository: Path, paths: tuple[str, ...]) -> list[Path]:
+    """The regular files under `paths` (files or directories), relative to `repository` and
+    sorted; build outputs and caches are skipped."""
+    files = set()
+    for name in paths:
+        path = repository / name
+        if path.is_file():
+            files.add(path.relative_to(repository))
+        elif path.is_dir():
+            for found in path.rglob("*"):
+                parts = found.relative_to(repository).parts
+                if found.is_file() and not any(part in ("target", "__pycache__")
+                                               or part.startswith(".") for part in parts):
+                    files.add(found.relative_to(repository))
+    return sorted(files)
+
+
+def image_sources_sha256(repository: Path = REPOSITORY,
+                         paths: tuple[str, ...] = IMAGE_SOURCE_PATHS) -> str:
+    """A digest of the image sources: each file's relative path and contents, in path order, so
+    that a changed, added, removed, or renamed file changes it."""
+    digest = hashlib.sha256()
+    for relative in image_source_files(repository, paths):
+        digest.update(str(relative).encode() + b"\0")
+        digest.update(sha256(repository / relative).encode() + b"\n")
+    return digest.hexdigest()
+
+
+def image_sources_problems(images: dict[str, Any], sources_sha256: str) -> list[str]:
+    """Why this checkout may not reopen the images: their sources digest is missing or differs.
+    The executables may differ; only the sources that define an image's content must match."""
+    written_with = images.get("image_sources_sha256")
+    if written_with is None:
+        return ["the images record no image_sources_sha256: adopt it with "
+                "--adopt-image-sources if the image sources are unchanged, or rebuild them"]
+    if written_with != sources_sha256:
+        return [f"the images were written from image sources {written_with}, but this checkout "
+                f"has {sources_sha256}: a file in IMAGE_SOURCE_PATHS changed, so rebuild the "
+                "images with --build-images"]
+    return []
+
+
+def status_path(line: str) -> str:
+    """The repository-relative path of a `git status --short` line, which `git_state` takes in
+    this directory, so its paths are relative to it; a rename gives its new path."""
+    path = line[3:].strip().split(" -> ")[-1].strip('"')
+    try:
+        return str((EXPERIMENT / path).resolve().relative_to(REPOSITORY))
+    except ValueError:
+        return path
+
+
+def adopt_image_sources(args: argparse.Namespace) -> int:
+    """Records the sources digest in an image directory written before the digest existed,
+    after checking with git that no image source or circuit generator changed since the
+    images' revision, and that the images were not built from a modified tree."""
+    root = args.adopt_image_sources.resolve()
+    path = root / IMAGES_MANIFEST
+    manifest = json.loads(path.read_text())
+    if manifest.get("status") != "complete":
+        print(f"measure: {path} is not complete", file=sys.stderr)
+        return 2
+    if manifest.get("image_sources_sha256"):
+        print(f"measure: {path} already records image_sources_sha256", file=sys.stderr)
+        return 2
+    watched = IMAGE_SOURCE_PATHS + IMAGE_GENERATOR_PATHS
+    dirty = [line for line in (manifest.get("git_status_short") or "").splitlines()
+             if any(status_path(line).startswith(prefix) for prefix in watched)]
+    if dirty:
+        print(f"measure: the images were built with uncommitted image sources: {dirty}",
+              file=sys.stderr)
+        return 1
+    changed = subprocess.run(["git", "diff", "--quiet", manifest["revision"], "--", *watched],
+                             cwd=REPOSITORY)
+    if changed.returncode != 0:
+        print(f"measure: image sources changed since {manifest['revision']}; rebuild the images",
+              file=sys.stderr)
+        return 1
+    # The native circuits' lib.rs are generated, not tracked: regenerate them from the
+    # unchanged generators before taking the digest.
+    subprocess.run([str(EXPERIMENT / "generate.sh")], cwd=EXPERIMENT, check=True)
+    manifest["image_sources_sha256"] = image_sources_sha256()
+    manifest["image_sources_adopted"] = {"revision": git_state()[0],
+                                         "images_revision": manifest["revision"]}
+    write_json(path, manifest)
+    print(f"measure: adopted image_sources_sha256 {manifest['image_sources_sha256']}")
+    return 0
 
 
 def run(argv: list[str]) -> int:
     args = parse_args(argv)
+    if getattr(args, "adopt_image_sources", None):
+        return adopt_image_sources(args)
     if args.build_images:
         return build_images(args)
     if args.complete_images:
@@ -1360,7 +1479,8 @@ def run(argv: list[str]) -> int:
         manifest["executables"] = {mode: {"path": str(path), "sha256": sha256(path)}
                                    for mode, path in binaries.items()}
         if images:
-            problems = image_executable_problems(images, manifest["executables"])
+            manifest["image_sources_sha256"] = image_sources_sha256()
+            problems = image_sources_problems(images, manifest["image_sources_sha256"])
             if problems:
                 raise ValueError("; ".join(problems))
         for repetition in range(1, args.runs + 1):
