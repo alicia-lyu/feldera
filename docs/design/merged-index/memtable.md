@@ -14,18 +14,30 @@
 - A *Z-set* maps each row to an integer weight: positive for insertions, negative for deletions.
 - Feldera's code calls the generic form, with any weight type `R`, a *W-set* (weighted set): `OrdWSet`, and `OrdZSet` when `R` is the `i64` weight.
 - An *indexed* W-set maps each key to values with weights. Join traces and the merged index are indexed W-sets.
-- In a file, an indexed W-set is two columns: column 0 holds the keys, column 1 the `(value, weight)` items. Each column is a B-tree of data blocks under index blocks.
+- *Key leaf*, *row boundaries*, *value branch*, *value leaf* and *item-offset map* are the file-run terms of the advisor deck's Appendix E, below.
+
+## The file run a seal must produce
+
+The advisor deck's Appendix E ([figure](slides-oct-8/figures/row-traversal.tex), sources in [SOURCE-EVIDENCE.md](slides-oct-8/SOURCE-EVIDENCE.md)) follows one key through a file run. An indexed W-set is two columns: keys, and `(value, weight)` items. Each column is a B-tree: its leaves are data blocks, its inner nodes index blocks ("branches"), and the file's trailer names each column's root.
+
+1. **Key leaf.** Key 43 is item 1 of its leaf. The leaf's row boundaries `[0, 2, 4, 6]` give key 43 the value rows `[2, 4)`. These are row numbers in the whole value column, not in one block.
+2. **Value branch.** Row 2 falls in child 1, by the cumulative row totals `[2, 4, 6]`. The branch's child offsets and sizes (512-byte units, compressed) locate that leaf in the file.
+3. **Value leaf.** Its item-offset map points to each serialized item, `(8, +1)` and `(15, +1)`; the walk stops before row 4.
+
+A reader descends from the root, keeping the branches it passed; moving to the next leaf goes back through that path, since leaves are not linked. The writer closes a leaf at `min_data_block` (8 KiB) once `min_branch` (32) items fit (`DataBlockBuilder::try_add_item`, `writer.rs`), so a column has about its bytes / 8 KiB leaves, and a branch of small keys has hundreds of children.
+
+Three of the appendix's numbers exist only once the file is laid out in key order: global row boundaries (they count every earlier key's values), cumulative row totals, and child offsets and sizes (they depend on each compressed leaf). Any seal therefore makes one ordered pass that assigns them. Today's writer is that pass.
 
 ## Why the seal copies
 
-**The first design** made each leaf a slotted layer-file data block. A seal then handed the leaves to the writer as finished blocks, with no copy. Assembly without a copy works only at leaf granularity, and an insert-efficient leaf does not make a good file block:
+**The first design** made each memtable leaf a slotted key leaf or value leaf in the appendix's format, so that the seal only assigned the three laid-out numbers: it rebased each key leaf's local row boundaries and let the writer build the branches over finished leaves. Assembly without a copy works only at leaf granularity, and an insert-efficient leaf does not make a good file leaf:
 
-- **Packing.** The writer fills a data block to at least `min_data_block` (8 KiB by default) once `min_branch` (32) items fit (`DataBlockBuilder::try_add_item`, `writer.rs`). A leaf that splits on insert averages about two-thirds full. A sealed file would get smaller, uneven blocks and more index entries.
-- **Garbage.** Updates and zero weights leave dead item bytes. They must be removed at seal, which is a copy after all.
-- **Encodings.** Prefix truncation and value-header elision rewrite a whole block, so slotted leaves could not use them.
-- **Cost of the bridges.** It needed a writer entry point for finished blocks, a `DataBlock` over memory leaves, and a shared rkyv serializer.
+- **Packing.** A leaf that splits on insert averages about two-thirds of the writer's 8 KiB. A sealed file would get smaller, uneven leaves and more branch entries.
+- **Garbage.** Updates and zero weights leave items that the item-offset map no longer points to. They must be removed at seal, which is a copy after all.
+- **Encodings.** Prefix truncation and value-header elision rewrite a whole leaf, so slotted leaves could not use them.
+- **Cost of the bridges.** It needed a writer entry point for finished leaves, a `DataBlock` over memory leaves, and a shared rkyv serializer.
 
-No insert-efficient structure produces large, packed blocks, so good files need a pass at seal. The structure to choose is the one whose in-order scan is cheapest:
+No insert-efficient structure produces packed leaves, so good files need a pass at seal, and the pass already exists. The structure to choose is the one whose in-order scan is cheapest:
 
 - **B+-tree leaves.** Each leaf is a set of contiguous sorted vectors. Leaves are disjoint and in key order, so the seal reads leaf after leaf, with no comparisons between leaves and no pointer chasing inside one.
 - **`imbl::OrdMap`.** Also a B-tree, but its nodes are sized by entry count, not bytes. Every node is reference-counted, and after a snapshot each insert copies a path of nodes. Its iterator yields single pairs, not slices.
@@ -56,7 +68,11 @@ The life of an update:
 
 ## What is genuinely new
 
-**(a) The leaf.** A small run in the `VecIndexedWSet` layout; a W-set's leaf has keys and weights only. A leaf splits at a byte target.
+**(a) The leaf.** A small run in the `VecIndexedWSet` layout; a W-set's leaf has keys and weights only. A leaf splits at a byte target. In Appendix E's terms, one memtable leaf holds a key leaf's keys and their value rows together:
+
+- its offsets vector is the key leaf's row boundaries, but local: they count from the leaf's first value, so an insert shifts only the later offsets of its own leaf;
+- its values and weights are the value rows themselves, typed, so it needs no item-offset map;
+- the seal turns the local boundaries into global ones as the writer counts rows.
 
 - **Insert.** A binary search, then a vector insert of the typed item.
 - **Weight update.** In place.
@@ -76,9 +92,9 @@ insert(k, v, w):
 
 **Single writer.** Each memtable has one writer, the thread that owns its spine (user, 2026-11-19). Frozen views are immutable and readable from any thread: the merged index's `Old` snapshot is read on the view worker, and background merges read snapshots on the merger thread. A spine written by more than one thread falls back to default run generation; none is today, in DBSP or the Q3 driver. So the active memtable needs no lock, and only its frozen view enters `SharedState`. Copy-on-write is still needed on one thread: a join's delayed trace holds the previous transaction's snapshot across yields while the same worker appends to the spine.
 
-**(b) The leaf index.** A two-level copy-on-write vector of `Arc<Leaf>`, kept in key order, with each leaf's bounds and row count.
+**(b) The leaf index.** A two-level copy-on-write vector of `Arc<Leaf>`, kept in key order, with each leaf's bounds and row count. It plays the value branch's role, with pointers in place of child offsets and sizes.
 
-- A seek is a binary search on bounds, then a search in the leaf.
+- A seek is Appendix E's walk in memory: a binary search on bounds, then a search in the leaf, whose offsets give the key's values directly.
 - A snapshot clones the top-level `Arc`.
 - Writing a leaf after a snapshot copies that leaf (`Arc::make_mut`) and its chunk of the vector; nothing else is copied.
 - Concurrency is as today: one worker writes each spine, frozen views are immutable, and one mutex guards the run list.
@@ -92,7 +108,7 @@ insert(k, v, w):
 **(d) The seal: one ordered copy.**
 
 - `ListMerger::merge(factories, builder, vec![memtable_cursor])`, with the file builder.
-- The writer serializes each item once and packs the blocks. Filters, prefix truncation and compression follow its settings, unchanged.
+- The writer serializes each item once, packs the key and value leaves, and assigns the three laid-out numbers: global row boundaries, cumulative row totals, and child offsets and sizes. Filters, prefix truncation and compression follow its settings, unchanged.
 - **Placement.**
   - At low pressure, the seal keeps the frozen memtable as an in-memory run, with no copy. From then on it counts in RSS under the normal rules.
   - At moderate pressure or above, the seal writes a file.
