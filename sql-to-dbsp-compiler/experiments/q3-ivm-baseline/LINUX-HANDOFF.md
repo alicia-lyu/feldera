@@ -292,6 +292,23 @@ cache each and 1,000,000-row transactions, before the cache was sized from the h
 
 The four images take 77 GB, and the build peaked near 125 GB on the SSD.
 
+The measurement version 15 images (revision `c274d00d7`, 2026-11-18): `native-A` loaded alone with
+`--sequential-loads`; the other three then loaded at once with `--complete-images`, each
+merged-index load getting twice native's cache (decision of 2026-11-18):
+
+| Image | Cache (GiB) | Load (min) | Of which merge wait (min) | Stored (GB) | Peak while loading (GB) | Read back from the SSD (GB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `native-A` | 138 | 60.2 | 6.3 | 19.55 | 37.7 | about 0 |
+| `native-B` | 27.7 | 80.7 | 21.7 | 19.51 | 35.3 | over 31.8 |
+| `merged-index-A` | 55.3 | 88.5 | 18.5 | 17.41 | 30.9 | over 16.9 |
+| `merged-index-B` | 55.3 | 87.0 | 16.2 | 20.40 | 34.1 | over 22.4 |
+
+The read-back figures are `/proc/<pid>/io` `read_bytes` at the last sample before each load
+ended (80 minutes in). All three parallel loads began to read back once their caches filled (at
+about 30 minutes for `native-B`, 50 for the merged-index loads). So a native load gains from a
+large cache too, not only a merged-index one: `native-B` with 27.7 GiB took 20 minutes longer than
+`native-A` with 138 GiB, most of it in the merge wait.
+
 `images.json` records the settings used, the revision, the input hashes, the executables' SHA-256,
 and each image's size and load time. Each image is `storage/` (one DBSP checkpoint of both
 circuits, and in reconstructed mode the merged index and its orphan lines) and `image.json`, the
