@@ -1458,7 +1458,10 @@ impl Config {
         if config.report.is_some() && config.runs != 1 {
             bail!("--report requires one run per process");
         }
-        if config.diagnostics.is_some() && (config.runs != 1 || config.storage_path.is_none()) {
+        // A refresh program's storage is its copy of the image.
+        if config.diagnostics.is_some()
+            && (config.runs != 1 || (config.storage_path.is_none() && config.from_image.is_none()))
+        {
             bail!("--diagnostics requires file storage and one run per process");
         }
         Ok(config)
@@ -2968,6 +2971,18 @@ mod tests {
         assert!(parse(&["--write-image", "i", "--refresh-list", "r.json"]).is_err());
         assert!(parse(&["--write-image", "i", "--storage-path", "s"]).is_err());
         assert!(parse(&["--write-image", "i", "--runs", "1"]).is_ok());
+        // A refresh program records diagnostics of its image copy's storage.
+        assert!(parse(&[
+            "--from-image",
+            "i",
+            "--no-verify",
+            "--runs",
+            "1",
+            "--diagnostics",
+            "d"
+        ])
+        .is_ok());
+        assert!(parse(&["--diagnostics", "d", "--runs", "1"]).is_err());
         assert!(
             parse(&["--from-image", "i", "--runs", "1"]).is_err(),
             "verification needs the single process"
