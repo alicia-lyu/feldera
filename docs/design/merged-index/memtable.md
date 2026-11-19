@@ -1,12 +1,12 @@
 # A memtable for DBSP spines
 
-**Status:** design only. Nothing here is built. The first version (user, 2026-11-19) built the leaves from the layer file's own data blocks. The user revised it the same day: the leaves hold typed items, and the seal copies them into a file. The current campaign plan measures order-key assignment and prefix Bloom filters first. The measurements that motivate this design are in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#one-budget-at-512-mib-base-tables-evicted-2026-11-19) (writes by kind at critical pressure) and in [compaction.md](compaction.md).
+**Status:** design only. Nothing here is built. The first version (user, 2026-11-19) built the leaves from the layer file's own data blocks. The user revised it the same day: the seal copies the leaves into a file, so the memory layout is free of the file format. The current campaign plan measures order-key assignment and prefix Bloom filters first. The measurements that motivate this design are in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#one-budget-at-512-mib-base-tables-evicted-2026-11-19) (writes by kind at critical pressure) and in [compaction.md](compaction.md).
 
 **Goal.**
 
 - Initial run generation spans transactions. Out-of-order inserts go into an in-memory structure under its own budget, so the memtable's contents never depend on RSS pressure (user, 2026-11-19).
-- The memtable is a B+-tree whose leaves are small, typed, sorted runs. The seal is one ordered pass that copies the leaves into the standard file writer (user, 2026-11-19). Sealed files are packed like any other file.
-- No new dependency. `imbl::OrdMap` and an ART were considered; see [Why the seal copies](#why-the-seal-copies).
+- The memtable is a B+-tree whose leaves are small sorted arrays. The seal is one ordered pass that copies the leaves into the standard file writer (user, 2026-11-19). Sealed files are packed like any other file.
+- No new dependency. A skiplist, `imbl::OrdMap` and an ART were considered; see [Choosing the in-memory structure](#choosing-the-in-memory-structure).
 - No prefix truncation in memory. Sealed files get prefix truncation, value-header elision and compression from the writer's settings, as any file does.
 
 **Terms.**
@@ -30,27 +30,59 @@ Three of the appendix's numbers exist only once the file is laid out in key orde
 
 ## Why the seal copies
 
-**The first design** made each memtable leaf a slotted key leaf or value leaf in the appendix's format, so that the seal only assigned the three laid-out numbers: it rebased each key leaf's local row boundaries and let the writer build the branches over finished leaves. Assembly without a copy works only at leaf granularity, and an insert-efficient leaf does not make a good file leaf:
+**The first design** made each memtable leaf a slotted key leaf or value leaf in the appendix's format, so that the seal only assigned the three laid-out numbers. Leaf size was never the obstacle: a file leaf is about 8 KiB, and so can an in-memory leaf be. What a seal without a copy cannot do is what a copy gives (user, 2026-11-19):
 
-- **Packing.** A leaf that splits on insert averages about two-thirds of the writer's 8 KiB. A sealed file would get smaller, uneven leaves and more branch entries.
-- **Garbage.** Updates and zero weights leave items that the item-offset map no longer points to. They must be removed at seal, which is a copy after all.
-- **Encodings.** Prefix truncation and value-header elision rewrite a whole leaf, so slotted leaves could not use them.
-- **Cost of the bridges.** It needed a writer entry point for finished leaves, a `DataBlock` over memory leaves, and a shared rkyv serializer.
+1. **Packing.** A leaf that splits on insert is half to two-thirds full. A copy combines such leaves into full 8 KiB file leaves, so the file has fewer leaves and branch entries.
+2. **Encodings.** Prefix truncation, value-header elision and compression rewrite a whole leaf.
+3. **Garbage and cancellations.** Items that updates or zero weights left behind are dropped.
 
-No insert-efficient structure produces packed leaves, so good files need a pass at seal, and the pass already exists. The structure to choose is the one whose in-order scan is cheapest:
+The first design also needed three bridges: a writer entry point for finished leaves, a `DataBlock` over memory leaves, and a shared rkyv serializer. With a copy, the memory layout no longer has to match the file's.
 
-- **B+-tree leaves.** Each leaf is a set of contiguous sorted vectors. Leaves are disjoint and in key order, so the seal reads leaf after leaf, with no comparisons between leaves and no pointer chasing inside one.
-- **`imbl::OrdMap`.** Also a B-tree, but its nodes are sized by entry count, not bytes. Every node is reference-counted, and after a snapshot each insert copies a path of nodes. Its iterator yields single pairs, not slices.
-- **ART** (byte keys, so merged indexes only). An in-order scan walks the inner nodes, and each entry is a separate heap leaf.
+### Where the copy happens
 
-These are expected costs, not measurements. The arm measures the seal's CPU.
+- **At seal (chosen).** The data is already in memory, and the file is written once. The seal runs on the merger runtime, off the worker's path. A skiplist or an ART can work only this way, since neither has leaves to keep.
+- **At the first compaction.** The seal would write an unpacked file, without encodings. Seeks would read it until a merge rewrote it. That costs a second write and worse reads in the meantime, and gains only the seal's CPU, which is already in the background. It also needs a new rule: `size_to_level` places runs by size, so every sealed memtable would have to be forced into L1 for the rewrite to be its first merge.
+- Whether the seal is the best place stays an open question (user, 2026-11-19); see the end of this doc.
+
+### RocksDB's memtable
+
+RocksDB copies at flush too.
+
+- Its memtable is a skiplist (`InlineSkipList`) in an arena, insert-only. Every write appends an entry tagged with a sequence number; a delete appends a tombstone.
+- A reader sees a snapshot by sequence number, with no copies and no locks.
+- A flush iterates the skiplist, in order, through `CompactionIterator`, which drops versions no snapshot needs, into the table builder. The builder packs blocks, prefix-compresses keys with restart points, compresses, and builds the filters and the index.
+
+A skiplist's scan chases pointers, and RocksDB accepts that. So the seal's scan cost is minor beside serialization and compression, and it does not decide the structure.
+
+## Choosing the in-memory structure
+
+The criteria, in order:
+
+- **Seek cost.** DBSP operators seek the live memtable every transaction, so the memtable is read as much as any run.
+- **Insert cost**, and **weight updates in place**: in a W-set, a later delta for the same `(key, value)` changes its weight, and a zero weight removes it.
+- **Snapshot cost** (below).
+- **Memory overhead** against the budget.
+- **Fit with DBSP's type erasure.** Batches hold rows through the factories as `dyn` traits, not as concrete Rust types.
+
+The candidates:
+
+- **B+-tree with sorted-array leaves (chosen).** Seeks are binary searches over contiguous arrays. Weights update in place.
+- **Skiplist, as in RocksDB.** Seeks chase pointers. Weights cannot be updated in place without breaking a reader's snapshot, so a weight change appends an entry tagged with its transaction, and a reader sums the entries its snapshot can see.
+- **`imbl::OrdMap`.** A persistent B-tree: copying the whole map takes constant time, since the copy shares every node with the original, and each later insert copies the nodes from the root to the leaf it changes. That is the copy-on-write chosen below. It is generic over concrete Rust types, while DBSP's rows are type-erased, so every key would need its own heap allocation.
+- **ART.** Byte keys only, so merged indexes only. It has no snapshots of its own; its nodes would need copy-on-write.
+
+**The leaf's layout depends on the spine.** A leaf holds no particular form of data. It must keep the spine's order and meet DBSP's cursor contract, under which `Cursor::key()` and `val()` return references, `&K` and `&V`.
+
+- **Native spines** (join traces, whose rows are Rust tuples): `DynVec` columns, so the cursor returns references into the leaf.
+- **Merged-index spines.** A `FoldedKey` is one `Vec<u8>`, and a payload is packed bytes. A `DynVec` of byte vectors costs a heap allocation per key and per payload. A *byte leaf* avoids that: one contiguous byte area plus an offset array, compared with `memcmp`. It is the first design's slotted leaf without the file format. Its cost is that the cursor must build a `FoldedKey` to return `&K`, a copy per read, as a file cursor does in its key buffer.
+- The `DynVec` leaf comes first, for both. The byte leaf is a merged-index arm, if allocations show in the measurements.
 
 ## What is reused, and how the memtable becomes a file run
 
 | Reused piece | Where | Role in the memtable |
 | --- | --- | --- |
 | `ListMerger::merge` and the file builder | `trace/spine_async/list_merger.rs`, `trace/ord/file/` | **The seal.** The memtable cursor is the merger's one input; with one cursor, its heaps are trivial, and the merge is a copy in key order. The builder packs blocks and builds the index blocks, filters (Bloom, prefix once built, range) and trailer as for any file. |
-| The `VecIndexedWSet` layout (keys, offsets, values, weights) and the factories' `DynVec` | `trace/ord/vec/`, `trace.rs` | **A leaf is a small run in this layout.** Items are typed, as in any in-memory run. |
+| The `VecIndexedWSet` column layout (keys, offsets, values, weights) and the factories' `DynVec` | `trace/ord/vec/`, `dynamic/vec.rs` | **The leaf's layout.** `VecIndexedWSet` itself is immutable: a builder fills it once, and then it is only read. The leaf reuses its columns, not the batch. `DynVec` (the `Vector` trait) can push, truncate and sort, but not insert or remove at an index, so the leaf needs new `insert_at` and `remove_at` methods. |
 | Fallback batch enums (`Inner { Vec, File }`) and `DelegatingCursor` | `trace/ord/fallback/wset.rs`, `indexed_wset.rs` | The frozen memtable is a third variant, `Inner::Memtable`. Every reader (`CursorList`, `SpineCursor`, `RunMerge`, replay) takes it unchanged. |
 | Spine snapshots under the `SharedState` lock; `size_to_level`, `MERGE_COUNTS`, the merger runtime | `spine_async.rs` | A snapshot includes the frozen memtable. The sealed file run is added at its level and compacted from then on like any other. |
 | `pick_merge_destination` | `trace/ord/fallback/utils.rs` | It decides whether a seal writes a file or keeps the frozen memtable as an in-memory run. |
@@ -68,38 +100,45 @@ The life of an update:
 
 ## What is genuinely new
 
-**(a) The leaf.** A small run in the `VecIndexedWSet` layout; a W-set's leaf has keys and weights only. A leaf splits at a byte target. In Appendix E's terms, one memtable leaf holds a key leaf's keys and their value rows together:
+**(a) The leaf.** Columns in the `VecIndexedWSet` layout; a W-set's leaf has keys and weights only. A leaf splits at a byte target. In Appendix E's terms, one memtable leaf holds a key leaf's keys and their value rows together:
 
 - its offsets vector is the key leaf's row boundaries, but local: they count from the leaf's first value, so an insert shifts only the later offsets of its own leaf;
-- its values and weights are the value rows themselves, typed, so it needs no item-offset map;
+- its values and weights are the value rows themselves, so it needs no item-offset map;
 - the seal turns the local boundaries into global ones as the writer counts rows.
 
-- **Insert.** A binary search, then a vector insert of the typed item.
+The operations:
+
+- **Insert.** A binary search, then `insert_at` in the columns.
 - **Weight update.** In place.
-- **Zero weight.** The item is removed, so leaves hold no garbage.
+- **Zero weight.** The item is removed (`remove_at`), so leaves hold no garbage.
 - **A key across two leaves.** A split may fall between the values of one key. That key is then repeated as the next leaf's first key, and the cursor joins the two parts.
 
 ```text
 insert(k, v, w):
-    leaf = leaf_index.find(k, v)          // binary search on leaf bounds
-    leaf = make_mut(leaf)                 // copy once if a snapshot holds it
+    path = tree.descend(k, v)             // binary search at each inner node
+    leaf = make_mut(path)                 // copy shared nodes on the path (Rodeh)
     i = leaf.position(k)                  // existing key, or insert k
     j = leaf.value_position(i, v)         // within k's value range
     if found: leaf.weight[j] += w; if zero: remove j (and k if now empty)
     else:     insert (v, w) at j; shift the later offsets of the leaf
-    if leaf.bytes > target: split leaf
+    if leaf.bytes > target: split leaf, add its bound to the parent
 ```
 
-**Single writer.** Each memtable has one writer, the thread that owns its spine (user, 2026-11-19). Frozen views are immutable and readable from any thread: the merged index's `Old` snapshot is read on the view worker, and background merges read snapshots on the merger thread. A spine written by more than one thread falls back to default run generation; none is today, in DBSP or the Q3 driver. So the active memtable needs no lock, and only its frozen view enters `SharedState`. Copy-on-write is still needed on one thread: a join's delayed trace holds the previous transaction's snapshot across yields while the same worker appends to the spine.
+**Snapshots: old versions, not concurrency control.** Each memtable has one writer, the thread that owns its spine (user, 2026-11-19). A spine written by more than one thread falls back to default run generation; none is today, in DBSP or the Q3 driver. The active memtable needs no lock, and only its frozen view enters `SharedState`. What one writer still needs is old versions:
 
-**(b) The leaf index.** A two-level copy-on-write vector of `Arc<Leaf>`, kept in key order, with each leaf's bounds and row count. It plays the value branch's role, with pointers in place of child offsets and sizes.
+- A held snapshot must keep seeing the state before later inserts. Two hold one: a join's delayed trace, across yields while the same worker appends to the spine, and the merged index's `Old` snapshot, read on the view worker. Background merges also read snapshots on the merger thread.
+- Key-value locking orders concurrent writers. It cannot give a reader the values from before an update, so there is no concurrency control to build.
+- **Copy-on-write (chosen)**, after Rodeh, "B-trees, Shadowing, and Clones" (ACM Transactions on Storage, 2008). A snapshot shares the root. An update copies each shared node on its path, from the leaf to the root, and reference counts (`Arc`) mark what is shared. `Arc::make_mut` copies a node only if a snapshot still holds it, so an insert with no snapshot held copies nothing.
+- The alternative is RocksDB's: entries tagged with a version, summed by the reader.
+- The build first checks, in `spine_async.rs` and the join operators, when an insert can happen while a snapshot is held. If it never can, copy-on-write never copies and stays as a guard.
 
-- A seek is Appendix E's walk in memory: a binary search on bounds, then a search in the leaf, whose offsets give the key's values directly.
-- A snapshot clones the top-level `Arc`.
-- Writing a leaf after a snapshot copies that leaf (`Arc::make_mut`) and its chunk of the vector; nothing else is copied.
+**(b) The inner nodes.** A standard B+-tree: each inner node holds its children's bounds, row counts and `Arc` pointers. They play the value branch's role, with pointers in place of child offsets and sizes. The budget bounds the height: a spine's cap is at most 256 MiB, which at 4–8 KiB per leaf is at most 64k leaves, so a fan-out of about 256 gives height 2.
+
+- A seek is Appendix E's walk in memory: a binary search at each inner node, then a search in the leaf, whose offsets give the key's values directly.
+- A snapshot clones the root's `Arc`.
 - Concurrency is as today: one worker writes each spine, frozen views are immutable, and one mutex guards the run list.
 
-**(c) The memtable cursor.** It implements `Cursor` and `MergeCursor`: the leaf index for navigation, then the leaf's vectors.
+**(c) The memtable cursor.** It implements `Cursor` and `MergeCursor`: the inner nodes for navigation, then the leaf's columns.
 
 - It joins a key that spans two leaves into one key with one value sequence.
 - `seek_key_exact` is exact, with no filter. `seek_key_in_prefix` (the prefix-filter plan) answers from the leaves.
@@ -108,6 +147,7 @@ insert(k, v, w):
 **(d) The seal: one ordered copy.**
 
 - `ListMerger::merge(factories, builder, vec![memtable_cursor])`, with the file builder.
+- The copy gives the three benefits above: full 8 KiB file leaves, the writer's encodings, and no garbage or cancelled items.
 - The writer serializes each item once, packs the key and value leaves, and assigns the three laid-out numbers: global row boundaries, cumulative row totals, and child offsets and sizes. Filters, prefix truncation and compression follow its settings, unchanged.
 - **Placement.**
   - At low pressure, the seal keeps the frozen memtable as an in-memory run, with no copy. From then on it counts in RSS under the normal rules.
@@ -151,7 +191,7 @@ insert(k, v, w):
 **(i) Diagnostics.**
 
 - `RunWriteKind::MemtableFlush` and `MemtableCheckpointFlush`.
-- `SpineRunCounts` and q3 `run_counts` gain `memtable_entries`, `memtable_bytes`, `flushing` and `memtable_flushes`.
+- `SpineRunCounts` and q3 `run_counts` gain `memtable_entries`, `memtable_bytes`, `memtable_node_copies`, `flushing` and `memtable_flushes`.
 - Metrics `MEMTABLE_*`.
 - `spill_kinds.py` moves into `q3-ivm-baseline/`, with the flush kinds added.
 
@@ -163,6 +203,7 @@ insert(k, v, w):
 ## Stages, tests, run
 
 1. **The leaf.**
+   - `Vector::insert_at` and `remove_at`, as unit tests.
    - Insert, update, zero removal and split, as unit tests, including a split between the values of one key.
    - A proptest against a `BTreeMap<(K, V), R>` model.
 2. **Leaf index and cursor.**
@@ -201,7 +242,7 @@ insert(k, v, w):
 - the seal's CPU: one serialization per item, the same work as any file build today, against a batch sort plus a build per transaction;
 - the CPU of per-item inserts, and the vector memmove for wide rows;
 - peak memory during a seal, since the flushing memtable counts in the budget until its file is closed;
-- leaf copies after a snapshot (one copy per touched leaf per transaction);
+- node copies after a snapshot (counted as `memtable_node_copies`);
 - accounting drift against RSS (report the delta).
 
 **Run.** A-seek clustered, K = 10, prefix filters on, three arms:
@@ -211,3 +252,8 @@ insert(k, v, w):
 - 448 cache + 64 MiB memtable.
 
 Report, view first: IVM percentiles, runs per spine, per-run seeks per group, view writes by kind, flush count and size, the seal's CPU, and pressure per refresh.
+
+## Open questions
+
+- **Where the copy happens** (user, 2026-11-19). At seal, as chosen, or at the first compaction, which would need every sealed memtable forced into L1. See [Where the copy happens](#where-the-copy-happens).
+- **Is copy-on-write ever exercised?** It depends on whether an insert can happen while a snapshot is held; the build checks this first.

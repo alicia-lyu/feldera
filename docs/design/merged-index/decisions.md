@@ -495,7 +495,7 @@ The user's goal is to implement CH-benCHmark eventually (owner: a future harness
 
 ### 2026-11-19: The memtable's seal copies its typed leaves
 
-The user decided on 2026-11-19 that the [memtable](memtable.md) keeps typed, sorted leaves in a B+-tree and that its seal copies them, in key order, into the standard file writer, through `ListMerger` with one input. The same day's first design, slotted data blocks assembled into a file without a copy, is dropped: assembly works only per leaf, and an insert-efficient leaf is part empty, holds garbage, and cannot be prefix-truncated. Since a pass at seal is needed anyway, B+-tree leaves were preferred over `imbl::OrdMap` and an ART for their cheaper in-order scan.
+The user decided on 2026-11-19 that the [memtable](memtable.md) keeps typed, sorted leaves in a B+-tree and that its seal copies them, in key order, into the standard file writer, through `ListMerger` with one input. The same day's first design, slotted data blocks assembled into a file without a copy, is dropped: assembly works only per leaf, and an insert-efficient leaf is part empty, holds garbage, and cannot be prefix-truncated. The user corrected the reason the same day: leaf size is not the obstacle, since a file leaf is about 8 KiB. The copy is worth having for three things: packing half-full leaves into full ones, the writer's encodings, and clearing garbage and cancellations. With the copy, the memory layout is free of the file format; the choice of structure and whether the copy belongs at seal or at the first compaction are in [memtable.md](memtable.md), the latter as an open question.
 
 ## Superseded and withdrawn
 
