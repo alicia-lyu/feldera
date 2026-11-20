@@ -87,7 +87,6 @@ The candidates:
 | Spine snapshots under the `SharedState` lock; `size_to_level`, `MERGE_COUNTS`, the merger runtime | `spine_async.rs` | A snapshot includes the frozen memtable. The sealed file run is added at its level and compacted from then on like any other. |
 | `pick_merge_destination` | `trace/ord/fallback/utils.rs` | It decides whether a seal writes a file or keeps the frozen memtable as an in-memory run. |
 | `persisted()`, `Spine::save`/`restore` | Fallback batches, `spine_async.rs` | `save` seals first. The checkpoint lists files only; its format is unchanged. |
-| `Accumulator` and `AccumulateUntimedTraceAppend` | `operator/dynamic/` | The per-transaction accumulator spine gets a memtable too, and the integral adopts or absorbs it at flush. |
 | Pressure levels, the `StorageOptions` plumbing, `RunWriteKind`, `SpineRunCounts` | `circuit/runtime.rs`, `feldera-types`, `storage/diagnostics.rs` | The budget, the knob and the counters follow these patterns. |
 
 The life of an update:
@@ -124,7 +123,7 @@ insert(k, v, w):
     if leaf.bytes > target: split leaf, add its bound to the parent
 ```
 
-**Snapshots: old versions, not concurrency control.** Each memtable has one writer, the thread that owns its spine (user, 2026-11-19). A spine written by more than one thread falls back to default run generation; none is today, in DBSP or the Q3 driver. The active memtable needs no lock, and only its frozen view enters `SharedState`. What one writer still needs is old versions:
+**Snapshots: old versions, not concurrency control.** Each memtable has one writer, the thread that owns its spine (user, 2026-11-19). A spine written by more than one thread falls back to default run generation; none is today, in DBSP or the Q3 driver. The active tree sits in a `Mutex` slot shared with the budget, so that a background seal can take it. The owner locks the slot once per inserted batch, and a snapshot or a seal locks it before `SharedState`. What one writer still needs is old versions:
 
 - A held snapshot must keep seeing the state before later inserts. Two hold one: a join's delayed trace, across yields while the same worker appends to the spine, and the merged index's `Old` snapshot, read on the view worker. Background merges also read snapshots on the merger thread.
 - Key-value locking orders concurrent writers. It cannot give a reader the values from before an update, so there is no concurrency control to build.
@@ -136,7 +135,7 @@ insert(k, v, w):
 
 - A seek is Appendix E's walk in memory: a binary search at each inner node, then a search in the leaf, whose offsets give the key's values directly.
 - A snapshot clones the root's `Arc`.
-- Concurrency is as today: one worker writes each spine, frozen views are immutable, and one mutex guards the run list.
+- Concurrency is as today: one worker writes each spine, frozen memtables are immutable, and one mutex guards the run list.
 
 **(c) The memtable cursor.** It implements `Cursor` and `MergeCursor`: the inner nodes for navigation, then the leaf's columns.
 
@@ -163,7 +162,7 @@ insert(k, v, w):
 **(f) Spine hooks** (`spine_async.rs`).
 
 - **The fields.** `Spine.memtable`, plus `memtable_view` and `flushing` in `SharedState`.
-- **`get_batches()`** returns the runs, then the flushing memtable, then the active memtable's frozen view.
+- **`get_batches()`** returns the runs, then the flushing memtable, then a frozen memtable of the active tree, made at snapshot time (lazy freeze).
 - **`insert`.**
   - A batch above the cap / 4 bypasses the memtable as a normal run.
   - Otherwise its items are inserted.
@@ -194,6 +193,25 @@ insert(k, v, w):
 - `SpineRunCounts` and q3 `run_counts` gain `memtable_entries`, `memtable_bytes`, `memtable_node_copies`, `flushing` and `memtable_flushes`.
 - Metrics `MEMTABLE_*`.
 - `spill_kinds.py` moves into `q3-ivm-baseline/`, with the flush kinds added.
+
+## Phases
+
+The build is split into three phases (user, 2026-11-19). The plan for phase 1 lists its stages; phases 2 and 3 are logged here.
+
+1. **Phase 1: the memtable.**
+   - The B+-tree with copy-on-write nodes, the memtable cursor, and `Inner::Memtable`.
+   - Integral spines only. The per-transaction accumulator gets no memtable (user, 2026-11-19): it never spans transactions, so it is not where small runs pile up.
+   - One budget for the runtime. A background seal takes the largest memtable, so a spine that stops inserting is still sealed. There is no per-spine cap.
+   - Diagnostics, and the harness's `--memtable-mib` flag.
+   - Each transaction's delta still arrives as a sorted batch. Its tuples are inserted one by one into the tree, between the tuples earlier transactions left there, using the previous tuple's leaf as a finger.
+2. **Phase 2: cheaper inserts.**
+   - `insert_tuples`, for unsorted input: it skips the per-transaction sort where the trace is the sole consumer of its input (see [Unsorted input](#what-is-genuinely-new), item g).
+   - A per-leaf merge of each sorted batch, in place of the tuple-by-tuple insert, so that a leaf shifts its items once per batch.
+   - The byte leaf for merged indexes, if allocations show in phase 3's measurements.
+3. **Phase 3: measurement, on Linux** (per `LINUX-HANDOFF.md`).
+   - Rebuild the images, and bump the measurement version.
+   - The three arms of [the run](#stages-tests-run).
+   - Rewrite `spill_kinds.py` in `q3-ivm-baseline/`; it was never committed. It tallies `compaction-log.jsonl` by write kind, the flush kinds included.
 
 ## The arm and its limits
 
