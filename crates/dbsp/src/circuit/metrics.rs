@@ -29,6 +29,14 @@ pub static FILES_SYNCED: AtomicU64 = AtomicU64::new(0);
 /// Time in nanoseconds a worker was stalled waiting for more merges to complete.
 pub static COMPACTION_STALL_TIME_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
 
+/// Number of memtables sealed into runs, that is, copied from memory to a run
+/// by a budget-triggered seal or by a checkpoint.
+pub static MEMTABLE_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+/// Time in nanoseconds a worker was stalled at insert, waiting for a memtable
+/// seal to free memory under `storage.memtable_mib`.
+pub static MEMTABLE_STALL_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+
 /// Number of records dropped due to LATENESS annotations
 pub static TOTAL_LATE_RECORDS: AtomicU64 = AtomicU64::new(0);
 

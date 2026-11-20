@@ -24,6 +24,7 @@ pub mod cache;
 pub mod checkpointer;
 pub mod circuit_builder;
 mod fingerprinter;
+pub mod memtable_budget;
 pub mod metrics;
 pub mod operator_traits;
 pub mod schedule;

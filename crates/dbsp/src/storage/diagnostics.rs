@@ -77,6 +77,10 @@ pub enum RunWriteKind {
     RequestedCompaction,
     /// A run inserted in memory that the spine wrote to storage at once.
     InsertSpill,
+    /// A memtable that the memory budget sealed into a run (`storage.memtable_mib`).
+    MemtableFlush,
+    /// A memtable sealed into a file synchronously, to be saved in a checkpoint.
+    MemtableCheckpointFlush,
 }
 
 /// One run that a spine wrote.
@@ -221,6 +225,23 @@ pub struct SpineRunCounts {
     /// CPU time the spine's merges have used, over all levels, in
     /// microseconds.
     pub merge_cpu_micros: u64,
+    /// Entries (tuples) in the memtable, including one being flushed. Zero if
+    /// the spine has no memtable.
+    pub memtable_entries: usize,
+    /// Bytes the memtable holds, counted as the budget counts them, including
+    /// one being flushed.
+    pub memtable_bytes: usize,
+    /// Tree nodes copied because a frozen memtable still shared them, since
+    /// the spine was created.
+    pub memtable_node_copies: u64,
+    /// Time spent copying those nodes, in nanoseconds, since the spine was
+    /// created.
+    pub memtable_copy_nanos: u64,
+    /// Whether a memtable is being flushed right now.
+    pub flushing: bool,
+    /// Memtables sealed since the spine was created, by the budget or by a
+    /// checkpoint.
+    pub memtable_flushes: u64,
 }
 
 impl SpineRunCounts {

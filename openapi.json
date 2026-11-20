@@ -15951,6 +15951,13 @@
             ],
             "default": "storage"
           },
+          "memtable_mib": {
+            "type": "integer",
+            "description": "The memory budget of the in-memory write buffers (memtables) of the\nintegral traces, in MiB, shared by all of the runtime's traces.\n\nIf set, an integral trace absorbs the batches of many transactions into\none sorted in-memory tree instead of spilling each batch as its own run.\nWhen the trees together exceed the budget, the largest is sealed in the\nbackground, that is, copied into one run on storage. The live total can\novershoot the budget by at most one batch.\n\nThe budget counts toward the process's memory, so it must be less than\nhalf of `max_rss_bytes`, and the circuit refuses to start otherwise.\nWhile a budget is set, memory pressure is measured on the resident\nmemory without the memtables' bytes against `max_rss_bytes` less the\nbudget, since the memtables can be sealed at will.\n\nIf unset, which is the default, there are no memtables.",
+            "default": null,
+            "nullable": true,
+            "minimum": 0
+          },
           "min_step_storage_bytes": {
             "type": "integer",
             "description": "For a batch of data passed through the pipeline during a single step,\nthe minimum estimated number of bytes to write it to storage.\n\nThis is provided for debugging and fine-tuning and should ordinarily be\nleft unset.  A value of 0 writes every batch that holds anything to\nstorage; an empty batch stays in memory, since it has nothing to spill\nand a layer file is not free.  Nonzero values provide a threshold.\n`usize::MAX`, the default, effectively disables storage for such\nbatches.  If it is set to another value, it should ordinarily be\ngreater than or equal to `min_storage_bytes`.",

@@ -411,6 +411,24 @@ pub struct StorageOptions {
     /// The setting decides how new batches are written. A batch written under
     /// the other setting keeps the form it was written in.
     pub filter_residency: FilterResidency,
+
+    /// The memory budget of the in-memory write buffers (memtables) of the
+    /// integral traces, in MiB, shared by all of the runtime's traces.
+    ///
+    /// If set, an integral trace absorbs the batches of many transactions into
+    /// one sorted in-memory tree instead of spilling each batch as its own run.
+    /// When the trees together exceed the budget, the largest is sealed in the
+    /// background, that is, copied into one run on storage. The live total can
+    /// overshoot the budget by at most one batch.
+    ///
+    /// The budget counts toward the process's memory, so it must be less than
+    /// half of `max_rss_bytes`, and the circuit refuses to start otherwise.
+    /// While a budget is set, memory pressure is measured on the resident
+    /// memory without the memtables' bytes against `max_rss_bytes` less the
+    /// budget, since the memtables can be sealed at will.
+    ///
+    /// If unset, which is the default, there are no memtables.
+    pub memtable_mib: Option<usize>,
 }
 
 /// Where the Bloom filters of batches on storage are kept. See

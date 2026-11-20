@@ -101,6 +101,8 @@ which Feldera is built.
 | <a name='max_rss_bytes'>`max_rss_bytes`</a> |gauge | Configured maximum process RSS in bytes. A value of 0 means no limit is configured. |
 | <a name='memory_pressure'>`memory_pressure`</a> |gauge | Current memory pressure level in [0..3]: low=0, moderate=1, high=2, critical=3. |
 | <a name='memory_pressure_epoch'>`memory_pressure_epoch`</a> |gauge | Monotonic counter incremented whenever memory pressure transitions to high/critical. |
+| <a name='memtable_flushes_total'>`memtable_flushes_total`</a> |counter | Number of memtables sealed into runs. |
+| <a name='memtable_stall_duration_seconds'>`memtable_stall_duration_seconds`</a> |counter | Time in seconds a worker was stalled at insert, waiting for a memtable seal to free memory. |
 | <a name='output_stall_seconds'>`output_stall_seconds`</a> |gauge | If the pipeline is currently stalled because one or more output connectors' output buffers were full, this is the time in seconds for which it has been stalled.<br/><br/>If the pipeline is not currently stalled, this is zero.<br/><br/>If this is nonzero, then the output connectors causing the stall can be identified by observing which values of `output_connector_queued_records` are greater than or equal to the configured maximum (which defaults to 1,000,000). |
 | <a name='output_stall_seconds_total'>`output_stall_seconds_total`</a> |counter | Time in seconds that the pipeline was stalled because one or more output connectors' output buffers were full.<br/><br/>This value is greater than or equal to `output_stall_seconds`. |
 

@@ -57,7 +57,8 @@ use dbsp::circuit::circuit_builder::{BootstrapInfo, ConcurrentRestoreOutcome};
 use dbsp::circuit::metrics::{
     COMPACTION_STALL_TIME_NANOSECONDS, DBSP_OPERATOR_COMMIT_LATENCY_MICROSECONDS, DBSP_STEP,
     DBSP_STEP_LATENCY_MICROSECONDS, DUPLICATE_EXCHANGE_MESSAGES_RECEIVED,
-    EXCHANGE_MESSAGES_RECEIVED, FILES_CREATED, FILES_DELETED, FILES_SYNCED, TOTAL_LATE_RECORDS,
+    EXCHANGE_MESSAGES_RECEIVED, FILES_CREATED, FILES_DELETED, FILES_SYNCED, MEMTABLE_FLUSHES,
+    MEMTABLE_STALL_NANOSECONDS, TOTAL_LATE_RECORDS,
 };
 use dbsp::circuit::tokio::TOKIO;
 use dbsp::circuit::{CheckpointCommitter, CircuitStorageConfig, Mode};
@@ -1661,6 +1662,18 @@ impl Controller {
             "Time in seconds a worker was stalled waiting for more merges to complete.",
             labels,
             COMPACTION_STALL_TIME_NANOSECONDS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        );
+        metrics.counter(
+            "memtable_flushes_total",
+            "Number of memtables sealed into runs.",
+            labels,
+            &MEMTABLE_FLUSHES,
+        );
+        metrics.counter(
+            "memtable_stall_duration_seconds",
+            "Time in seconds a worker was stalled at insert, waiting for a memtable seal to free memory.",
+            labels,
+            MEMTABLE_STALL_NANOSECONDS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
         );
         metrics.counter(
             "output_stall_seconds_total",

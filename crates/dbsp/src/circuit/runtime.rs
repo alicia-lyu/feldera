@@ -86,6 +86,12 @@ pub enum Error {
     /// stepping a bootstrap circuit that does not exist or creating one
     /// while another exists.
     BootstrapCircuit(String),
+    /// `storage.memtable_mib` asks for a budget of half the process's memory
+    /// limit or more.
+    MemtableBudgetTooLarge {
+        budget_bytes: usize,
+        max_rss_bytes: u64,
+    },
     Terminated,
 }
 
@@ -98,6 +104,7 @@ impl DetailedError for Error {
             Self::IncompatibleStorage => Cow::from("IncompatibleStorage"),
             Self::CheckpointParseError(_) => Cow::from("CheckpointParseError"),
             Self::BootstrapCircuit(_) => Cow::from("BootstrapCircuit"),
+            Self::MemtableBudgetTooLarge { .. } => Cow::from("MemtableBudgetTooLarge"),
         }
     }
 }
@@ -127,11 +134,44 @@ impl Display for Error {
             Self::BootstrapCircuit(error) => {
                 write!(f, "Bootstrap circuit error: {error}")
             }
+            Self::MemtableBudgetTooLarge {
+                budget_bytes,
+                max_rss_bytes,
+            } => write!(
+                f,
+                "storage.memtable_mib is {} MiB, which is half of max_rss_bytes ({} MiB) or more; \
+                 the memtables must stay below half of the memory limit",
+                budget_bytes / MEMTABLE_BYTES_PER_MIB,
+                max_rss_bytes / MEMTABLE_BYTES_PER_MIB as u64,
+            ),
         }
     }
 }
 
 impl StdError for Error {}
+
+const MEMTABLE_BYTES_PER_MIB: usize = 1024 * 1024;
+
+/// Converts `storage.memtable_mib` to bytes, and refuses a budget of half of
+/// `max_rss_bytes` or more.
+///
+/// Memory pressure is measured against `max_rss_bytes` less the budget, so a
+/// budget that large would leave the rest of the process almost no room.
+fn validate_memtable_budget(
+    memtable_mib: usize,
+    max_rss_bytes: Option<u64>,
+) -> Result<usize, Error> {
+    let budget_bytes = memtable_mib.saturating_mul(MEMTABLE_BYTES_PER_MIB);
+    match max_rss_bytes {
+        Some(max_rss_bytes) if budget_bytes as u64 >= max_rss_bytes / 2 => {
+            Err(Error::MemtableBudgetTooLarge {
+                budget_bytes,
+                max_rss_bytes,
+            })
+        }
+        _ => Ok(budget_bytes),
+    }
+}
 
 // Thread-local variables set for all threads in the DBSP runtime (foreground and background).
 thread_local! {
@@ -562,6 +602,14 @@ impl RuntimeInner {
         } else {
             None
         };
+
+        // Memtables exist only with storage, which their seal writes to.
+        if let Some(memtable_mib) = storage
+            .as_ref()
+            .and_then(|storage| storage.options.memtable_mib)
+        {
+            validate_memtable_budget(memtable_mib, config.max_rss_bytes)?;
+        }
 
         let total_cache_bytes = if let Some(storage) = &storage {
             match storage.options.cache_mib {
@@ -1298,6 +1346,25 @@ impl Runtime {
             .unwrap_or(FilterResidency::Memory)
     }
 
+    /// Returns the memory budget of the integral traces' memtables, in bytes
+    /// (`storage.memtable_mib`), or `None` if memtables are off.
+    ///
+    /// Off a runtime thread, or on a runtime without storage, there is no
+    /// budget: a memtable is sealed to storage, so it needs the runtime.
+    pub fn memtable_budget_bytes() -> Option<usize> {
+        RUNTIME.with(|rt| {
+            let memtable_mib = rt
+                .borrow()
+                .as_ref()?
+                .inner()
+                .storage
+                .as_ref()?
+                .options
+                .memtable_mib?;
+            Some(memtable_mib.saturating_mul(MEMTABLE_BYTES_PER_MIB))
+        })
+    }
+
     pub fn get_mode(&self) -> Mode {
         self.inner().mode
     }
@@ -1951,7 +2018,9 @@ impl ExactSizeIterator for WorkerLocations {}
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{BUFFER_CACHE, BufferCache, Parker, Runtime, RuntimeInner};
+    use super::{
+        BUFFER_CACHE, BufferCache, Error, Parker, Runtime, RuntimeInner, validate_memtable_budget,
+    };
     use crate::{
         Circuit, RootCircuit,
         circuit::{
@@ -1960,6 +2029,7 @@ pub(crate) mod tests {
             metadata::{LOOSE_MEMORY_RECORDS_COUNT, MERGING_MEMORY_RECORDS_COUNT},
             schedule::{DynamicScheduler, Scheduler},
         },
+        error::Error as DbspError,
         operator::Generator,
         profile::DbspProfile,
         storage::backend::FileId,
@@ -2580,6 +2650,91 @@ pub(crate) mod tests {
 
         sleep(Duration::from_millis(100));
         hruntime.kill().unwrap();
+    }
+
+    /// A runtime config with storage under `path` and `memtable_mib`.
+    fn memtable_config(
+        path: &std::path::Path,
+        memtable_mib: Option<usize>,
+        max_rss_bytes: Option<u64>,
+    ) -> CircuitConfig {
+        CircuitConfig::with_workers(1)
+            .with_max_rss_bytes(max_rss_bytes)
+            .with_storage(Some(
+                CircuitStorageConfig::for_config(
+                    StorageConfig {
+                        path: path.to_string_lossy().into_owned(),
+                        cache: StorageCacheConfig::default(),
+                    },
+                    StorageOptions {
+                        memtable_mib,
+                        ..StorageOptions::default()
+                    },
+                )
+                .unwrap(),
+            ))
+    }
+
+    #[test]
+    fn memtable_budget_must_be_below_half_of_max_rss() {
+        const MIB: u64 = 1024 * 1024;
+
+        // No limit, no refusal.
+        assert_eq!(
+            validate_memtable_budget(4096, None).unwrap(),
+            4096 * MIB as usize
+        );
+        // Just below half of 1024 MiB is accepted; half and above are refused.
+        assert_eq!(
+            validate_memtable_budget(511, Some(1024 * MIB)).unwrap(),
+            511 * MIB as usize
+        );
+        for memtable_mib in [512, 513, usize::MAX] {
+            let error = validate_memtable_budget(memtable_mib, Some(1024 * MIB)).unwrap_err();
+            assert!(matches!(error, Error::MemtableBudgetTooLarge { .. }));
+            assert!(error.to_string().contains("storage.memtable_mib"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn runtime_refuses_a_memtable_budget_of_half_of_max_rss() {
+        const MIB: u64 = 1024 * 1024;
+        let storage_dir = tempfile::tempdir().unwrap();
+
+        let refused = RuntimeInner::new(memtable_config(
+            storage_dir.path(),
+            Some(512),
+            Some(1024 * MIB),
+        ));
+        assert!(matches!(
+            refused,
+            Err(DbspError::Runtime(Error::MemtableBudgetTooLarge { .. }))
+        ));
+
+        // The refusal released the storage directory's lock, so a budget below half starts.
+        RuntimeInner::new(memtable_config(
+            storage_dir.path(),
+            Some(511),
+            Some(1024 * MIB),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn memtable_budget_bytes_follows_the_storage_option() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        for (memtable_mib, expected) in [(None, None), (Some(64), Some(64 * 1024 * 1024))] {
+            let handle = Runtime::run(
+                memtable_config(storage_dir.path(), memtable_mib, None),
+                move |_parker| assert_eq!(Runtime::memtable_budget_bytes(), expected),
+            )
+            .unwrap();
+            handle.join().unwrap();
+        }
+        // Off a runtime thread there is no budget.
+        assert_eq!(Runtime::memtable_budget_bytes(), None);
     }
 
     // Test the memory pressure thresholds and how merger threads behave under different memory pressure levels.
