@@ -214,6 +214,7 @@ The build is split into three phases (user, 2026-11-19). The plan for phase 1 li
    - A per-leaf merge of each sorted batch, in place of the tuple-by-tuple insert, so that a leaf shifts its items once per batch.
    - The byte leaf for merged indexes, if allocations show in phase 3's measurements.
 3. **Phase 3: measurement, on Linux** (per `LINUX-HANDOFF.md`).
+   - First compile the adapters crate (`cargo check -p dbsp_adapters`). Its memtable metrics export (`memtable_flushes_total`, `memtable_stall_duration_seconds` in `controller.rs`) has never been compiled: `rdkafka-sys`'s build script fails on the Mac before reaching it (2026-11-20).
    - Rebuild the images, and bump the measurement version.
    - The three arms of [the run](#stages-tests-run).
    - Rewrite `spill_kinds.py` in `q3-ivm-baseline/`; it was never committed. It tallies `compaction-log.jsonl` by write kind, the flush kinds included.
