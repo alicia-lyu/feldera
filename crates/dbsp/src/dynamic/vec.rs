@@ -735,12 +735,14 @@ mod test {
                 let (a, mut b, c, mut d): ($ty, $ty, $ty, $ty) = ($a, $b, $c, $d);
                 vec.insert_ref(0, a.erase());
                 model.insert(0, a.clone());
-                vec.insert_val(0, b.erase_mut());
+                // `insert_val` moves the value out, so the model clones it first.
                 model.insert(0, b.clone());
+                vec.insert_val(0, b.erase_mut());
                 vec.insert_ref(1, c.erase());
                 model.insert(1, c.clone());
-                vec.insert_val(3, d.erase_mut());
+                // `insert_val` moves the value out, so the model clones it first.
                 model.insert(3, d.clone());
+                vec.insert_val(3, d.erase_mut());
                 assert_eq!(contents(&*vec), model);
 
                 // Remove from the middle, the front and the end.
@@ -816,7 +818,8 @@ mod test {
         vec.insert(1, DropCounter(20, &drops));
         vec.insert(0, DropCounter(0, &drops));
         assert_eq!(drops.get(), 0);
-        let ids = |vec: &LeanVec<DropCounter>| vec.as_slice().iter().map(|x| x.0).collect::<Vec<_>>();
+        let ids =
+            |vec: &LeanVec<DropCounter>| vec.as_slice().iter().map(|x| x.0).collect::<Vec<_>>();
         assert_eq!(ids(&vec), [0, 10, 20, 30]);
 
         // The removed element is moved out, and dropped by the caller.

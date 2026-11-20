@@ -42,7 +42,7 @@ where
     V: DataTrait + ?Sized,
     R: WeightTrait + ?Sized,
 {
-    layer_factories: LayerFactories<K, LeafFactories<V, R>>,
+    pub(crate) layer_factories: LayerFactories<K, LeafFactories<V, R>>,
     item_factory: &'static dyn Factory<DynPair<K, V>>,
     weighted_items_factory: &'static dyn Factory<DynWeightedPairs<DynPair<K, V>, R>>,
     weighted_vals_factory: &'static dyn Factory<DynWeightedPairs<V, R>>,
@@ -558,7 +558,7 @@ where
 /// When a move of a cursor over a run reads the key or value it lands on.
 /// Moves of a file cursor and of a memory cursor follow the same rules.
 #[derive(Clone, Copy)]
-enum Landing {
+pub(crate) enum Landing {
     /// Steps, rewinds, and reverse seeks read any row they end on.
     Always,
     /// Forward seeks read a row only when they leave the current one.
@@ -568,7 +568,7 @@ enum Landing {
 impl Landing {
     /// Whether a move from `start` to `end` reads, given whether `end` is on a
     /// row.
-    fn reads(self, start: usize, end: usize, ends_on_row: bool) -> bool {
+    pub(crate) fn reads<P: PartialEq>(self, start: P, end: P, ends_on_row: bool) -> bool {
         match self {
             Landing::Always => ends_on_row,
             Landing::IfMoved => ends_on_row && end != start,

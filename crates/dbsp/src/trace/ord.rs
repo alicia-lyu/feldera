@@ -1,5 +1,6 @@
 pub mod fallback;
 pub mod file;
+pub mod memtable;
 pub mod merge_batcher;
 pub mod vec;
 pub use fallback::{

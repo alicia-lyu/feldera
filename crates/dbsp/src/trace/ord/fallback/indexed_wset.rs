@@ -11,11 +11,12 @@ use crate::{
     trace::{
         Batch, BatchLocation, BatchReader, Builder, FallbackValBatch, FileIndexedWSet,
         FileIndexedWSetFactories, Filter, GroupFilter, MergeCursor,
-        cursor::{CursorFactory, DelegatingCursor, PushCursor},
+        cursor::{CursorFactory, DefaultPushCursor, DelegatingCursor, PushCursor},
         deserialize_indexed_wset, merge_batches_by_reference,
         ord::{
             fallback::utils::BuildTo,
             file::indexed_wset_batch::FileIndexedWSetBuilder,
+            memtable::{FrozenMemtable, IndexedLeaf},
             merge_batcher::MergeBatcher,
             vec::indexed_wset_batch::{VecIndexedWSet, VecIndexedWSetBuilder},
         },
@@ -46,6 +47,38 @@ where
     inner: Inner<K, V, R>,
 }
 
+impl<K, V, R> FallbackIndexedWSet<K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    /// A batch that reads a frozen memtable in place.
+    pub fn from_memtable(
+        factories: &FallbackIndexedWSetFactories<K, V, R>,
+        memtable: FrozenMemtable<IndexedLeaf<K, V, R>>,
+    ) -> Self {
+        Self {
+            factories: factories.clone(),
+            inner: Inner::Memtable(memtable),
+        }
+    }
+
+    /// Copies a memtable into an in-memory run.
+    fn materialize(
+        &self,
+        memtable: &FrozenMemtable<IndexedLeaf<K, V, R>>,
+    ) -> VecIndexedWSet<K, V, R> {
+        let mut builder = VecIndexedWSetBuilder::with_capacity(
+            &self.factories.vec_indexed_wset_factory,
+            memtable.totals().keys,
+            memtable.totals().tuples,
+        );
+        copy_to_builder(&mut builder, memtable.cursor());
+        builder.done()
+    }
+}
+
 #[derive(SizeOf)]
 #[allow(clippy::large_enum_variant)]
 enum Inner<K, V, R>
@@ -56,6 +89,8 @@ where
 {
     Vec(VecIndexedWSet<K, V, R>),
     File(FileIndexedWSet<K, V, R>),
+    /// A frozen memtable, read in place.
+    Memtable(FrozenMemtable<IndexedLeaf<K, V, R>>),
 }
 
 impl<K, V, R> Debug for FallbackIndexedWSet<K, V, R>
@@ -67,6 +102,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             Inner::Vec(vec) => vec.fmt(f),
+            Inner::Memtable(memtable) => memtable.fmt(f),
             Inner::File(file) => file.fmt(f),
         }
     }
@@ -83,6 +119,7 @@ where
             factories: self.factories.clone(),
             inner: match &self.inner {
                 Inner::Vec(vec) => Inner::Vec(vec.clone()),
+                Inner::Memtable(memtable) => Inner::Memtable(memtable.clone()),
                 Inner::File(file) => Inner::File(file.clone()),
             },
         }
@@ -122,6 +159,7 @@ where
         match &self.inner {
             Inner::File(file) => file.num_entries_shallow(),
             Inner::Vec(vec) => vec.num_entries_shallow(),
+            Inner::Memtable(memtable) => memtable.totals().keys,
         }
     }
 
@@ -129,6 +167,7 @@ where
         match &self.inner {
             Inner::File(file) => file.num_entries_deep(),
             Inner::Vec(vec) => vec.num_entries_deep(),
+            Inner::Memtable(memtable) => memtable.totals().tuples,
         }
     }
 }
@@ -147,6 +186,7 @@ where
             inner: match &self.inner {
                 Inner::File(file) => Inner::File(file.neg_by_ref()),
                 Inner::Vec(vec) => Inner::Vec(vec.neg_by_ref()),
+                Inner::Memtable(memtable) => Inner::Vec(self.materialize(memtable).neg_by_ref()),
             },
         }
     }
@@ -217,6 +257,7 @@ where
     fn cursor(&self) -> Self::Cursor<'_> {
         DelegatingCursor(match &self.inner {
             Inner::Vec(vec) => Box::new(vec.cursor()),
+            Inner::Memtable(memtable) => Box::new(memtable.cursor()),
             Inner::File(file) => Box::new(file.cursor()),
         })
     }
@@ -226,6 +267,7 @@ where
     ) -> Box<dyn PushCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
         match &self.inner {
             Inner::Vec(vec) => vec.push_cursor(),
+            Inner::Memtable(memtable) => Box::new(DefaultPushCursor::new(memtable.cursor())),
             Inner::File(file) => file.push_cursor(),
         }
     }
@@ -237,6 +279,7 @@ where
     ) -> Box<dyn MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
         match &self.inner {
             Inner::Vec(vec) => vec.merge_cursor(key_filter, value_filter),
+            Inner::Memtable(memtable) => memtable.merge_cursor(key_filter, value_filter),
             Inner::File(file) => file.merge_cursor(key_filter, value_filter),
         }
     }
@@ -248,6 +291,7 @@ where
     ) -> Box<dyn MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
         match &mut self.inner {
             Inner::Vec(vec) => vec.consuming_cursor(key_filter, value_filter),
+            Inner::Memtable(memtable) => memtable.merge_cursor(key_filter, value_filter),
             Inner::File(file) => file.consuming_cursor(key_filter, value_filter),
         }
     }
@@ -257,6 +301,7 @@ where
         match &self.inner {
             Inner::File(file) => file.key_count(),
             Inner::Vec(vec) => vec.key_count(),
+            Inner::Memtable(memtable) => memtable.totals().keys,
         }
     }
 
@@ -265,6 +310,7 @@ where
         match &self.inner {
             Inner::File(file) => file.len(),
             Inner::Vec(vec) => vec.len(),
+            Inner::Memtable(memtable) => memtable.totals().tuples,
         }
     }
 
@@ -273,6 +319,7 @@ where
         match &self.inner {
             Inner::File(file) => file.approximate_byte_size(),
             Inner::Vec(vec) => vec.approximate_byte_size(),
+            Inner::Memtable(memtable) => memtable.totals().bytes,
         }
     }
 
@@ -281,6 +328,7 @@ where
         match &self.inner {
             Inner::File(file) => file.membership_filter_stats(),
             Inner::Vec(vec) => vec.membership_filter_stats(),
+            Inner::Memtable(_) => FilterStats::default(),
         }
     }
 
@@ -288,6 +336,7 @@ where
         match &self.inner {
             Inner::File(file) => file.membership_filter_kind(),
             Inner::Vec(vec) => vec.membership_filter_kind(),
+            Inner::Memtable(_) => FilterKind::None,
         }
     }
 
@@ -295,6 +344,7 @@ where
         match &self.inner {
             Inner::File(file) => file.range_filter_stats(),
             Inner::Vec(vec) => vec.range_filter_stats(),
+            Inner::Memtable(_) => FilterStats::default(),
         }
     }
 
@@ -302,6 +352,7 @@ where
     fn location(&self) -> BatchLocation {
         match &self.inner {
             Inner::Vec(vec) => vec.location(),
+            Inner::Memtable(_) => BatchLocation::Memory,
             Inner::File(file) => file.location(),
         }
     }
@@ -309,6 +360,7 @@ where
     fn cache_stats(&self) -> CacheStats {
         match &self.inner {
             Inner::Vec(vec) => vec.cache_stats(),
+            Inner::Memtable(_) => CacheStats::default(),
             Inner::File(file) => file.cache_stats(),
         }
     }
@@ -320,6 +372,7 @@ where
         match &self.inner {
             Inner::File(file) => file.sample_keys(rng, sample_size, sample),
             Inner::Vec(vec) => vec.sample_keys(rng, sample_size, sample),
+            Inner::Memtable(memtable) => memtable.sample_keys(rng, sample_size, sample),
         }
     }
 
@@ -332,6 +385,7 @@ where
     {
         match &self.inner {
             Inner::Vec(vec) => vec.fetch(keys).await,
+            Inner::Memtable(_) => None,
             Inner::File(file) => file.fetch(keys).await,
         }
     }
@@ -339,6 +393,7 @@ where
     fn keys(&self) -> Option<&DynVec<Self::Key>> {
         match &self.inner {
             Inner::Vec(vec) => vec.keys(),
+            Inner::Memtable(_) => None,
             Inner::File(file) => file.keys(),
         }
     }
@@ -368,6 +423,18 @@ where
                     factories: self.factories.clone(),
                 })
             }
+            Inner::Memtable(memtable) => {
+                let mut file = FileIndexedWSetBuilder::with_capacity(
+                    &self.factories,
+                    memtable.totals().keys,
+                    memtable.totals().tuples,
+                );
+                copy_to_builder(&mut file, memtable.cursor());
+                Some(Self {
+                    inner: Inner::File(file.done()),
+                    factories: self.factories.clone(),
+                })
+            }
             Inner::File(_) => None,
         }
     }
@@ -375,6 +442,7 @@ where
     fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         match &self.inner {
             Inner::Vec(vec) => vec.file_reader(),
+            Inner::Memtable(_) => None,
             Inner::File(file) => file.file_reader(),
         }
     }
@@ -382,6 +450,7 @@ where
     fn file_block_locations(&self) -> Result<Option<Vec<BlockLocation>>, ReaderError> {
         match &self.inner {
             Inner::Vec(vec) => vec.file_block_locations(),
+            Inner::Memtable(_) => Ok(None),
             Inner::File(file) => file.file_block_locations(),
         }
     }
@@ -397,6 +466,7 @@ where
         match &self.inner {
             Inner::File(file) => file.key_bounds(),
             Inner::Vec(vec) => vec.key_bounds(),
+            Inner::Memtable(memtable) => memtable.key_bounds(),
         }
     }
 
@@ -404,6 +474,10 @@ where
         match &self.inner {
             Inner::File(file) => file.maybe_contains_prefix(probe, spec),
             Inner::Vec(vec) => vec.maybe_contains_prefix(probe, spec),
+            // No filter: only the key bounds can rule a prefix out.
+            Inner::Memtable(memtable) => memtable.key_bounds().is_some_and(|(min, max)| {
+                !spec.cmp(probe, min).is_lt() && !spec.cmp(probe, max).is_gt()
+            }),
         }
     }
 
@@ -411,6 +485,7 @@ where
         match &self.inner {
             Inner::File(file) => file.negative_weight_count(),
             Inner::Vec(vec) => vec.negative_weight_count(),
+            Inner::Memtable(memtable) => Some(memtable.totals().negative_weights),
         }
     }
 
@@ -418,6 +493,7 @@ where
         match &self.inner {
             Inner::File(file) => file.touched_window_count(),
             Inner::Vec(vec) => vec.touched_window_count(),
+            Inner::Memtable(_) => TouchedWindowCount::default(),
         }
     }
 }
