@@ -56,6 +56,20 @@ pub trait Vector<T: DataTrait + ?Sized>: Data {
     /// Append an element to the back of the vector.
     fn push_ref(&mut self, val: &T);
 
+    /// Insert an element at `index` without cloning, shifting the later
+    /// elements to the right; panic if `index > self.len()`.
+    ///
+    /// Sets `val` to the default value.
+    fn insert_val(&mut self, index: usize, val: &mut T);
+
+    /// Insert a clone of an element at `index`, shifting the later elements
+    /// to the right; panic if `index > self.len()`.
+    fn insert_ref(&mut self, index: usize, val: &T);
+
+    /// Remove and drop the element at `index`, shifting the later elements to
+    /// the left; panic if `index >= self.len()`.
+    fn remove_at(&mut self, index: usize);
+
     /// Append an element to the back of the vector; call `f` to initialize the new element.
     fn push_with(&mut self, f: &mut dyn FnMut(&mut T));
 
@@ -362,6 +376,22 @@ where
         let val = unsafe { val.downcast::<T>() }.clone();
 
         LeanVec::push(self, val);
+    }
+
+    fn insert_val(&mut self, index: usize, val: &mut Trait) {
+        let val = take(unsafe { val.downcast_mut::<T>() });
+
+        LeanVec::insert(self, index, val);
+    }
+
+    fn insert_ref(&mut self, index: usize, val: &Trait) {
+        let val = unsafe { val.downcast::<T>() }.clone();
+
+        LeanVec::insert(self, index, val);
+    }
+
+    fn remove_at(&mut self, index: usize) {
+        drop(LeanVec::remove(self, index));
     }
 
     fn push_with(&mut self, f: &mut dyn FnMut(&mut Trait)) {
@@ -680,9 +710,125 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        dynamic::{DowncastTrait, DynData, DynVec, LeanVec, WithFactory},
+        dynamic::{DowncastTrait, DynData, DynVec, Erase, LeanVec, WithFactory},
         lean_vec,
     };
+
+    /// Builds a test that drives `insert_val`, `insert_ref` and `remove_at` of
+    /// a `DynVec<DynData>` of `$ty` against a `Vec` that applies the same
+    /// operations.
+    macro_rules! insert_and_remove_test {
+        ($name:ident, $ty:ty, $a:expr, $b:expr, $c:expr, $d:expr) => {
+            #[test]
+            fn $name() {
+                let factory = <DynVec<DynData> as WithFactory<LeanVec<$ty>>>::FACTORY;
+                let mut vec = factory.default_box();
+                let mut model: Vec<$ty> = Vec::new();
+                let contents = |vec: &DynVec<DynData>| {
+                    vec.dyn_iter()
+                        .map(|x| x.downcast_checked::<$ty>().clone())
+                        .collect::<Vec<$ty>>()
+                };
+
+                // Insert into the empty vector, at the front, in the middle
+                // and at the end.
+                let (a, mut b, c, mut d): ($ty, $ty, $ty, $ty) = ($a, $b, $c, $d);
+                vec.insert_ref(0, a.erase());
+                model.insert(0, a.clone());
+                vec.insert_val(0, b.erase_mut());
+                model.insert(0, b.clone());
+                vec.insert_ref(1, c.erase());
+                model.insert(1, c.clone());
+                vec.insert_val(3, d.erase_mut());
+                model.insert(3, d.clone());
+                assert_eq!(contents(&*vec), model);
+
+                // Remove from the middle, the front and the end.
+                for index in [1, 0, 1] {
+                    vec.remove_at(index);
+                    model.remove(index);
+                    assert_eq!(contents(&*vec), model);
+                }
+                assert_eq!(vec.len(), 1);
+            }
+        };
+    }
+
+    insert_and_remove_test!(dyn_vec_insert_and_remove_fixed_width, u64, 1, 2, 3, 4);
+    insert_and_remove_test!(
+        dyn_vec_insert_and_remove_strings,
+        String,
+        "a".to_string(),
+        "bb".to_string(),
+        "a string longer than the inline size".to_string(),
+        String::new()
+    );
+
+    #[test]
+    fn dyn_vec_insert_val_leaves_the_default() {
+        let factory = <DynVec<DynData> as WithFactory<LeanVec<String>>>::FACTORY;
+        let mut vec = factory.default_box();
+        let mut moved = "moved".to_string();
+
+        vec.insert_val(0, moved.erase_mut());
+
+        assert!(moved.is_empty());
+        assert_eq!(vec.index(0).downcast_checked::<String>(), "moved");
+    }
+
+    #[test]
+    #[should_panic(expected = "insertion index (is 2) should be <= len (is 1)")]
+    fn dyn_vec_insert_past_the_end_panics() {
+        let factory = <DynVec<DynData> as WithFactory<LeanVec<u64>>>::FACTORY;
+        let mut vec = factory.default_box();
+        vec.push_ref(1u64.erase());
+
+        vec.insert_ref(2, 2u64.erase());
+    }
+
+    #[test]
+    #[should_panic(expected = "removal index (is 1) should be < len (is 1)")]
+    fn dyn_vec_remove_past_the_end_panics() {
+        let factory = <DynVec<DynData> as WithFactory<LeanVec<u64>>>::FACTORY;
+        let mut vec = factory.default_box();
+        vec.push_ref(1u64.erase());
+
+        vec.remove_at(1);
+    }
+
+    /// Counts its drops, to show that `remove` hands the element out exactly
+    /// once and that the shifted elements are neither dropped nor leaked.
+    struct DropCounter<'a>(u32, &'a std::cell::Cell<u32>);
+
+    impl Drop for DropCounter<'_> {
+        fn drop(&mut self) {
+            self.1.set(self.1.get() + 1);
+        }
+    }
+
+    #[test]
+    fn lean_vec_insert_and_remove_drop_exactly_once() {
+        let drops = std::cell::Cell::new(0);
+        let mut vec = LeanVec::new();
+        for id in [10, 30] {
+            vec.push(DropCounter(id, &drops));
+        }
+        vec.insert(1, DropCounter(20, &drops));
+        vec.insert(0, DropCounter(0, &drops));
+        assert_eq!(drops.get(), 0);
+        let ids = |vec: &LeanVec<DropCounter>| vec.as_slice().iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(ids(&vec), [0, 10, 20, 30]);
+
+        // The removed element is moved out, and dropped by the caller.
+        let removed = vec.remove(1);
+        assert_eq!((removed.0, drops.get()), (10, 0));
+        drop(removed);
+        assert_eq!((ids(&vec), drops.get()), (vec![0, 20, 30], 1));
+
+        // Dropping the vector drops the three that remain.
+        drop(vec);
+        assert_eq!(drops.get(), 4);
+    }
 
     #[test]
     fn dyn_vec_test() {

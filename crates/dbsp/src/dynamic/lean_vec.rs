@@ -1316,6 +1316,50 @@ impl<T> LeanVec<T> {
         unsafe { self.vec.push_raw(&*value as *const T as *const u8) };
     }
 
+    /// Inserts `value` at `index`, shifting the later elements one place to
+    /// the right.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index > self.len()`, as `Vec::insert` does.
+    pub fn insert(&mut self, index: usize, value: T) {
+        let len = self.len();
+        assert!(
+            index <= len,
+            "insertion index (is {index}) should be <= len (is {len})"
+        );
+        self.reserve(1);
+        unsafe {
+            let slot = self.as_mut_ptr().add(index);
+            // Open a gap at `index`, then fill it; the gap's old bytes are
+            // now owned by the shifted elements.
+            ptr::copy(slot, slot.add(1), len - index);
+            ptr::write(slot, value);
+            self.set_len(len + 1);
+        }
+    }
+
+    /// Removes and returns the element at `index`, shifting the later
+    /// elements one place to the left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.len()`, as `Vec::remove` does.
+    pub fn remove(&mut self, index: usize) -> T {
+        let len = self.len();
+        assert!(
+            index < len,
+            "removal index (is {index}) should be < len (is {len})"
+        );
+        unsafe {
+            let slot = self.as_mut_ptr().add(index);
+            let removed = ptr::read(slot);
+            ptr::copy(slot.add(1), slot, len - index - 1);
+            self.set_len(len - 1);
+            removed
+        }
+    }
+
     /// Push `value` to `self` without checking for spare capacity or allocating
     /// new capacity.
     ///
