@@ -513,6 +513,10 @@ The user decided on 2026-11-20 that MI_P's Q14 readers live in `merged-index-p/`
 
 The user decided on 2026-11-20 that MI_P's Q14 view circuit is a crate of its own, `sql-to-dbsp-compiler/experiments/q14-ivm-baseline/q14-trie-view-circuit/`, written by hand like `q3-trie-view-circuit`, and that the Q14 harness of step 5 will live in `q14-ivm-baseline/` too. Whether that harness shares code with the Q3 harness (for example through a shared crate) is decided with step 5.
 
+### 2026-11-20: Q14's step 5 is a correctness harness with a driver of its own
+
+The user decided on 2026-11-20 that MI_P's step 5 builds only the correctness harness: the base circuit and the native view circuit generated from SQL, the index upkeep, both modes in one runtime, and the byte-for-byte transcript comparison (`q14-ivm-baseline/verify.sh`). Measurement (timing, images, `measure.py`, TPC-H data) is a later step. The harness is a small driver of its own that follows the Q3 harness's structure and shares no code with it; whether the measurement shares the Q3 harness's code, for example through a shared crate, is decided when measurement starts.
+
 ## Superseded and withdrawn
 
 Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).
