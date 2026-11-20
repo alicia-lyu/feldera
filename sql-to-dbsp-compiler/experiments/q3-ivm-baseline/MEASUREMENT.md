@@ -299,6 +299,42 @@ Per transaction, view-state owners (`query`, `merged_index`):
 
 Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512/manifest.json`; diagnostics `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512-diag/runs/run-1-<mode>/diagnostics/`.
 
+## Prefix-filter A/B and the uuid order keys (2026-11-20)
+
+Pilot A-seek clustered, K = 10, at measurement version 17 (revision `d4010417d`), one repetition per arm, with the same settings as the 512/512 pilot above: target and cache 512 MiB, cgroup 1 GiB, base tables evicted after each base transaction. Three image sets: `images-v17` (dbgen keys, filter off), `images-v17-pf` (dbgen keys, `--index-prefix-filter`), and `images-v17-uuid` (uuid keys, filter off). All six runs qualify. Every merged-index run was at `low` pressure in refresh 1 and `critical` from refresh 2, so the merged-index rows compare like with like. Refreshes 2 to 6, per transaction; view circuit first.
+
+**The prefix filter (merged index, dbgen keys):**
+
+| | RF1 off | RF1 on | RF2 off | RF2 on |
+| --- | ---: | ---: | ---: | ---: |
+| `ivm_ms` p50 / p95 / p99 | 4.56 / 7.42 / 9.14 | 3.98 / 6.61 / 8.36 | 3.36 / 5.76 / 7.20 | 3.06 / 4.82 / 6.11 |
+| index per-run seeks | 9.8 | 2.5 | 26.6 | 7.0 |
+| runs skipped by the filter (`filtered_prefix_probes`) | 0 | 7.3 | 0 | 21.6 |
+| index device reads (`other/merged_index`; the session runs on the driver's thread) | 6.41 | 5.59 | 1.34 | 1.50 |
+| `base_ms` p50 (amortized) | 3.77 | 3.56 | 15.57 | 14.68 |
+
+- **Seeks.** The filter skips three of every four runs a group read used to seek: per touched group, about 2.4 seeks instead of 9.3 to 11.6 from refresh 2 on (5.4 in refresh 1).
+- **Latency.** The view's median falls 13% (RF1) and 9% (RF2), its p99 9% and 15%. Each of refreshes 2 to 6 is lower, by 5 to 15% in total `ivm_ms`.
+- **Device reads.** The index's reads fell 13% in RF1 (0.82 per transaction, for 7.3 skipped runs) and rose 0.16 in RF2 (for 21.6 skipped runs), so about nine in ten skipped seeks were buffer-cache hits and the saving is mostly the seeks' CPU. The skipped runs are mostly small, recent ones, written through the cache and sought on every transaction, while the bottom runs, which hold nearly every customer and take the cold reads, are rarely skipped; this is inferred, since the report counts no hits per run. RF2's rise may be cold loads of stored prefix-filter partitions (runs above 120 prefixes), which the report does not count. The worker's reads, both circuits, were unchanged (9.98 and 58.7 to 58.9).
+- **Size.** The index's files were 3.05 GB at the end, against 3.23 GB without the filter: the dropped whole-key filter less the prefix filters. The filter bytes per kind are not in the report.
+- **Noise.** One repetition per arm. The merged-index runs of versions 16 and 17 without the filter, the same code path, differ by at most 6% at the median (RF1 4.31 against 4.56). Native, which never uses the filter, varied far more between identical configurations: its version 17 runs went `critical` at refresh 5 (filter off) and refresh 3 (on), against refresh 2 at version 16, and its median `ivm_ms` ranged from 1.7 to 4.5 ms with pressure. Native rows of this A/B are therefore not reported.
+
+**uuid order keys (filter off), against dbgen** (native from version 16, which went `critical` from refresh 2 as the uuid run did; merged-index from version 17 off):
+
+| | RF1 native | RF1 merged-index | RF2 native | RF2 merged-index |
+| --- | ---: | ---: | ---: | ---: |
+| `ivm_ms` p50 / p99, dbgen | 3.88 / 8.93 | 4.56 / 9.14 | 4.46 / 10.04 | 3.36 / 7.20 |
+| `ivm_ms` p50 / p99, uuid | 5.76 / 14.10 | 4.15 / 8.10 | 9.28 / 19.86 | 3.49 / 6.53 |
+| worker-thread device reads, dbgen | 11.5 | 10.0 | 33.5 | 58.9 |
+| worker-thread device reads, uuid | 61.1 | 50.2 | 62.0 | 85.0 |
+| `base_ms` p50, dbgen / uuid (amortized) | 3.39 / 13.86 | 3.77 / 11.92 | 7.96 / 11.44 | 15.57 / 20.20 |
+
+- **The prediction held.** Random keys slow native's view, whose traces are keyed by order: its median rises 48% (RF1) and 108% (RF2). The merged index, clustered by customer, keeps its view latency. With uuid keys its median is 28% (RF1) and 62% (RF2) below native's.
+- **Base pays in both modes.** Each transaction's orders now land in scattered blocks of the base tables, and those blocks are evicted after every base transaction, so the worker reads 50 to 85 blocks per transaction.
+- **No cancelled-row stretch.** The driver's main-thread reads grow from refresh to refresh as in dbgen (RF1 64 to 126 per transaction, against 49 to 90), with no run-away like the `sequence` arm's ([compaction.md](../../../docs/design/merged-index/compaction.md#watch-for-cancelled-rows-at-the-front-of-the-key-range)): the uuid arm needs no compaction fix.
+
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v17-t512-c512{,-pf,-uuid}/manifest.json`.
+
 ## Pending: pressure evidence
 
 The instrumentation is implemented (Linux paths unrun and untested on Linux; macOS records `null`) but has produced no Linux data. Implemented:
