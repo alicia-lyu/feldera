@@ -956,6 +956,28 @@ The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../
 
 The Linux campaign is a separate pending milestone. Its plan is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md), and its commands are in the [Linux handoff](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/LINUX-HANDOFF.md).
 
+## 2026-11-20: Memtable design history and alternatives
+
+What [memtable.md](memtable.md) no longer carries: its earlier versions, and the options considered and not chosen. The live doc describes only the design as built.
+
+**The first version (2026-11-19).** Each memtable leaf was a slotted layer-file data block (a key leaf or value leaf in Appendix E's format), made insertable, so that a seal would hand the leaves to the writer as finished blocks with no copy. It needed three bridges: a writer entry point for finished blocks, a `DataBlock` over memory leaves, and a shared rkyv serializer. The user revised it the same day: assembly without a copy gives part-empty leaves, keeps garbage, and cannot be prefix-truncated, so the seal copies instead. The user's first reason (that an insert-efficient structure cannot make large blocks) was corrected the same day: a file leaf is only about 8 KiB; the reasons that hold are packing, encodings, and garbage.
+
+**Where the copy happens.** The other option was the first compaction: the seal would write an unpacked file without encodings, seeks would read it until a merge rewrote it, and every sealed memtable would have to be forced into L1, since `size_to_level` places runs by size. That costs a second write and worse reads, for the seal's CPU, which is in the background anyway. It stays an open question in memtable.md.
+
+**RocksDB's memtable**, as the precedent for copying at flush: an arena-allocated, insert-only skiplist (`InlineSkipList`) whose writes are entries tagged with sequence numbers (a delete is a tombstone); readers see a snapshot by sequence number, with no copies or locks; a flush iterates the skiplist through `CompactionIterator`, which drops versions no snapshot needs, into the table builder, which packs blocks, prefix-compresses keys with restart points, compresses, and builds filters and the index. RocksDB accepts a pointer-chasing scan at flush, so scan cost did not decide the structure. Its write stall (an insert waits while the previous memtable flushes) was planned and then dropped by the user on 2026-11-20: inserts never wait.
+
+**Structures considered.**
+
+- *Skiplist*, as in RocksDB: seeks chase pointers, and weights cannot change in place without breaking a reader's snapshot, so a weight change would append a versioned entry for readers to sum.
+- *`imbl::OrdMap`*: a persistent B-tree (an O(1) copy that shares every node; each later insert copies the path from the root), which is the copy-on-write chosen; but it is generic over concrete Rust types, while DBSP's rows are type-erased, so each key would need its own heap allocation.
+- *ART*: byte keys only, so merged indexes only, and no snapshots of its own.
+- *A byte leaf* for merged indexes: one contiguous byte area plus offsets, compared with `memcmp`, to save the per-key and per-payload heap allocations. It is valid only where byte order equals the spine's order (folded keys), and its cursor would copy a `FoldedKey` per read to return `&K`. Not planned.
+- The word "typed" for the leaves was dropped (user, 2026-11-19): it meant "in the spine's in-memory form, not rkyv bytes", and merged-index rows are bytes anyway.
+
+**Snapshots.** Key-value locking was raised and set aside: it orders concurrent writers, and the problem is old versions for readers. A *deferred fold* was proposed on 2026-11-19 (keep inserts pending while a snapshot holds the tree, and apply them in place once it is released) and dropped by the user the same day, in favor of plain copy-on-write measured by counters. A per-leaf reference from the snapshot was also considered: it would save only the inner-node copies, and taking a snapshot would cost one increment per leaf.
+
+**Budget.** An exemption from memory pressure (pressure computed on `rss − memtable` against `max_rss − budget`) was the first rule; the user replaced it on 2026-11-19 with a soft cap counted in RSS, since the exemption changes the pressure mechanism for one side of the comparison. A per-spine cap (the budget / 4, clamped to [1, 256] MiB) was planned and dropped: the budget seals the largest memtable in the background, so a spine that stops inserting is still sealed. The budget / 4 survives only as the bypass size.
+
 ## 2026-11-20: The memtable's dropped phase of cheaper inserts
 
 The [memtable](memtable.md) was planned on 2026-11-19 in three phases. The user dropped the second, cheaper inserts, entirely on 2026-11-20; the measurement on Linux became phase 2. None of these changed what the tree can do, only what an insert costs:
