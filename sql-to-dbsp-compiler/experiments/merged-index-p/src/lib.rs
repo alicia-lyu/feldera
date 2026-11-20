@@ -57,3 +57,6 @@ fn fold_rows(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod storage_tests;

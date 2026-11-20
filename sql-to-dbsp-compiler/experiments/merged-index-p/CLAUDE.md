@@ -1,6 +1,6 @@
 # merged-index-p: Part–Partsupp–Lineitem index
 
-This standalone library supplies the concrete MI_P definition for DBSP's general merged-index module, `dbsp::trace::merged_index`. It is step 1 of [new-merged-index.md](../../../docs/design/merged-index/new-merged-index.md): the spec, its generated module, and tests that pin the encoding. It has no readers, view circuit, or harness yet. Shared rules for any index and harness are in [experiments/CLAUDE.md](../CLAUDE.md); the generic machinery is in [crates/dbsp/src/trace/merged_index/CLAUDE.md](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md). The sibling [merged-index-col](../merged-index-col/CLAUDE.md) is the worked example.
+This standalone library supplies the concrete MI_P definition for DBSP's general merged-index module, `dbsp::trace::merged_index`. It holds steps 1 and 2 of [new-merged-index.md](../../../docs/design/merged-index/new-merged-index.md): the spec, its generated module, tests that pin the encoding, and storage tests with file runs. It has no readers, view circuit, or harness yet. Shared rules for any index and harness are in [experiments/CLAUDE.md](../CLAUDE.md); the generic machinery is in [crates/dbsp/src/trace/merged_index/CLAUDE.md](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md). The sibling [merged-index-col](../merged-index-col/CLAUDE.md) is the worked example.
 
 ## Definition
 
@@ -40,4 +40,10 @@ How MI_P differs from COL:
 cargo +1.96.1 test --offline --locked     # this directory
 ```
 
-`src/tests.rs`: golden key and payload bytes, record order, malformed keys, the trie and its constants (`check_against_trie`), prefix widths and ranges, payload validation, and batch consolidation. Storage tests with file runs are step 2.
+`src/tests.rs`: golden key and payload bytes, record order, malformed keys, the trie and its constants (`check_against_trie`), prefix widths and ranges, payload validation, and batch consolidation.
+
+`src/storage_tests.rs` sets both storage thresholds to zero, so every run is a file. It keeps what is particular to MI_P; the scale test of DBSP's storage is COL's.
+
+- `file_runs_compact_with_their_prefix_filter_and_preserve_snapshots`: eight interleaved runs of even parts compact in a spine; the compacted file reopens with its rows and its part-group prefix filter (no false negatives; the absent parts, odd ones included, mostly rejected); earlier snapshots keep their rows; after updates that delete a part, change payloads, and move a line to another part, full, prefix, and `RunMerge::seek_group` reads match a `BTreeMap` oracle.
+- `seek_group_parks_runs_without_the_part_and_moves_a_line`: a run that lacks the part is parked and counted in `filtered_prefix_probes`; the moved line cancels in its old part and appears in the new one.
+- `build_batch_in_follows_the_runtimes_step_placement_in_files` and `_in_memory`.
