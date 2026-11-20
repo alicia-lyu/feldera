@@ -13,9 +13,13 @@ This harness maintains `V = Part ⋈ Lineitem` on `partkey` (Q14 without its pre
 | `ManualIndex` (the index's owner thread on the runtime's buffer cache: snapshot and append only) and `index_rows` (the net delta folded row by row) | `src/index.rs` |
 | Rows, `Change`, `ViewRow`, and `Reference` (the tests' oracle by primary key) | `src/data.rs` |
 | Tests and the transcript | `src/verification.rs` |
+| Driver: the command line (`Config`), loading, and the refreshes, each checked against `Reference` unless `--no-verify`; `main.rs` only adds the allocator | `src/driver.rs`, `src/main.rs` |
+| dbgen's base files loaded in transactions of at most `--batch` rows; refresh lists in the Q3 format (`rf1_lines` or `rf2`; `rf1_orders` ignored; `transaction_orders` refused), read before the first refresh | `src/workload.rs` |
 | Generates the native pair and `plan.json`, as Q3's does | `generate.sh` |
 
-The Cargo feature `merged-index` builds the reconstructed mode (`q14-trie-view-circuit` in place of `q14-view-circuit`). The crate is a library: there is no driver CLI until measurement.
+The Cargo feature `merged-index` builds the reconstructed mode (`q14-trie-view-circuit` in place of `q14-view-circuit`).
+
+Q14's tables are Part, Partsupp, and Lineitem, so TPC-H's refreshes reach it only through Lineitem: RF1 inserts `lineitem.tbl.uN`, and RF2 deletes every line item of the orders in `delete.N`. Both modes find RF2's line items in the base circuit's Lineitem (`Pipeline::order_lines`), since MI_P is keyed by part. The driver times nothing yet; measurement follows Q3's accounting, without Q3's images, cgroups, or base-block eviction (user decision of 2026-11-20).
 
 ## Q14 instances of the shared rules
 
@@ -31,9 +35,13 @@ cargo +1.96.1 test --offline --locked                           # native
 cargo +1.96.1 test --offline --locked --features merged-index   # reconstructed
 cargo +1.96.1 test --offline --locked -p q14-trie-view-circuit  # the hand-written circuit alone
 ./verify.sh                                                     # the gate
+cargo +1.96.1 run --release --offline --locked [--features merged-index] -- \
+  --part part.tbl --partsupp partsupp.tbl --lineitem lineitem.tbl --refresh-list list.json \
+  [--batch 10000] [--storage-path NEW_DIR --cache-bytes B] [--memory-target-bytes B] [--session-pass seek|step] [--no-verify]
 ```
 
 - `general_transcript`: ten transactions over every kind of general change (load with a line of an absent part, empty, part retyped, lines moved between parts and suppliers in three steps, part deleted with its lines kept, part inserted for waiting lines, Partsupp-only, part returned with a new type and a line in three steps, lines and a part deleted, empty in three steps). After each, the committed change of `V` and the materialized `V` must equal `Reference`'s; the contract check is on. With `Q14_GENERAL_TRANSCRIPT` set, it writes the transcript.
 - `the_net_delta_has_whole_rows_for_upserts_and_deletions`; `random_general_changes_match_the_reference` (proptest, 16 sequences of random table states, one step or three); `the_transcript_does_not_depend_on_the_pass` (reconstructed only).
+- Driver: `a_run_loads_and_refreshes_in_agreement_with_the_reference` (file-backed, both modes), the command line's checks, the dbgen parsers, loading's batches, and the refresh lists.
 - `q14-trie-view-circuit`: `general_deltas_match_the_brute_force_join` and `random_transactions_match_the_brute_force_join`, against a brute-force join with no base circuit.
 - `verify.sh` generates the native pair, runs fmt, both builds' tests and Clippy, the hand-written circuit's tests, compares the two transcripts with `cmp`, checks that MI_P's `generated.rs` is fresh, runs MI_P's fmt, tests, and Clippy, and checks shell syntax and whitespace. Logs go to `target/q14-verification/<run>/`.

@@ -94,7 +94,6 @@ serves it with a separate index on Partsupp.
 These are not decided. Record each answer in [decisions.md](decisions.md), or in the harness's
 own decision log if it is harness-specific.
 
-- Whether MI_P's measurement shares code with the Q3 harness. (Its index crate is `merged-index-p/`, and its first query is Q14: decision of 2026-11-19. Its readers live in that crate, on DBSP's generic `merged_index::transaction`; its Q14 view circuit and correctness harness, a driver of its own, are in `q14-ivm-baseline/`: decisions of 2026-11-20.)
 - How one view circuit mixes index reads with native trace reads. Q3's program has no trace reads.
 - How an aggregation on a key of the trie (Q17's `A`) or an antijoin (Q16) reads the index. The
   generic readers serve join partners only. The appendix's last section also proposes storing such

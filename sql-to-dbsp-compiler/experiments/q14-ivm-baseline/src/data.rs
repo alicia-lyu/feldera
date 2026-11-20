@@ -1,5 +1,6 @@
-//! The harness's rows: the three base tables, a transaction's change, the rows
-//! of `V`, and the in-memory reference that the tests compare `V` with.
+//! The harness's rows: the three base tables (from dbgen's files or from the
+//! circuits' JSON), a transaction's change, the rows of `V`, and the in-memory
+//! reference that `V` is checked against.
 
 use std::collections::BTreeMap;
 
@@ -50,6 +51,15 @@ impl Row for Part {
 }
 
 impl Part {
+    /// A row of dbgen's `part.tbl`.
+    pub fn from_tbl(row: &str) -> Result<Self> {
+        let f = tbl_fields(row, 9)?;
+        Ok(Self {
+            key: f[0].parse()?,
+            part_type: f[4].to_owned(),
+        })
+    }
+
     pub fn parse(row: &Value) -> Result<Self> {
         Ok(Self {
             key: integer(row, "p_partkey")?,
@@ -70,6 +80,16 @@ impl Row for Partsupp {
 }
 
 impl Partsupp {
+    /// A row of dbgen's `partsupp.tbl`.
+    pub fn from_tbl(row: &str) -> Result<Self> {
+        let f = tbl_fields(row, 5)?;
+        Ok(Self {
+            part_key: f[0].parse()?,
+            supplier_key: f[1].parse()?,
+            available: f[2].parse()?,
+        })
+    }
+
     pub fn parse(row: &Value) -> Result<Self> {
         Ok(Self {
             part_key: integer(row, "ps_partkey")?,
@@ -94,6 +114,20 @@ impl Row for Line {
 }
 
 impl Line {
+    /// A row of dbgen's `lineitem.tbl` or of an RF1 file (`lineitem.tbl.uN`).
+    pub fn from_tbl(row: &str) -> Result<Self> {
+        let f = tbl_fields(row, 16)?;
+        Ok(Self {
+            order_key: f[0].parse()?,
+            number: f[3].parse()?,
+            part_key: f[1].parse()?,
+            supplier_key: f[2].parse()?,
+            price_cents: parse_hundredths(f[5])?,
+            discount_hundredths: parse_hundredths(f[6])?,
+            ship_date: f[10].to_owned(),
+        })
+    }
+
     pub fn parse(row: &Value) -> Result<Self> {
         Ok(Self {
             order_key: integer(row, "l_orderkey")?,
@@ -247,6 +281,20 @@ pub fn difference<T: Ord + Clone>(
     delta
 }
 
+/// The order key of a row of an RF2 file (dbgen's `delete.N`).
+pub fn delete_order_key(row: &str) -> Result<i64> {
+    Ok(tbl_fields(row, 1)?[0].parse()?)
+}
+
+/// The fields of a dbgen row, which ends with `|`; there must be `count`.
+fn tbl_fields(row: &str, count: usize) -> Result<Vec<&str>> {
+    let fields: Vec<_> = row.strip_suffix('|').unwrap_or(row).split('|').collect();
+    if fields.len() != count {
+        bail!("expected {count} dbgen fields, got {}: {row}", fields.len());
+    }
+    Ok(fields)
+}
+
 fn field<'a>(row: &'a Value, name: &str) -> Result<&'a Value> {
     row.as_object()
         .context("a row must be a JSON object")?
@@ -269,17 +317,21 @@ fn string(row: &Value, name: &str) -> Result<String> {
         .with_context(|| format!("{name} must be a string"))
 }
 
-/// A decimal field with at most two fractional digits, in hundredths. DBSP
-/// writes decimals as JSON numbers.
+/// A decimal field in hundredths. DBSP writes decimals as JSON numbers.
 fn hundredths(row: &Value, name: &str) -> Result<i64> {
     let value = field(row, name)?;
     let text = value
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string());
+    parse_hundredths(&text).with_context(|| format!("field {name}"))
+}
+
+/// A decimal with at most two fractional digits, in hundredths.
+fn parse_hundredths(text: &str) -> Result<i64> {
     let (negative, unsigned) = text
         .strip_prefix('-')
-        .map_or((false, text.as_str()), |rest| (true, rest));
+        .map_or((false, text), |rest| (true, rest));
     let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
     if whole.is_empty()
         || fraction.len() > 2
@@ -288,7 +340,7 @@ fn hundredths(row: &Value, name: &str) -> Result<i64> {
             .chain(fraction.bytes())
             .all(|b| b.is_ascii_digit())
     {
-        bail!("{name} needs at most two fractional digits: {text}");
+        bail!("a decimal needs at most two fractional digits: {text}");
     }
     let magnitude = whole.parse::<i64>()? * 100 + format!("{fraction:0<2}").parse::<i64>()?;
     Ok(if negative { -magnitude } else { magnitude })
@@ -313,5 +365,45 @@ mod tests {
         assert_eq!(hundredths(&json!({"d": 1.5}), "d").unwrap(), 150);
         assert!(hundredths(&json!({"d": "1.234"}), "d").is_err());
         assert!(hundredths(&json!({"d": ".5"}), "d").is_err());
+    }
+
+    #[test]
+    fn dbgen_rows_parse_with_exact_field_counts() {
+        assert_eq!(
+            Part::from_tbl(
+                "7|name|Manufacturer#1|Brand#13|PROMO BRUSHED TIN|7|JUMBO PKG|907.00|c|"
+            )
+            .unwrap(),
+            Part {
+                key: 7,
+                part_type: "PROMO BRUSHED TIN".into()
+            }
+        );
+        assert_eq!(
+            Partsupp::from_tbl("7|8|9|1.50|c|").unwrap(),
+            Partsupp {
+                part_key: 7,
+                supplier_key: 8,
+                available: 9
+            }
+        );
+        assert_eq!(
+            Line::from_tbl("1|155|8|2|36|45983.16|0.09|0.06|N|O|1996-04-12|1996-02-28|1996-04-20|TAKE BACK RETURN|MAIL|c|")
+                .unwrap(),
+            Line {
+                order_key: 1,
+                number: 2,
+                part_key: 155,
+                supplier_key: 8,
+                price_cents: 4_598_316,
+                discount_hundredths: 9,
+                ship_date: "1996-04-12".into(),
+            }
+        );
+        assert_eq!(delete_order_key("7|").unwrap(), 7);
+        assert!(Part::from_tbl("7|name|").is_err());
+        assert!(Partsupp::from_tbl("x|8|9|1.50|c|").is_err());
+        assert!(delete_order_key("7|8|").is_err());
+        assert!(Line::from_tbl("1|155|8|2|36|1.234|0.09|0.06|N|O|1996-04-12|d|d|i|m|c|").is_err());
     }
 }

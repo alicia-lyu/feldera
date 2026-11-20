@@ -11,7 +11,7 @@
 //!   `Dlt`, collects once, and hands the driving deltas to the hand-written
 //!   circuit's input handles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "merged-index")]
 use std::sync::{Arc, OnceLock};
 
@@ -20,6 +20,8 @@ use anyhow::{bail, Context, Result};
 use dbsp::trace::merged_index::Pass;
 use dbsp::{
     circuit::{CircuitConfig, CircuitConstructor},
+    dynamic::Erase,
+    utils::Tup2,
     DBSPHandle, RootCircuit, Runtime,
 };
 use dbsp_adapters::{Catalog, CircuitCatalog, DeCollectionStream, RecordFormat};
@@ -296,6 +298,41 @@ impl Pipeline {
                 _ => bail!("{name} delta has weight {weight}; primary keys allow only +1 and -1"),
             })
             .collect()
+    }
+
+    /// The line items of the orders in `order_keys`, from the base circuit's
+    /// Lineitem after the last transaction: RF2's rows. Both modes find them
+    /// here, since MI_P is keyed by part and cannot find an order's line
+    /// items. The reads go through the runtime's buffer cache.
+    ///
+    /// Taking the base snapshot consumes it, so call this at most once per
+    /// transaction.
+    pub fn order_lines(&self, order_keys: &BTreeSet<i64>) -> Result<Vec<Line>> {
+        let lines = self
+            .base_catalog
+            .output_handles(&SqlIdentifier::from("LINEITEM"))
+            .context("missing base relation LINEITEM")?
+            .integrate_handle
+            .as_ref()
+            .context("LINEITEM is not materialized")?
+            .concat()
+            .snapshot();
+        self.base.runtime().with_buffer_cache(0, || {
+            let mut cursor = lines.cursor(RecordFormat::Json(Default::default()))?;
+            let mut found = Vec::new();
+            for &order_key in order_keys {
+                cursor.seek_key(Tup2(order_key, i32::MIN).erase());
+                while cursor.key_valid() {
+                    let line = Line::parse(&cursor.val_to_json()?)?;
+                    if line.order_key != order_key {
+                        break;
+                    }
+                    found.push(line);
+                    cursor.step_key();
+                }
+            }
+            Ok(found)
+        })
     }
 
     /// The last transaction's change of `V`, and `V` after it.

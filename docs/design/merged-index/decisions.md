@@ -546,3 +546,7 @@ Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-com
 
 - **Is the interesting-ordering shape required?** Reconstructing state from a merged index may require the circuit to read state in the merged index's order (customer > order > line). If so, the compiler cannot always produce that shape, and some queries will need hand-written circuits.
 - **Clustered primary storage.** Deferred; see the secondary-storage decision.
+
+### 2026-11-20: Q14's measurement leaves the Q3 harness unchanged
+
+The user decided on 2026-11-20 that Q14's measurement shares no code with the Q3 harness and does not change it: `q14-ivm-baseline/` gets its own driver, which takes from Q3 only what it needs. The first version runs TPC-H's refreshes, which reach Q14 only through Lineitem (RF1 inserts line items; RF2 deletes the line items of the named orders, found in the base circuit's Lineitem in both modes, since MI_P is keyed by part), as a smoke run at a small scale factor. Its timing follows Q3's accounting (`base_ms` with `index_ms`, `forward_ms`, `delta_ms`, `q14_ms`, `ivm_ms = delta_ms + q14_ms`), with base and IVM side by side. Images, cgroups, base-block eviction, run counts, diagnostics, and Q3's other workloads are left out until they are needed.
