@@ -1,0 +1,33 @@
+[package]
+name = "q14-ivm-baseline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The Q14 correctness harness: the base circuit and a view circuit in one runtime, native or reconstructed from MI_P."
+
+[workspace]
+
+[features]
+merged-index = ["dep:crossbeam", "dep:merged-index-p", "dep:q14-trie-view-circuit"]
+
+[dependencies]
+anyhow = "1"
+crossbeam = { version = "0.8", optional = true }
+dbsp = { path = "../../../crates/dbsp", features = ["backend-mode"] }
+dbsp_adapters = { path = "../../../crates/adapters", default-features = false }
+feldera-adapterlib = { path = "../../../crates/adapterlib" }
+feldera-sqllib = { path = "../../../crates/sqllib" }
+feldera-storage = { path = "../../../crates/storage" }
+feldera-types = { path = "../../../crates/feldera-types" }
+merged-index-p = { path = "../merged-index-p", optional = true }
+q14-base-circuit = { path = "q14-base-circuit" }
+q14-trie-view-circuit = { path = "q14-trie-view-circuit", optional = true }
+q14-view-circuit = { path = "q14-view-circuit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[dev-dependencies]
+proptest = "1.5.0"
+
+[profile.dev]
+debug = "line-tables-only"

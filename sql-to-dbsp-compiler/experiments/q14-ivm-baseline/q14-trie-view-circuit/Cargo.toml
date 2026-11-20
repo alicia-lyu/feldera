@@ -3,17 +3,24 @@ name = "q14-trie-view-circuit"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "The Q14 view circuit over MI_P, written by hand like q3-trie-view-circuit: DBSP's join, with its partner reads from the merged index."
-
-[workspace]
+description = "The Q14 view circuit over MI_P, written by hand like q3-trie-view-circuit: DBSP's join, with its partner reads from the merged index. It replaces the generated view circuit in the merged-index build."
 
 [dependencies]
+arcstr = "1"
+compare = "0.1"
 dbsp = { path = "../../../../crates/dbsp", features = ["backend-mode"] }
+dbsp_adapters = { path = "../../../../crates/adapters", default-features = false }
+derive_more = { version = "1", features = ["add", "not", "from"] }
+erased-serde = "0.3"
 feldera-sqllib = { path = "../../../../crates/sqllib" }
+feldera-types = { path = "../../../../crates/feldera-types" }
+feldera-macros = { path = "../../../../crates/feldera-macros" }
 merged-index-p = { path = "../../merged-index-p" }
+paste = "1"
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+size-of = { version = "0.1", package = "feldera-size-of" }
 
 [dev-dependencies]
 proptest = "1.5.0"
-
-[profile.dev]
-debug = "line-tables-only"
