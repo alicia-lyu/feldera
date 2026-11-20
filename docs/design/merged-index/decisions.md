@@ -509,6 +509,10 @@ The user decided on 2026-11-19 that MI_P's first served query is Q14 (`L ⋈ P` 
 
 The user decided on 2026-11-20 that MI_P's Q14 readers live in `merged-index-p/`, as Q3's live in `merged-index-col/`, and that the query-independent part of a query's reader state moves to DBSP's generic layer before MI_P uses it: `dbsp::trace::merged_index::transaction` holds `TransactionViews` (publish, collect once, sealed readers, partner reads with the contract check, finish), `SessionReads` with `measure_collection`, and the hook's weight arithmetic (`Weighted`, `consolidate`, `multiply_weights`). Each query keeps its readers, its routing hook, and its joins. Where MI_P's view circuits and harness live stays open.
 
+### 2026-11-20: Q14's view circuit lives in `q14-ivm-baseline/`
+
+The user decided on 2026-11-20 that MI_P's Q14 view circuit is a crate of its own, `sql-to-dbsp-compiler/experiments/q14-ivm-baseline/q14-trie-view-circuit/`, written by hand like `q3-trie-view-circuit`, and that the Q14 harness of step 5 will live in `q14-ivm-baseline/` too. Whether that harness shares code with the Q3 harness (for example through a shared crate) is decided with step 5.
+
 ## Superseded and withdrawn
 
 Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).

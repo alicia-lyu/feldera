@@ -1,0 +1,19 @@
+[package]
+name = "q14-trie-view-circuit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The Q14 view circuit over MI_P, written by hand like q3-trie-view-circuit: DBSP's join, with its partner reads from the merged index."
+
+[workspace]
+
+[dependencies]
+dbsp = { path = "../../../../crates/dbsp", features = ["backend-mode"] }
+feldera-sqllib = { path = "../../../../crates/sqllib" }
+merged-index-p = { path = "../../merged-index-p" }
+
+[dev-dependencies]
+proptest = "1.5.0"
+
+[profile.dev]
+debug = "line-tables-only"
