@@ -12,10 +12,10 @@ use dbsp::{
     storage::attribution::Component,
     trace::{
         merged_index::{Pass, ScanSession, SessionCounts},
-        Batch, BatchLocation, BatchReaderFactories, Builder, OrdIndexedWSetFactories, RunReads,
-        WithSnapshot,
+        with_read_owner, Batch, BatchLocation, BatchReader as DynamicBatchReader,
+        BatchReaderFactories, Builder, Cursor, OrdIndexedWSetFactories, RunReads, WithSnapshot,
     },
-    typed_batch::TypedBatch,
+    typed_batch::{BatchReader, TypedBatch},
     DynZWeight, Runtime,
 };
 use feldera_types::config::{StorageConfig, StorageOptions};
@@ -281,7 +281,7 @@ fn snap<K: DBData, V: DBData>(batch: OrdIndexedZSet<K, V>) -> SpineSnapshot<OrdI
 /// The readers of a published and collected `state`.
 fn with_readers<T>(state: &Q3State, f: impl FnOnce(&CollectedReaders) -> T) -> T {
     let views = state.views().unwrap();
-    let readers = views.collected_readers().unwrap();
+    let readers = views.collected().unwrap();
     f(readers)
 }
 
@@ -605,7 +605,7 @@ fn assert_sync<T: Sync>() {}
 /// driver's `Arc` is shared, with no lock around the readers.
 #[test]
 fn collected_readers_are_shared_with_the_worker_thread() {
-    assert_sync::<ReadViews>();
+    assert_sync::<Published<CollectedReaders>>();
     assert_sync::<CollectedReaders>();
 
     let (state, driving) = published(

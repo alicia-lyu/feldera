@@ -505,6 +505,10 @@ The user decided on 2026-11-19 that the [memtable](memtable.md) keeps typed, sor
 
 The user decided on 2026-11-19 that MI_P's first served query is Q14 (`L ⋈ P` on `partkey`: one join, no trace reads), and that MI_P's index library is a new sibling crate, `sql-to-dbsp-compiler/experiments/merged-index-p/`, modeled on `merged-index-col/`. Its payloads carry Q14's columns only; each later query adds its columns and regenerates. Where MI_P's readers, view circuits, and harness live stays open.
 
+### 2026-11-20: MI_P's readers live in its index crate; transaction state is generic
+
+The user decided on 2026-11-20 that MI_P's Q14 readers live in `merged-index-p/`, as Q3's live in `merged-index-col/`, and that the query-independent part of a query's reader state moves to DBSP's generic layer before MI_P uses it: `dbsp::trace::merged_index::transaction` holds `TransactionViews` (publish, collect once, sealed readers, partner reads with the contract check, finish), `SessionReads` with `measure_collection`, and the hook's weight arithmetic (`Weighted`, `consolidate`, `multiply_weights`). Each query keeps its readers, its routing hook, and its joins. Where MI_P's view circuits and harness live stays open.
+
 ## Superseded and withdrawn
 
 Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).

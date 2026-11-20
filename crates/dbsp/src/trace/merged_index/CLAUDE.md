@@ -20,6 +20,7 @@ Rules for any index and harness: the root `CLAUDE.md` and `sql-to-dbsp-compiler/
 | Merging cursor | `run_merge.rs`: `RunMerge` |
 | Scan session | `session.rs` (tests in `session/`): `ScanSession`, `Pass`, `SessionCounts` |
 | Generic readers | `reader.rs` (tests in `reader/`) |
+| A query's transaction state | `transaction.rs`: `TransactionViews`, `Published`, `SessionReads`, `measure_collection`, `consolidate`, `multiply_weights` |
 | Test helpers | `testing.rs` (`check_against_trie` ties the generated fold constants to the trie) |
 
 ## The key trie

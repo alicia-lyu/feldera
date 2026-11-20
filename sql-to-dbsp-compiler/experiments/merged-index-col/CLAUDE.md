@@ -38,7 +38,7 @@ Payload rules:
 
 The `q3` module reconstructs the four native accumulated reads from COL snapshots that the harness maintains outside the circuit. The harness's `ManualIndex` ([q3-ivm-baseline](../q3-ivm-baseline/CLAUDE.md)) appends to the index; this library never does.
 
-- `Q3State::publish(old, dlt)` supplies a transaction's snapshots. `Q3State::collect(Pass)` captures `Dlt` and scans the touched groups once. `finish` returns `SessionReads` and releases the readers.
+- `Q3State::publish(old, dlt)` supplies a transaction's snapshots. `Q3State::collect(Pass)` captures `Dlt` and scans the touched groups once. `finish` returns `SessionReads` and releases the readers. The publication, the sealed readers, the contract check, and `SessionReads` are the generic `TransactionViews` (`dbsp::trace::merged_index::transaction`); `q3` re-exports `SessionReads`, `OwnerReads`, `OwnerExpansions`, and `SourceSnapshot`.
 - The readers: `CustomersAfter` (`C⁺`), `OrdersBefore` (`O⁻`), `JoinedAfter` (`J⁺`), `LineitemsBefore` (`L⁻`). Their requests and kept rows are tabulated in [shared-traversal.md](../../../docs/design/merged-index/shared-traversal.md).
 - `collect` returns a `Collection` whose `DrivingDeltas` move `ΔC`, `ΔO`, and `ΔL` out once per transaction, no clone, and seals each reader (`Reader::into_sealed`, `SealedReader`: its requests and finished partner batch, `Sync`), so the joins read the partners with no lock (user decision of 2026-11-16).
 - The types are named `*Vector` (user decision of 2026-11-10).
