@@ -169,11 +169,11 @@ The build has two phases. The plan for phase 1 lists its stages; phase 2 is logg
    - Diagnostics, and the harness's `--memtable-mib` flag.
    - Each transaction's delta still arrives as a sorted batch. Its tuples are inserted one by one into the tree, between the tuples earlier transactions left there, using the previous tuple's leaf as a finger.
 2. **Phase 2: measurement, on Linux** (per `LINUX-HANDOFF.md`).
-   - First compile the adapters crate (`cargo check -p dbsp_adapters`). Its memtable metrics export (`memtable_flushes_total`, `memtable_stall_duration_seconds` in `controller.rs`) has never been compiled: `rdkafka-sys`'s build script fails on the Mac before reaching it (2026-11-20).
-   - Rebuild the images: measurement version 18 changed `spine_async.rs` and `trace/ord/**`, which are in the image digest.
-   - `measure.py --memtable-mib`, passed through to the driver's flag (the driver has it since measurement version 18).
-   - The three arms of the run below (**Run**).
-   - Rewrite `spill_kinds.py` in `q3-ivm-baseline/`; it was never committed. It tallies `compaction-log.jsonl` by write kind, the flush kinds included.
+   - **Done (2026-11-20): the adapters crate compiles**, with no warnings. The check was `cargo check -p dbsp_adapters` with every default feature but `with-kafka`. This host also lacks librdkafka, but `controller.rs`'s memtable metrics are not behind that feature.
+   - **Done: `measure.py --memtable-mib N`.** It passes the budget to the driver, records it in `configuration.memtable_mib`, and checks it against the driver's report. It refuses a budget of half the memory target or more, and refuses the flag with `--build-images`.
+   - **Done: `spill_kinds.py` in `q3-ivm-baseline/`.** It classes the files of a `--diagnostics` window by write kind, the flush kinds included, with each memtable flush's seal time.
+   - **Rebuild the images:** `images-v18-pf`, prefix filters on. Measurement version 18 changed `spine_async.rs` and `trace/ord/**`, which are in the image digest.
+   - **The three arms** of the run below (**Run**), then diagnostics reruns for writes by kind.
 
 ## The arm and its limits
 

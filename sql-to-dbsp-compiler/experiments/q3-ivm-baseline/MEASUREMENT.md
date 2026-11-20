@@ -282,7 +282,7 @@ Both runs qualify, and the cgroup's `memory.events max` is 0. View circuit first
 
 **Which writes they are** (diagnostics rerun of the same pilot, `--diagnostics`):
 - **Setup.** Same images and budgets, but the cgroup was raised to 2 GiB, because the diagnostics logs are held in memory and the run at 1 GiB was OOM-killed. Both runs qualify. Pressure reached `critical` from refresh 3 (native) and refresh 2 (merged-index). Its latencies are not comparable to the table above and are not reported.
-- **Method.** Every file flushed in the window is classed from `compaction-log.jsonl`: a merge output (`background_compaction`), an insert spill (`insert_spill`), or else a file built straight to storage during a step. The logs cannot tell that last class apart: it holds both inserted runs that were files from the start and temporary in-step runs. The window covers all six refreshes, 36,170 transactions, the low-pressure refreshes included.
+- **Method.** Every file flushed in the window is classed from `compaction-log.jsonl` (`spill_kinds.py`, committed on 2026-11-20; it counts every owner but the base tables as the view, which moves the merged-index merge outputs from 165.2 to 165.3 KiB): a merge output (`background_compaction`), an insert spill (`insert_spill`), or else a file built straight to storage during a step. The logs cannot tell that last class apart: it holds both inserted runs that were files from the start and temporary in-step runs. The window covers all six refreshes, 36,170 transactions, the low-pressure refreshes included.
 
 Per transaction, view-state owners (`query`, `merged_index`):
 

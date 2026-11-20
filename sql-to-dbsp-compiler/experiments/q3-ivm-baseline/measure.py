@@ -441,6 +441,20 @@ def index_prefix_filter_problems(report: dict[str, Any], asked: bool) -> list[st
     return []
 
 
+def memtable_mib_problems(report: dict[str, Any], asked: int | None) -> list[str]:
+    """List a mismatch between the memtable budget the runner asked for (`--memtable-mib`, `None`
+    for off) and the one the driver reports. A report that names neither mode is not checked."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    configuration = report.get("configuration", {})
+    if "memtable_mib" not in configuration:
+        return [f"configuration.memtable_mib is missing, expected {asked!r}"]
+    if configuration["memtable_mib"] != asked:
+        return [f"configuration.memtable_mib is {configuration['memtable_mib']!r}, "
+                f"expected {asked!r}"]
+    return []
+
+
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
     """Every consistency check of one driver report."""
     return (measurement_version_problems(report) + layout_fallback_problems(report)
@@ -863,6 +877,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.append("--elide-value-headers")
     if args.get("index_prefix_filter"):
         command.append("--index-prefix-filter")
+    if args.get("memtable_mib") is not None:
+        command.extend(["--memtable-mib", str(args["memtable_mib"])])
     command.extend(["--session-pass", args.get("session_pass", "seek")])
     return command
 
@@ -1023,6 +1039,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "the runs it rules out (an A/B arm, measurement version 17); "
                              "images record it, so each arm needs its own images; native runs "
                              "ignore it")
+    parser.add_argument("--memtable-mib", type=int, metavar="MIB",
+                        help="a campaign's memtable budget for the integral spines, in MiB "
+                             "(measurement version 18; off by default); memtables count in RSS, "
+                             "so the budget must stay below half of --memory-target-bytes; not "
+                             "a storage setting, so images need no rebuild per budget")
     parser.add_argument("--session-pass", choices=SESSION_PASSES, default="seek",
                         help="how the reconstructed build's scan session passes the untouched "
                              "groups (default seek); native runs have no scan session")
@@ -1073,6 +1094,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                                            and args.cache_bytes < 1) or \
             (args.memory_target_bytes is not None and args.memory_target_bytes < 1):
         parser.error("runs, batch, cache bytes, and memory target bytes must be positive")
+    if args.memtable_mib is not None:
+        if loading:
+            parser.error("--memtable-mib applies to a campaign: images load without memtables")
+        if args.memtable_mib < 1:
+            parser.error("--memtable-mib must be positive")
+        if args.memory_target_bytes is not None and \
+                args.memtable_mib * MIB * 2 >= args.memory_target_bytes:
+            parser.error("--memtable-mib must be below half of --memory-target-bytes, which the "
+                         "driver's runtime refuses at startup")
     if args.cache_bytes is not None and args.cache_bytes % MIB:
         parser.error("cache bytes must be a whole MiB")
     if not math.isfinite(args.compaction_timeout_secs) or args.compaction_timeout_secs <= 0:
@@ -1498,6 +1528,7 @@ def run(argv: list[str]) -> int:
                           "front_code_byte_keys": args.front_code_byte_keys,
                           "elide_value_headers": args.elide_value_headers,
                           "index_prefix_filter": args.index_prefix_filter,
+                          "memtable_mib": args.memtable_mib,
                           "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None,
@@ -1569,6 +1600,7 @@ def run(argv: list[str]) -> int:
                                  "front_code_byte_keys": args.front_code_byte_keys,
                                  "elide_value_headers": args.elide_value_headers,
                                  "index_prefix_filter": args.index_prefix_filter,
+                                 "memtable_mib": args.memtable_mib,
                                  "session_pass": args.session_pass,
                                  "warm_up": str(args.warm_up.resolve()) if args.warm_up else None}}
                 if images:
@@ -1612,7 +1644,8 @@ def run(argv: list[str]) -> int:
                 if raw.get("status") not in (None, "complete"):
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
                 problems = (report_problems(raw, args.session_pass)
-                            + index_prefix_filter_problems(raw, args.index_prefix_filter))
+                            + index_prefix_filter_problems(raw, args.index_prefix_filter)
+                            + memtable_mib_problems(raw, args.memtable_mib))
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

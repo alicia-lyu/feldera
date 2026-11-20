@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -763,7 +764,7 @@ class MeasureTest(unittest.TestCase):
             resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
             resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
         resources.update(changes)
-        return {"mode": mode, "configuration": {"index_prefix_filter": False},
+        return {"mode": mode, "configuration": {"index_prefix_filter": False, "memtable_mib": None},
                 "sequence": {"resources": resources},
                 "refreshes": [{"refresh": 1, "resources": resources}]}
 
@@ -1084,6 +1085,59 @@ class MeasureTest(unittest.TestCase):
         spec["args"]["index_prefix_filter"] = False
         self.assertNotIn("--index-prefix-filter", measure.driver_command(spec, inputs))
         self.assertFalse(measure.parse_args(self.args).index_prefix_filter)
+
+    def test_reported_memtable_mib_must_be_the_requested_budget(self) -> None:
+        def report(mode: str, configuration: dict) -> dict:
+            return {"mode": mode, "configuration": configuration}
+        for mode in ("native", "reconstructed"):
+            self.assertEqual(
+                measure.memtable_mib_problems(report(mode, {"memtable_mib": 64}), 64), [])
+            self.assertEqual(
+                measure.memtable_mib_problems(report(mode, {"memtable_mib": None}), None), [])
+            self.assertIn("expected 64",
+                          measure.memtable_mib_problems(report(mode, {"memtable_mib": None}),
+                                                        64)[0])
+            self.assertIn("is 64, expected None",
+                          measure.memtable_mib_problems(report(mode, {"memtable_mib": 64}),
+                                                        None)[0])
+            # A driver older than measurement version 18 does not report it at all.
+            self.assertIn("missing", measure.memtable_mib_problems(report(mode, {}), None)[0])
+        self.assertEqual(measure.memtable_mib_problems({}, 64), [])
+
+    def test_memtable_mib_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "memtable_mib": 64}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        command = measure.driver_command(spec, inputs)
+        self.assertEqual(command[command.index("--memtable-mib") + 1], "64")
+        spec["args"]["memtable_mib"] = None
+        self.assertNotIn("--memtable-mib", measure.driver_command(spec, inputs))
+        del spec["args"]["memtable_mib"]
+        self.assertNotIn("--memtable-mib", measure.driver_command(spec, inputs))
+        self.assertIsNone(measure.parse_args(self.args).memtable_mib)
+
+    def test_memtable_mib_must_stay_below_half_of_the_memory_target(self) -> None:
+        def args_with(memtable_mib: str, target_bytes: int) -> list[str]:
+            args = list(self.args)
+            args[args.index("--memory-target-bytes") + 1] = str(target_bytes)
+            return args + ["--memtable-mib", memtable_mib]
+        self.assertEqual(measure.parse_args(args_with("64", 512 * 1024 * 1024)).memtable_mib, 64)
+        self.assertEqual(measure.parse_args(args_with("255", 512 * 1024 * 1024)).memtable_mib,
+                         255)
+        for memtable_mib, target_bytes in (("256", 512 * 1024 * 1024), ("0", 1 << 30),
+                                           ("-1", 1 << 30)):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                measure.parse_args(args_with(memtable_mib, target_bytes))
+
+    def test_memtable_mib_is_refused_when_loading(self) -> None:
+        args = ["--build-images", str(self.root / "images"),
+                "--customer", str(self.root / "customer"),
+                "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem"), "--memtable-mib", "64"]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            measure.parse_args(args)
 
     def test_session_pass_flag_reaches_the_driver(self) -> None:
         spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",

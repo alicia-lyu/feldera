@@ -254,10 +254,12 @@ example `$R5_OUT/images-v17-pf`), and to every campaign that reopens it. The run
 report of the other arm.
 
 The memtable arm (`--memtable-mib N`, measurement version 18, off by default) is not a storage
-setting: images load without it, and only the refresh program takes it. Version 18 changed the
-image digest's DBSP sources, so rebuild the images first. `measure.py` does not pass the flag yet,
-and the adapters crate's memtable metrics have not been compiled; both are first steps of the
-memtable's phase 2 ([memtable.md](../../../docs/design/merged-index/memtable.md#phases)).
+setting: images load without it, and only a campaign takes it (`measure.py --memtable-mib N`,
+which refuses it with `--build-images`). Version 18 changed the image digest's DBSP sources, so
+rebuild the images first. `spill_kinds.py MANIFEST` classes a `--diagnostics` campaign's files by
+write kind, memtable flushes included; a diagnostics run needs a 2 GiB cgroup, since its logs are
+held in memory. The memtable's phase 2 is logged in
+[memtable.md](../../../docs/design/merged-index/memtable.md#phases).
 
 **Completing an image directory.** `measure.py --complete-images "$R5_OUT/images" --customer ...
 --orders ... --lineitem ... --elide-value-headers` loads, all at once, the images that
