@@ -190,6 +190,13 @@ A campaign used to reopen an image only with the byte-identical executable that 
 
 Report the view circuit (user direction): the base circuit's cost, merged-index upkeep included, is assumed amortized over the views an index serves (two indexes cover 18 of the 22 TPC-H queries), and its side effects on the view are mitigated ad hoc in both modes. Neither view reads the base tables, but in the version 15 pilot the base tables and the merged index evicted each other's blocks from the one cache. Keeping base blocks out of the cache altogether was rejected, since it would also starve their compaction. So the base circuit uses the cache normally, and when its transaction commits the driver evicts its tables' blocks before the view phase (measurement version 16). Later, one base circuit will feed several chained view circuits on the same index.
 
+### 2026-11-19: The sequence arm is stopped; cancelled rows are a watch item
+
+- **Stopped.** The `sequence` order-key arm's 512/512 pilot was stopped during its native run, after 3 h 37 min (the dbgen pilot ran in 23 min), and the arm is not measured further. Its key space is close enough to dbgen's for this work (user, 2026-11-19).
+- **Why it was slow.** RF2 deletes the lowest keys, and with sequence keys no RF1 Order lands among them, so the cancelled rows form one stretch at the front of base Orders' and Lineitem's key range. They wait for a merge into each spine's largest run, and every new cursor walks them (`CursorList::new`). The driver's per-lookup cursors in `BaseState` read that stretch again in every transaction: 85 of the run's 86 GB of device reads. Evidence and the existing solutions: [compaction.md](../../../docs/design/merged-index/compaction.md#watch-for-cancelled-rows-at-the-front-of-the-key-range).
+- **No fix yet.** A driver-side change to `BaseState` would hide the effect rather than remove it; the root cause is that size-tiered merging keeps a deletion apart from the row it cancels. The choice among deletion-triggered compaction, key-partitioned levels, and read-side bounds waits until the `uuid` arm shows whether it meets the same growth (user, 2026-11-19).
+- **Order of runs.** The prefix-filter A/B (dbgen keys, version 17) runs first, then the `uuid` pilot at version 17 with the filter off, from new `images-v17-uuid`; the version 16 `uuid` images no longer match the image sources.
+
 ### 2026-11-19: Order keys are a dimension: dbgen, sequence, uuid
 
 - **Arms** (`prepare_inputs.py --order-keys`). The selection is the same in every arm: RF2 deletes the oldest Orders and RF1 Orders arrive in dbgen's file order; only the keys the files carry differ.
