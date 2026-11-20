@@ -1030,6 +1030,14 @@ where
         Ok(None)
     }
 
+    /// A memtable for a spine of this batch type to absorb deltas into, or
+    /// `None` if the batch type has none (see [`crate::trace::ord::memtable`]).
+    fn new_memtable(
+        _factories: &Self::Factories,
+    ) -> Option<Box<dyn crate::trace::ord::memtable::BatchMemtable<Self>>> {
+        None
+    }
+
     /// Minimum and maximum keys in this batch.
     ///
     /// File-backed batches materialize these bounds at write time. In-memory

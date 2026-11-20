@@ -6,6 +6,7 @@ use super::dbsp_handle::{Layout, Mode};
 use crate::SchedulerError;
 use crate::circuit::checkpointer::Checkpointer;
 use crate::circuit::dbsp_handle::StepSize;
+use crate::circuit::memtable_budget::MemtableBudget;
 use crate::error::Error as DbspError;
 use crate::operator::communication::{Exchange, ExchangeActivity};
 use crate::storage::backend::StorageBackend;
@@ -346,6 +347,10 @@ struct RuntimeInner {
     memory_pressure_notify: Arc<Notify>,
 
     storage: Option<RuntimeStorage>,
+
+    /// The budget of the integral spines' memtables, when `storage.memtable_mib` is set.
+    memtable_budget: Option<Arc<MemtableBudget>>,
+
     store: LocalStore,
     kill_signal: KillSignal,
     aux_threads: Mutex<Vec<(JoinHandle<()>, Unparker)>>,
@@ -604,12 +609,16 @@ impl RuntimeInner {
         };
 
         // Memtables exist only with storage, which their seal writes to.
-        if let Some(memtable_mib) = storage
+        let memtable_budget = match storage
             .as_ref()
             .and_then(|storage| storage.options.memtable_mib)
         {
-            validate_memtable_budget(memtable_mib, config.max_rss_bytes)?;
-        }
+            Some(memtable_mib) => Some(Arc::new(MemtableBudget::new(validate_memtable_budget(
+                memtable_mib,
+                config.max_rss_bytes,
+            )?))),
+            None => None,
+        };
 
         let total_cache_bytes = if let Some(storage) = &storage {
             match storage.options.cache_mib {
@@ -676,6 +685,7 @@ impl RuntimeInner {
             memory_pressure_epoch: AtomicU64::new(0),
             memory_pressure_notify: Arc::new(Notify::new()),
             storage,
+            memtable_budget,
             store: TypedDashMap::new(),
             kill_signal: KillSignal::default(),
             aux_threads: Mutex::new(Vec::new()),
@@ -1419,6 +1429,11 @@ impl Runtime {
 
     pub fn memory_pressure_epoch(&self) -> u64 {
         self.inner().memory_pressure_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The budget that this runtime's memtables share, or `None` if memtables are off.
+    pub(crate) fn memtable_budget(&self) -> Option<Arc<MemtableBudget>> {
+        self.inner().memtable_budget.clone()
     }
 
     pub(crate) fn memory_pressure_notify(&self) -> Arc<Notify> {

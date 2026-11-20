@@ -16,7 +16,9 @@ use crate::{
         ord::{
             fallback::utils::BuildTo,
             file::indexed_wset_batch::FileIndexedWSetBuilder,
-            memtable::{FrozenMemtable, IndexedLeaf},
+            memtable::{
+                BatchMemtable, FromFrozenMemtable, FrozenMemtable, IndexedLeaf, LeafBatchMemtable,
+            },
             merge_batcher::MergeBatcher,
             vec::indexed_wset_batch::{VecIndexedWSet, VecIndexedWSetBuilder},
         },
@@ -399,6 +401,20 @@ where
     }
 }
 
+impl<K, V, R> FromFrozenMemtable<IndexedLeaf<K, V, R>> for FallbackIndexedWSet<K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    fn from_frozen_memtable(
+        factories: &FallbackIndexedWSetFactories<K, V, R>,
+        frozen: FrozenMemtable<IndexedLeaf<K, V, R>>,
+    ) -> Self {
+        Self::from_memtable(factories, frozen)
+    }
+}
+
 impl<K, V, R> Batch for FallbackIndexedWSet<K, V, R>
 where
     K: DataTrait + ?Sized,
@@ -408,6 +424,17 @@ where
     type Timed<T: crate::Timestamp> = FallbackValBatch<K, V, T, R>;
     type Batcher = MergeBatcher<Self>;
     type Builder = FallbackIndexedWSetBuilder<K, V, R>;
+
+    fn new_memtable(
+        factories: &FallbackIndexedWSetFactories<K, V, R>,
+    ) -> Option<Box<dyn BatchMemtable<Self>>> {
+        Some(Box::new(
+            LeafBatchMemtable::<IndexedLeaf<K, V, R>, Self>::new(
+                factories,
+                &factories.vec_indexed_wset_factory,
+            ),
+        ))
+    }
 
     fn persisted(&self) -> Option<Self> {
         match &self.inner {

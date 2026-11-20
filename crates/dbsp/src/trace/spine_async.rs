@@ -10,6 +10,7 @@ use crate::{
     Error, NumEntries, Runtime,
     circuit::{
         ElapsedTime, max_level0_batch_size_records,
+        memtable_budget::{MemtableBudget, MemtableHandle},
         metadata::{
             BLOOM_FILTER_BITS_PER_KEY, BLOOM_FILTER_HIT_RATE_PERCENT, BLOOM_FILTER_HITS_COUNT,
             BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_PARTITION_CACHE_HITS_COUNT,
@@ -24,7 +25,7 @@ use crate::{
             ROARING_FILTER_MISSES_COUNT, ROARING_FILTER_SIZE_BYTES, SPINE_BATCHES_COUNT,
             SPINE_STORAGE_SIZE_BYTES,
         },
-        metrics::COMPACTION_STALL_TIME_NANOSECONDS,
+        metrics::{COMPACTION_STALL_TIME_NANOSECONDS, MEMTABLE_FLUSHES},
         min_accumulator_merge_batches, min_integral_merge_batches, negative_weight_multiplier,
         runtime::{TOKIO_BUFFER_CACHE, TOKIO_WORKER_INDEX},
     },
@@ -44,7 +45,10 @@ use crate::{
         TraceRole,
         cursor::{CursorList, Position},
         merge_batches,
-        ord::fallback::{pick_insert_destination, pick_merge_destination},
+        ord::{
+            fallback::{pick_insert_destination, pick_merge_destination},
+            memtable::BatchMemtable,
+        },
         sample_keys_from_batches,
         spine_async::{
             list_merger::ArcListMerger, push_merger::ArcPushMerger, snapshot::FetchList,
@@ -72,8 +76,8 @@ use std::{
     borrow::Cow,
     future::Future,
     sync::{
-        Arc,
-        atomic::{AtomicIsize, AtomicU32},
+        Arc, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize},
     },
 };
 use std::{
@@ -424,6 +428,18 @@ where
     request_exit: bool,
     #[size_of(skip)]
     spine_stats: SpineStats,
+
+    /// The memtable that absorbs inserted batches, on an integral spine when
+    /// `storage.memtable_mib` is set (see `docs/design/merged-index/memtable.md`).
+    #[size_of(skip)]
+    memtable: Option<Box<dyn BatchMemtable<B>>>,
+    /// The memtable being sealed, which readers see until its run replaces it,
+    /// and the counter of its leaf memory.
+    #[size_of(skip)]
+    flushing: Option<(Arc<B>, Arc<AtomicUsize>)>,
+    /// Memtables sealed so far.
+    #[size_of(skip)]
+    memtable_flushes: usize,
 }
 
 impl<B> SharedState<B>
@@ -451,6 +467,9 @@ where
             slots: std::array::from_fn(|_| Slot::default()),
             request_exit: false,
             spine_stats: SpineStats::default(),
+            memtable: None,
+            flushing: None,
+            memtable_flushes: 0,
         }
     }
 
@@ -493,13 +512,39 @@ where
         (self.key_filter.clone(), self.value_filter.clone())
     }
 
-    /// Gets a copy of all of the batches (whether loose or being merged).
+    /// Gets a copy of all of the batches (whether loose or being merged),
+    /// then the memtable being sealed, then a frozen memtable of the active
+    /// one. Freezing here, at snapshot time, costs nothing unless an insert
+    /// follows while the snapshot is held.
     fn get_batches(&self) -> Vec<Arc<B>> {
-        let mut batches = Vec::with_capacity(self.count_all_batches());
+        let mut batches = Vec::with_capacity(self.count_all_batches() + 2);
         for slot in &self.slots {
             batches.extend(slot.all_batches().cloned());
         }
+        if let Some((flushing, _)) = &self.flushing {
+            batches.push(flushing.clone());
+        }
+        if let Some(frozen) = self
+            .memtable
+            .as_ref()
+            .and_then(|memtable| memtable.freeze())
+        {
+            batches.push(Arc::new(frozen));
+        }
         batches
+    }
+
+    /// The leaf bytes of the active and the flushing memtable.
+    fn memtable_live_bytes(&self) -> usize {
+        let active = self
+            .memtable
+            .as_ref()
+            .map_or(0, |memtable| memtable.live_leaf_bytes());
+        let flushing = self
+            .flushing
+            .as_ref()
+            .map_or(0, |(_, memory)| memory.load(Ordering::Relaxed));
+        active + flushing
     }
 
     fn get_snapshot(&self) -> SpineSnapshot<B> {
@@ -522,7 +567,7 @@ where
     /// If this returns false, a new merge might still start without any further
     /// batches being submitted if there are enough loose batches.
     fn is_merging(&self) -> bool {
-        self.slots.iter().any(|slot| slot.merging_batches.is_some())
+        self.slots.iter().any(|slot| slot.merging_batches.is_some()) || self.flushing.is_some()
     }
 
     /// Returns `true` if compaction has fully converged: all compaction
@@ -920,6 +965,14 @@ where
                 counts.merge_real_micros += slot.elapsed.real.as_micros() as u64;
                 counts.merge_cpu_micros += slot.elapsed.cpu.as_micros() as u64;
             }
+            if let Some(memtable) = &state.memtable {
+                counts.memtable_entries = memtable.tuples();
+                counts.memtable_node_copies = memtable.node_copies();
+                counts.memtable_copy_nanos = memtable.copy_nanos();
+            }
+            counts.memtable_bytes = state.memtable_live_bytes();
+            counts.flushing = state.flushing.is_some();
+            counts.memtable_flushes = state.memtable_flushes as u64;
             Some(counts)
         }));
     }
@@ -943,6 +996,51 @@ where
 
     fn set_frontier(&self, frontier: &B::Time) {
         self.state.lock().unwrap().frontier = frontier.clone();
+    }
+
+    /// Gives the spine a memtable, if it is an integral spine of a batch type
+    /// that has one and the runtime has a memtable budget.
+    fn install_memtable(&self, runtime: &Runtime, factories: &B::Factories, role: TraceRole) {
+        if role != TraceRole::Integral {
+            return;
+        }
+        let (Some(budget), Some(memtable)) =
+            (runtime.memtable_budget(), B::new_memtable(factories))
+        else {
+            return;
+        };
+        self.state.lock().unwrap().memtable = Some(memtable);
+        let handle = Arc::new(SpineMemtableHandle {
+            budget: budget.clone(),
+            merge_workers: Arc::downgrade(&self.merge_workers),
+            reported: AtomicUsize::new(0),
+            sealing: AtomicBool::new(false),
+        });
+        budget.register(Arc::downgrade(&handle) as Weak<dyn MemtableHandle>);
+        let _ = self.merge_workers.memtable.set(handle);
+    }
+
+    /// Inserts `batch` into the memtable and returns true, or returns false if
+    /// the spine has no memtable or `batch` is above a quarter of the budget,
+    /// which then goes in as a normal run.
+    fn insert_into_memtable(&self, batch: &B) -> bool {
+        let Some(handle) = self.merge_workers.memtable.get() else {
+            return false;
+        };
+        if batch.approximate_byte_size() > handle.budget.budget_bytes() / 4 {
+            return false;
+        }
+        match self.state.lock().unwrap().memtable.as_mut() {
+            Some(memtable) => memtable.insert_batch(batch),
+            None => return false,
+        }
+        self.merge_workers.report_memtable_bytes();
+        true
+    }
+
+    /// See [`MergeWorkers::memtable_into_run`].
+    fn memtable_into_run(&self) {
+        self.merge_workers.memtable_into_run();
     }
 
     /// Adds `batch` to the shared merging state and wakes up the merger.
@@ -1419,6 +1517,53 @@ where
 ///
 /// All the mergers for a spine share a single copy of this structure through an
 /// `Arc`.
+/// A spine's memtable as the runtime's [`MemtableBudget`] sees it. The budget
+/// reads it from any thread, so it answers from atomics.
+struct SpineMemtableHandle<B>
+where
+    B: Batch,
+{
+    budget: Arc<MemtableBudget>,
+    merge_workers: Weak<MergeWorkers<B>>,
+    /// The bytes last reported to the budget for this spine.
+    reported: AtomicUsize,
+    /// Set from a seal request until the seal finishes.
+    sealing: AtomicBool,
+}
+
+impl<B> MemtableHandle for SpineMemtableHandle<B>
+where
+    B: Batch,
+{
+    fn live_bytes(&self) -> usize {
+        self.reported.load(Ordering::Relaxed)
+    }
+
+    fn is_flushing(&self) -> bool {
+        self.sealing.load(Ordering::Relaxed)
+    }
+
+    fn request_seal(&self) {
+        if self.sealing.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        match self.merge_workers.upgrade() {
+            Some(merge_workers) => merge_workers.spawn_seal(),
+            None => self.sealing.store(false, Ordering::Relaxed),
+        }
+    }
+}
+
+impl<B> Drop for SpineMemtableHandle<B>
+where
+    B: Batch,
+{
+    fn drop(&mut self) {
+        // The spine is gone, and so are its memtable bytes.
+        self.budget.add_bytes(-(*self.reported.get_mut() as isize));
+    }
+}
+
 struct MergeWorkers<B>
 where
     B: Batch,
@@ -1438,6 +1583,9 @@ where
     /// The owner of the spine, fixed when the spine is created. Mergers run
     /// under it, so a compaction's files belong to the spine's owner.
     write_owner: Component,
+
+    /// The spine's memtable as the budget sees it, if the spine has one.
+    memtable: OnceLock<Arc<SpineMemtableHandle<B>>>,
 }
 
 impl<B> MergeWorkers<B>
@@ -1463,6 +1611,150 @@ where
             max_level0_batch_size_records,
             worker_index,
             write_owner,
+            memtable: OnceLock::new(),
+        }
+    }
+
+    /// Reports this spine's memtable bytes to the budget, which may ask the
+    /// largest memtable to seal. Called without the state lock held.
+    fn report_memtable_bytes(&self) {
+        let Some(handle) = self.memtable.get() else {
+            return;
+        };
+        let live = self.state.lock().unwrap().memtable_live_bytes();
+        let reported = handle.reported.swap(live, Ordering::Relaxed);
+        handle.budget.add_bytes(live as isize - reported as isize);
+    }
+
+    /// Moves the active memtable into the spine as an in-memory run, without a
+    /// copy, under one lock so that no snapshot misses or doubles it. Operations
+    /// that reorganize the runs (save, consolidation, compaction) call it first.
+    fn memtable_into_run(self: &Arc<Self>) {
+        let level = {
+            let mut state = self.state.lock().unwrap();
+            let Some((batch, _)) = state.memtable.as_mut().and_then(|memtable| memtable.take())
+            else {
+                return;
+            };
+            let level =
+                Spine::<B>::size_to_level(&batch, self.max_level0_batch_size_records, false);
+            state.add_batch(Arc::new(batch), level);
+            level
+        };
+        self.start(level);
+        self.report_memtable_bytes();
+    }
+
+    /// Seals the memtable on the merger runtime.
+    fn spawn_seal(self: &Arc<Self>) {
+        let Some(handle) = self.runtime.tokio_merger_runtime() else {
+            if let Some(memtable) = self.memtable.get() {
+                memtable.sealing.store(false, Ordering::Relaxed);
+            }
+            return;
+        };
+        let local_worker_offset = self.worker_index - self.runtime.layout().local_workers().start;
+        let this = self.clone();
+        handle.spawn(async move {
+            let buffer_cache = this
+                .runtime
+                .get_buffer_cache(local_worker_offset, ThreadType::Background);
+            let slab_allocator = this
+                .runtime
+                .get_fbuf_slab_allocator(local_worker_offset, ThreadType::Background);
+            let (worker_index, write_owner) = (this.worker_index, this.write_owner);
+            scope_tokio_merger_locals(
+                worker_index,
+                write_owner,
+                buffer_cache,
+                slab_allocator,
+                async move {
+                    this.seal_memtable();
+                },
+            )
+            .await;
+        });
+    }
+
+    /// Seals the memtable: copies it, in key order, into a file run, or keeps it
+    /// as an in-memory run where the merge placement rule says memory.
+    fn seal_memtable(self: &Arc<Self>) {
+        let started_micros = now_micros();
+        // Take the memtable and show it as flushing, under one lock.
+        let taken = {
+            let mut state = self.state.lock().unwrap();
+            match state.memtable.as_mut().and_then(|memtable| memtable.take()) {
+                Some((batch, memory)) => {
+                    let batch = Arc::new(batch);
+                    state.flushing = Some((batch.clone(), memory));
+                    Some((
+                        batch,
+                        state.factories.clone(),
+                        state.get_filters(),
+                        state.name.clone(),
+                    ))
+                }
+                None => None,
+            }
+        };
+        let sealed = taken.is_some();
+        if let Some((flushing, factories, (key_filter, value_filter), name)) = taken {
+            self.report_memtable_bytes();
+            let output = match pick_merge_destination([&*flushing], None) {
+                BatchLocation::Storage => {
+                    let builder = B::Builder::for_merge(
+                        &factories,
+                        [&*flushing],
+                        Some(BatchLocation::Storage),
+                    );
+                    Arc::new(ListMerger::merge(
+                        &factories,
+                        builder,
+                        vec![flushing.merge_cursor(key_filter, value_filter)],
+                    ))
+                }
+                BatchLocation::Memory => flushing.clone(),
+            };
+
+            // Replace the flushing memtable by its run, under one lock.
+            let level =
+                Spine::<B>::size_to_level(&output, self.max_level0_batch_size_records, false);
+            {
+                let mut state = self.state.lock().unwrap();
+                state.flushing = None;
+                state.memtable_flushes += 1;
+                if !output.is_empty() {
+                    state.add_batch(output.clone(), level);
+                }
+            }
+            self.start(level);
+            self.idle.notify_all();
+            MEMTABLE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            diagnostics::log_compaction(|| {
+                let (output_file, output_file_bytes) = file_of(&*output);
+                CompactionRecord {
+                    kind: RunWriteKind::MemtableFlush,
+                    owner: self.write_owner,
+                    spine: name.to_string(),
+                    level,
+                    started_micros,
+                    finished_micros: now_micros(),
+                    input_runs: 1,
+                    input_records: flushing.len() as u64,
+                    output_records: output.len() as u64,
+                    output_location: location_name(output.location()),
+                    output_file,
+                    output_file_bytes,
+                }
+            });
+        }
+        if let Some(memtable) = self.memtable.get() {
+            memtable.sealing.store(false, Ordering::Relaxed);
+        }
+        if sealed {
+            // Not after an empty seal: the bytes left are copies a snapshot
+            // holds, and reporting them would only ask for another empty seal.
+            self.report_memtable_bytes();
         }
     }
 
@@ -2441,6 +2733,7 @@ where
         // A batch `Arc` can be shared outside this spine, e.g., with a
         // [`SpineSnapshot`] or a [`Trace::fork`] of this spine, in which case
         // `Arc::unwrap_or_clone` copies the batch instead of taking ownership.
+        self.merger.memtable_into_run();
         let batches = self.merger.pause().into_iter().map(Arc::unwrap_or_clone);
         let result = with_write_owner(self.merger.write_owner(), || {
             merge_batches(
@@ -2458,7 +2751,16 @@ where
     }
 
     async fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) {
-        let batch = self.spill_if_due(batch.into());
+        let batch = batch.into();
+        if batch.is_empty() {
+            return;
+        }
+        // A memtable absorbs the batch with no run, no spill and no backpressure.
+        if self.merger.insert_into_memtable(&batch) {
+            self.dirty = true;
+            return;
+        }
+        let batch = self.spill_if_due(batch);
         if !batch.is_empty() {
             self.dirty = true;
             if self
@@ -2553,6 +2855,8 @@ where
         // that we don't have to persist them again for the next checkpoint,
         // saving time then. On the other hand, we do have to read them back
         // from disk to use them: no free lunch.)
+        // The memtable is saved as a run, which `persist_batches` writes.
+        self.merger.memtable_into_run();
         let (not_merging, merging) = self.merger.pause_new_merges();
         let owner = self.merger.write_owner();
         let not_merging = with_write_owner(owner, || persist_batches(not_merging));
@@ -2638,6 +2942,7 @@ where
     }
 
     fn initiate_compaction(&self) {
+        self.merger.memtable_into_run();
         self.merger.initiate_compaction();
     }
 
@@ -2706,7 +3011,8 @@ where
         name: Arc<String>,
         role: TraceRole,
     ) -> Self {
-        let merger = AsyncMerger::new(runtime, worker_index, factories, name, role);
+        let merger = AsyncMerger::new(runtime.clone(), worker_index, factories, name, role);
+        merger.install_memtable(&runtime, factories, role);
         merger.register_run_counter();
         if diagnostics::enabled() {
             merger.register_for_diagnostics();
@@ -2760,6 +3066,7 @@ where
     }
 
     pub fn complete_merges(&mut self) {
+        self.merger.memtable_into_run();
         let batches = self.merger.pause();
         let batch = with_write_owner(self.merger.write_owner(), || {
             merge_batches(
@@ -3259,5 +3566,278 @@ mod single_batch_compaction_test {
         assert_eq!(before, vec![BatchLocation::Memory]);
         assert!(complete, "compaction did not finish within five seconds");
         assert_eq!(after, vec![BatchLocation::Memory]);
+    }
+}
+
+#[cfg(test)]
+mod memtable_test {
+    use crate::{
+        DynZWeight, OrdIndexedZSet as TypedOrdIndexedZSet, ZWeight,
+        algebra::OrdIndexedZSet,
+        circuit::{CircuitConfig, mkconfig},
+        dynamic::{DowncastTrait, DynData},
+        trace::{
+            BatchLocation, BatchReader, BatchReaderFactories, Cursor, Spine, Trace, TraceRole,
+            WithSnapshot, test::run_in_circuit_with_storage_config,
+        },
+        utils::Tup2,
+    };
+    use feldera_storage::tokio::TOKIO;
+    use std::{
+        collections::BTreeMap,
+        path::Path,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tempfile::tempdir;
+
+    type B = OrdIndexedZSet<DynData, DynData>;
+    type Model = BTreeMap<(i32, i32), ZWeight>;
+
+    /// A one-worker runtime with storage, `memtable_mib`, and merge outputs
+    /// placed in storage at or above `min_storage_bytes`.
+    fn config(path: &Path, memtable_mib: Option<usize>, min_storage_bytes: usize) -> CircuitConfig {
+        let mut config = mkconfig(path);
+        let options = &mut config.storage.as_mut().unwrap().options;
+        options.memtable_mib = memtable_mib;
+        options.min_storage_bytes = Some(min_storage_bytes);
+        config
+    }
+
+    fn spine(role: TraceRole) -> Spine<B> {
+        Spine::new(
+            &BatchReaderFactories::new::<i32, i32, ZWeight>(),
+            Arc::new("memtable_test".to_owned()),
+            role,
+        )
+    }
+
+    fn batch(tuples: &[(i32, i32, ZWeight)]) -> B {
+        TypedOrdIndexedZSet::<i32, i32>::from_tuples(
+            (),
+            tuples
+                .iter()
+                .map(|&(k, v, w)| Tup2(Tup2(k, v), w))
+                .collect(),
+        )
+        .into_inner()
+    }
+
+    fn apply(model: &mut Model, tuples: &[(i32, i32, ZWeight)]) {
+        for &(k, v, w) in tuples {
+            let weight = model.entry((k, v)).or_default();
+            *weight += w;
+            if *weight == 0 {
+                model.remove(&(k, v));
+            }
+        }
+    }
+
+    fn contents<C>(mut cursor: C) -> Model
+    where
+        C: Cursor<DynData, DynData, (), DynZWeight>,
+    {
+        let mut model = Model::new();
+        while cursor.key_valid() {
+            let key = *cursor.key().downcast_checked::<i32>();
+            while cursor.val_valid() {
+                let val = *cursor.val().downcast_checked::<i32>();
+                let weight = *cursor.weight().downcast_checked::<ZWeight>();
+                *model.entry((key, val)).or_default() += weight;
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        model.retain(|_, weight| *weight != 0);
+        model
+    }
+
+    fn insert(spine: &mut Spine<B>, model: &mut Model, tuples: &[(i32, i32, ZWeight)]) {
+        TOKIO.block_on(spine.insert(batch(tuples)));
+        apply(model, tuples);
+    }
+
+    /// The memtable's tuple count and the number of runs, from the locked state.
+    fn memtable_and_runs(spine: &Spine<B>) -> (Option<usize>, usize) {
+        let state = spine.merger.state.lock().unwrap();
+        (
+            state.memtable.as_ref().map(|memtable| memtable.tuples()),
+            state.count_all_batches(),
+        )
+    }
+
+    /// Waits until `n` seals have finished.
+    fn wait_for_flushes(spine: &Spine<B>, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let state = spine.merger.state.lock().unwrap();
+                if state.memtable_flushes >= n && state.flushing.is_none() {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "no seal within ten seconds");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Three transactions whose keys interleave, with a cancellation.
+    const TRANSACTIONS: [&[(i32, i32, ZWeight)]; 3] = [
+        &[(1, 10, 1), (5, 50, 1), (9, 90, 1)],
+        &[(2, 20, 1), (5, 51, 1), (8, 80, -1)],
+        &[(1, 10, -1), (3, 30, 2), (9, 91, 1)],
+    ];
+
+    #[test]
+    fn without_the_knob_a_spine_has_no_memtable() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), None, 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            insert(&mut spine, &mut model, TRANSACTIONS[0]);
+            assert_eq!(memtable_and_runs(&spine), (None, 1));
+        });
+    }
+
+    #[test]
+    fn an_accumulator_spine_has_no_memtable() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(64), 0), || {
+            let spine = spine(TraceRole::Accumulator);
+            assert_eq!(memtable_and_runs(&spine).0, None);
+        });
+    }
+
+    #[test]
+    fn transactions_interleave_in_the_memtable_without_runs() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(64), 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            for tuples in TRANSACTIONS {
+                insert(&mut spine, &mut model, tuples);
+            }
+            assert_eq!(memtable_and_runs(&spine), (Some(model.len()), 0));
+            assert_eq!(contents(spine.cursor()), model);
+            let batches = spine.get_batches();
+            assert_eq!(batches.len(), 1, "one frozen memtable");
+            assert_eq!(batches[0].location(), BatchLocation::Memory);
+        });
+    }
+
+    #[test]
+    fn a_held_snapshot_is_unchanged_by_later_inserts() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(64), 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            insert(&mut spine, &mut model, TRANSACTIONS[0]);
+            let snapshot = spine.ro_snapshot();
+            let before = model.clone();
+            insert(&mut spine, &mut model, TRANSACTIONS[1]);
+            assert_eq!(contents(snapshot.cursor()), before);
+            assert_eq!(contents(spine.cursor()), model);
+            let state = spine.merger.state.lock().unwrap();
+            assert!(state.memtable.as_ref().unwrap().node_copies() > 0);
+        });
+    }
+
+    #[test]
+    fn a_batch_above_a_quarter_of_the_budget_goes_in_as_a_run() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(1), 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            let large: Vec<_> = (0..40_000).map(|i| (i, i, 1)).collect();
+            assert!(batch(&large).approximate_byte_size() > 256 * 1024);
+            insert(&mut spine, &mut model, &large);
+            assert_eq!(memtable_and_runs(&spine), (Some(0), 1));
+            assert_eq!(contents(spine.cursor()), model);
+        });
+    }
+
+    /// Fills a 1 MiB memtable with batches below the bypass size until the
+    /// budget seals it, and returns the locations of the runs.
+    fn fill_until_sealed(min_storage_bytes: usize) -> Vec<BatchLocation> {
+        let directory = tempdir().unwrap();
+        let result = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let report = result.clone();
+        run_in_circuit_with_storage_config(
+            config(directory.path(), Some(1), min_storage_bytes),
+            move || {
+                let mut spine = spine(TraceRole::Integral);
+                let mut model = Model::new();
+                let mut next = 0;
+                while spine.merger.state.lock().unwrap().memtable_flushes == 0
+                    && spine.merger.state.lock().unwrap().flushing.is_none()
+                {
+                    let tuples: Vec<_> = (next..next + 2_000).map(|i| (i, -i, 1)).collect();
+                    next += 2_000;
+                    insert(&mut spine, &mut model, &tuples);
+                    assert!(next < 2_000_000, "the budget never sealed the memtable");
+                }
+                wait_for_flushes(&spine, 1);
+                assert_eq!(contents(spine.cursor()), model);
+                let state = spine.merger.state.lock().unwrap();
+                *report.lock().unwrap() = state
+                    .slots
+                    .iter()
+                    .flat_map(|slot| slot.all_batches())
+                    .map(|batch| batch.location())
+                    .collect();
+            },
+        );
+        Arc::try_unwrap(result).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn the_budget_seals_the_memtable_into_a_file_run() {
+        assert!(fill_until_sealed(0).contains(&BatchLocation::Storage));
+    }
+
+    #[test]
+    fn a_seal_keeps_the_memtable_in_memory_where_merges_stay_in_memory() {
+        let locations = fill_until_sealed(usize::MAX);
+        assert!(!locations.is_empty());
+        assert!(
+            locations
+                .iter()
+                .all(|location| *location == BatchLocation::Memory)
+        );
+    }
+
+    #[test]
+    fn complete_merges_and_consolidate_include_the_memtable() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(64), 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            for tuples in TRANSACTIONS {
+                insert(&mut spine, &mut model, tuples);
+            }
+            spine.complete_merges();
+            assert_eq!(memtable_and_runs(&spine), (Some(0), 1));
+            assert_eq!(contents(spine.cursor()), model);
+
+            insert(&mut spine, &mut model, &[(4, 40, 1)]);
+            let consolidated = spine.consolidate().unwrap();
+            assert_eq!(contents(consolidated.cursor()), model);
+        });
+    }
+
+    #[test]
+    fn a_fork_sees_the_memtable() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(directory.path(), Some(64), 0), || {
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            for tuples in TRANSACTIONS {
+                insert(&mut spine, &mut model, tuples);
+            }
+            let fork = spine.fork();
+            assert_eq!(contents(fork.cursor()), model);
+            insert(&mut spine, &mut model, &[(4, 40, 1)]);
+            assert_ne!(contents(fork.cursor()), model, "the fork is independent");
+        });
     }
 }

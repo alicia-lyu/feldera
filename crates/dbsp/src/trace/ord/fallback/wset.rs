@@ -14,7 +14,9 @@ use crate::{
         ord::{
             fallback::utils::BuildTo,
             file::wset_batch::FileWSetBuilder,
-            memtable::{FrozenMemtable, WSetLeaf},
+            memtable::{
+                BatchMemtable, FromFrozenMemtable, FrozenMemtable, LeafBatchMemtable, WSetLeaf,
+            },
             merge_batcher::MergeBatcher,
             vec::wset_batch::{VecWSet, VecWSetBuilder},
         },
@@ -387,6 +389,19 @@ where
     }
 }
 
+impl<K, R> FromFrozenMemtable<WSetLeaf<K, R>> for FallbackWSet<K, R>
+where
+    K: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    fn from_frozen_memtable(
+        factories: &FallbackWSetFactories<K, R>,
+        frozen: FrozenMemtable<WSetLeaf<K, R>>,
+    ) -> Self {
+        Self::from_memtable(factories, frozen)
+    }
+}
+
 impl<K, R> Batch for FallbackWSet<K, R>
 where
     K: DataTrait + ?Sized,
@@ -395,6 +410,15 @@ where
     type Timed<T: crate::Timestamp> = FallbackKeyBatch<K, T, R>;
     type Batcher = MergeBatcher<Self>;
     type Builder = FallbackWSetBuilder<K, R>;
+
+    fn new_memtable(
+        factories: &FallbackWSetFactories<K, R>,
+    ) -> Option<Box<dyn BatchMemtable<Self>>> {
+        Some(Box::new(LeafBatchMemtable::<WSetLeaf<K, R>, Self>::new(
+            factories,
+            &factories.vec_wset_factory,
+        )))
+    }
 
     fn persisted(&self) -> Option<Self> {
         match &self.inner {

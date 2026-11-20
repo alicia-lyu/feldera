@@ -121,6 +121,35 @@ decision of 2026-11-19 in `docs/design/merged-index/decisions.md`):
   `a_partitioned_prefix_filter_reloads_and_refuses_another_prefix`), and `prefix_tests`
   (native tuple keys with both filters).
 
+## Spine memtable (phase 1)
+
+A memtable on integral spines when `StorageOptions::memtable_mib` is set (design and phases:
+[memtable.md](../../docs/design/merged-index/memtable.md)):
+
+- **The tree.** `trace/ord/memtable/`: a B+-tree of general height with `Arc` nodes, copied on
+  write (Rodeh 2008) only while a frozen memtable shares them. Leaves are `VecIndexedWSet`-layout
+  columns (`IndexedLeaf`) or keys and weights (`WSetLeaf`), split at `TreeShape::leaf_bytes`
+  (8 KiB); a split may repeat a key in the next leaf. `Vector::insert_val`, `insert_ref` and
+  `remove_at` (`dynamic/vec.rs`) do the in-leaf shifts. Leaf memory is counted at allocation and
+  released in `Drop`, so copies a snapshot still holds count.
+- **As a batch.** `Inner::Memtable` in the fallback W-set and indexed W-set reads a
+  `FrozenMemtable` in place; `Batch::new_memtable` returns a `BatchMemtable` only for those two.
+  The memtable cursor counts reads as the Vec cursor of its kind does (indexed: yes; W-set: none).
+- **In the spine.** `SharedState` holds the active memtable and the flushing one, under the one
+  state lock. `get_batches` appends the flushing memtable and a frozen memtable of the active one
+  (lazy freeze). `Trace::insert` puts a batch into the memtable unless it exceeds a quarter of
+  the budget; save, `consolidate`, `complete_merges` and `initiate_compaction` first move the
+  memtable in as an in-memory run (`memtable_into_run`).
+- **The budget.** `circuit/memtable_budget.rs`: one `MemtableBudget` per runtime
+  (`Runtime::memtable_budget`), a soft cap. Over it, the largest memtable that is not flushing is
+  asked to seal; the seal runs on the merger runtime (`MergeWorkers::seal_memtable`), copies the
+  memtable through `ListMerger` into a file where `pick_merge_destination` says storage, and logs
+  `RunWriteKind::MemtableFlush`. Memtable bytes count in RSS; memory pressure is unchanged.
+- **Counters.** `SpineRunCounts::memtable_*` and `flushing`; metrics `MEMTABLE_FLUSHES` and
+  `MEMTABLE_STALL_NANOSECONDS` (no stall is implemented yet, so the latter stays zero).
+- Tests: filter `memtable` (tree, leaves, cursor conformance, budget, and
+  `trace::spine_async::memtable_test`).
+
 ## Evicting a set of files from the buffer cache
 
 `BufferCache::evict_files(&HashSet<FileId>)` removes every entry of those files (blocks, trailers,
@@ -142,5 +171,6 @@ file.
 From the repository root, `cargo +1.96.1 test --offline -p dbsp --lib <filter>`:
 
 - `merged_index` and its sub-filters (see the merged-index CLAUDE.md);
+- `memtable` (the spine memtable);
 - `supplied_snapshot_join`, `run_reads`, `read_owner_cursor`;
 - `init_circuits`, `separate_runtimes_miss_each_others_blocks`.
