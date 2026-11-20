@@ -127,33 +127,14 @@ insert(k, v, w):
 
 - A held snapshot must keep seeing the state before later inserts. Key-value locking orders concurrent writers; it cannot give a reader the values from before an update, so there is no concurrency control to build.
 - **A snapshot is held at nearly every insert.** A join's `delay_trace()` snapshot is taken before `UntimedTraceAppend` inserts the same step's delta into the same spine, and the join may read it afterwards (`integrate_trace_inner`, `JoinTrace::eval`). The merged index's `Old` snapshot is read on the view worker in the same way.
-- **Copy-on-write alone would therefore copy in every step**, after Rodeh, "B-trees, Shadowing, and Clones" (ACM Transactions on Storage, 2008). A snapshot shares the root, and an update copies each shared node on its path. Only touched nodes are copied, not the whole memtable: a node another snapshot shares is copied once, and later updates in the same step reuse the copy. The cost per step is still about one leaf per touched key, plus its inner nodes: about 8 KiB per row for a small transaction with scattered keys.
-- **A leaf copy is a deep copy.** A `DynVec` clones each element. An `SqlString` (an `ArcStr`) clones by a reference-count increment, but a `FoldedKey` (a `Vec<u8>`) allocates and copies its bytes. So a merged-index leaf of about 100 entries costs about 200 allocations per copy.
-- Referencing each leaf from the snapshot, rather than the root, does not help. The touched leaves are still shared and still copied; only the inner-node copies are saved, and taking a snapshot would cost one reference-count increment per leaf.
+- **Copy-on-write (chosen)**, after Rodeh, "B-trees, Shadowing, and Clones" (ACM Transactions on Storage, 2008). A snapshot shares the root, and an update copies each shared node on its path. Only touched nodes are copied: a node a snapshot shares is copied once per step, and later updates in the same step reuse the copy.
+- **The cost is the one copy-on-write B-trees pay.** LMDB likewise copies every page a write transaction touches. Row-level MVCC (Postgres, Hekaton) copies only the row, but pays for it with version chains, visibility checks and garbage collection. Here a step copies about one leaf per touched key, plus its inner nodes. A leaf copy is a deep copy: an `SqlString` (an `ArcStr`) clones by a reference-count increment, while a `FoldedKey` (a `Vec<u8>`) allocates. Old copies live only until the snapshot is released.
+- **Measured, not assumed.** The counters report node copies and the time spent copying per transaction. The leaf size is a parameter, so smaller leaves can be measured if copies matter.
+- *Note.* Inserts could be kept pending while a snapshot holds the tree and applied in place once it is released, avoiding copies. This is not planned.
 
-**Deferred fold (proposed 2026-11-19, unconfirmed).** Copies can be avoided where the snapshot pattern above holds: a snapshot is released by the end of its step, before the next step's snapshot is taken.
+**Accounting.** Leaf memory is counted when a leaf is allocated and released when it is dropped, through a counter in each leaf's `Drop`. The budget therefore counts every live leaf, including old copies that a snapshot still holds.
 
-- **Insert while shared.** When `Spine::insert` finds the tree shared (`Arc::strong_count > 1`), the batch is not applied to the tree. It is kept, already sorted and immutable, in a short *pending* list beside the tree.
-- **Fold while unshared.** At the next freeze (`ro_snapshot`, `get_batches`, the spine cursor, `fetch`) or insert, if the tree is unshared, the pending batches are applied to it in place, with no copy. The freeze then shares the updated tree.
-- **Snapshots** hold the tree and the pending batches: a few extra runs at most, each one batch.
-- **Fallback.** If the tree stays shared past a bound (say 4 pending batches, or a byte bound), the oldest pending batch is folded with copy-on-write. A long-held snapshot then costs copies, not unbounded pending runs.
-
-```text
-insert(batch):
-    if tree is unshared: fold(pending); apply(batch)      // in place
-    else: pending.push(batch)                            // no copy
-          if pending over bound: fold_one_with_copy_on_write()
-
-freeze():
-    if tree is unshared: fold(pending)                   // in place
-    return Frozen { tree: Arc::clone(tree), pending: pending.clone() }
-```
-
-In the step pattern above: the step-`s` snapshot holds the tree; the step-`s` insert goes to pending; the snapshot is released at the end of step `s`; and the step-`s + 1` freeze finds the tree unshared and folds in place. The build verifies the pattern with two counters, folds in place and copies, before relying on it.
-
-**Accounting.** Leaf memory is counted when a leaf is allocated and released when it is dropped, through a counter in each leaf's `Drop`. The budget therefore counts every live leaf, including old copies that a snapshot still holds, and pending batches count until they are folded.
-
-**Leaf size** is free of the file's 8 KiB, since the seal repacks. A smaller leaf, of 1–2 KiB, cuts the cost of a copy-on-write fallback at the price of more inner entries. The default is a measured choice.
+**Leaf size** is free of the file's 8 KiB, since the seal repacks. Smaller leaves cut the cost of a copy at the price of more inner entries. The default starts at 8 KiB.
 
 **(b) The inner nodes.** A standard B+-tree: each inner node holds its children's bounds, row counts and `Arc` pointers. They play the value branch's role, with pointers in place of child offsets and sizes. The budget bounds the height: a spine's cap is at most 256 MiB, which at 4–8 KiB per leaf is at most 64k leaves, so a fan-out of about 256 gives height 2.
 
@@ -284,7 +265,7 @@ The build is split into three phases (user, 2026-11-19). The plan for phase 1 li
 - the seal's CPU: one serialization per item, the same work as any file build today, against a batch sort plus a build per transaction;
 - the CPU of per-item inserts, and the vector memmove for wide rows;
 - peak memory during a seal, since the flushing memtable counts in the budget until its file is closed;
-- copies and pending batches while a snapshot is held (counted as `memtable_node_copies` and in-place folds);
+- copies while a snapshot is held (counted as `memtable_node_copies`, with the copy time);
 - accounting drift against RSS (report the delta).
 
 **Run.** A-seek clustered, K = 10, prefix filters on, three arms:
@@ -298,4 +279,3 @@ Report, view first: IVM percentiles, runs per spine, per-run seeks per group, vi
 ## Open questions
 
 - **Where the copy happens** (user, 2026-11-19). At seal, as chosen, or at the first compaction, which would need every sealed memtable forced into L1. See [Where the copy happens](#where-the-copy-happens).
-- **Deferred fold** (proposed 2026-11-19). Is a step's snapshot always released before the next step's freeze? If so, folds happen in place and copies are rare; the counters decide.
