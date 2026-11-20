@@ -4,7 +4,7 @@
 
 **Goal.**
 
-- Initial run generation spans transactions. Out-of-order inserts go into an in-memory structure under its own budget, so the memtable's contents never depend on RSS pressure (user, 2026-11-19).
+- Initial run generation spans transactions. Out-of-order inserts go into an in-memory structure, soft-capped by its own budget. The memtable counts in RSS like any other memory (user, 2026-11-19), so it competes under the same pressure mechanism; the harness lowers the RSS target if needed.
 - The memtable is a B+-tree whose leaves are small sorted arrays. The seal is one ordered pass that copies the leaves into the standard file writer (user, 2026-11-19). Sealed files are packed like any other file.
 - No new dependency. A skiplist, `imbl::OrdMap` and an ART were considered; see [Choosing the in-memory structure](#choosing-the-in-memory-structure).
 - No prefix truncation in memory. Sealed files get prefix truncation, value-header elision and compression from the writer's settings, as any file does.
@@ -185,11 +185,11 @@ insert(k, v, w):
 - Operator outputs and input handles feed other operators' cursors and stay sorted.
 - `ManualIndex`'s `Dlt` is also published to the readers, so its sort stays, but its insert becomes inserts into the memtable.
 
-**(h) The budget, exempt from pressure.**
+**(h) The budget: a soft cap, counted in RSS.**
 
-- **Knob.** `StorageOptions::memtable_mib` (off by default; `openapi.json` hand-edited). A per-spine cap dev tweak defaults to the budget / 4, clamped to [1, 256] MiB.
-- **The budget.** `MemtableBudget` tracks the live leaf bytes of the active and the flushing memtables. A flushing memtable counts until its file is closed. Above the budget, it flushes the largest active memtable.
-- **The pressure rule.** `raw_memory_pressure` compares `rss − live_memtable` against `max_rss − memtable_budget`. So filling a memtable never raises pressure, and RSS stays within `max_rss`.
+- **Knob.** `StorageOptions::memtable_mib` (off by default; `openapi.json` hand-edited).
+- **The budget.** `MemtableBudget` tracks the live leaf bytes of the active and the flushing memtables, including old copies a snapshot still holds. A flushing memtable counts until its file is closed. Above the budget, a background seal takes the largest memtable that is not flushing. There is no per-spine cap. The total may overshoot by at most one batch, since a seal starts between batches; a batch above the budget / 4 bypasses the memtable as a normal run.
+- **Pressure is unchanged** (user, 2026-11-19). The memtable counts in RSS, and `raw_memory_pressure` is Feldera's own. A filling memtable therefore raises pressure, so other runs spill a little earlier when it is full and later after a seal. The harness reports pressure per refresh to show that sawtooth, and lowers the RSS target if the memtable's share needs room. An exemption (pressure computed on `rss − memtable` against `max_rss − budget`) was considered and rejected: it changes the pressure mechanism for one side of the comparison.
 - **Startup** refuses a budget of `max_rss / 2` or more.
 
 **(i) Diagnostics.**
