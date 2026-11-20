@@ -1262,6 +1262,9 @@ struct Config {
     /// (`--index-prefix-filter`, measurement version 17; an A/B arm, off by default). Native
     /// mode has no index and ignores it.
     index_prefix_filter: bool,
+    /// The integral spines' memtable budget in MiB (`--memtable-mib`, measurement version 18);
+    /// `None` leaves memtables off. The budget is a soft cap whose memtables count in RSS.
+    memtable_mib: Option<usize>,
     /// How the reconstructed build's scan session passes untouched groups
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
@@ -1347,6 +1350,13 @@ impl Config {
                 "--front-code-byte-keys" => config.front_code_byte_keys = true,
                 "--elide-value-headers" => config.elide_value_headers = true,
                 "--index-prefix-filter" => config.index_prefix_filter = true,
+                "--memtable-mib" => {
+                    config.memtable_mib = Some(
+                        args.next()
+                            .context("--memtable-mib needs number")?
+                            .parse()?,
+                    )
+                }
                 "--session-pass" => {
                     config.session_pass = Some(parse_pass(
                         &args.next().context("--session-pass needs seek or step")?,
@@ -2265,6 +2275,7 @@ fn storage_options(config: &Config) -> StorageOptions {
     StorageOptions {
         cache_mib: cache_mib(config.cache_bytes),
         compression: feldera_types::config::StorageCompression::None,
+        memtable_mib: config.memtable_mib,
         ..StorageOptions::default()
     }
 }
@@ -2763,7 +2774,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 17,
+        "measurement_version": 18,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2796,6 +2807,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "front_code_byte_keys": config.front_code_byte_keys,
             "elide_value_headers": config.elide_value_headers,
             "index_prefix_filter": config.index_prefix_filter,
+            "memtable_mib": config.memtable_mib,
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
@@ -4104,7 +4116,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 17);
+        assert_eq!(output["measurement_version"], 18);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4271,7 +4283,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 17);
+        assert_eq!(output["measurement_version"], 18);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");

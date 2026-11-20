@@ -955,3 +955,12 @@ Each cell is the median of three repetitions, with the minimum and maximum in br
 The earlier macOS smoke tables (version 1 and version 2) are in [history.md](../../../docs/design/merged-index/history.md). They were measured before POSIX flush fix `f7fec2391`, with byte-string values, no setup compaction, and no prefix truncation. They are not results for the current configuration.
 
 The Linux campaign is a separate pending milestone. Its plan is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md), and its commands are in the [Linux handoff](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/LINUX-HANDOFF.md).
+
+## 2026-11-20: The memtable's dropped phase of cheaper inserts
+
+The [memtable](memtable.md) was planned on 2026-11-19 in three phases. The user dropped the second, cheaper inserts, entirely on 2026-11-20; the measurement on Linux became phase 2. None of these changed what the tree can do, only what an insert costs:
+
+- **`Spine::insert_tuples`**, for unsorted input: skip the per-transaction sort and batch build where the trace is the sole consumer of its input. Q3's join traces are not sole consumers, since each delta also drives a join, so it would save nothing there.
+- **A per-leaf merge** of each sorted batch, in place of the tuple-by-tuple insert: merge the batch's slice for a leaf with the leaf's items in one pass, so the leaf shifts once per batch. It pays only when several tuples of one batch land in one leaf.
+- **A byte leaf** for merged indexes: one contiguous byte area plus offsets, compared with `memcmp`, to save the heap allocation of each `FoldedKey` and payload. It applies only where byte order equals the spine's order.
+

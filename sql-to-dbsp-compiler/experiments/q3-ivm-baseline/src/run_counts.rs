@@ -101,6 +101,12 @@ impl RunCountSampler {
                         "completed_merges": end.completed_merges - start.completed_merges,
                         "merge_real_ms": (end.merge_real_micros - start.merge_real_micros) as f64 / 1000.0,
                         "merge_cpu_ms": (end.merge_cpu_micros - start.merge_cpu_micros) as f64 / 1000.0,
+                        // The memtable is not a run: its tuples and bytes are reported apart.
+                        "memtable_entries_at_end": end.memtable_entries,
+                        "memtable_bytes_at_end": end.memtable_bytes,
+                        "memtable_flushes": end.memtable_flushes - start.memtable_flushes,
+                        "memtable_node_copies": end.memtable_node_copies - start.memtable_node_copies,
+                        "memtable_copy_ms": (end.memtable_copy_nanos - start.memtable_copy_nanos) as f64 / 1e6,
                     }),
                     None => json!({
                         "owner": start.owner.name(), "name": start.name, "alive_at_end": false,

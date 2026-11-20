@@ -253,6 +253,12 @@ is a storage setting too: add the flag to `--build-images` for a separate images
 example `$R5_OUT/images-v17-pf`), and to every campaign that reopens it. The runner rejects a
 report of the other arm.
 
+The memtable arm (`--memtable-mib N`, measurement version 18, off by default) is not a storage
+setting: images load without it, and only the refresh program takes it. Version 18 changed the
+image digest's DBSP sources, so rebuild the images first. `measure.py` does not pass the flag yet,
+and the adapters crate's memtable metrics have not been compiled; both are first steps of the
+memtable's phase 2 ([memtable.md](../../../docs/design/merged-index/memtable.md#phases)).
+
 **Completing an image directory.** `measure.py --complete-images "$R5_OUT/images" --customer ...
 --orders ... --lineitem ... --elide-value-headers` loads, all at once, the images that
 `images.json` lacks, with the executables recorded there (so every image comes from the same

@@ -146,7 +146,7 @@ A memtable on integral spines when `StorageOptions::memtable_mib` is set (design
   memtable through `ListMerger` into a file where `pick_merge_destination` says storage, and logs
   `RunWriteKind::MemtableFlush`. Memtable bytes count in RSS; memory pressure is unchanged.
 - **Counters.** `SpineRunCounts::memtable_*` and `flushing`; metrics `MEMTABLE_FLUSHES` and
-  `MEMTABLE_STALL_NANOSECONDS` (no stall is implemented yet, so the latter stays zero).
+  `MEMTABLE_STALL_NANOSECONDS` (inserts never stall, by decision of 2026-11-20, so the latter stays zero).
 - Tests: filter `memtable` (tree, leaves, cursor conformance, budget, and
   `trace::spine_async::memtable_test`).
 

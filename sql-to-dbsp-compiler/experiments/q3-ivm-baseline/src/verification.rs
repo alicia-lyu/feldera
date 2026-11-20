@@ -421,7 +421,7 @@ type Fixture = (&'static str, Change, bool);
 /// `session_pass` is the reconstructed build's scan-session pass; the native build has no
 /// session.
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
-    replay_with_image(fixtures, session_pass, None, false)
+    replay_with_image(fixtures, session_pass, None, false, None)
 }
 
 /// A scratch storage directory for one test, removed when dropped.
@@ -451,15 +451,22 @@ impl Drop for ScratchStorage {
 #[cfg_attr(not(feature = "merged-index"), allow(unused_variables))]
 ///
 /// `index_prefix_filter` gives the merged index's files prefix filters (`--index-prefix-filter`).
+/// `memtable_mib` gives the integral spines memtables (`--memtable-mib`); a memtable needs
+/// storage, so it keeps the state in a scratch directory even without an image.
 fn replay_with_image(
     fixtures: Vec<Fixture>,
     session_pass: Pass,
     image_after: Option<usize>,
     index_prefix_filter: bool,
+    memtable_mib: Option<usize>,
 ) -> Result<Vec<Value>> {
-    let storage = image_after
-        // Tests run concurrently in one process: name the directory by every parameter.
-        .map(|_| ScratchStorage::new(&format!("{session_pass:?}-prefix-{index_prefix_filter}")))
+    let storage = (image_after.is_some() || memtable_mib.is_some())
+        .then(|| {
+            // Tests run concurrently in one process: name the directory by every parameter.
+            ScratchStorage::new(&format!(
+                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}"
+            ))
+        })
         .transpose()?;
     let config = || -> Result<CircuitConfig> {
         let config = CircuitConfig::with_workers(1).with_splitter_chunk_size_records(8);
@@ -470,7 +477,10 @@ fn replay_with_image(
                     path: storage.0.to_string_lossy().into_owned(),
                     cache: StorageCacheConfig::default(),
                 },
-                StorageOptions::default(),
+                StorageOptions {
+                    memtable_mib,
+                    ..StorageOptions::default()
+                },
             )?)),
         })
     };
@@ -563,7 +573,7 @@ fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
     for fixtures in [rf1_rf2_fixtures, general_fixtures] {
         let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
         for split in [1, fixtures().len() / 2, fixtures().len() - 1] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false)?;
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false, None)?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
@@ -583,15 +593,49 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
     for fixtures in [rf1_rf2_fixtures, general_fixtures] {
         let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
         assert_eq!(
-            serde_json::to_vec(&replay_with_image(fixtures(), Pass::Seek, None, true)?)?,
+            serde_json::to_vec(&replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                None,
+                true,
+                None
+            )?)?,
             whole
         );
         for split in [1, fixtures().len() / 2] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), true)?;
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), true, None)?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
                 "an image after {split} fixtures, with prefix filters"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The integral spines' memtables leave every transcript unchanged, whole and across an image:
+/// the image saves each memtable as a run, and the reopened pipeline fills new memtables.
+#[test]
+fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
+        assert_eq!(
+            serde_json::to_vec(&replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                None,
+                false,
+                Some(1)
+            )?)?,
+            whole
+        );
+        for split in [1, fixtures().len() / 2] {
+            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false, Some(1))?;
+            assert_eq!(
+                serde_json::to_vec(&reopened)?,
+                whole,
+                "an image after {split} fixtures, with memtables"
             );
         }
     }
