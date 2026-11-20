@@ -396,32 +396,45 @@ mod tests {
         let factories =
             OrdIndexedWSetFactories::<DynData, DynData, DynZWeight>::new::<Vec<u8>, u8, ZWeight>();
         let dlt = super::super::batch::build_batch::<u8>(Vec::new()).unwrap();
-        (DynamicSnapshot::with_batches(&factories, Vec::new()), Arc::new(dlt))
+        (
+            DynamicSnapshot::with_batches(&factories, Vec::new()),
+            Arc::new(dlt),
+        )
     }
 
     #[test]
     fn a_publication_is_collected_once_and_finished_once() {
         let views = TransactionViews::<u8>::new("Test");
-        assert!(views.published().err().unwrap().contains("publish merged-index views"));
+        assert!(
+            views
+                .published()
+                .err()
+                .unwrap()
+                .contains("publish merged-index views")
+        );
         assert!(views.finish().unwrap_err().contains("no Test transaction"));
 
         let (old, dlt) = empty_views();
         views.publish(old.clone(), dlt.clone()).unwrap();
         let clone = views.clone();
-        assert!(clone
-            .publish(old.clone(), dlt.clone())
-            .unwrap_err()
-            .contains("finish the previous Test transaction"));
+        assert!(
+            clone
+                .publish(old.clone(), dlt.clone())
+                .unwrap_err()
+                .contains("finish the previous Test transaction")
+        );
         let published = clone.published().unwrap();
         assert!(published.collected().err().unwrap().contains("collect"));
 
         let mut reads = SessionReads::default();
         reads.counts.groups = 2;
         published.set_collected(7, reads).unwrap();
-        assert!(published
-            .set_collected(8, reads)
-            .unwrap_err()
-            .contains("already collected"));
+        assert!(
+            published
+                .set_collected(8, reads)
+                .unwrap_err()
+                .contains("already collected")
+        );
         assert_eq!(views.published().unwrap().collected(), Ok(&7));
 
         assert_eq!(views.finish(), Ok(reads));
