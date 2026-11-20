@@ -7,7 +7,7 @@ Rules here apply to any merged index and any IVM harness in this directory. The 
 | Directory | What it is |
 | --- | --- |
 | `merged-index-col/` | The index library for Customer–Orders–Lineitem (COL): its spec `col.mi`, the generated definition, storage tests, and the Q3 readers. |
-| `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, and encoding and storage tests. Payloads serve Q14 for now; no readers yet. |
+| `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, encoding and storage tests, and the Q14 readers. Payloads serve Q14 for now; no view circuit or harness yet. |
 | `q3-ivm-baseline/` | The Q3 harness: loading, RF1/RF2 refreshes, the index upkeep thread, measurement, and the circuits (base, native view, hand-written reconstructed view). |
 
 How the pieces relate:

@@ -1,6 +1,6 @@
 # merged-index-p: Part–Partsupp–Lineitem index
 
-This standalone library supplies the concrete MI_P definition for DBSP's general merged-index module, `dbsp::trace::merged_index`. It holds steps 1 and 2 of [new-merged-index.md](../../../docs/design/merged-index/new-merged-index.md): the spec, its generated module, tests that pin the encoding, and storage tests with file runs. It has no readers, view circuit, or harness yet. Shared rules for any index and harness are in [experiments/CLAUDE.md](../CLAUDE.md); the generic machinery is in [crates/dbsp/src/trace/merged_index/CLAUDE.md](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md). The sibling [merged-index-col](../merged-index-col/CLAUDE.md) is the worked example.
+This standalone library supplies the concrete MI_P definition for DBSP's general merged-index module, `dbsp::trace::merged_index`. It holds steps 1 to 3 of [new-merged-index.md](../../../docs/design/merged-index/new-merged-index.md): the spec, its generated module, tests that pin the encoding, storage tests with file runs, and the Q14 readers. It has no view circuit or harness yet. Shared rules for any index and harness are in [experiments/CLAUDE.md](../CLAUDE.md); the generic machinery is in [crates/dbsp/src/trace/merged_index/CLAUDE.md](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md). The sibling [merged-index-col](../merged-index-col/CLAUDE.md) is the worked example.
 
 ## Definition
 
@@ -40,7 +40,24 @@ How MI_P differs from COL:
 cargo +1.96.1 test --offline --locked     # this directory
 ```
 
+## Q14 readers (`src/q14.rs`, `src/q14/`)
+
+`V = L ⋈ P` on `partkey`; `ΔV = ΔL ⋈ P⁺ + L⁻ ⋈ ΔP`. Two readers, both at depth 1 (the part group):
+
+| Reader | Requests of | Keeps |
+| --- | --- | --- |
+| `PartsAfter` (`P⁺`) | `ΔL` | the parts of `ΔL`, after: `Old`'s row and `ΔP`'s rows |
+| `LineitemsBefore` (`L⁻`) | `ΔP` | the line items of each part in `ΔP`, before |
+
+- `Q14State` wraps DBSP's `TransactionViews` (publish, `collect(Pass)`, the partner reads `parts_after` and `lineitems_before`, `finish`), as `Q3State` does. `collect` returns `DrivingDeltas { parts, lines }`.
+- The hook is the part step only: `route` copies `Old`'s rows, and the step adds `ΔP`'s rows to `P⁺` in the part's entry, or in an entry of their own if `Old` has no part row. Nothing is computed at routing.
+- The types: `PartByPartkeyVector` (`Tup1<i64>` → `Tup1<p_type>`), `LineitemByPartkeyVector` (`Tup1<i64>` → `LineValue`, `Tup6<l_suppkey, l_orderkey, l_linenumber, l_extendedprice, l_discount, l_shipdate>`). `LineValue` starts with `l_suppkey` so a part's lines arrive in value order (rule in the merged-index CLAUDE.md).
+- `join_lineitems_parts` is the join for the view circuit (`join_with_snapshot_readers`).
+- A Partsupp-only change touches its part's group; the scan visits it and keeps nothing.
+
 `src/tests.rs`: golden key and payload bytes, record order, malformed keys, the trie and its constants (`check_against_trie`), prefix widths and ranges, payload validation, and batch consolidation.
+
+`src/q14/tests.rs`: a worked transaction (a type change, a deleted part, a part inserted with its line, a line moved to another part, a Partsupp-only change, two suppliers out of orderkey order) in both passes; the contract check; a proptest of both readers, their requests, and the delta rule `ΔL ⋈ P⁺ + L⁻ ⋈ ΔP = V(after) − V(before)` against a brute force; and `join_lineitems_parts` in a circuit over four transactions.
 
 `src/storage_tests.rs` sets both storage thresholds to zero, so every run is a file. It keeps what is particular to MI_P; the scale test of DBSP's storage is COL's.
 

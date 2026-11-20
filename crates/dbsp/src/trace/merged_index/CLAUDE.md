@@ -126,6 +126,8 @@ delta's keys, with a forward pointer) and a partner batch holding the requested 
 
 A partner read errors on a delta key outside its reader's requests.
 
+A reader's value must start with the trie's path fields below its request node, in trie order: its builder requires rows in ascending value order within a key, and the index delivers them in path order. MI_P's Lineitem value under `partkey` therefore starts with `l_suppkey` (the proptest of `merged-index-p/src/q14/tests.rs` found the bug without it).
+
 Reused as is: `ReaderDefinition`, `Requests`, `capture`, `route`, `RowBuilder`, sealing. An
 index-specific hook is needed wherever rows are combined rather than copied: the generic `route`
 copies entries and has no notion of a join or of the state before or after the transaction. Q3's
