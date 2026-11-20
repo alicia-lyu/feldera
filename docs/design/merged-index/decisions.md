@@ -514,6 +514,10 @@ On 2026-11-20 the user dropped the phase of cheaper inserts entirely; the measur
 
 On 2026-11-20 the user confirmed that inserts never stall for a seal: while a memtable is sealing, inserts fill a new one, and the total may overshoot the soft cap until the seal ends.
 
+### 2026-11-19: MI_P starts with Q14, in its own index crate
+
+The user decided on 2026-11-19 that MI_P's first served query is Q14 (`L ⋈ P` on `partkey`: one join, no trace reads), and that MI_P's index library is a new sibling crate, `sql-to-dbsp-compiler/experiments/merged-index-p/`, modeled on `merged-index-col/`. Its payloads carry Q14's columns only; each later query adds its columns and regenerates. Where MI_P's readers, view circuits, and harness live stays open.
+
 ## Superseded and withdrawn
 
 Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).

@@ -1,0 +1,27 @@
+-- The Part-Partsupp-Lineitem (MI_P) merged index over schema.sql.
+-- generate.sh compiles this spec into src/generated.rs.
+--
+-- Lineitem takes every path domain from its own columns, so it needs no `via`.
+-- The orderkey node holds no placement: it only orders a supply's lines by
+-- (l_orderkey, l_linenumber), Lineitem's primary key.
+
+domains {
+  partkey   = Part.p_partkey, Partsupp.ps_partkey, Lineitem.l_partkey;
+  suppkey    = Partsupp.ps_suppkey, Lineitem.l_suppkey;
+  orderkey   = Lineitem.l_orderkey;
+  linenumber = Lineitem.l_linenumber;
+}
+
+merged_index PartPartsuppLineitem {
+  partkey {
+    Part: *;
+    suppkey {
+      Partsupp: *;
+      orderkey {
+        linenumber {
+          Lineitem: l_shipdate, l_extendedprice, l_discount;
+        }
+      }
+    }
+  }
+}
