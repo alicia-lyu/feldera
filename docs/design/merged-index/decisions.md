@@ -501,6 +501,10 @@ The user's goal is to implement CH-benCHmark eventually (owner: a future harness
 
 The user decided on 2026-11-19 that the [memtable](memtable.md) keeps typed, sorted leaves in a B+-tree and that its seal copies them, in key order, into the standard file writer, through `ListMerger` with one input. The same day's first design, slotted data blocks assembled into a file without a copy, is dropped: assembly works only per leaf, and an insert-efficient leaf is part empty, holds garbage, and cannot be prefix-truncated. The user corrected the reason the same day: leaf size is not the obstacle, since a file leaf is about 8 KiB. The copy is worth having for three things: packing half-full leaves into full ones, the writer's encodings, and clearing garbage and cancellations. With the copy, the memory layout is free of the file format; the choice of structure and whether the copy belongs at seal or at the first compaction are in [memtable.md](memtable.md), the latter as an open question.
 
+### 2026-11-19: MI_P starts with Q14, in its own index crate
+
+The user decided on 2026-11-19 that MI_P's first served query is Q14 (`L ⋈ P` on `partkey`: one join, no trace reads), and that MI_P's index library is a new sibling crate, `sql-to-dbsp-compiler/experiments/merged-index-p/`, modeled on `merged-index-col/`. Its payloads carry Q14's columns only; each later query adds its columns and regenerates. Where MI_P's readers, view circuits, and harness live stays open.
+
 ## Superseded and withdrawn
 
 Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/DECISIONS.md#superseded-and-withdrawn).

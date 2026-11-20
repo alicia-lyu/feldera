@@ -75,6 +75,7 @@ Each code directory has a short `CLAUDE.md` that Claude loads when it works ther
 | [`sql-to-dbsp-compiler/SQL-compiler/`](sql-to-dbsp-compiler/SQL-compiler/CLAUDE.md) | `.mi` spec parser and validator, Rust emitter, `SqlCircuit::build`, generated names |
 | [`sql-to-dbsp-compiler/experiments/`](sql-to-dbsp-compiler/experiments/CLAUDE.md) | Rules for any merged index and IVM harness: one runtime, accounting, transactions, general deltas, placement, images |
 | [`.../experiments/merged-index-col/`](sql-to-dbsp-compiler/experiments/merged-index-col/CLAUDE.md) | COL's definition and the Q3 readers |
+| [`.../experiments/merged-index-p/`](sql-to-dbsp-compiler/experiments/merged-index-p/CLAUDE.md) | MI_P's definition (Part > Partsupp > Lineitem), step 1: spec, generated module, encoding tests |
 | [`.../experiments/q3-ivm-baseline/`](sql-to-dbsp-compiler/experiments/q3-ivm-baseline/CLAUDE.md) | The Q3 harness: circuits, `ManualIndex`, `verify.sh`, `measure.py`; siblings `MEASUREMENT.md`, `LINUX-HANDOFF.md`, `DECISIONS.md`, `CIRCUIT.md` |
 | [`docs/design/merged-index/slides-oct-8/`](docs/design/merged-index/slides-oct-8/README.md) | The advisor deck; its README holds the editing rules |
 
