@@ -15,6 +15,7 @@ pub mod reader;
 pub mod run_merge;
 pub mod session;
 pub mod testing;
+pub mod transaction;
 pub mod trie;
 
 pub use batch::MergedIndexBatch;
@@ -26,6 +27,10 @@ pub use reader::{
 };
 pub use run_merge::RunMerge;
 pub use session::{Pass, ScanSession, SessionCounts};
+pub use transaction::{
+    OwnerExpansions, OwnerReads, Published, SessionReads, SourceSnapshot, TransactionViews,
+    Weighted, consolidate, measure_collection, multiply_weights, require_requested,
+};
 pub use trie::{ColumnRef, Domain, KeyTrie, Node, Payload, PlacedIndex, Placement, Via};
 
 /// Terminates the key fields of a folded key. No domain may use it as a tag.

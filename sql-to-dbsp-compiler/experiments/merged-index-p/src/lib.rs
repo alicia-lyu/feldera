@@ -55,6 +55,9 @@ fn fold_rows(
         .collect()
 }
 
+/// The partner reads of the Q14 view circuit.
+pub mod q14;
+
 #[cfg(test)]
 mod tests;
 

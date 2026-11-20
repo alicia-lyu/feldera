@@ -20,6 +20,7 @@ Rules for any index and harness: the root `CLAUDE.md` and `sql-to-dbsp-compiler/
 | Merging cursor | `run_merge.rs`: `RunMerge` |
 | Scan session | `session.rs` (tests in `session/`): `ScanSession`, `Pass`, `SessionCounts` |
 | Generic readers | `reader.rs` (tests in `reader/`) |
+| A query's transaction state | `transaction.rs`: `TransactionViews`, `Published`, `SessionReads`, `measure_collection`, `consolidate`, `multiply_weights` |
 | Test helpers | `testing.rs` (`check_against_trie` ties the generated fold constants to the trie) |
 
 ## The key trie
@@ -124,6 +125,8 @@ delta's keys, with a forward pointer) and a partner batch holding the requested 
 | `Reader::into_sealed`, `SealedReader` | The finished requests and partner batch, `Sync`, so joins read with no lock |
 
 A partner read errors on a delta key outside its reader's requests.
+
+A reader's value must start with the trie's path fields below its request node, in trie order: its builder requires rows in ascending value order within a key, and the index delivers them in path order. MI_P's Lineitem value under `partkey` therefore starts with `l_suppkey` (the proptest of `merged-index-p/src/q14/tests.rs` found the bug without it).
 
 Reused as is: `ReaderDefinition`, `Requests`, `capture`, `route`, `RowBuilder`, sealing. An
 index-specific hook is needed wherever rows are combined rather than copied: the generic `route`

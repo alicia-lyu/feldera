@@ -7,7 +7,7 @@ Rules here apply to any merged index and any IVM harness in this directory. The 
 | Directory | What it is |
 | --- | --- |
 | `merged-index-col/` | The index library for Customer–Orders–Lineitem (COL): its spec `col.mi`, the generated definition, storage tests, and the Q3 readers. |
-| `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, and encoding and storage tests. Payloads serve Q14 for now; no readers yet. |
+| `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, encoding and storage tests, and the Q14 readers. Payloads serve Q14 for now; no view circuit or harness yet. |
 | `q3-ivm-baseline/` | The Q3 harness: loading, RF1/RF2 refreshes, the index upkeep thread, measurement, and the circuits (base, native view, hand-written reconstructed view). |
 
 How the pieces relate:
@@ -16,7 +16,7 @@ How the pieces relate:
 - A **hand-written view circuit** (`q3-trie-view-circuit`) takes the readers' batches and the driving deltas through DBSP's `Input` operator handles.
 - A **harness** runs the base circuit and a view circuit in one runtime, maintains the index, and measures. It is the only place that wires index, circuits, and measurement together.
 
-A new index adds sibling crates here. MI_P (for Q2, Q9, Q14, Q16, Q17, Q19, Q20) has its index crate, `merged-index-p/` (user decision of 2026-11-19). Where its readers, view circuits, and harness live, and whether it shares the Q3 harness, are open questions, not decided.
+A new index adds sibling crates here. MI_P (for Q2, Q9, Q14, Q16, Q17, Q19, Q20) has its index crate, `merged-index-p/` (user decision of 2026-11-19). Its readers live there too, and the query-independent transaction state is DBSP's `merged_index::transaction` (user decision of 2026-11-20). Where its view circuits and harness live, and whether it shares the Q3 harness, are open questions, not decided.
 
 ## Rules for any index and harness
 
