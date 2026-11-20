@@ -50,7 +50,7 @@ SESSION_PASSES = ("seek",)
 # refresh's `run_counts` (runs per spine after each transaction, merges, device reads by owner).
 # 16 evicts the base tables' blocks from the cache after each base transaction (`base_eviction_ms`,
 # `base_evicted_bytes`, `configuration.evict_base_after_transaction`).
-MEASUREMENT_VERSION = 17
+MEASUREMENT_VERSION = 18
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
