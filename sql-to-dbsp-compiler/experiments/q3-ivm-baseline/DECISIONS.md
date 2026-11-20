@@ -190,14 +190,9 @@ A campaign used to reopen an image only with the byte-identical executable that 
 
 Report the view circuit (user direction): the base circuit's cost, merged-index upkeep included, is assumed amortized over the views an index serves (two indexes cover 18 of the 22 TPC-H queries), and its side effects on the view are mitigated ad hoc in both modes. Neither view reads the base tables, but in the version 15 pilot the base tables and the merged index evicted each other's blocks from the one cache. Keeping base blocks out of the cache altogether was rejected, since it would also starve their compaction. So the base circuit uses the cache normally, and when its transaction commits the driver evicts its tables' blocks before the view phase (measurement version 16). Later, one base circuit will feed several chained view circuits on the same index.
 
-### 2026-11-20: The memtable arm splits one 512 MiB budget: 448 MiB cache, 64 MiB memtable
+### 2026-11-18: One memory budget: the cache about equals the memory target
 
-- **Arms.** All three run at measurement version 18 from `images-v18-pf`: A-seek clustered, K = 10, dbgen keys, prefix filters on (`--index-prefix-filter`), base eviction on, memory target 512 MiB, cgroup 1 GiB. The split is the one [memtable.md](../../../docs/design/merged-index/memtable.md#the-arm-and-its-limits) specifies.
-  - **512/512, memtable off:** the baseline, as in the prefix-filter A/B.
-  - **448 cache, memtable off:** the control, which separates the smaller cache's effect from the memtable's.
-  - **448 cache + `--memtable-mib 64`:** the arm.
-- **Why the cache gives way.** The memtable counts in RSS. A cache equal to the target keeps the run at critical pressure by construction: RSS was about 720 MiB in the 512/512 pilot. So the memtable's 64 MiB comes out of the cache, and the target is unchanged.
-- **Writes by kind.** These come from separate `--diagnostics` reruns in a 2 GiB cgroup, since the diagnostics logs are held in memory. Their latencies are not reported.
+With Bloom filters storage-resident there is no point in two layers of memory management (user direction). The buffer cache is set equal to the memory target, or nearly, in both modes: the merged index never calls `seek_key_exact`, so its share of memory can all go to cache. First run: target 512 MiB, cache 512 MiB. If that leaves pressure low in both modes, both are halved, and halved again, to gauge performance under memory pressure, the target workload of this work.
 
 ### 2026-11-19: The sequence arm is stopped; cancelled rows are a watch item
 
@@ -215,9 +210,14 @@ Report the view circuit (user direction): the base circuit's cost, merged-index 
 - **Dropped:** timestamp IDs (Snowflake-style: time, node, counter; MySQL's `UUID()`, MongoDB's ObjectId). With one writer they order keys as a sequence does, with gaps that DBSP does not see (user, 2026-11-19).
 - **Base tables and images.** `sequence` and `uuid` re-key the base tables into `<out>/base/`, so each needs its own images. `measure.py --images` refuses refreshes prepared for other base files (`refresh_base_problems`, against `refresh_base` in `prepare-manifest.json`).
 
-### 2026-11-18: One memory budget: the cache about equals the memory target
+### 2026-11-20: The memtable arm splits one 512 MiB budget: 448 MiB cache, 64 MiB memtable
 
-With Bloom filters storage-resident there is no point in two layers of memory management (user direction). The buffer cache is set equal to the memory target, or nearly, in both modes: the merged index never calls `seek_key_exact`, so its share of memory can all go to cache. First run: target 512 MiB, cache 512 MiB. If that leaves pressure low in both modes, both are halved, and halved again, to gauge performance under memory pressure, the target workload of this work.
+- **Arms.** All three run at measurement version 18 from `images-v18-pf`: A-seek clustered, K = 10, dbgen keys, prefix filters on (`--index-prefix-filter`), base eviction on, memory target 512 MiB, cgroup 1 GiB. The split is the one [memtable.md](../../../docs/design/merged-index/memtable.md#the-arm-and-its-limits) specifies.
+  - **512/512, memtable off:** the baseline, as in the prefix-filter A/B.
+  - **448 cache, memtable off:** the control, which separates the smaller cache's effect from the memtable's.
+  - **448 cache + `--memtable-mib 64`:** the arm.
+- **Why the cache gives way.** The memtable counts in RSS. A cache equal to the target keeps the run at critical pressure by construction: RSS was about 720 MiB in the 512/512 pilot. So the memtable's 64 MiB comes out of the cache, and the target is unchanged.
+- **Writes by kind.** These come from separate `--diagnostics` reruns in a 2 GiB cgroup, since the diagnostics logs are held in memory. Their latencies are not reported.
 
 ## Superseded and withdrawn
 

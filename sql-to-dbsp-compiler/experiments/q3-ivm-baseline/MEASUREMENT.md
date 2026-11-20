@@ -1,258 +1,156 @@
 # Maintenance measurement (R5)
 
-R5 compares native and reconstructed maintenance of `V = Customer ⋈ Orders ⋈ Lineitem` under identical refreshes (RF1/RF2 in the campaign) with file-backed maintained state. Reconstructed mode reads the Customer–Orders–Lineitem (COL) merged index in place of four traces (see [reconstruction.md](../../../docs/design/merged-index/reconstruction.md)).
+R5 compares two ways of maintaining `V = Customer ⋈ Orders ⋈ Lineitem` under the same refreshes, with file-backed state:
 
-This file defines what is measured and what remains pending. It merges the former `measurement.md` with the column definitions of the former `RESULTS.md`. The Linux commands (input generation, the pilot, the campaign) are in [LINUX-HANDOFF.md](LINUX-HANDOFF.md); the harness commands are in [CLAUDE.md](CLAUDE.md). The dated macOS smoke results (measurement versions 2 to 11) and the record-size investigation are in [history.md](../../../docs/design/merged-index/history.md). Raw artifacts are local-only, in git-ignored `target/` directories. Following [decisions.md](../../../docs/design/merged-index/decisions.md), nothing here infers an unmeasured quantity.
+- **Native:** Feldera's own traces.
+- **Merged-index** (reconstructed mode): the joins read the Customer–Orders–Lineitem (COL) merged index instead of four traces ([reconstruction.md](../../../docs/design/merged-index/reconstruction.md)).
 
-## Status
+This file says what is measured, which dimensions are decided and which are still measured, and what the results are.
 
-- Harness, runner, and macOS smoke runs (measurement version 2) are done.
-- The macOS smoke runs were repeated in the current configuration after Step 5 (2026-10-22, in history.md); storage matched the packed, elided campaign byte for byte.
-- Measurement version 3 (two chained circuits, refresh pre-read, input eviction) ran the same smoke workloads on 2026-10-25 (in history.md). Storage matched again, and forwarding the base delta as JSON took more time than either circuit in large-group. Forwarding is harness overhead: a single DBSP circuit passes deltas between views as in-memory streams, so the JSON hop has no counterpart in a deployed pipeline.
-- Measurement version 4 (the merged index maintained in the base runtime and booked in `base_ms`; `combined_maintenance_ms` renamed `ivm_ms`) ran the same smoke workloads on 2026-10-26 (in history.md), with base and IVM reported side by side. Storage matched again.
-- Measurement version 5 (2026-11-04) adds run reads: the merged index's per reader, the view worker's per owner in both modes, and the index snapshots' layout. Its timing and write fields are those of version 4. One macOS smoke run per workload and mode is in [Run reads](../../../docs/design/merged-index/history.md), with native joins reading through run cursors.
-- Measurement version 6 (2026-11-05) runs the base and view circuits in one runtime, with one buffer cache, and adds the CPU profiler's per-circuit step CPU time; see [One runtime](../../../docs/design/merged-index/history.md). Its timing definitions are those of version 4.
-- Measurement version 7 (2026-11-10) drops `min_storage_bytes: Some(0)` from the harness and uses DBSP's default run placement in both modes (user decision of 2026-11-09; see [CLAUDE.md](CLAUDE.md#q3-instances-of-the-shared-rules)), and adds the in-memory runs' access counters (`memory_key_reads`, `memory_value_reads`, `memory_weight_reads`) to every run-read record. Its timing and write fields are those of version 6. Results of versions 6 and earlier ran with the override, so they are not comparable in file placement. Version 7 also publishes `Old` and `Dlt` in place of two spine snapshots, so the after reads take `Old`'s runs plus `Dlt`, which follows step placement (in memory unless the runtime is at Critical memory pressure); version 6 read the spine after the append, whose new run could be in a file.
-- Measurement version 8 (2026-11-10) follows roadmap step 4: reconstructed mode runs the hand-written view circuit and one scan session per transaction in place of the four readers' scans. `index_run_reads` is `{session}`, `index_session_counts` and `index_upkeep_run_reads` are new, and `q3_ms`/`ivm_ms` in reconstructed mode now include the session's collection and the push of the driving deltas ([report fields](#report-fields)). Timing and write fields are otherwise those of version 7. No version 8 run has been recorded; version 7 results do not carry over.
-- Measurement version 9 (2026-11-11) books the boundary copy of the driving deltas into the view circuit's input handles in `forward_ms` in both modes (user decision of 2026-11-11). Native's feed of the net delta was already there; reconstructed mode's `push_driving_deltas` moves out of `q3_ms`/`ivm_ms`, which keep the scan session's collection and the view circuit's transaction. The fields are those of version 8. No version 9 run has been recorded.
-- Measurement version 10 (2026-11-11) follows roadmap step 5: reconstructed mode's view circuit takes the driving deltas as whole batches from the typed readers, through DBSP's `Input` operator. Their hand-off to the input handles, before the transaction, is booked in `forward_ms` as native's feed is: `ΔO` and `ΔL` are moved and `ΔC` is cloned, so no row is pushed. The session's collection, in `q3_ms`, now also projects the entries into the readers' typed rows, and the joins' flush no longer projects per request. The fields are those of version 9. No version 10 run has been recorded.
-- The first version 10 run is the macOS smoke run of 2026-11-11, with the session pass as an A/B ([Version 10 smoke](../../../docs/design/merged-index/history.md)).
-- Measurement version 11 (2026-11-12) follows the reader change of that day, in which each reader holds its driving delta's requests and keeps only the rows it requests ([Readers](../../../crates/dbsp/src/trace/merged_index/CLAUDE.md)). `view_run_reads` gains the owner `requested_slice`, the joins' reads of the readers' requested slices, which leave `query`: `query` is now the DBSP operators' own reads. The scan session no longer opens a cursor over `Dlt`, so `cursor_opens` is 1; the capture reads `Dlt` once and fills `payload_decodes_dlt`, and `payload_decodes_old` counts the entries that a reader keeps. The per-owner write arrays gain two owners, `requested_slice` and `partner_trace`, whose writes are zero. `partner_trace` is the native joins' reads of their partner traces (the counterpart of `requested_slice`), so native's `query` is the deltas' and the rest of the circuit's. `driver_run_reads` reports the reads that the driver's thread made while collecting, per owner: the index's, and the routing's reads of the driving deltas under `requested_slice`; the summarizer adds the latter to the `requested_slice` columns, and the raw report keeps the split. Timing fields are those of version 10. No version 11 run has been recorded; version 10's view-worker counters do not carry over.
-- Measurement version 11 (2026-11-12) books the preparation of the view circuit's transaction delta in a new sub-phase, `delta_ms`, inside the IVM window in both modes (user decision of 2026-11-12; it revises version 9's boundary-copy rule). `ivm_ms = delta_ms + q3_ms`. Native's `delta_ms` is the conversion of the net delta into the view circuit's input rows, which was in `forward_ms`; reconstructed mode's is phase A of the collection, which builds `ΔC`, `ΔO`, and `ΔL` from `Dlt` (timed inside `Q3State::collect`, which returns it), plus their hand-off to the input handles (`Pipeline::build_view_delta`), which was in `forward_ms`. `forward_ms` keeps only the net-delta read (`workload::net_delta`), the same operation in both modes. The report shows `delta_ms` beside `ivm_ms`, since the two modes' operations are not identical. `measure.py` requires the field, finite and non-negative, and `ivm_ms >= delta_ms`. The macOS smoke at version 11 is in [Version 11 smoke](../../../docs/design/merged-index/history.md).
-- Measurement version 12 (2026-11-16) adds `block_expansions` (storage-level rebuilds of encoded data blocks on cache misses, apart from item decodes) and the manifest block `storage_device`; it changes no timing field. Through version 12 `measure.py` and `summarize.py` accepted only version 12. Only macOS smoke runs exist at version 12. In a smoke run whose cache and memory target were shrunk to force file runs, every expansion was on reconstructed mode's driver thread (the scan of `Old`, owner `merged_index`) or in the index upkeep. The view worker expanded nothing, since the joins read the readers' in-memory batches, and native expanded nothing.
-- Measurement version 14 (2026-11-17) times every transaction. A refresh may be cut into transactions (`transaction_orders` in the refresh list, from `prepare_inputs.py --transaction-rows`; user decision of 2026-11-17); each refresh's report gives `transactions` and `transaction_latency`, with each transaction's `total_ms` (its foreground wall time), `base_ms`, and `ivm_ms` and their nearest-rank p50, p95, p99, maximum, and mean. The resource, pressure, and window-evidence samples are taken around a refresh, not around each transaction. A refresh that is not cut is one transaction, as in version 13. `measure.py` checks the latencies (`transaction_latency_problems`), and `summarize.py` pools them per phase (`rf1_total_ms_p50`, ...). Both accept only version 14.
-- Measurement version 15 (2026-11-18) writes Bloom filters storage-resident and adds compaction counters (user decisions of [2026-11-18](DECISIONS.md#2026-11-18-bloom-filters-are-storage-resident-read-through-the-buffer-cache)):
-  - **Filters.** DBSP's `StorageOptions::filter_residency` defaults to `storage`: a new file run's Bloom filter is written as 4 KiB partitions (`PartitionedBloomShape`, `StoredPartitionedBloom` in `crates/dbsp/src/storage/file/filter/partitioned.rs`). A probe reads only the partition its key's hash picks, through the thread's buffer cache, where it competes with data blocks; a filter nothing probes is never read. A filter that fits in one partition (fewer than about 1,700 keys) stays memory-resident, since storing it would cost a 4 KiB write per small run. Bits per key and false positive rates follow the modular filters. Roaring filters stay memory-resident. The report records `configuration.filter_residency`. The spine profiles report `bloom_filter_size_bytes` as the memory-resident part, plus `bloom_filter_stored_bytes`, `bloom_filter_partition_loads_count`, and `bloom_filter_partition_cache_hits_count`.
-  - **Cache.** The refresh runs' cache is 256 MiB (`--cache-bytes 268435456`), up from 128 MiB, since filter partitions now share it.
-  - **Counters.** Each refresh has `run_counts`: per spine (owner and name, from `dbsp::storage::diagnostics::spine_run_counts`), the runs after each transaction (minimum, median, maximum), the runs at the refresh's start and end, the runs per level at the end, and the merges completed during the refresh with their real and CPU time; the total runs after each transaction; and `device_reads`, every storage read of the process during the refresh, by reading thread (foreground worker, background merger, other) and split once by read owner and once by write owner (`dbsp::storage::attribution::read_snapshot`). The samples are taken after each transaction's timers stop, and `run_counts_sampling_ms` is removed from the refresh's `foreground_ms`.
-  - `measure.py` and `summarize.py` accept only version 15. The version 14 images cannot be reused: the file format changed.
-- Measurement version 16 (2026-11-18) evicts the base tables' blocks after each base transaction, in both modes ([decision](DECISIONS.md#2026-11-18-base-table-blocks-leave-the-cache-after-each-base-transaction)). The base circuit uses the buffer cache normally, merges included; then `Pipeline::evict_base_blocks` removes every block of CUSTOMER's, ORDERS', and LINEITEM's current files in one pass (`BufferCache::evict_files`), before the merged index's upkeep and the view phase. Each refresh reports `base_eviction_ms` (in neither `base_ms` nor `ivm_ms`; in `total_ms`) and `base_evicted_bytes`; the report records `configuration.evict_base_after_transaction`. Loading does not evict. A base merge still running after an eviction re-admits its blocks until the next transaction's eviction. `measure.py` and `summarize.py` accept only version 16. Version 16 needs new images once: it moved `BaseState` out of `src/workload.rs`, which is an image source, into `src/base_state.rs`, which is not, so that later changes to the refreshes' base state keep the images valid.
-- Measurement version 17 (2026-11-19) adds an A/B arm of prefix filters for the merged index, off by default until the A/B sets it (`--index-prefix-filter`, in `measure.py` and the driver; [decision](../../../docs/design/merged-index/decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter)). Off, the index is as in version 16. On, every file run of the index carries a filter over its customer groups (the first 9 bytes of the folded key) and no whole-key filter, which the index never probed. The scan session's group seeks park the runs whose key bounds or prefix filter rule the group out (`RunMerge::seek_group`), and the driver's `lines_below` reads only the runs that may hold the customer (`SpineSnapshot::retain_prefix`). `view_run_reads` and `index_run_reads` gain `filtered_prefix_probes`: the runs a group seek skipped. The report records `configuration.index_prefix_filter`, and so does `image.json` (`ImageSettings`), so each arm needs its own images, built with the same flag; the runner rejects a report of the other arm. Native mode ignores the flag: its view makes only exact probes. The file format and the image sources changed, so version 16 images cannot be reused, in either arm. `measure.py` and `summarize.py` accept only version 17.
-- Measurement version 13 (2026-11-17) separates loading from the measured runs (user decision of 2026-11-17). A run of `measure.py --images` starts the refresh program (`--from-image`) on its own copy of a loaded image, so its report's `load` is `null` and its `image` records the image (settings, checkpoint, and the image's own `load` record); `qualification` takes the loaded size from `image.load.observed_storage_bytes`. Every restored run is a file, so the window starts with no in-memory run, and the buffer cache starts empty unless `warm_up` applied a warm-up pair. The single-process driver's reports are unchanged apart from `image` and `warm_up` being `null`. `measure.py` and `summarize.py` accept only version 13. Loading, now unmeasured, runs once per image with no cgroup limit and no memory target (`measure.py --build-images`).
-- macOS runs are smoke tests only. Their highest RSS (47.0 MiB in the 2026-10-22 rerun) is far below the 85% pressure threshold of the 512 MiB runtime target (435.2 MiB), so they show neither memory pressure nor beyond-memory behavior.
-- The smoke runs' write and storage gap is explained down to record size; see [the investigation](../../../docs/design/merged-index/history.md#2026-10-14-write-and-storage-investigation). With the packed payloads of [Packed, untagged values](../../../docs/design/merged-index/history.md), the merged index's file is smaller than the four join traces' files in these runs.
-- Pressure instrumentation is implemented, with Linux paths not yet run (see [Pending: pressure evidence](#pending-pressure-evidence)). Pending: the Linux pilot and the three-repetition campaign, all below. Input preparation (`prepare_inputs.py`) exists and ran end to end on macOS at SF 0.01; no SF 10 input has been generated.
+- **The commands** are in [LINUX-HANDOFF.md](LINUX-HANDOFF.md).
+- **Harness details** are in [CLAUDE.md](CLAUDE.md).
+- **Decisions** are in [DECISIONS.md](DECISIONS.md), with generic ones in [decisions.md](../../../docs/design/merged-index/decisions.md).
+- **History.** macOS smoke results (versions 2 to 11) and the record-size investigation are in [history.md](../../../docs/design/merged-index/history.md).
+- **Raw artifacts** stay on the machine that ran them.
 
-## Definitions
+Nothing here infers an unmeasured quantity.
 
-- **Setup versus measured.** Initial loading is setup and is excluded. The measured sequence is the refreshes only, from the first refresh to the last refresh's publication and cleanup.
-- **Completion boundary** (version 2). `completion_boundary=last_refresh_complete`. There is no forced compaction, no final compaction wait, and no extra publication transaction. Loading waits only for naturally eligible background merges, then publishes once with an empty transaction. Version 1 forced a final compaction; its results are historical and not comparable (see [history.md](../../../docs/design/merged-index/history.md#2026-10-08-r5-version-1-smoke-runs)).
-- **Two circuits** (version 3, with the index moved in version 4). The base tables and the view are separate circuits, chained by the base circuit's net delta (they ran in separate runtimes through version 5, and share one runtime from version 6) (the forwarding hop is harness overhead with no counterpart in a deployed single-circuit pipeline; it is excluded from the base and IVM figures but inside the sequence totals). The merged index is secondary storage of the base relations, so `ManualIndex` runs in the runtime (auxiliary thread, buffer cache, storage directory) and its upkeep is base maintenance: `base_ms` is the base circuit's transaction plus `index_ms`, which is a sub-phase of `base_ms` and never added to it again. `ivm_ms` equals `q3_ms`, the view circuit alone; the view circuit's join readers read the index through published snapshots. Base and IVM are always reported side by side, and an IVM figure alone is never quoted as a saving (see "Timing definitions" below). The report records the runtime's storage directory and cache (`configuration.runtime`) and the cache occupancy and capacity (`sequence.cache_*`); through version 5 it recorded these per circuit (`configuration.circuits`, `sequence.circuits`). `measurement_version` 2 results timed base-relation maintenance inside `q3_ms`, and version 3 results booked the index in `combined_maintenance_ms` (`index_ms + q3_ms`) and not in `base_ms`; neither is comparable with version 4.
-- **Refresh deltas stay whole.** Each refresh is complete in RAM. An oversized legitimate refresh must fail rather than be split to fit a budget.
-- **Refresh files are pre-read** (version 3, before any smoke run at that version). After loading and setup compaction, and before the window opens, the driver parses every refresh file into memory: RF1 into the `Change` the loop applies, RF2 into its key set. The loop consumes each by value and drops it once applied. The window therefore times no file read or parse: RF1 `checks_input_preparation_ms` no longer includes them, and RF2 `discovery_ms` is the key lookup alone. Version 2 timed them inside the window, so those two columns are not comparable. The pre-read memory is ordinary process memory, equal in both modes; it counts toward DBSP's RSS-based pressure level and the window peak. `refresh_inputs` reports the row counts and `VmRSS` before and after the pre-read (Linux).
-- **Input page cache evicted.** On Linux the driver calls `posix_fadvise(DONTNEED)` on every base input and refresh file it read, after the pre-read and before the window; inside the run's cgroup, before the driver starts, `measure.py` does the same for every input (after an `fsync`). Every run of every campaign reads one set of input files in place, and none is copied, so this eviction is what makes each run start cold ([decisions.md](DECISIONS.md#2026-11-11-one-set-of-inputs-read-in-place-every-run-starts-cold)); a run whose inputs were not evicted does not qualify. The driver reports `inputs_evicted` with the cgroup's `memory.current` before and after. The DBSP buffer cache is left warm, since clearing it would need a new DBSP API; its occupancy is recorded at window start and end (`sequence.cache_occupancy_at_window_start_bytes`).
-- **Window versus lifetime.** `resources.peak_rss_bytes` is the process-lifetime high-water mark and includes loading. The window figures below cover the refreshes only.
-- **Durability.** Refresh completion implies none. Checkpoint costs are deferred.
-- **Equality of inputs.** Both modes receive the same logical refreshes; the runner records input and executable SHA-256 hashes in a manifest (`measure.py`).
-- **Excluded.** Independent full-join validation runs only on request (`--no-verify` omits it) and is outside the measured interval. Reconstruction decoding, copying, sorting, spill, and output cleanup remain inside their real intervals.
+**Contents:**
+1. [Synopsis](#synopsis): every result in one table.
+2. [Dimensions](#dimensions): active and decided.
+3. The dated results.
+4. [Pending: Linux campaign](#pending-linux-campaign).
+5. Definitions and report fields.
+6. [Appendix: measurement versions](#appendix-measurement-versions).
 
-Per-refresh phases (`discovery`, `checks_input_preparation`, `base` (includes `index` in reconstructed mode), `forward`, `index` (a sub-phase of `base`), `q3`, `publication_cleanup`, `ivm = q3`), sequence wall time and CPU, and the storage, RSS, and cache columns are defined under "Column definitions" below. Backend read and write counters are storage-backend operations, not OS I/O. On Linux the driver also records OS physical `read_bytes` and `write_bytes` from `/proc/self/io` (`linux_physical_io` in `q3-ivm-baseline/src/measurement.rs`); these count the whole process, and they are `null` on macOS. When `--cgroup-root` is given, the runner additionally records the run cgroup's `io.stat` (`cgroup_evidence` in `measure.py`).
+## Synopsis
 
-## RF2 discovery
+**How to read the table:**
+- Every figure is from one-repetition pilots: SF 10, A-seek, K = 10, clustered unless noted, on the SSD.
+- The view column is per-transaction `ivm_ms` p50 in ms, RF1 / RF2, over refreshes 2 to 6. The pilots of 2026-11-18 pool every refresh.
+- Base is amortized over the views an index would serve, so it comes last ([decision](DECISIONS.md#2026-11-18-base-table-blocks-leave-the-cache-after-each-base-transaction)).
+- Rows differ in measurement version and settings: compare within a row, not across rows.
 
-The driver keeps one `BaseState` of shared Catalog batch snapshots and replaces it after each transaction (`CatalogHandle::concat` consumes its output mailbox, so a second copy of the relations is not kept). RF2 order IDs are resolved from the current maintained Orders snapshot. Complete deletion rows come from native Lineitem primary-key ranges, or from the merged index's `(custkey, orderkey)` line range in reconstructed mode. Requested IDs are deduplicated; absent Orders are ignored and counted. Discovery never rescans base files or replays refreshes.
+| Dimension | Arms measured (version) | View: `ivm_ms` p50 | Base: `base_ms` p50 | Status |
+| --- | --- | --- | --- | --- |
+| Prefix truncation | A (on), B (off) (v14) | merged-index A 4.51 / 3.07, B 5.55 / 3.61; native the same in both (3.6–3.8 RF1) | merged-index A 1.44 / 1.94, B 1.62 / 2.26 | **Decided 2026-11-18:** on (A only) |
+| Session pass | seek, step (v14) | step: the merged-index run was stopped after 49 min (seek: about 7 min) | — | **Decided 2026-11-18:** seek |
+| Setup compaction | on, off (v4–6, macOS) | — | — | **Decided 2026-11-09:** off; the flag stays to isolate fragmentation |
+| Filter residency | memory, storage (v14–15) | — (the motive was memory: 305 MiB native and 461 MiB merged-index of resident filters after restore) | — | **Decided 2026-11-18:** storage-resident |
+| Memory budget | cache 128 (v14), 256 (v15), 512 (v16); target 512 | 512/512: native 3.88 / 4.46, merged-index 4.31 / 3.38, both `critical` from refresh 3 | native 3.4 / 8.0, merged-index 3.8 / 15.5 | **Decided 2026-11-18:** one budget, the cache about equal to the target; 512/512 now |
+| Base eviction | on (v16) | not measured in isolation (it came with the 512 MiB cache) | eviction 5.5–6 ms, in neither phase | **Decided 2026-11-18:** on, always |
+| Prefix filter | off, on (v17) | merged-index off 4.56 / 3.36, on 3.98 / 3.06; index seeks 9.8 → 2.5 and 26.6 → 7.0 | off 3.77 / 15.57, on 3.56 / 14.68 | **Active:** the default awaits the user |
+| Order keys | dbgen (v16–17), uuid (v17), sequence (stopped) | uuid: native 3.88 → 5.76 / 4.46 → 9.28; merged-index 4.56 → 4.15 / 3.36 → 3.49 | uuid: native 13.86 / 11.44, merged-index 11.92 / 20.20 | **Decided:** dbgen is the default, and `sequence` and timestamp IDs are out. **Active:** uuid |
+| Memtable | 512/512; 448 cache; 448 + 64 MiB memtable (v18) | running | running | **Active:** [running](#memtable-at-512-mib-2026-11-20) |
+| Workload | clustered, scattered (v14) | clustered: native 3.77 / 4.63, merged-index 4.51 / 3.07; scattered: native 4.30 / 4.44, merged-index 8.06 / 3.14 | 1.0–1.4 / 1.1–1.9 | **Active:** scattered not run since v14 |
+| Transaction size | K = 10 | as above | — | **Active:** K = 100 and 1,000 next |
+| Device | SSD | as above | — | **Active:** the hard-disk probe has not run |
 
-## Buffer cache
+What the rows add up to, so far:
+- **Where the merged index helps.** Its view is faster on deletes (RF2) in every measured setting, and it holds its latency when Order keys are random, while native's doubles.
+- **Where it pays.** With dbgen keys its inserts (RF1) are slower, since each transaction lands on a new customer's group (first-touch reads), and most of all with scattered customers. With uuid keys its RF1 is the faster one.
+- **The prefix filter** cut the index's seeks by three quarters and its RF1 median by 13%.
+- **Pressure.** Every run since the 512 MiB cache is at `critical` pressure, which is the target regime ([one budget](#one-budget-at-512-mib-base-tables-evicted-2026-11-19)).
 
-The driver's snapshot reads and the manual-index auxiliary thread would otherwise use the runtime's fixed 256 MiB fallback cache, outside `StorageOptions.cache_mib`. They run inside `Runtime::with_buffer_cache` (`crates/dbsp/src/circuit/runtime.rs`), bound to the configured worker cache, so the reported cache capacity covers driver reads, Q3 workers, and the manual index. No new cache is created. The manual index's thread, the driver (for RF2 discovery and verification reads), and the workers all use the one runtime's cache (version 6). Through version 5 the index was written through the base runtime's cache and read by the view worker through the view runtime's cache.
+## Dimensions
 
-## Report fields
+### Active
 
-The JSON report (`q3-ivm-baseline/src/main.rs`) records:
+| Dimension | Arms | Selected by | Own images? | Now | Next | Decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| Memtable | off; `--memtable-mib N` | the campaign's `--memtable-mib` | no | the three arms are running | report, view first | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget) |
+| Prefix filter | off, on | `--index-prefix-filter` on `--build-images` and on the campaign | yes | on in the memtable arms | the user sets the default | [decision](../../../docs/design/merged-index/decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter) |
+| Order keys | `dbgen` (default), `uuid` | `prepare_inputs.py --order-keys`; images from `<out>/base` | yes | dbgen | uuid as an arm of later runs | [decision](DECISIONS.md#2026-11-19-order-keys-are-a-dimension-dbgen-sequence-uuid) |
+| Workload | clustered, scattered | the refresh list (`clustered/`, `scattered/`) | no | clustered | scattered at the current version | [decision](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order) |
+| Transaction size | K = 10, 100, 1,000; the TPC-H batch later | `prepare_inputs.py --transaction-rows`, one `--out` per K | no | K = 10 | K = 100, then 1,000 | [decision](DECISIONS.md#2026-11-17-transaction-size-is-a-dimension-small-transactions-first) |
+| Device | SSD; hard disk as a probe | `--storage-path`, `--device-label` | no | SSD | the hard-disk probe, pilots only | [decision](DECISIONS.md#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe) |
+| Repetitions | 1 (pilot), 3 (campaign) | `--runs` | no | 1 | `--runs 3` once the arms are chosen | — |
 
-- `measurement_version` (14), `completion_boundary` (`last_refresh_complete`), and `compaction_policy` (`no forced compaction; loading waits for normal background merges only; no final wait`, or with `--setup-full-compaction`, `setup full compaction after loading, before the refreshes; no compaction requested after any refresh; no final wait`);
-- `configuration.front_code_byte_keys` and `configuration.elide_value_headers` (booleans), with the writer counters `front_coding` and `value_header_elision` (blocks written encoded, `layout_fallbacks`, `size_fallbacks`; see [CLAUDE.md](CLAUDE.md)). The key encoding of `--front-code-byte-keys` is prefix truncation; the code keeps the older name;
-- `configuration.session_pass` (version 10): `seek` or `step`, the pass the reconstructed build's scan session uses for untouched groups (`--session-pass`, default `seek`); `null` in native mode, which has no scan session. `measure.py` checks it against the pass it asked for;
-- `configuration.min_storage_bytes` (version 7): the resolved `min_storage_bytes`, DBSP's default 10 MiB (`Runtime::DEFAULT_MIN_STORAGE_BYTES`), with `min_storage_bytes_source` (the harness sets no value) and `run_placement`, which says what the default does at each memory-pressure level. `min_step_storage_bytes` is the default too, unlimited;
-- `configuration.setup_full_compaction` (boolean) and `load.setup_full_compaction`: `null` by default; with the flag, `wait_for_compaction_ms`, `elapsed_ms` (request full compaction plus wait for compaction to finish), and a `resources` block with that setup's writes by owner. `load.background_merge_wait_ms` excludes this time;
-- `sequence.snapshot_publication_transactions` (0; the loading phase reports 1);
-- `load.background_merge_wait_ms` and `load.observed_storage_bytes` (loading only, not part of the refresh sequence);
-- `sequence.observed_storage_bytes`, taken after the last refresh without a compaction wait, so background merges may still be active; it is not a settled size;
-- per Catalog relation: `snapshot_batch_count`, `memory_batch_count`, `storage_batch_count`, `file_backed`; and `manual_index_storage` for the auxiliary index. Memory batches are permitted, so `file_backed` does not mean every batch is on disk;
-- OS I/O counters, `null` where unavailable (macOS);
-- `backend_write_by_owner` in every `resources` block (each refresh and the sequence): write operations and bytes per owner, keyed `query`, `base_relation`, `merged_index`, `requested_slice` and `partner_trace` (version 11; the last two are read owners, so their writes are zero, which `measure.py` checks). The owners sum to `backend_write_operations` and `backend_write_bytes`, which are unchanged. A file's owner is fixed when its writer is created, and a spine's owner when the spine is created; a background compaction runs under its spine's owner. `query` covers join traces, V and query execution; `base_relation` covers the input-map state and the base tables' delta accumulators; `merged_index` covers `ManualIndex`. A native run reports no `merged_index` writes. `measure.py` rejects a report whose owners do not sum to the totals;
-- per refresh, `index_run_reads` (version 5; `null` in native mode): from version 8 it is `{session}`, the `RunReads` (`seeks`, `filtered_probes` (exact probes answered by a file run's filters, key range then Roaring bitmap or Bloom filter, with no seek), `key_decodes`, `value_decodes`, `weight_decodes`, `memory_key_reads`, `memory_value_reads`, `memory_weight_reads`) that the view phase's scan session made on the driver's thread, under the `merged_index` read owner; `Q3State::finish` returns them (`SessionReads`). Versions 5 to 7 reported the same fields per reader (`customers_after`, `orders_before`, `joined_orders_after`, `lineitems_before`). `sequence.index_run_reads` sums the refreshes. File runs count the decodes and in-memory runs count the `memory_*` reads, by the same rules (a landing reads a key, a value counts once per position, each weight returned reads a weight). The two are never added: a memory read deserializes nothing, so it costs a cache line, not a block read and a deserialization. Decodes are not disk reads: a decoded entry usually comes from the buffer cache, so compare `backend_read_operations` for storage traffic. The `filtered_probes` field was named `filter_rejections` until 2026-11-16, and the macOS version 11 smoke manifests use that name; the numbers are unchanged, so the measurement version stays 11;
-- per refresh, `index_session_counts` (version 8; `null` in native mode): the scan session's `SessionCounts` (groups, cursor opens, logical seeks and steps, positions, payload decodes from `Old` and `Dlt`, cancelled values). From version 11 `cursor_opens` is 1, `payload_decodes_old` counts the entries that a reader kept, and `payload_decodes_dlt` is the capture's (one decode per `Dlt` entry that a driving delta took). `sequence.index_session_counts` sums the refreshes, which `measure.py` checks, as it does for `index_upkeep_run_reads` and for `profiled_cpu_ms` in both modes;
-- per refresh, `index_upkeep_run_reads` (version 8; `null` in native mode): the `RunReads` of base maintenance, namely `prepare`'s reads of `Old` for the lines of an order whose owner changes. They belong to the base phase, so they stay apart from `index_run_reads`. `sequence.index_upkeep_run_reads` sums the refreshes;
-- per refresh, `view_run_reads` (version 5, both modes): the view worker's `RunReads` in the view transaction, per read owner (`query`, `base_relation`, `merged_index`, and from version 11 `requested_slice`, `partner_trace`), from `DBSPHandle::run_reads` before and after the transaction. Native join traces count under `query`. In reconstructed mode `query` holds the DBSP operators' own reads (the deltas'), and the joins' reads of the readers' requested slices, with their reader callbacks, count under `requested_slice` (a native run has none, and `measure.py` requires some over a reconstructed run's sequence). Native joins' reads of their partner traces, and their sampling, count under `partner_trace` (a reconstructed run has none, and a native run must have some). `summarize.py` reports the operators' counters as `dbsp_operator_*` (every owner but those two), the partner traces' as `partner_trace_*`, and the slice's as `requested_slice_*`, which include the driver thread's routing reads. The partner-read contract check (every circuit delta key is a request of its reader) runs only in tests and validation runs, never in a measured run; its walk of the circuit's delta, when on, is under `query`. The scan session reads the index on the driver's thread (`Pipeline::collect_groups`, inside `in_cache`), not on the view worker, so the worker's `merged_index` part is zero in both modes (`measure.py` checks it); the session's reads are in `index_run_reads`. The same fields as `index_run_reads`, so native traces' memory runs count as well as the index's. Only indexed Z-set runs count, so other traces, such as `V`'s output, are not in either mode's figures. Background compaction runs on other threads and is excluded. `sequence.view_run_reads` sums the refreshes;
-- per refresh, `profiled_cpu_ms` (version 6, both modes): the CPU profiler's step CPU time of the base circuit (`base`) and the view circuit (`q3`) in that refresh's transactions, from the diff of `retrieve_profile` snapshots (the root circuit's `circuit_cpu_time_seconds`) taken before the base transaction, after it, and after the view transaction. It cross-checks `base_ms` and `q3_ms`; it is not a phase. `base` excludes the merged index's upkeep, which runs on its own thread, and the snapshots are read outside the phase timers. The profiler is enabled in both circuits for the whole run;
-- per refresh, `index_layout` (version 5; `null` in native mode): for the views that the view circuit's before and after reads take (`before` is `Old`; `after` is `Old`'s runs plus `Dlt`, from version 7), the nonempty runs and their `approximate_byte_size` bytes, under `file` and `memory`;
-- `storage_device` (measurement version 12): the device behind the campaign root `--storage-path`, as `path`, `device` (the parent disk, such as `/dev/nvme0n1`), `filesystem`, `logical_sector_bytes`, `rotational` (a boolean), `model`, and `label` (from `--device-label ssd|hdd`, which `measure.py` rejects if it contradicts `rotational`). Every field but `label` is `null` on macOS or when the device cannot be resolved; a device-mapper, md, loop, or zram device is reported unresolved, not guessed. `summarize.py` shows the label beside the arm;
-- `block_expansions` (measurement version 12), per refresh (`refreshes[].block_expansions`) and for the window (`sequence.block_expansions`, the sum of the refreshes). Each has `view_worker.<owner>` for the five read owners, `driver.<owner>` (the collecting thread, `null` in native mode), and `index_upkeep` (base maintenance's reads of `Old` in `reconstruction::prepare`, `null` in native mode). Each entry has `prefix_truncated_blocks`, `prefix_truncated_encoded_bytes`, `prefix_truncated_expanded_bytes`, `elided_blocks`, `elided_encoded_bytes`, and `elided_expanded_bytes`. A block expansion is the storage-level rebuild of one encoded data block on a buffer-cache miss (`front_code::decode` in `decompress`, `crates/dbsp/src/storage/file/reader.rs`). It is not an item decode: `RunReads` keeps "decode" for the key, value, and weight that a cursor deserializes, and does not count expansions. A hit expands nothing, and an unencoded (fallback) block is never expanded. `encoded_bytes` is the block as loaded after decompression, including an uncompressed block's sector padding. `measure.py` checks that the counts are well formed non-negative integers, that the window equals the sum of the refreshes, that bytes are 0 when blocks are 0 and expanded bytes are at least encoded bytes, and that an encoding that is off has 0 counts. See [storage-layout.md](../../../docs/design/merged-index/storage-layout.md#prefix-truncation-on-the-read-path);
-- the layout-fallback gate (user decision of 2026-11-16): `measure.py` rejects a report whose `front_coding.layout_fallbacks` is not 0 with prefix truncation on, or whose `value_header_elision.layout_fallbacks` is not 0 with elision on. `size_fallbacks` stay unchecked, since they are legitimate;
-- `load` (the single-process driver) or `image` (the refresh program, measurement version 13): `load` is the loading record (`rows`, `transactions`, `observed_storage_bytes`, `background_merge_wait_ms`, `setup_full_compaction`, ...); `image` is the image the run reopened, as `directory` (the run's copy), `settings` (`mode`, `workers`, `front_code_byte_keys`, `elide_value_headers`, which the refresh program requires to match its own), `checkpoint` (DBSP's `CheckpointMetadata`), `inputs` (the base files loaded), and `load` (the load program's record). The other is `null`. `warm_up` is `null`, or the warm-up's `refresh_list`, `refreshes`, and `elapsed_ms`; the warm-up is outside every window figure;
-- `os` (`std::env::consts::OS`), which the summarizer uses to decide whether Linux-only fields may be `null`;
-- `refresh_inputs`: `per_refresh` row counts (RF1 `orders` and `lines`; RF2 `order_keys`), and `vm_rss_before_pre_read_bytes` and `vm_rss_after_pre_read_bytes` (Linux; `null` elsewhere), which measure the pre-read's fixed overhead;
-- `inputs_evicted`: `evicted` (true only on Linux with every file advised), `files`, `failures`, and `cgroup_memory_current_before_bytes` and `..._after_bytes` (`null` outside cgroup v2). `evicted` is false on macOS;
-- per refresh, `memory_pressure.before` and `memory_pressure.after`: the level (`low`, `moderate`, `high`, `critical`) of the `runtime`, sampled at the refresh's boundaries. DBSP updates its level about once a second from RSS, so a sample can lag;
-- `sequence.window_peak_rss_bytes` and `sequence.window_end_rss_bytes` (Linux only, `null` elsewhere): `VmHWM` after `clear_refs` reset it at window start, and `VmRSS`, at window end. `window_peak_rss_error` holds the reason the reset failed, in which case the peak is `null`;
-- `sequence.cgroup` (Linux with cgroup v2; `null` otherwise): `path`; `before`, `after` and `delta` of `memory.current`, `memory.events`, the named subset of `memory.stat` that the kernel has (`anon`, `file`, `pgfault`, `pgmajfault`, `pgscan`, `pgsteal`, `workingset_refault[_anon|_file]`) and `memory.pressure` (`delta` gives total stall microseconds); and `peak` with `window_peak_supported`, `window_peak_bytes` (from resetting `memory.peak` by writing to it and reading it through the same open file, kernel 6.12 and later; UNVERIFIED on the project's Linux host), `lifetime_peak_at_end_bytes`, and `max_sampled_memory_current_bytes` (the fallback: the maximum over the window start, each refresh end and the window end). A missing file gives `null` for its fields. These are evidence of memory use, not proof of pressure;
-- `sequence.window_started_micros` and `sequence.window_finished_micros` (Unix-epoch microseconds), which place the flush and compaction logs of `--diagnostics` runs inside or outside the window; and `configuration.diagnostics`, the diagnostics directory or `null`.
+### Decided
 
-From version 11, `ivm_ms` is `delta_ms + q3_ms`; `delta_ms` prepares the view circuit's transaction delta (native: the net delta's conversion into input rows; reconstructed: phase A, which builds the driving deltas from `Dlt`, and their hand-off to the input handles), and `q3_ms` is the view circuit's transaction, with the scan of `Old` (phase B) before it in reconstructed mode. `forward_ms` is the net-delta read only. A transaction's latency (`latency_summary`) is its `ivm_ms`. In version 4, `q3_ms` (then equal to `ivm_ms`) is the view circuit's transaction alone, and `base_ms` times the base circuit's transaction (the primary-key input maps, `add_input_map_persistent`, owner `base_relation`, and their delta accumulators) plus the merged index's append (`index_ms`, owner `merged_index`). Version 3 left the index out of `base_ms`. In version 2, including the 2026-10-22 macOS rerun, `q3_ms` was the single `circuit.transaction()` and covered both; that base maintenance is common to both modes and dilutes any version 2 ratio between them.
+Each row is a fixed setting of every run. The reasoning is as the decision entry records it.
 
-Process CPU includes natural background merges inside the interval. Reconstruction's temporary-batch decoding, copying, and sorting are charged to `q3_ms` (and so `ivm_ms`).
+| Dimension | Decided setting | Dropped | Date | Reasoning | Last result |
+| --- | --- | --- | --- | --- | --- |
+| Prefix truncation | on (arm A), with value-header elision on | arm B (prefix truncation off) | [2026-11-18](DECISIONS.md#2026-11-18-arm-b-and-the-step-pass-are-retired) | The entry records the user's decision and no further reason. | v14: B was slower in merged-index mode (RF1 5.55 against 4.51 clustered, 8.82 against 8.06 scattered); native was the same |
+| Session pass | `seek` | `step` | [2026-11-18](DECISIONS.md#2026-11-18-the-step-arms-are-dropped) | Under `step` a small transaction walks about half the index from the session's start. | A-step's merged-index run read 15 GB in 49 min and was stopped |
+| Setup compaction | off | on (kept as `--setup-full-compaction`) | [2026-11-09](DECISIONS.md#2026-11-09-no-setup-compaction-is-the-default-workload) | No compaction before the refreshes is the more realistic workload; the flag isolates fragmentation. | v4–6 macOS smoke ran with it on |
+| Filter residency | storage-resident Bloom filters, read through the buffer cache | memory-resident | [2026-11-18](DECISIONS.md#2026-11-18-bloom-filters-are-storage-resident-read-through-the-buffer-cache) | Resident filters took 305 MiB native and 461 MiB merged-index; two were never probed. A budget beats a per-spine opt-out (RocksDB's partitioned filters). | v14 window start: 361–371 MiB native and 527–528 MiB merged-index anonymous memory |
+| Memory budget | one budget: the cache about equals the target; 512/512 now, halved only if pressure stays low | cache 128 MiB, then 256 MiB, separate from the target | [2026-11-18](DECISIONS.md#2026-11-18-one-memory-budget-the-cache-about-equals-the-memory-target) | With filters on storage, two layers of memory management have no point. | 512/512 reached `critical`, so it is not halved |
+| Base eviction | the base tables' blocks are evicted after each base transaction | — | [2026-11-18](DECISIONS.md#2026-11-18-base-table-blocks-leave-the-cache-after-each-base-transaction) | Report the view; the base cost is amortized, and its side effects on the view are mitigated in both modes. | v15: base and index blocks evicted each other from the one cache |
+| Order keys | dbgen as the default | `sequence` (stopped); timestamp IDs | [2026-11-19](DECISIONS.md#2026-11-19-the-sequence-arm-is-stopped-cancelled-rows-are-a-watch-item) | `sequence`'s key space is close to dbgen's, and its run was slowed by cancelled rows at the key range's front ([watch item](../../../docs/design/merged-index/compaction.md#watch-for-cancelled-rows-at-the-front-of-the-key-range)). Timestamp IDs order like a sequence with one writer. | `sequence`: 3 h 37 min against 23 min, and 85 of 86 GB read by the driver's lookups |
+| RF1 selection | clustered: TPC-C NURand in sessions of 4; scattered: uniform; only Customers whose key is not a multiple of 3 | Zipf over a permutation | [2026-11-17](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order) | Independent draws tie locality to popularity; sessions make locality its own parameter. | — |
+| RF2 selection | the oldest Orders, the same in both workloads | per-workload rules | [2026-11-04](DECISIONS.md#2026-11-04-rf2-deletes-the-oldest-orders) | An analytical database ages out its oldest history. | — |
+| Loading | once, into an image per mode; each run starts a new process from a copy | loading inside each run | [2026-11-17](DECISIONS.md#2026-11-17-load-once-into-an-image-each-refresh-run-is-a-new-process-from-a-copy-of-it) | Loading SF 10 under 1 GiB took 96 min and timed out before any refresh. | — |
+| Cold start | inputs evicted; the cache starts empty (`--warm-up` optional, unused) | warm cache from loading | [2026-11-11](DECISIONS.md#2026-11-11-one-set-of-inputs-read-in-place-every-run-starts-cold) | Every run starts the same way from the same inputs. | — |
+| Run placement | DBSP's default in both modes | `min_storage_bytes: Some(0)` | [2026-11-09](../../../docs/design/merged-index/decisions.md#2026-11-09-dbsps-default-placement-in-both-modes) | Let memory pressure decide what reaches disk. | — |
+| Workers | one | — | root [CLAUDE.md](../../../CLAUDE.md) | Maintenance and loading both use one worker. | — |
 
-## Workloads
+### Adding a dimension, an arm, or a version
 
-Three macOS smoke workloads exist, each starting from 64 Customers, 512 Orders, and 2,048 Lines (table under "Workload definitions" below): clustered (16 Orders on one Customer per RF1), scattered (16 Orders on 16 Customers), and large-group (one Order with 10,000 Lines). Each runs the sequence RF1, RF2, repeated RF2 (absent Orders), RF1 reinsertion, RF2, empty RF2.
-## Column definitions
-
-These definitions come from the former `RESULTS.md`. The Status section and "Report fields" above hold the changes of later measurement versions, which win where they differ.
-
-### Workload definitions
-
-All three smoke workloads start with **64 Customers, 512 Orders, and 2,048
-Lines**. The label describes each RF1's inserted groups:
-
-| Workload type | Orders per RF1 | Customers referenced | Lines per Order | Total Lines per RF1 |
-| --- | ---: | ---: | ---: | ---: |
-| **clustered** | 16 | 1 shared Customer | 4 | 64 |
-| **scattered** | 16 | 16 distinct Customers | 4 | 64 |
-| **large-group** | 1 | 1 Customer | 10,000 | 10,000 |
-
-Each sequence is **RF1, RF2, repeated RF2 for absent Orders, RF1 reinsertion,
-RF2, and empty RF2**. RF1 inserts complete groups; RF2 deletes each requested
-Order and every current Line belonging to it. Requested duplicate IDs are
-removed and absent Orders counted. Both modes receive the same inputs.
-
-**Native** uses the generated native Q3 circuit and its traces.
-**Reconstructed** maintains the merged index in an auxiliary thread of the base
-runtime, beside the base tables, and the view circuit reads published snapshots of it. The index uses the ordinary DBSP
-Spine background merger; its compaction can continue across transactions.
-
-### Timing definitions
-
-**All columns below cover the six refreshes; loading and independent correctness
-checking are excluded.** The performance processes use `--no-verify` and retain
-zero `Reference` map bytes.
-
-| Column | Definition |
-| --- | --- |
-| **Foreground ms** | Sum of the six refresh wall times, including discovery (the lookup; the refresh files are read before the window), operational checks, input preparation, the base circuit, forwarding, index maintenance, the view circuit, publication, and cleanup. |
-| **Sequence ms** | Wall time from the start of the refresh sequence through the last refresh's publication/cleanup. Includes between-refresh measurement/logging overhead; excludes final reporting and any subsequent compaction. |
-| **Sequence CPU ms** | Process user + system CPU over the sequence, summed across driver, runtime, and auxiliary threads. Includes naturally scheduled background merge work executed inside that interval. |
-
-**Per-refresh JSON phases:**
-
-| Field | Definition |
-| --- | --- |
-| **discovery_ms** | RF2 maintained-state lookups and assembly of complete current deletion rows, including decoding. The delete-ID file is parsed into a key set before the window opens, so its read is not included (version 2 included it). |
-| **checks_input_preparation_ms** | Operational checks, workload statistics, logical-row conversion, and circuit input serialization. RF1 input files are parsed before the window and are not included. |
-| **index_ms** | A sub-phase of `base_ms`; never add it to `base_ms` again. Reconstructed index append and snapshot acquisition. The index rows come from the base circuit's net delta; the conversion to rows (`reconstruction::prepare`) stays in `checks_input_preparation_ms`, and the append includes folded-key/payload encoding, copying, and sorting. The index runs on an auxiliary thread of the runtime that hosts both circuits (measurement version 6; through version 5 it ran in the base circuit's own runtime, storage directory `run-N/base`). Zero in native mode. |
-| **base_ms** | Base maintenance, in version 4: the base circuit's transaction (the primary-key input maps and their delta accumulators) plus, in reconstructed mode, the merged index's upkeep (`index_ms`). The merged index is secondary storage of the base relations, so its upkeep is base maintenance and not IVM. The two parts are separate intervals of the transaction: the forward read and the row conversion fall between them. |
-| **forward_ms** | Reading the base circuit's net delta (`workload::net_delta`) and, through version 10, feeding it to the view circuit's inputs; from version 11 it is the net-delta read only, and the conversion and hand-off are `delta_ms`. Harness overhead: a single DBSP circuit passes deltas between views as in-memory streams, so the JSON hop has no counterpart in a deployed pipeline. Excluded from the base and IVM figures, but inside the sequence totals. |
-| **q3_ms** | The view circuit's transaction alone: delta accumulation, the joins (native traces or reconstructed readers), and materialized `V`. Reconstructed execution includes its temporary reconstruction, decoding, copying, and sorting. In version 2 it was the single `circuit.transaction()` and also covered base-relation maintenance (`add_input_map_persistent`, owner `base_relation`), common to both modes, which dilutes any version 2 native-to-reconstructed ratio. |
-| **publication_cleanup_ms** | Snapshot publication/release, refreshed Catalog snapshots, and foreground output/driver cleanup. |
-| **ivm_ms** | Incremental view maintenance, in version 4: equal to `q3_ms`, the view circuit's transaction. Native mode counts its join traces here; reconstructed mode counts its snapshot readers here, and not the merged index's upkeep. It replaces version 3's `combined_maintenance_ms` (`index_ms + q3_ms`). Excludes `base_ms`, `forward_ms`, discovery, preparation, and publication/cleanup. From version 11, `ivm_ms = delta_ms + q3_ms`, where `delta_ms` prepares the view circuit's transaction delta (see "Report fields"). |
-
-**Reporting rule: base and IVM are always reported side by side.** Native against
-reconstructed is compared in two parts: base maintenance (`base_ms`: native base tables, against
-base tables plus the merged index) and IVM (`ivm_ms`: native join traces, against snapshot
-readers). An IVM figure alone is never quoted as a saving, because the merged index's upkeep is
-booked in the base phase. `index_ms` is shown only as a part of `base_ms`.
-
-**Final drainage ms is absent in v2, v3 and v4.** The report records
-`measurement_version=4`, `completion_boundary=last_refresh_complete`, and zero
-sequence `snapshot_publication_transactions`. Version 3 splits the transaction
-into the base circuit and the view circuit, each in its own runtime (through version 5; one runtime from version 6) with its own
-storage directory and buffer cache. Version 4 moves the merged index into the base
-runtime and phase: `base_ms` includes `index_ms`, and `combined_maintenance_ms` is renamed
-`ivm_ms` and equals `q3_ms`. Version 2 results, such as the macOS rerun of
-2026-10-22, keep their label: their `q3_ms` includes base-relation maintenance, so
-they are not comparable with version 3 or 4. Version 3 results keep their label too: their
-`base_ms` leaves out the merged index and their `combined_maintenance_ms` includes it, so
-their phase figures are not comparable with version 4.
-
-### Resource definitions
-
-**Backend counters cover the sequence interval. Storage, RSS, and cache columns
-are bytes.** Storage observations do not require compaction to finish.
-
-| Column | Definition |
-| --- | --- |
-| **Read/write ops and bytes** | Storage-backend operation counts and bytes submitted during the sequence; distinct from OS physical I/O. |
-| **Observed storage** | Regular-file lengths in the storage directory observed after the last refresh without a compaction wait; background merges can still be active. |
-| **Sampled peak storage** | Largest directory size sampled during the sequence and its final storage observation, every 10 ms and once at the end. Shorter peaks may be missed. |
-| **Peak RSS** | Process-lifetime resident-memory high-water mark since process start (`getrusage`), including loading, setup compaction, the refresh pre-read, driver, runtime, and auxiliary threads. Not a maintenance-window figure. |
-| **Window peak RSS** | `sequence.window_peak_rss_bytes`. Linux only (`null` elsewhere): `VmHWM` at the end of the window, after `echo 5 > /proc/self/clear_refs` reset it at the window's start. It includes the pre-read refresh rows still held. `window_peak_rss_error` explains a failed reset (the peak is then `null`). |
-| **Window end RSS** | `sequence.window_end_rss_bytes`. Linux only: `VmRSS` at the end of the window. |
-| **Cgroup window block** | `sequence.cgroup`. Linux with cgroup v2 only (`null` elsewhere). `before`, `after` and `delta` of `memory.current`, `memory.events`, a named subset of `memory.stat` (`pgscan`, `pgsteal`, `workingset_refault*` and others the kernel has) and `memory.pressure`, taken before the first refresh and after the last. `peak`: `window_peak_bytes` from resetting and re-reading `memory.peak` (kernel 6.12 or later; unverified, null with `window_peak_supported: false` if it fails), `lifetime_peak_at_end_bytes`, and `max_sampled_memory_current_bytes` (the fallback, sampled at the window start, each refresh end and the window end). Evidence of memory use, not proof of pressure. |
-| **Memory pressure (per refresh)** | `memory_pressure.before` and `.after`: DBSP's level for the one runtime that hosts both circuits (`runtime`; through version 5, `base_runtime` and `q3_runtime`), sampled at the refresh's boundaries. The level comes from process RSS against the memory target, not from cgroup memory. |
-| **Refresh inputs** | `refresh_inputs`: per-refresh row counts of the pre-read refresh files, and `VmRSS` before and after the pre-read (Linux), which measure its fixed overhead. |
-| **Inputs evicted** | `inputs_evicted`: whether `posix_fadvise(DONTNEED)` was applied to every base and refresh input file after the pre-read (Linux only; false on macOS), with the cgroup's `memory.current` before and after. |
-| **Cache occupancy** | Configured worker-cache occupancy observed after the last refresh (`cache_occupancy_bytes`) and at the start of the window (`cache_occupancy_at_window_start_bytes`), under `sequence`, for the one runtime's cache (`cache_capacity_bytes` is the configured `--cache-bytes`; through version 5 the figures were per runtime under `circuits`). |
-| **Memory/storage batches** | Counts of nonempty RAM and disk batches in the retained Catalog snapshots; the auxiliary index reports its current batches separately. File-backed configuration permits RAM batches. |
-
-`load.background_merge_wait_ms` includes the loading wait, its snapshot
-publication, and associated cleanup. `load.observed_storage_bytes` is the
-loaded storage observation used by the Linux size qualification check. Neither
-loading field is part of the refresh sequence.
-
-## Pending: Linux campaign
-
-macOS gives no enforced memory limit, so qualification needs Linux. The runner (`measure.py`) already supports `--cgroup-root` and `--total-memory-bytes`: it creates a cgroup v2 child per run with `memory.max` set, `memory.swap.max=0`, evicts the shared input files from the page cache inside that cgroup before the driver starts, and records `memory.peak` (`null` on a kernel without that file), `memory.events`, and `io.stat`.
-
-Plan (not yet executed):
-
-1. **Inputs.** SF 10 dbgen: `dbgen -s 10 -T c`, `dbgen -s 10 -T o`, and `dbgen -s 10 -U 3`; a bare `-U 3` would use scale factor 1, the default in dbgen's `driver.c` (about 1.5 million Customers, 15 million Orders, 60 million Lines; each RF1 about 15,000 Orders and 60,000 Lines). The sizes are the dbgen scale-factor figures and are unchecked here.
-2. **RF2 deletions.** Three sets of distinct existing base Orders, each as large as its pair's RF1 (15,000 at SF 10 by the dbgen formula), never reused across pairs. Both workloads delete the oldest Orders: the lowest base Order keys, each pair taking the next block, so the two share their RF2 sets ([decisions.md](DECISIONS.md#2026-11-04-rf2-deletes-the-oldest-orders)); `prepare-manifest.json` records the highest deleted key. (Until 2026-11-04, clustered RF2 took the lowest-keyed Customers' Orders and scattered RF2 a seeded uniform sample.) RF1 keeps dbgen's complete Order and Lineitem groups and changes only each Order's Customer, chosen independently of the RF2 sets ([decisions.md](DECISIONS.md#2026-10-23-linux-campaign-refresh-selection)). Only Customers whose key is not a multiple of 3 receive RF1 Orders. Clustered RF1 draws TPC-C's NURand(1023, 1, 3000) over blocks of 3,000 of them, in sessions of 4 Orders per Customer per transaction; scattered RF1 is uniform over them ([decision of 2026-11-17](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order)). Lineitems stay grouped by Order. The Order keys the files carry follow `--order-keys` (dbgen, sequence, or uuid; [decision of 2026-11-19](DECISIONS.md#2026-11-19-order-keys-are-a-dimension-dbgen-sequence-uuid)). The `sequence` arm was stopped on 2026-11-19 ([decision](DECISIONS.md#2026-11-19-the-sequence-arm-is-stopped-cancelled-rows-are-a-watch-item)). The manifest records, per pair, the distinct Customers and the Order counts of the top 1, 10, and 100 Customers.
-3. **Settings.** Fresh process, storage directory, and cgroup per run. `memory.max` 1 GiB, swap 0, cache 256 MiB (128 MiB through measurement version 14), runtime RSS target 512 MiB, one worker, 10,000-row loading target, three repetitions; identical across modes. Input hashes must match between modes.
-4. **Pilot first** (one repetition, per workload and per arm of step 6; the exact command is in the [Linux handoff](LINUX-HANDOFF.md)). Require `load.observed_storage_bytes > memory.max` in both modes, aiming at roughly four times the limit. This checks stored-state scale only. Do not substitute transient peak disk size, and do not treat it as proof of memory pressure.
-5. **Campaign** (`--runs 3`, fresh destinations) only after every pilot passes and the pressure instrumentation below exists.
-6. **Four arms: prefix truncation × session pass** (user decisions of 2026-10-22, 2026-11-09, and [2026-11-11](DECISIONS.md#2026-11-11-the-linux-campaign-crosses-prefix-truncation-with-the-session-pass)). *Since [2026-11-18](DECISIONS.md#2026-11-18-arm-b-and-the-step-pass-are-retired) only `A-seek` runs: the step arms and arm B are retired; the text below is kept for the record.* Prefix truncation is on in A (`--front-code-byte-keys`) and off in B; the scan session's pass is `--session-pass seek` or `step`. The arms `A-seek`, `A-step`, `B-seek`, and `B-step` are each the campaign above, with the same inputs, settings, `--runs 3`, and fresh destinations. All keep `--elide-value-headers`, and none uses `--setup-full-compaction` (2026-11-09).
-   - The pass changes only reconstructed mode's scan session: how it passes the untouched groups between touched ones. Compare reconstructed mode across the passes, with prefix truncation fixed: `index_session_counts` (logical seeks and steps, positions), `index_run_reads`, `ivm_ms`, and `profiled_cpu_ms.q3`. The groups and payload decodes must be equal; the driver's test pins that on a small workload.
-   - Prefix truncation applies only to byte-string keys, so it changes only the merged index. Native keys are not byte strings. Each arm still runs both modes, because `measure.py` always does, and native's storage and run reads must match across all four arms; a mismatch means the arms are not comparable.
-   - Compare the reconstructed mode across arms: the merged index's storage, writes by owner (`merged_index`), `base_ms` with its sub-phase `index_ms`, `ivm_ms`, and process CPU. On macOS, prefix truncation changed only the key level (132,096 B to 33,280 B; see [history.md](../../../docs/design/merged-index/history.md#2026-10-16-to-2026-10-19-record-size-typed-value-steps)) and wrote 17 prefix-truncated blocks with no fallbacks. Its read cost has not been measured: a seek expands one whole block per cache miss ([storage-layout.md](../../../docs/design/merged-index/storage-layout.md#prefix-truncation-on-the-read-path)), which version 12 counts as `block_expansions`.
-   - Device (user decision of [2026-11-16](DECISIONS.md#2026-11-16-the-ssd-runs-the-campaign-the-hard-disk-only-a-pilot-probe)): the full campaign runs on the SSD (eight pilots, 16 runs, then 48 campaign runs). The hard disk gets only the eight pilots as a probe (16 runs), with the inputs and the build still on the SSD; an HDD campaign is decided after the probe, which is evidence only. Each manifest records the device in `storage_device`.
-   - Both the pilot and the campaign run all four arms, which quadruples their runs. The arms alternate per workload (`A-seek`, `A-step`, `B-seek`, `B-step` for clustered, then for scattered), so slow drift on the machine does not fall on one arm. The inputs are shared, so the arms add stored state, not input copies.
-
-On Linux, storage files open with `O_DIRECT`, while input reads go through the page cache and count against the cgroup. This was checked against the code:
-
-- `StorageCacheConfig::to_custom_open_flags` (`crates/feldera-types/src/config.rs`) returns `O_DIRECT` for `FelderaCache` on Linux, and 0 for `PageCache` and on other systems.
-- `cache_flags` (`crates/dbsp/src/storage/backend.rs`) applies those flags when the POSIX backend creates and opens a file (`posixio_impl.rs`).
-- The driver selects `FelderaCache` (`main.rs`).
-- The `.tbl` inputs are read with `BufReader` over `File` (`main.rs`, `workload.rs`), so they use the page cache. The runner evicts the shared inputs inside the run's cgroup, so the driver's reads fault their pages again and are charged to that cgroup.
-- `FBuf::ALIGNMENT` is 512 (`crates/storage/src/fbuf.rs`). A filesystem that needs larger direct-I/O alignment (a 4Kn disk) or that rejects `O_DIRECT` (tmpfs, some overlay filesystems) may fail; whether this build then fails is not tested here. Put the storage path on a local ext4 or xfs filesystem.
+- **A decision comes first:** an entry in `DECISIONS.md` (Q3) or `decisions.md` (generic), then a row here.
+- **A new arm:** a row in Active (or a new arm in a row), its flag in the [handoff's dimension table](LINUX-HANDOFF.md#measurement-dimensions), a dated results section below, and a Synopsis row once measured.
+- **A dimension that becomes decided:** move its row to Decided, with the fixed setting stated explicitly, and update its Synopsis status.
+- **A new measurement version:** a bullet in the [appendix](#appendix-measurement-versions), `MEASUREMENT_VERSION` in `measure.py` (the tests and `summarize.py` follow), and the version list in [CLAUDE.md](CLAUDE.md). New images are needed only if the image sources changed (`IMAGE_SOURCE_PATHS` in `measure.py`).
 
 ## Linux pilots at K = 10 (2026-11-18)
 
-The first SSD pilots, one repetition each, on the first Linux host (Xeon Silver 4114, kernel 6.8, turbo off), from the SF 10 images of revision `da074ff7e` (measurement version 14). Workloads: `prepare_inputs.py --transaction-rows 10 --seed 1 --pairs 3` (about 12.5 rows per transaction; 18,041 RF1 and 18,129 RF2 transactions per window; clustered draws one Customer per transaction). Settings: cgroup `memory.max` 1 GiB, cache 128 MiB, DBSP memory target 512 MiB, cold start, no warm-up. These are pilot figures, not campaign results: one repetition, and no claim of cost or saving.
+The first SSD pilots, one repetition each, from the SF 10 images of revision `da074ff7e` (measurement version 14).
 
-Per-transaction medians (p50, milliseconds) over all transactions of each phase:
+**Settings:**
+- **Host.** Xeon Silver 4114, kernel 6.8, turbo off.
+- **Workloads.** `prepare_inputs.py --transaction-rows 10 --seed 1 --pairs 3`: about 12.5 rows per transaction, and 18,041 RF1 and 18,129 RF2 transactions per window. Clustered draws one Customer per transaction.
+- **Memory.** cgroup 1 GiB, cache 128 MiB, memory target 512 MiB.
+- **Start.** Cold, with no warm-up.
+
+Per-transaction p50 in ms, over every transaction of each phase:
 
 | Pilot | Mode | RF1 base | RF1 IVM | RF2 base | RF2 IVM |
 | --- | --- | ---: | ---: | ---: | ---: |
 | A-seek clustered | native | 1.11 | 3.77 | 1.20 | 4.63 |
-| A-seek clustered | reconstructed | 1.44 | 4.51 | 1.94 | 3.07 |
+| A-seek clustered | merged-index | 1.44 | 4.51 | 1.94 | 3.07 |
 | B-seek clustered | native | 1.06 | 3.59 | 1.16 | 4.65 |
-| B-seek clustered | reconstructed | 1.62 | 5.55 | 2.26 | 3.61 |
+| B-seek clustered | merged-index | 1.62 | 5.55 | 2.26 | 3.61 |
 | A-seek scattered | native | 1.03 | 4.30 | 1.13 | 4.44 |
-| A-seek scattered | reconstructed | 1.37 | 8.06 | 1.93 | 3.14 |
+| A-seek scattered | merged-index | 1.37 | 8.06 | 1.93 | 3.14 |
 | B-seek scattered | native | 1.11 | 4.51 | 1.18 | 4.56 |
-| B-seek scattered | reconstructed | 1.33 | 8.82 | 1.96 | 3.27 |
+| B-seek scattered | merged-index | 1.33 | 8.82 | 1.96 | 3.27 |
 
-What the pilots show, and what they do not:
+- **Qualification.** Every completed run qualifies: the loaded state (17 to 20 GB) exceeds the limit, the copy was evicted, and the cgroup was verified.
+- **Which limit binds: DBSP's, not the kernel's.**
+  - **The kernel's limit never bound.** `memory.events` shows `max 0` and `oom 0` in every run. `memory.peak` was 605 to 652 MiB native and 777 to 784 MiB merged-index.
+  - **DBSP's target did.** Its pressure was `critical` in every refresh, since the window's peak RSS (521 to 563 MiB native, 689 to 693 MiB merged-index) exceeds the 512 MiB target.
+- **`total_ms` is not a latency figure at K = 10.** Besides `base_ms` and `ivm_ms`, it holds:
+  - input checks and preparation: 0.9 to 2.4 ms in RF1, under 0.1 ms in RF2;
+  - `forward_ms`: about 0.2 ms;
+  - cleanup: about 0.1 ms;
+  - an unmeasured residual: 3 to 5 ms native, 2 to 3 ms merged-index RF1, 6 to 9 ms merged-index RF2.
 
-- **Qualification.** Every completed run is `qualifying`: the loaded state (17 to 20 GB) exceeds the enforced limit, the copy was evicted, and the cgroup was verified.
-- **Which limit binds.** The cgroup limit never did: `memory.events` shows `max 0` and `oom 0` in every run, and `memory.peak` was 605 to 652 MiB (native) and 777 to 784 MiB (reconstructed). DBSP's runtime pressure was `critical` in every refresh, since the window's peak RSS (521 to 563 MiB native, 689 to 693 MiB reconstructed) exceeds the 512 MiB target. The pressure in these pilots is DBSP's, not the kernel's.
-- **`total_ms` holds time that no phase timer covers.** Per transaction, besides `base_ms` and `ivm_ms`, it holds input validation and loading (`checks_input_preparation_ms`: 0.9 to 2.4 ms in RF1, under 0.1 ms in RF2), the net-delta read (`forward_ms`, about 0.2 ms), cleanup (about 0.1 ms), and a residual that no timer covers. The residual spans three CPU profile reads and four counter reads, but it is not constant: 3 to 5 ms native, 2 to 3 ms reconstructed RF1, and 6 to 9 ms reconstructed RF2 (from each refresh's `foreground_ms` minus the named timers). So it is not shown to be instrumentation alone; what it holds is unmeasured. Compare `base_ms` and `ivm_ms`; `total_ms` is not a latency figure at K = 10. *Corrected on 2026-11-18; the first version called it about 4 ms of instrumentation.*
-- **Memory at the window's start.** Before any refresh, with the buffer cache empty, the cgroup's anonymous memory was 361 to 371 MiB native and 527 to 528 MiB reconstructed. Most of it is the membership filters of the restored file runs, which stay resident: from the images' file trailers, 305 MiB native and 461 MiB reconstructed (Bloom filters at 19.2 bits per key on the Lineitem-keyed spines and on `V`, 137.5 MiB each, and roaring filters on the Order-keyed ones). The merged index's own Bloom filter is 175 MiB (76.5 million keys); it accounts for most of the 166 MiB difference in RSS, and it is outside the circuit profiles' `bloom_filter_size_bytes`, which agree with the trailers for the circuits' spines. The rest, about 40 to 50 MiB in each mode, is unattributed. Reconstructed mode therefore starts above the 512 MiB target, at `critical`, while native starts at `low` and reaches `critical` during its first refresh, as the cache fills. Native's first refresh ran partly under lighter pressure: in the clustered pilots its RF1 IVM was 2.7 to 2.8 ms per transaction against 4.0 to 4.6 ms in the later RF1 refreshes, with 3.8 to 4.0 write operations per transaction against 10.4 (scattered: 7.6 to 7.8 write operations, and no lower IVM). The pooled native RF1 percentiles include that refresh.
-- **Spilling under `critical` pressure.** Every refresh after the first writes about 9 to 10 storage operations and 0.9 to 1.4 GB per refresh of about 6,000 transactions of about 12.5 rows, in both modes: at `critical` DBSP writes every inserted run to a file.
-- **No storage read reaches the page cache.** The cgroup's file memory stays below 1 MiB, `pgmajfault` is 0, and `/proc/self/io` read bytes equal the storage backend's read bytes in every run: storage files are opened with `O_DIRECT`, so every buffer-cache miss reads the SSD.
-- **Where reconstructed RF1's extra IVM time is.** The CPU profiler's view-circuit step time is lower in reconstructed mode (1.7 to 2.2 ms per transaction against 2.8 to 3.4 ms in native's refreshes after the first), so the extra `ivm_ms` lies outside the view circuit's steps: in the scan session's collection, which the profiler does not cover. Scattered reconstructed RF1 refreshes read 42 to 49 storage operations per transaction, against 24 to 28 clustered.
-- **Native agrees across arms**, as it should, since neither factor changes it: RF1 IVM p50 3.6 to 3.8 ms clustered, 4.3 to 4.5 ms scattered.
-- **The step arms did not run.** `A-step` clustered's native run completed (RF1 IVM p50 3.57 ms), and its reconstructed run was stopped after 49 minutes: under `Pass::Step` a small transaction walks the index from its first key ([LINUX-HANDOFF.md](LINUX-HANDOFF.md#known-limits)). `A-step` scattered and both `B-step` pilots were not started, and the step arms were dropped on [2026-11-18](DECISIONS.md#2026-11-18-the-step-arms-are-dropped).
+  Compare `base_ms` and `ivm_ms` instead. *Corrected on 2026-11-18; the first version called the residual about 4 ms of instrumentation.*
+- **Memory at the window's start.** Before any refresh, anonymous memory was 361 to 371 MiB native and 527 to 528 MiB merged-index.
+  - **The restored runs' filters.** Most of it is these filters, which stay resident: 305 MiB native and 461 MiB merged-index, from the file trailers.
+  - **The merged index's own Bloom filter** is 175 MiB, for 76.5 million keys, and the index never probes it.
+  - **Native's first refresh.** Merged-index mode starts at `critical`. Native starts at `low` and reaches `critical` during its first refresh, so in clustered its RF1 IVM there was 2.7 to 2.8 ms against 4.0 to 4.6 ms later. Its pooled RF1 percentiles include that refresh.
 
-Artifacts (local to the host): `/mnt/ssd/r5-out/pilot-<arm>-<workload>-k10/manifest.json` and its `runs/run-1-<mode>/driver.json`.
+  This led to [storage-resident filters](DECISIONS.md#2026-11-18-bloom-filters-are-storage-resident-read-through-the-buffer-cache).
+- **Spilling at `critical`.** Every refresh after the first writes 0.9 to 1.4 GB in both modes: at `critical`, DBSP writes every inserted run to a file.
+- **No storage read reaches the page cache.** Files use `O_DIRECT`, so every buffer-cache miss reads the SSD. Accordingly:
+  - file memory stays below 1 MiB;
+  - `pgmajfault` is 0;
+  - `/proc/self/io` read bytes equal the backend's.
+- **Merged-index RF1's extra time is outside the view circuit's steps.** The profiler's view-circuit CPU is lower in merged-index mode (1.7 to 2.2 ms against 2.8 to 3.4 ms), so the extra `ivm_ms` is in the scan session's collection, which the profiler does not cover. Scattered merged-index RF1 read 42 to 49 storage operations per transaction, against 24 to 28 clustered.
+- **The step arms did not finish.** A-step clustered's merged-index run was stopped after 49 minutes ([known limits](LINUX-HANDOFF.md#known-limits)).
+
+Artifacts: `/mnt/ssd/r5-out/pilot-<arm>-<workload>-k10/manifest.json`.
 
 ## One budget at 512 MiB, base tables evicted (2026-11-19)
 
-Pilot A-seek clustered, K = 10, from the measurement version 16 images (revision `727c76c52`), one repetition. Settings:
-- memory target 512 MiB, buffer cache 512 MiB (one budget, [decision of 2026-11-18](DECISIONS.md#2026-11-18-one-memory-budget-the-cache-about-equals-the-memory-target)); cgroup 1 GiB;
+**Settings.** Pilot A-seek clustered, K = 10, version 16 images (revision `727c76c52`), one repetition:
+- target 512 MiB, cache 512 MiB ([one budget](DECISIONS.md#2026-11-18-one-memory-budget-the-cache-about-equals-the-memory-target));
+- cgroup 1 GiB;
 - base-table blocks evicted after each base transaction.
 
-Both runs qualify, and the cgroup's `memory.events max` is 0. View circuit first (user direction), refreshes 2 to 6, per transaction:
+Both runs qualify, and `memory.events max` is 0. Refreshes 2 to 6, per transaction:
 
 | | RF1 native | RF1 merged-index | RF2 native | RF2 merged-index |
 | --- | ---: | ---: | ---: | ---: |
@@ -262,27 +160,30 @@ Both runs qualify, and the cgroup's `memory.events max` is 0. View circuit first
 | view-side device reads | 1.52 | 6.40 | 3.07 | 1.34 |
 | view-state writes (`query`, `merged_index`) | 10.6 | 9.4 | 10.3 | 8.9 |
 
-- **Pressure.** It went `critical` in both modes from refresh 3, once the cache filled. Peak RSS was about 720 MiB, against the 512 MiB target, in both modes. The cache counts in RSS, and the program, the refresh inputs, and the in-memory runs add about 200 MiB to it. A cache as large as the target therefore reaches `critical` once it is full.
-- **RF2 (deletes).** Merged-index's IVM is 24% lower than native's at the median and 28% lower at p99. Its index seeks are more numerous, but they stay in the cache: 1.34 device reads against 3.07.
-- **RF1 (inserts).** Merged-index's IVM is 11% higher at the median. Each transaction lands on a new customer's group, so its reads are first touches: 6.40 device reads against 1.52. Its view circuit takes less CPU.
-- **Against the version 15 pilot** (cache 256 MiB, target 512 MiB, pressure `low`): both modes are slower under `critical` pressure (native about 1.1 to 4 ms, merged-index about 2 to 3.4 to 4.3 ms), and both write about 10 spilled runs per transaction.
-- **Base (amortized; reported last).** `base_ms` p50 was 3.4 (RF1) and 8.0 (RF2) native, 3.8 and 15.5 merged-index. The eviction took 5.5 to 6 ms per transaction (one pass over the 512 MiB cache, about 690 KiB freed), in neither phase but in `total_ms`.
+- **Pressure.** `critical` in both modes from refresh 3, once the cache filled. Peak RSS was about 720 MiB. The cache counts in RSS, and the program, the refresh inputs and the in-memory runs add about 200 MiB, so a cache as large as the target reaches `critical` once full.
+- **RF2 (deletes).** Merged-index IVM is 24% lower at the median and 28% lower at p99. Its seeks are more numerous but stay in the cache: 1.34 device reads against 3.07.
+- **RF1 (inserts).** Merged-index IVM is 11% higher at the median. Each transaction lands on a new customer's group, so its reads are first touches: 6.40 device reads against 1.52. Its view circuit takes less CPU.
+- **Against version 15** (cache 256 MiB, pressure `low`): both modes are slower at `critical`, and both write about 10 spilled runs per transaction.
+- **Base (amortized).** `base_ms` p50 was 3.4 (RF1) and 8.0 (RF2) native, and 3.8 and 15.5 merged-index. The eviction took 5.5 to 6 ms per transaction, which is in `total_ms` but in neither phase.
 
 **What spills at `critical` pressure** (`circuit/runtime.rs`):
-- **An inserted run.** Every run a transaction inserts into a spine becomes a file at once: from `high`, `min_insert_storage_bytes` is 0. That covers the base tables, native's join traces and `V`, and merged-index's `Dlt` run and `V`.
+- **An inserted run.** From `high`, `min_insert_storage_bytes` is 0. This covers the base tables, native's traces and `V`, and merged-index's `Dlt` run and `V`.
 - **A merge output.** From `moderate`, `min_merge_storage_bytes` is 0.
-- **A run passed between operators within a step.** Only at `critical` (`min_step_storage_bytes` is 0). It is built straight into a file from its first row, and it is dropped, with its file, at the end of the step.
+- **A run passed between operators within a step.** At `critical`, `min_step_storage_bytes` is 0. The run is built straight into a file, and that file is dropped at the end of the step.
 
-**Why they do not wait in the buffer cache.**
-- **The cache holds only file blocks.** It is a cache of clean, immutable blocks of files that already exist. Eviction drops a block, and a miss rereads it from its file. There is no dirty or write-back state, so a run must be written before any of its blocks can be cached.
-- **A run not yet written has no cache budget.** It is a heap batch, counted in RSS, under neither the cache's budget nor its eviction policy.
-- **Spilled runs are cached anyway.** The writer puts every data and index block in the cache as it writes (`from_raw_with_cache` in `storage/file/writer.rs`), so a recently spilled run reads as a cache hit.
-- **So the cost is the write.** Each spill is a file creation and its writes, mostly on the transaction's thread. For a temporary run, the file is gone at the end of the step.
-- **The alternative.** A write-back design would keep small runs unwritten under the cache's budget and write a run only when the cache evicted it. Short-lived runs (tiny inserts merged away soon, temporary in-step runs) would then never reach the disk. That is the one-budget idea in its full form, and a stronger form of the spill floor in [compaction.md](../../../docs/design/merged-index/compaction.md). DBSP does not do it.
+**Why they do not wait in the buffer cache:**
+- **The cache holds only blocks of files that exist.** It has no dirty or write-back state, so a run must be written before any of its blocks can be cached. A run not yet written is a heap batch, in RSS, under neither the cache's budget nor its eviction.
+- **Spilled runs are cached anyway.** The writer caches every block it writes (`from_raw_with_cache` in `storage/file/writer.rs`). The cost is therefore the write, mostly on the transaction's thread.
+- **The alternative.** A write-back design would keep small runs unwritten under the cache's budget and write a run only on eviction, so short-lived runs never reach the disk. DBSP does not do this; the memtable arm tests a form of it ([memtable.md](../../../docs/design/merged-index/memtable.md)).
 
-**Which writes they are** (diagnostics rerun of the same pilot, `--diagnostics`):
-- **Setup.** Same images and budgets, but the cgroup was raised to 2 GiB, because the diagnostics logs are held in memory and the run at 1 GiB was OOM-killed. Both runs qualify. Pressure reached `critical` from refresh 3 (native) and refresh 2 (merged-index). Its latencies are not comparable to the table above and are not reported.
-- **Method.** Every file flushed in the window is classed from `compaction-log.jsonl` (`spill_kinds.py`, committed on 2026-11-20; it counts every owner but the base tables as the view, which moves the merged-index merge outputs from 165.2 to 165.3 KiB): a merge output (`background_compaction`), an insert spill (`insert_spill`), or else a file built straight to storage during a step. The logs cannot tell that last class apart: it holds both inserted runs that were files from the start and temporary in-step runs. The window covers all six refreshes, 36,170 transactions, the low-pressure refreshes included.
+**Which writes they are** (a `--diagnostics` rerun of the same pilot):
+- **Setup.** The cgroup was 2 GiB, because the diagnostics logs are held in memory and a 1 GiB run was OOM-killed. Pressure was `critical` from refresh 3 (native) and refresh 2 (merged-index). Its latencies are not reported.
+- **Method.** `spill_kinds.py` classes every file flushed in the window by its `compaction-log.jsonl` record:
+  - a merge output;
+  - an insert spill;
+  - otherwise, a file built during a step. The logs cannot tell an inserted run that was a file from the start from a temporary in-step run.
+
+  The window is all six refreshes: 36,170 transactions.
 
 Per transaction, view-state owners (`query`, `merged_index`):
 
@@ -293,15 +194,21 @@ Per transaction, view-state owners (`query`, `merged_index`):
 | built during a step | 6.59 | 14.0 | 4.20 | 9.3 |
 | total | 8.71 | 305.2 | 7.80 | 182.1 |
 
-- **Most writes are tiny files.** Insert spills and step-built files average 2.1 to 2.3 KiB each, and they are 95% of native's view files and 97% of merged-index's, but only 6% and 9% of the bytes. The merge outputs, a few hundred KiB each, carry the rest.
-- **What a lazy spill could save.** Keeping runs below a floor in memory, or in a write-back cache, would remove about 8 of native's 9 view writes per transaction and about 7.6 of merged-index's 7.8, and those files hold about 18 KiB (native) and 17 KiB (merged-index) per transaction. This counts files, not time: the cost of each file creation on the transaction's thread was not measured.
-- **Base (amortized).** The base tables wrote 0.23 to 0.24 merge outputs per transaction (about 115 KiB) and almost no spills.
+- **Most writes are tiny files.** Insert spills and step-built files average 2.1 to 2.3 KiB. They are 95% of native's view files and 97% of merged-index's, but only 6% and 9% of the bytes.
+- **What a lazy spill could save.** About 8 of native's 9 view writes per transaction, and 7.6 of merged-index's 7.8: 18 and 17 KiB. This counts files, not time.
+- **Base (amortized).** 0.23 to 0.24 merge outputs per transaction (about 115 KiB), and almost no spills.
+- `spill_kinds.py` counts every owner but the base tables as the view, which gives 165.3 KiB for merged-index merge outputs.
 
-Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512/manifest.json`; diagnostics `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512-diag/runs/run-1-<mode>/diagnostics/`.
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v16-t512-c512{,-diag}/`.
 
 ## Prefix-filter A/B and the uuid order keys (2026-11-20)
 
-Pilot A-seek clustered, K = 10, at measurement version 17 (revision `d4010417d`), one repetition per arm, with the same settings as the 512/512 pilot above: target and cache 512 MiB, cgroup 1 GiB, base tables evicted after each base transaction. Three image sets: `images-v17` (dbgen keys, filter off), `images-v17-pf` (dbgen keys, `--index-prefix-filter`), and `images-v17-uuid` (uuid keys, filter off). All six runs qualify. Every merged-index run was at `low` pressure in refresh 1 and `critical` from refresh 2, so the merged-index rows compare like with like. Refreshes 2 to 6, per transaction; view circuit first.
+**Settings.** Pilot A-seek clustered, K = 10, version 17 (revision `d4010417d`), one repetition per arm. The settings are those of the 512/512 pilot above. There are three image sets:
+- `images-v17`: dbgen keys, filter off;
+- `images-v17-pf`: dbgen keys, filter on;
+- `images-v17-uuid`: uuid keys, filter off.
+
+All six runs qualify. Every merged-index run was `low` in refresh 1 and `critical` from refresh 2, so the merged-index rows compare like with like. Refreshes 2 to 6, per transaction.
 
 **The prefix filter (merged index, dbgen keys):**
 
@@ -310,16 +217,21 @@ Pilot A-seek clustered, K = 10, at measurement version 17 (revision `d4010417d`)
 | `ivm_ms` p50 / p95 / p99 | 4.56 / 7.42 / 9.14 | 3.98 / 6.61 / 8.36 | 3.36 / 5.76 / 7.20 | 3.06 / 4.82 / 6.11 |
 | index per-run seeks | 9.8 | 2.5 | 26.6 | 7.0 |
 | runs skipped by the filter (`filtered_prefix_probes`) | 0 | 7.3 | 0 | 21.6 |
-| index device reads (`other/merged_index`; the session runs on the driver's thread) | 6.41 | 5.59 | 1.34 | 1.50 |
+| index device reads (`other/merged_index`, the driver's thread) | 6.41 | 5.59 | 1.34 | 1.50 |
 | `base_ms` p50 (amortized) | 3.77 | 3.56 | 15.57 | 14.68 |
 
-- **Seeks.** The filter skips three of every four runs a group read used to seek: per touched group, about 2.4 seeks instead of 9.3 to 11.6 from refresh 2 on (5.4 in refresh 1).
-- **Latency.** The view's median falls 13% (RF1) and 9% (RF2), its p99 9% and 15%. Each of refreshes 2 to 6 is lower, by 5 to 15% in total `ivm_ms`.
-- **Device reads.** The index's reads fell 13% in RF1 (0.82 per transaction, for 7.3 skipped runs) and rose 0.16 in RF2 (for 21.6 skipped runs), so about nine in ten skipped seeks were buffer-cache hits and the saving is mostly the seeks' CPU. The skipped runs are mostly small, recent ones, written through the cache and sought on every transaction, while the bottom runs, which hold nearly every customer and take the cold reads, are rarely skipped; this is inferred, since the report counts no hits per run. RF2's rise may be cold loads of stored prefix-filter partitions (runs above 120 prefixes), which the report does not count. The worker's reads, both circuits, were unchanged (9.98 and 58.7 to 58.9).
-- **Size.** The index's files were 3.05 GB at the end, against 3.23 GB without the filter: the dropped whole-key filter less the prefix filters. The filter bytes per kind are not in the report.
-- **Noise.** One repetition per arm. The merged-index runs of versions 16 and 17 without the filter, the same code path, differ by at most 6% at the median (RF1 4.31 against 4.56). Native, which never uses the filter, varied far more between identical configurations: its version 17 runs went `critical` at refresh 5 (filter off) and refresh 3 (on), against refresh 2 at version 16, and its median `ivm_ms` ranged from 1.7 to 4.5 ms with pressure. Native rows of this A/B are therefore not reported.
+- **Seeks.** The filter skips three of every four runs a group read used to seek: about 2.4 seeks per touched group instead of 9.3 to 11.6.
+- **Latency.** The median falls 13% (RF1) and 9% (RF2), and p99 falls 9% and 15%. Each of refreshes 2 to 6 is lower, by 5 to 15%.
+- **Device reads.** Down 13% in RF1 (0.82 per transaction, for 7.3 skipped runs), and up 0.16 in RF2. So about nine in ten skipped seeks were cache hits, and the saving is mostly CPU.
+  - **Inferred, not counted:** the skipped runs are mostly small recent ones, written through the cache, while the bottom runs that take the cold reads are rarely skipped.
+  - **RF2's rise** may be cold loads of stored filter partitions, which the report does not count.
+  - **The worker's reads** were unchanged.
+- **Size.** The index's files were 3.05 GB at the end, against 3.23 GB: the dropped whole-key filter, less the prefix filters.
+- **Noise.** Merged-index at versions 16 and 17, same code path, differs by at most 6% at the median. Native varied far more between identical configurations, so its rows are not reported:
+  - its onset of `critical` moved between refresh 2 and refresh 5;
+  - its median ranged from 1.7 to 4.5 ms.
 
-**uuid order keys (filter off), against dbgen** (native from version 16, which went `critical` from refresh 2 as the uuid run did; merged-index from version 17 off):
+**uuid order keys (filter off), against dbgen.** Native's dbgen run is from version 16, which went `critical` from refresh 2 as the uuid run did; merged-index's is from version 17 off.
 
 | | RF1 native | RF1 merged-index | RF2 native | RF2 merged-index |
 | --- | ---: | ---: | ---: | ---: |
@@ -329,100 +241,309 @@ Pilot A-seek clustered, K = 10, at measurement version 17 (revision `d4010417d`)
 | worker-thread device reads, uuid | 61.1 | 50.2 | 62.0 | 85.0 |
 | `base_ms` p50, dbgen / uuid (amortized) | 3.39 / 13.86 | 3.77 / 11.92 | 7.96 / 11.44 | 15.57 / 20.20 |
 
-- **The prediction held.** Random keys slow native's view, whose traces are keyed by order: its median rises 48% (RF1) and 108% (RF2). The merged index, clustered by customer, keeps its view latency. With uuid keys its median is 28% (RF1) and 62% (RF2) below native's.
-- **Base pays in both modes.** Each transaction's orders now land in scattered blocks of the base tables, and those blocks are evicted after every base transaction, so the worker reads 50 to 85 blocks per transaction.
-- **No cancelled-row stretch.** The driver's main-thread reads grow from refresh to refresh as in dbgen (RF1 64 to 126 per transaction, against 49 to 90), with no run-away like the `sequence` arm's ([compaction.md](../../../docs/design/merged-index/compaction.md#watch-for-cancelled-rows-at-the-front-of-the-key-range)): the uuid arm needs no compaction fix.
+- **Random keys slow native's view, whose traces are keyed by order.** Its median rises 48% (RF1) and 108% (RF2). The merged index, clustered by customer, keeps its view latency: with uuid keys its median is 28% and 62% below native's.
+- **Base pays in both modes.** Each transaction's orders land in scattered base blocks, which are evicted after every base transaction, so the worker reads 50 to 85 blocks per transaction. The worker-thread reads cover both circuits; the index's own reads on the driver's thread are not in this table.
+- **No cancelled-row stretch.** The driver's reads grow from refresh to refresh as with dbgen (RF1 64 to 126 per transaction, against 49 to 90), with no run-away like `sequence`'s, so uuid needs no compaction fix.
 
 Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v17-t512-c512{,-pf,-uuid}/manifest.json`.
 
+## Memtable at 512 MiB (2026-11-20)
+
+Running.
+
+**Settings.** Measurement version 18, revision `2275c7446`, images `images-v18-pf`. The pilot is A-seek clustered, K = 10, dbgen keys, prefix filters on, target 512 MiB, cgroup 1 GiB. The arms, from the [decision](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable):
+- 512 MiB cache with the memtable off;
+- 448 MiB cache with the memtable off;
+- 448 MiB cache with `--memtable-mib 64`.
+
+Each is followed by a `--diagnostics` rerun in 2 GiB, for writes by kind (`spill_kinds.py`).
+
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448-m64}{,-diag}/`.
+
+## Pending: Linux campaign
+
+**Settings of every run.** These are the decided settings above, on the SSD:
+- arm A-seek, with prefix truncation and value-header elision on;
+- cgroup `memory.max` 1 GiB with swap 0;
+- memory target 512 MiB and cache 512 MiB (one budget);
+- base eviction on;
+- no setup compaction;
+- one worker;
+- each run a fresh process from a copy of its image, with the inputs evicted.
+
+**Remaining, by active dimension:**
+1. **The memtable.** Report the three arms, then the user decides.
+2. **The prefix filter's default.** The user's decision. Every later arm records `configuration.index_prefix_filter`.
+3. **Scattered, uuid, and K = 100 and 1,000.** Pilots at the current version. Every arm needs its own inputs, and uuid its own images.
+4. **The campaign.** `--runs 3` per chosen arm, after its pilot passes. `summarize.py` pools the manifests.
+5. **The hard-disk probe.** The pilots, repeated with `--storage-path` on the hard disk. This is evidence only.
+
+**Inputs** ([handoff](LINUX-HANDOFF.md#generate-tpc-h-inputs)):
+- **Base tables.** SF 10 dbgen gives 1.5 M Customers, 15 M Orders and 60 M Lines.
+- **Refreshes.** Three RF1/RF2 pairs of 15,000 Orders each, plus an optional warm-up pair.
+- **Requirement.** Each image's loaded size must exceed `memory.max`: 17 to 20 GB against 1 GiB. That checks scale, not pressure.
+
+**Storage files bypass the page cache, and inputs do not** (checked against the code):
+- `StorageCacheConfig::to_custom_open_flags` (`crates/feldera-types/src/config.rs`) returns `O_DIRECT` for `FelderaCache` on Linux. `cache_flags` (`crates/dbsp/src/storage/backend.rs`) applies it when the POSIX backend opens a file. The driver selects `FelderaCache`.
+- The `.tbl` inputs are read with `BufReader` over `File`, so they use the page cache. The runner evicts them inside the run's cgroup, so their reads are charged to it.
+- `FBuf::ALIGNMENT` is 512 (`crates/storage/src/fbuf.rs`). A 4Kn disk, tmpfs or an overlay filesystem may fail. Use local ext4 or xfs.
+
+## Definitions
+
+- **The window.** Loading is setup and is excluded (it is a separate program since version 13). The measured window is the refreshes, from the first to the last refresh's cleanup.
+  - **No forced compaction.** There is no final compaction wait and no extra publication (`completion_boundary = last_refresh_complete`).
+  - **Since version 13** a run starts from a restored image. Every run is then a file, and the cache starts empty unless `--warm-up` ran.
+- **Two circuits, one runtime.** The base circuit (primary-key tables) and the view circuit are chained by the base circuit's net delta, in one runtime with one buffer cache. The merged index is secondary storage of the base tables: `ManualIndex` runs on an auxiliary thread of that runtime, and its upkeep is base maintenance.
+- **Phases.** [Timing definitions](#timing-definitions) define them. Base and IVM are always reported side by side, and an IVM figure alone is never quoted as a saving.
+- **Refreshes stay whole.** Each refresh is complete in RAM; an oversized refresh fails rather than being split to fit a budget. A refresh may be cut into small transactions by the input files (`transaction_orders`), and each transaction is timed.
+- **Refresh files are pre-read** before the window: RF1 into the `Change` the loop applies, RF2 into its key set. The window times no file read. The pre-read rows are process memory and count toward DBSP's pressure. Their cost is `refresh_inputs`.
+- **Inputs evicted.** On Linux the driver advises `DONTNEED` on every input it read, after the pre-read. `measure.py` does the same inside the run's cgroup before the driver starts. A run whose inputs were not evicted does not qualify.
+- **Window versus lifetime.** `resources.peak_rss_bytes` is the process's lifetime peak; the window figures are in `sequence`.
+- **Durability.** A refresh's completion implies none. Checkpoint costs are deferred.
+- **Equal inputs.** Both modes get the same logical refreshes. The manifest records the SHA-256 of every input and executable.
+- **Excluded.** Full-join validation runs only on request and outside the window (`--no-verify` omits it). Reconstruction decoding, copying, sorting, spills and cleanup stay inside their intervals.
+- **Counters.** Backend read and write counters are storage-backend operations. OS I/O is `linux_physical_io` (`/proc/self/io`, the whole process), and the cgroup's `io.stat` is under `cgroup_evidence`.
+
+## RF2 discovery
+
+The driver keeps one `BaseState` of the base tables' snapshots, replaced after each transaction.
+
+- **Order IDs.** RF2 Order IDs resolve against the current Orders snapshot.
+- **Deletion rows.** The complete rows come from native Lineitem's primary-key range, or, in merged-index mode, from the index's `(custkey, orderkey)` line range.
+- **Duplicates and absent Orders.** Requested IDs are deduplicated, and absent Orders are counted.
+- **No rescans.** Discovery never rescans base files.
+
+Each lookup opens a new cursor. That cost grew without bound under `sequence` keys ([watch item](../../../docs/design/merged-index/compaction.md#watch-for-cancelled-rows-at-the-front-of-the-key-range)).
+
+## Buffer cache
+
+There is one cache: the runtime's worker cache (`--cache-bytes`). The view worker, the merged index's thread, and the driver's snapshot reads (RF2 discovery, verification and the scan session) all run inside `Runtime::with_buffer_cache`. No other cache is created, so the reported capacity covers every reader.
+
+- **Bloom filter partitions** are in it since version 15.
+- **The base tables' blocks** are evicted from it after each base transaction, since version 16.
+
+## Report fields
+
+The driver's JSON report (`src/main.rs`). `measure.py` rejects a report that fails `report_problems`, listed under [The runner](#the-runner).
+
+**Version and configuration:**
+- `measurement_version` (18), `completion_boundary`, and `compaction_policy`.
+- `configuration`:
+  - `front_code_byte_keys` and `elide_value_headers`;
+  - `session_pass` (`null` in native mode);
+  - `min_storage_bytes`, with its source and `run_placement`;
+  - `setup_full_compaction`;
+  - `filter_residency`;
+  - `evict_base_after_transaction`;
+  - `index_prefix_filter`;
+  - `memtable_mib` (`null` when off);
+  - `diagnostics`;
+  - `runtime` (the storage directory and the cache).
+- `front_coding` and `value_header_elision`: blocks written encoded, `layout_fallbacks` (which must be 0) and `size_fallbacks` (legitimate).
+- `os`, `storage_device` (from `measure.py`; device, filesystem, sector size, `rotational`, `label`), and `image` (the reopened image's settings, checkpoint, inputs and load record). `load` is `null` for a run from an image. `warm_up` is `null`, or the warm-up's list and time.
+
+**Per refresh:**
+- **Phases.** As defined in [Timing definitions](#timing-definitions). With `transactions` and `transaction_latency`: each transaction's `total_ms`, `base_ms` and `ivm_ms`, with nearest-rank p50, p95, p99, maximum and mean.
+- `base_eviction_ms` and `base_evicted_bytes`.
+- `memory_pressure.before` and `.after`: DBSP's level (`low`, `moderate`, `high`, `critical`), sampled at the refresh's boundaries. It is updated about once a second, so a sample can lag.
+- **Run reads** (`RunReads`):
+  - **Fields:** seeks, `filtered_probes` (exact probes a file run's filters answered), `filtered_prefix_probes` (runs a group seek skipped), key, value and weight decodes, and `memory_*_reads` for in-memory runs, which are never added to decodes.
+  - **Decodes are not disk reads;** compare device reads for storage traffic.
+  - **Where they are counted:**
+    - `view_run_reads`: the view worker per read owner (`query`, `base_relation`, `merged_index`, `requested_slice`, `partner_trace`). The worker's `merged_index` part is always zero: the scan session runs on the driver's thread.
+    - `index_run_reads`: the scan session, on the driver's thread.
+    - `index_upkeep_run_reads`: base maintenance's reads of `Old`.
+    - `driver_run_reads`: the driver thread's reads per owner, including the routing's reads of the driving deltas under `requested_slice`.
+  - **In `summarize.py`:** `dbsp_operator_*` (every owner but the last two), `partner_trace_*` and `requested_slice_*`.
+- `index_session_counts`: the scan session's groups, cursor opens, logical seeks and steps, positions, payload decodes from `Old` and `Dlt`, and cancelled values.
+- `index_layout`: the runs and bytes, in file and memory, of the before view (`Old`) and the after view (`Old` + `Dlt`).
+- `profiled_cpu_ms`: the CPU profiler's step time of the base and view circuits. It cross-checks `base_ms` and `q3_ms`, and is not a phase. It leaves out the index upkeep and the scan session.
+- `block_expansions`: storage-level rebuilds of encoded data blocks on cache misses, per thread (`view_worker`, `driver`, `index_upkeep`) and owner. They are not item decodes ([storage-layout.md](../../../docs/design/merged-index/storage-layout.md#prefix-truncation-on-the-read-path)).
+- `run_counts`, from `dbsp::storage::diagnostics::spine_run_counts`:
+  - **Per spine:** runs after each transaction (minimum, median, maximum), runs at the start and the end, runs per level, and merges with their real and CPU time.
+  - **Memtable fields, when on:** `memtable_entries_at_end`, `memtable_bytes_at_end`, `memtable_flushes`, `memtable_node_copies` and `memtable_copy_ms`.
+  - **`device_reads`:** every storage read of the process, by thread (`foreground`, `background`, `other`), split once by read owner and once by write owner.
+- `backend_write_by_owner` in every `resources` block: writes per owner (`query`, `base_relation`, `merged_index`; the read owners `requested_slice` and `partner_trace` write nothing). The owners sum to the totals, and a compaction runs under its spine's owner.
+
+**Per window** (`sequence`):
+- `window_peak_rss_bytes`, `window_end_rss_bytes`, `window_peak_rss_error`;
+- `cgroup`: `memory.current`, `memory.events`, named `memory.stat` counters and `memory.pressure`, before, after and as a delta, with `peak`;
+- `window_started_micros` and `window_finished_micros`, which place the diagnostics logs;
+- the cache occupancy at the start and the end;
+- `observed_storage_bytes`, taken with merges possibly still running;
+- the sums of every per-refresh counter, which `measure.py` checks.
+
+**Inputs:**
+- `refresh_inputs`: row counts, and `VmRSS` before and after the pre-read.
+- `inputs_evicted`: `evicted`, files, failures, and the cgroup's `memory.current` before and after.
+
+## Workloads
+
+**SF 10 Linux workloads.** These are prepared by `prepare_inputs.py`; see [the handoff](LINUX-HANDOFF.md#prepare-the-workloads) and the RF1 and RF2 rows under [Decided](#decided).
+
+**macOS smoke workloads.** Each starts from 64 Customers, 512 Orders and 2,048 Lines, and runs RF1, RF2, a repeated RF2 (absent Orders), an RF1 reinsertion, RF2, and an empty RF2. They are smoke tests only. Their highest RSS (47 MiB) is far below the pressure thresholds, so they show no memory pressure.
+
+| Workload | Orders per RF1 | Customers referenced | Lines per Order | Lines per RF1 |
+| --- | ---: | ---: | ---: | ---: |
+| clustered | 16 | 1 shared Customer | 4 | 64 |
+| scattered | 16 | 16 distinct Customers | 4 | 64 |
+| large-group | 1 | 1 Customer | 10,000 | 10,000 |
+
+## Column definitions
+
+### Timing definitions
+
+These are current since version 11. The history of each phase is in the [appendix](#appendix-measurement-versions).
+
+| Field | Definition |
+| --- | --- |
+| `discovery_ms` | RF2 lookups and the assembly of complete deletion rows, with their decoding. |
+| `checks_input_preparation_ms` | Operational checks, workload statistics, logical-row conversion, and circuit input serialization. |
+| `base_ms` | Base maintenance: the base circuit's transaction plus, in merged-index mode, `index_ms`. |
+| `index_ms` | A part of `base_ms`, never added again: completing and appending `Dlt` to the merged index, and taking its snapshot, on the index's thread. Zero in native mode. |
+| `forward_ms` | Reading the base circuit's net delta (`workload::net_delta`), the same in both modes. This is harness overhead, since one deployed circuit passes deltas as streams; it is in neither phase. |
+| `delta_ms` | A part of `ivm_ms`: preparing the view circuit's transaction delta. Native converts the net delta into input rows; merged-index builds `ΔC`, `ΔO` and `ΔL` from `Dlt` and hands them over. The two operations are not identical, so compare with and without it. |
+| `q3_ms` | The view circuit's transaction, plus the scan session's collection in merged-index mode. |
+| `ivm_ms` | `delta_ms + q3_ms`. A transaction's latency figure. |
+| `base_eviction_ms` | Evicting the base tables' blocks after the base transaction: in `total_ms`, in neither phase. |
+| `publication_cleanup_ms` | Snapshot publication and release, and driver cleanup. |
+| Foreground ms | Sum of the refreshes' wall times, every phase above included. |
+| Sequence ms and CPU ms | Wall time and process CPU (every thread, background merges included) from the first refresh to the last's cleanup. |
+
+### Resource definitions
+
+| Column | Definition |
+| --- | --- |
+| Read and write ops and bytes | Storage-backend operations submitted during the window; not OS I/O. |
+| Observed storage | File lengths in the storage directory after the last refresh, with merges possibly running. |
+| Sampled peak storage | The largest directory size, sampled every 10 ms and at the end. Shorter peaks may be missed. |
+| Peak RSS | The process's lifetime peak (`getrusage`), including restore and the pre-read. Not a window figure. |
+| Window peak RSS | `VmHWM` at the window's end, after `clear_refs` reset it at the start (Linux). |
+| Window end RSS | `VmRSS` at the window's end (Linux). |
+| Cgroup window block | `sequence.cgroup`: evidence of memory use, not proof of pressure. `peak` falls back to the sampled maximum of `memory.current` where `memory.peak` cannot be reset. |
+| Memory pressure | DBSP's level for the runtime, from process RSS against the target, not from cgroup memory. |
+| Cache occupancy | The worker cache's occupancy at the window's start and end; the capacity is `--cache-bytes`. |
+| Memory and storage batches | Nonempty in-memory and file runs in the retained snapshots; the index reports its own. |
+
 ## Pending: pressure evidence
 
-The instrumentation is implemented (Linux paths unrun and untested on Linux; macOS records `null`) but has produced no Linux data. Implemented:
-
-- Per-refresh `Runtime::current_memory_pressure()` levels for the runtime (`refreshes[].memory_pressure`).
-- A cgroup snapshot of `memory.current`, `memory.events`, `memory.stat` reclaim and refault counters, and `memory.pressure` before the first refresh and after the last, with deltas (`sequence.cgroup`), apart from loading and input preparation.
-- A window peak: `VmHWM` reset through `clear_refs` (`sequence.window_peak_rss_bytes`), and `memory.peak` reset by writing to it, with the sampled `memory.current` maximum as the fallback.
-- Pre-reading of the refresh files and eviction of the input page cache (see [Definitions](#definitions)).
+What the instrumentation showed on the first Linux host (kernel 6.8; for example the version 17 reports):
+- **The `clear_refs` reset works:** `window_peak_rss_error` is `null`.
+- **`memory.peak` cannot be reset on 6.8.** It is read-only, so `window_peak_supported` is false, and `peak` falls back to `max_sampled_memory_current_bytes`.
+- **Per-refresh pressure levels** show `critical` from refresh 2 or 3 at 512/512. The cgroup's `memory.events max` stays 0, so DBSP's target binds, not the kernel's limit.
 
 Still pending:
-
-- The first Linux pilot, which shows whether the `clear_refs` and `memory.peak` resets work on the host.
-- Keeping the runner's run-level cgroup peak and `io.stat` as run-level evidence (unchanged). The enforced limit covers the driver, runtime, auxiliary threads, configured cache, and cgroup-charged input page cache together.
-- As a probe, repeat a pilot with a 192 MiB runtime target and check that the samples show the intended levels. An optional delta stress case concatenates eight complete RF1 sets in RAM; a run that exceeds its budget must fail as one complete refresh.
-- Any claim of pressure or reclaim. The new fields are evidence to read, not proof.
+- **A pressure probe.** A run at a lower target (for example 192 MiB) whose samples show the intended levels.
+- **An optional stress case.** Eight complete RF1 sets in RAM; a refresh that exceeds its budget must fail whole.
+- **Any claim of reclaim or beyond-memory behavior.** The fields are evidence, not proof.
 
 ### Two pressure signals
 
 DBSP's pressure level and the cgroup limit measure different things:
 
-- **DBSP's signal.** The `rss-monitor` thread (`crates/dbsp/src/circuit/runtime.rs`) calls `process_rss_bytes` (`crates/dbsp/src/utils.rs`, `memory_stats().physical_mem`) once a second. This is process RSS only.
-  - **Thresholds.** The levels are fractions of `max_rss`, which the driver sets from `--memory-target-bytes` through `CircuitConfig::with_max_rss_bytes` (`main.rs`). Moderate is 0.85, High 0.90, and Critical 0.95 (`crates/feldera-types/src/memory_pressure.rs`). Without a target, the level is always Low.
-  - **Hysteresis.** After High, the level falls back only when the raw level reaches Low. After Critical, it falls back only when the raw level reaches Moderate or Low.
-- **The cgroup limit.** `memory.max` charges anonymous memory and page cache together. The cache includes the driver's `BufReader` input reads and the refresh-file reads; the runner copies no input. State files are opened with `O_DIRECT` (`StorageCacheConfig::to_custom_open_flags` for `FelderaCache`), so state I/O adds no page cache.
-- **Consequence.** The cgroup can approach `memory.max`, and the kernel can reclaim page cache, while DBSP still reports Low pressure and does not spill. Kernel reclaim in a pilot is therefore not evidence of DBSP memory pressure, and DBSP's level says nothing about cgroup headroom. Report the two signals apart.
-- **Mitigations (implemented).** The driver and the runner evict the input page cache after loading, and the driver reads the refresh files into memory before the window. This narrows the gap but does not close it: page cache charged inside the window would stay invisible to DBSP's signal, and pre-read rows count as process memory and so toward DBSP's signal (their size is `refresh_inputs`). The cgroup and the DBSP levels are reported apart (`sequence.cgroup` and `refreshes[].memory_pressure`).
-
-Until these are recorded in this file or in history.md, with raw artifacts, make no memory-pressure, reclaim, or beyond-memory claim.
+- **DBSP's signal.** The `rss-monitor` thread (`crates/dbsp/src/circuit/runtime.rs`) reads process RSS once a second (`process_rss_bytes`).
+  - **Levels.** Moderate, High and Critical are 0.85, 0.90 and 0.95 of `max_rss`, which is set from `--memory-target-bytes` (`crates/feldera-types/src/memory_pressure.rs`). With no target, the level stays Low.
+  - **Hysteresis.** After High, the level falls back only at Low. After Critical, only at Moderate or Low.
+- **The cgroup limit.** `memory.max` charges anonymous memory and page cache together. Page cache here is input reads only, since state files use `O_DIRECT`.
+- **Consequence.** The cgroup can near its limit, and the kernel can reclaim, while DBSP reports Low. Equally, DBSP's level says nothing about cgroup headroom. Report the two apart.
+- **Mitigations.** Evicting the inputs and pre-reading the refreshes narrow the gap but do not close it.
 
 ## Setup compaction and the compaction threshold
 
-A Spine starts a background compaction when one of its levels reaches 8 runs (`MIN_LEVEL0_MERGE_BATCHES`). Writes inside the measured window therefore depend on where each Spine stands against that threshold when the window opens, not on how much state it keeps. `--setup-full-compaction` isolates that dependence, to measure the fragmentation effect on its own. After loading, it requests full compaction, waits for compaction to finish, then publishes and starts the refreshes, so both modes start from one run per Spine. No compaction is requested after any refresh. The flag is off by default: no compaction before the refreshes is the more realistic workload (decision of 2026-11-09). The results recorded in this file (versions 4 to 6) ran with the flag, and each keeps the settings it ran with.
+A spine starts a background compaction when a level reaches 8 runs (`MIN_LEVEL0_MERGE_BATCHES`), so the window's writes depend on where each spine stands against that threshold when the window opens.
 
-Loading itself is unchanged. The merged index takes a run from every transaction that touches any of its tables, so it reaches the threshold one refresh earlier than each native trace, by design. The evidence for both points (the 2026-10-14 smoke runs, the POSIX flush fix, and the write attribution by owner) is in [history.md](../../../docs/design/merged-index/history.md#2026-10-14-write-and-storage-investigation).
+- **What the flag does.** `--setup-full-compaction` removes that dependence. Both modes start from one run per spine, which isolates the effect of fragmentation.
+- **Off by default.** The flag is off ([decided](#decided)); results of versions 4 to 6 ran with it on.
+- **The merged index reaches the threshold first.** It takes a run from every transaction that touches any of its tables, so it reaches the threshold a refresh earlier than each native trace. The evidence is in [history.md](../../../docs/design/merged-index/history.md#2026-10-14-write-and-storage-investigation).
 
 ### Terms
 
-- **Batch:** the delta of one transaction. **Run:** an immutable sorted collection in a Spine, in memory or on disk; `memory_batch_count` and similar code fields count runs.
-- **Compaction:** LSM compaction. Background compaction starts when a Spine level reaches 8 runs (`MIN_LEVEL0_MERGE_BATCHES`). A requested full compaction is `DBSPHandle::start_compaction`, or `initiate_compaction` on the merged index's Spine.
-- **Base-relation state:** the base tables stored by primary key (Feldera's "input map").
-- **Operations**, named separately: finish a transaction, request full compaction, wait for compaction to finish, publish snapshots, release snapshots.
+- **Run:** an immutable sorted collection in a spine, in memory or in a file. Feldera's code calls it a batch, and fields like `memory_batch_count` count runs.
+- **Compaction:** LSM compaction. A requested full compaction is `DBSPHandle::start_compaction`, or `initiate_compaction` on the index's spine.
+- **Base-relation state:** the base tables stored by primary key (Feldera's input map).
 
 ## Driver and runner options
 
-Moved from the former WORKFLOW.md ("Run the driver", "Measure R5"). The command lines are in [CLAUDE.md](CLAUDE.md); the Linux campaign's are in [LINUX-HANDOFF.md](LINUX-HANDOFF.md).
+The command lines are in [CLAUDE.md](CLAUDE.md) and [LINUX-HANDOFF.md](LINUX-HANDOFF.md).
 
 ### The driver
 
-The driver takes complete dbgen base files and one refresh batch. Build the release binary first (native or reconstructed), then run it from a fresh run directory. `--storage-path DIR` selects file-backed state in a distinct `run-N` subdirectory per run. `--dump-runtime-circuit DIR` writes each run's per-worker runtime graphs after its final refresh, outside the phase timers; the directory must not already hold a run.
+The driver takes complete dbgen base files and the refresh list.
 
-- `--write-image DIR` loads the base files and writes `DIR/storage` (one DBSP checkpoint of both circuits, and in reconstructed mode the merged index and its orphan lines) and `DIR/image.json`, then stops. It takes `--runs 1` and no refresh, report, or `--storage-path`.
-- `--from-image DIR` reopens the image in `DIR` (a copy: its `storage/` changes as the refreshes run) and runs only the refreshes. It refuses an image written with other storage settings.
-
-The CLI accepts RF1 insertion and RF2 deletion under referential integrity only. Reconstructed mode itself accepts general deltas of the base tables ([DECISIONS.md](DECISIONS.md) and [decisions.md](../../../docs/design/merged-index/decisions.md)); only the tests exercise them.
+- **Running it.** Build the release binary (native, or with `--features merged-index`) and run it from a fresh run directory.
+  - `--storage-path DIR` puts file-backed state in a new `run-N` directory.
+  - `--dump-runtime-circuit DIR` writes the runtime graphs after the last refresh.
+- `--write-image DIR` loads the base files, writes one DBSP checkpoint of both circuits (plus, in merged-index mode, the index and its orphan lines) to `DIR/storage`, with `DIR/image.json`, and stops.
+- `--from-image DIR` reopens a copy of an image and runs only the refreshes. It refuses an image written with other storage settings (`ImageSettings`: mode, workers, the two encodings, the prefix filter).
+- **Deltas.** The CLI applies RF1 inserts and RF2 deletes under referential integrity. Merged-index mode accepts any base-table delta, but only the tests exercise that.
 
 ### The runner
 
-`--storage-path` is the campaign root. Each run gets a new `run-<repetition>-<mode>` directory under it, holding `storage/`, `driver.json`, and the logs. The Linux campaign adds `--cgroup-root` and `--total-memory-bytes`.
+`measure.py` is the runner.
 
-The runner always starts the driver with `--r5`. That flag (`Config::from_args` in `src/main.rs`) selects the measured configuration. Native joins probe their traces through run cursors, with DBSP's asynchronous join fetch off (`native_join_fetch: false` in the report; it was on until 2026-11-04). It is accepted only with one worker, one run per process (`--runs 1`), `--storage-path`, `--cache-bytes`, `--memory-target-bytes`, and `--report`; otherwise the driver exits with an error. `--cache-bytes` must be a whole number of MiB.
+**Layout.** `--storage-path` is the campaign root; each run gets `run-<repetition>-<mode>` under it, with `storage/`, `driver.json` and the logs.
 
-`python3 measure.py --help` lists the remaining options (`--compaction-timeout-secs`, `--batch`, `--runs`, `--storage-path`, `--diagnostics`, `--setup-full-compaction`, `--front-code-byte-keys`, `--elide-value-headers`, `--session-pass`, `--cgroup-root`, `--total-memory-bytes`, `--device-label`).
+**`--r5`.** The runner always passes it, which selects the measured configuration:
+- native joins probe their traces through run cursors (`native_join_fetch: false`);
+- one worker and one run per process;
+- `--storage-path`, `--cache-bytes` (a whole number of MiB), `--memory-target-bytes` and `--report` are required.
 
-- `--session-pass seek|step` (default `seek`, also a driver flag) selects how reconstructed mode's scan session passes the untouched groups; native ignores it and reports `configuration.session_pass` as `null`.
-- `--setup-full-compaction` (also a driver flag) changes only the setup. After loading, it requests full compaction for the circuit and the merged index and waits for compaction to finish, then publishes and starts the measured refreshes. Nothing is compacted on request after any refresh. It is off by default (decision of 2026-11-09). Add it to isolate the fragmentation effect: both modes then start from one run per Spine.
-- `--front-code-byte-keys` (also a driver flag) sets DBSP's `front_code_byte_keys` dev tweak. Every storage file writer then prefix-truncates data blocks whose keys are raw byte strings with no auxiliary data, which in this experiment is only the merged index's key level; native runs write the same files as without it. The report's `front_coding` holds the writer's counters: blocks written prefix-truncated, `layout_fallbacks` (eligible blocks the encoder did not understand, which should be 0), and `size_fallbacks` (blocks that prefix truncation would not have shrunk by a 512-byte sector).
-- `--elide-value-headers` (also a driver flag) sets DBSP's `elide_value_headers` dev tweak, independent of `--front-code-byte-keys`, so each is measured on its own. Every storage file writer then drops the redundant 16-byte `ArchivedVec` header of each byte-string value in data blocks whose items are a `Vec<u8>` with an `i64` weight, which in this experiment is only the merged index's value level (its packed payloads), and rebuilds the header when the block is read. Native runs write the same files as without it. The report's `value_header_elision` holds the counters, with the same meaning as `front_coding`'s.
-- `--diagnostics` turns on the opt-in storage diagnostics. Each run directory then gains a `diagnostics/` directory (the driver's own `--diagnostics DIR`, which needs file storage and one run per process) with four files. The scans run outside the timed window.
-  - `flush-log.jsonl`: one line per backend flush, with file, bytes, owner and times.
-  - `compaction-log.jsonl`: one line per run that a spine wrote outside the circuit's steps, with kind (background compaction, requested compaction, or insert spill), owner, spine, input runs, and output file and size.
-  - `run-contents.json`: for every spine alive at the end of the window, each run's location, records, negative-weight records, file size and bytes per block type, plus the consolidated row count, labelled with the run's mode.
-  - `summary.json`: the window, the flush log split before, in and after the window, and whether the flush log matches the backend's counters.
+**Options** (`python3 measure.py --help` lists them all):
+- `--images DIR`: start each run from a copy of its mode's image (`--build-images` and `--complete-images` make them).
+- `--front-code-byte-keys`, `--elide-value-headers`: the merged index's key and value encodings, with prefix truncation for keys and header elision for values. Native writes the same files either way.
+- `--index-prefix-filter`: the prefix-filter arm. Images record it, so each arm needs its own.
+- `--memtable-mib N`: the memtable arm. It must stay below half of the memory target, and is refused when building images.
+- `--session-pass seek`: the only pass offered.
+- `--setup-full-compaction`: compact fully after loading.
+- `--warm-up LIST`: run one pair before the window, untimed.
+- `--diagnostics`: write `flush-log.jsonl`, `compaction-log.jsonl`, `run-contents.json` and `summary.json` per run. The logs are held in memory, so allow a 2 GiB cgroup. `spill_kinds.py` classes their files by write kind.
+- `--cgroup-root`, `--total-memory-bytes`: the per-run cgroup.
+- `--device-label`: names the device.
+- `--keep-run-storage`: keep each run's image copy.
 
-The refresh list is a JSON array in execution order. Each item is `{"rf1_orders": "orders.tbl.u1", "rf1_lines": "lineitem.tbl.u1"}` or `{"rf2": "delete.1"}`; relative paths resolve against the list file.
+**The refresh list** is a JSON array in execution order, of `{"rf1_orders": ..., "rf1_lines": ...}` or `{"rf2": ...}` items. A cut refresh also carries `transaction_orders`. Relative paths resolve against the list file.
 
-The runner rejects any driver report that fails `report_problems` in `measure.py`:
+**`report_problems` rejects a report unless:**
+- the per-owner writes sum to the totals, and read owners write nothing;
+- `delta_ms` is finite and non-negative, and `ivm_ms >= delta_ms`;
+- the run reads follow the mode: native has `partner_trace` reads and no `requested_slice` reads, merged-index the reverse, and the worker never reads `merged_index`;
+- `driver_run_reads`, the session counts, `index_upkeep_run_reads`, `profiled_cpu_ms` and `block_expansions` are well formed and sum over the refreshes;
+- the transaction latencies are well formed;
+- `session_pass`, `index_prefix_filter` and `memtable_mib` are what the runner asked for;
+- the layout fallbacks are 0 for each encoding that is on;
+- `measurement_version` is `MEASUREMENT_VERSION` (18).
 
-- per-owner writes sum to the totals;
-- `delta_ms` is present, finite, and non-negative, and `ivm_ms >= delta_ms`;
-- `view_run_reads` of `requested_slice` and `partner_trace` follow the mode: a native run has no `requested_slice` reads and some `partner_trace` reads, a reconstructed run the reverse, and nothing is read under `merged_index` on the view worker;
-- `driver_run_reads` is well formed (`null` in native mode), and no writes are charged to `requested_slice`;
-- the scan session's counts, `index_upkeep_run_reads`, and `profiled_cpu_ms` are well formed and their sequence totals are the sums of the refreshes;
-- `configuration.session_pass` is the pass that the runner asked for;
-- `front_coding.layout_fallbacks` is 0 when prefix truncation is on, and `value_header_elision.layout_fallbacks` is 0 when elision is on (decision of 2026-11-16);
-- the report is measurement version 13 (`MEASUREMENT_VERSION`; the former text said 12), and `block_expansions` are well formed, sum over the refreshes to the window's, and are 0 for an encoding that is off.
-
-The runner builds and preserves separate native and reconstructed release executables, regenerates the native circuits at the end, and starts a fresh process and storage directory for each mode and repetition (three by default).
+The runner builds and keeps separate native and merged-index executables. It starts a fresh process and storage directory per mode and repetition.
 
 ## Deferred
 
-Broader updates, residual Q3 (see [deferred.md](../../../docs/design/merged-index/deferred.md)), periodic checkpoint measurements, and Q5/Q10.
+These are deferred:
+- broader updates;
+- residual Q3 ([deferred.md](../../../docs/design/merged-index/deferred.md));
+- periodic checkpoint measurements;
+- Q5 and Q10.
+
+## Appendix: measurement versions
+
+Each version changed what the report means. `measure.py` and `summarize.py` accept only the current version.
+
+- **2.** No forced final compaction (`last_refresh_complete`). Version 1 forced one; its results are historical ([history.md](../../../docs/design/merged-index/history.md#2026-10-08-r5-version-1-smoke-runs)). `q3_ms` covered the base tables as well.
+- **3** (2026-10-25). Two chained circuits, the refresh pre-read, and input eviction. The merged index was booked in `combined_maintenance_ms` (`index_ms + q3_ms`), not in `base_ms`.
+- **4** (2026-10-26). The merged index moved into the base runtime and phase: `base_ms` includes `index_ms`, and `ivm_ms = q3_ms`.
+- **5** (2026-11-04). Run reads: per reader for the index, per owner for the view worker, and the index's layout.
+- **6** (2026-11-05). One runtime with one buffer cache for both circuits, and the profiler's per-circuit CPU time.
+- **7** (2026-11-10). DBSP's default run placement, with no `min_storage_bytes: Some(0)`. Results of version 6 and earlier differ in file placement. In-memory runs' access counters. `Old` and `Dlt` are published.
+- **8** (2026-11-10). One scan session per transaction instead of four readers' scans. `index_run_reads` becomes `{session}`; `index_session_counts` and `index_upkeep_run_reads` are new.
+- **9** (2026-11-11). The driving deltas' boundary copy is booked in `forward_ms`.
+- **10** (2026-11-11). The driving deltas reach the view circuit as whole batches through DBSP's `Input` operator. `session_pass` is reported.
+- **11** (2026-11-12).
+  - **Readers.** Each reader holds its requests and keeps only its rows, and the `requested_slice` and `partner_trace` owners are new.
+  - **`delta_ms`.** It is inside `ivm_ms` (`ivm_ms = delta_ms + q3_ms`), and `forward_ms` keeps only the net-delta read.
+  - **A rename.** `filtered_probes` was `filter_rejections` until 2026-11-16, without a version change.
+- **12** (2026-11-16). `block_expansions` and `storage_device`.
+- **13** (2026-11-17). Loading separated: runs start from images (`--images`, the driver's `--from-image`), `load` is `null` and `image` is recorded.
+- **14** (2026-11-17). Every transaction is timed (`transactions`, `transaction_latency`), and refreshes are cut by `transaction_orders`.
+- **15** (2026-11-18). Bloom filters storage-resident (`filter_residency`), the cache 256 MiB, and `run_counts` with `device_reads`. New images.
+- **16** (2026-11-18). Base tables evicted after each base transaction (`base_eviction_ms`, `base_evicted_bytes`). `BaseState` moved out of the image sources. New images.
+- **17** (2026-11-19). The prefix-filter arm (`--index-prefix-filter`, `filtered_prefix_probes`), with its own images. The file format changed. New images.
+- **18** (2026-11-20). The memtable arm (`--memtable-mib`, `configuration.memtable_mib`, `run_counts` memtable fields). `spine_async.rs` and `trace/ord/**` changed, so new images. `measure.py` accepts 18 from `2275c7446`.
