@@ -172,8 +172,12 @@ The build has two phases. The plan for phase 1 lists its stages; phase 2 is logg
    - **Done (2026-11-20): the adapters crate compiles**, with no warnings. The check was `cargo check -p dbsp_adapters` with every default feature but `with-kafka`. This host also lacks librdkafka, but `controller.rs`'s memtable metrics are not behind that feature.
    - **Done: `measure.py --memtable-mib N`.** It passes the budget to the driver, records it in `configuration.memtable_mib`, and checks it against the driver's report. It refuses a budget of half the memory target or more, and refuses the flag with `--build-images`.
    - **Done: `spill_kinds.py` in `q3-ivm-baseline/`.** It classes the files of a `--diagnostics` window by write kind, the flush kinds included, with each memtable flush's seal time.
-   - **Rebuild the images:** `images-v18-pf`, prefix filters on. Measurement version 18 changed `spine_async.rs` and `trace/ord/**`, which are in the image digest.
-   - **The three arms** of the run below (**Run**), then diagnostics reruns for writes by kind.
+   - **Done: the images**, `images-v18-pf`, prefix filters on. Measurement version 18 changed `spine_async.rs` and `trace/ord/**`, which are in the image digest.
+   - **Done (2026-11-20): the three arms** of the run below (**Run**), with diagnostics reruns for writes by kind. Results: [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20).
+     - The merged index's view p99 fell 27 to 36% at the same median, and every arm was `critical`.
+     - Writes per transaction fell from about 300 to 400 KiB to 18 KiB, since background compaction nearly stopped. Step-built files remain.
+     - The budget was reached once, in refresh 4, so only one round of seals was measured. Native with the memtable stayed at `low` pressure.
+     - Whether the campaign uses the memtable is the user's decision.
 
 ## The arm and its limits
 

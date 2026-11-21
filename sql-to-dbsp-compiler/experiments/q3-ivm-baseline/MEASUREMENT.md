@@ -41,7 +41,7 @@ Nothing here infers an unmeasured quantity.
 | Base eviction | on (v16) | not measured in isolation (it came with the 512 MiB cache) | eviction 5.5–6 ms, in neither phase | **Decided 2026-11-18:** on, always |
 | Prefix filter | off, on (v17) | merged-index off 4.56 / 3.36, on 3.98 / 3.06; index seeks 9.8 → 2.5 and 26.6 → 7.0 | off 3.77 / 15.57, on 3.56 / 14.68 | **Active:** the default awaits the user |
 | Order keys | dbgen (v16–17), uuid (v17), sequence (stopped) | uuid: native 3.88 → 5.76 / 4.46 → 9.28; merged-index 4.56 → 4.15 / 3.36 → 3.49 | uuid: native 13.86 / 11.44, merged-index 11.92 / 20.20 | **Decided:** dbgen is the default, and `sequence` and timestamp IDs are out. **Active:** uuid |
-| Memtable | 512/512; 448 cache; 448 + 64 MiB memtable (v18) | running | running | **Active:** [running](#memtable-at-512-mib-2026-11-20) |
+| Memtable | 512/512; 448 cache; 448 + 64 MiB memtable (v18) | 448 off → 448 + 64: merged-index 3.91 → 3.83 / 3.16 → 3.18, p99 8.19 → 5.28 / 6.58 → 4.78; native 3.00 → 1.71 / 1.60 → 1.87, but native stayed `low` with the memtable | merged-index 3.38 → 3.89 / 15.20 → 11.07; native 3.22 → 3.14 / 6.11 → 5.62 | **Active:** [measured](#memtable-at-512-mib-2026-11-20); the user decides |
 | Workload | clustered, scattered (v14) | clustered: native 3.77 / 4.63, merged-index 4.51 / 3.07; scattered: native 4.30 / 4.44, merged-index 8.06 / 3.14 | 1.0–1.4 / 1.1–1.9 | **Active:** scattered not run since v14 |
 | Transaction size | K = 10 | as above | — | **Active:** K = 100 and 1,000 next |
 | Device | SSD | as above | — | **Active:** the hard-disk probe has not run |
@@ -50,7 +50,8 @@ What the rows add up to, so far:
 - **Where the merged index helps.** Its view is faster on deletes (RF2) in every measured setting, and it holds its latency when Order keys are random, while native's doubles.
 - **Where it pays.** With dbgen keys its inserts (RF1) are slower, since each transaction lands on a new customer's group (first-touch reads), and most of all with scattered customers. With uuid keys its RF1 is the faster one.
 - **The prefix filter** cut the index's seeks by three quarters and its RF1 median by 13%.
-- **Pressure.** Every run since the 512 MiB cache is at `critical` pressure, which is the target regime ([one budget](#one-budget-at-512-mib-base-tables-evicted-2026-11-19)).
+- **The memtable** cut the merged index's p99 by 27 to 36% and its writes by 94%, since background compaction nearly stopped. Medians barely moved.
+- **Pressure.** Every run since the 512 MiB cache is at `critical` pressure, which is the target regime ([one budget](#one-budget-at-512-mib-base-tables-evicted-2026-11-19)). The exception is native with the memtable, which stayed `low`.
 
 ## Dimensions
 
@@ -58,7 +59,7 @@ What the rows add up to, so far:
 
 | Dimension | Arms | Selected by | Own images? | Now | Next | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| Memtable | off; `--memtable-mib N` | the campaign's `--memtable-mib` | no | the three arms are running | report, view first | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget) |
+| Memtable | off; `--memtable-mib N` | the campaign's `--memtable-mib` | no | off; 448 + 64 [measured](#memtable-at-512-mib-2026-11-20) | the user decides whether it joins the campaign | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget) |
 | Prefix filter | off, on | `--index-prefix-filter` on `--build-images` and on the campaign | yes | on in the memtable arms | the user sets the default | [decision](../../../docs/design/merged-index/decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter) |
 | Order keys | `dbgen` (default), `uuid` | `prepare_inputs.py --order-keys`; images from `<out>/base` | yes | dbgen | uuid as an arm of later runs | [decision](DECISIONS.md#2026-11-19-order-keys-are-a-dimension-dbgen-sequence-uuid) |
 | Workload | clustered, scattered | the refresh list (`clustered/`, `scattered/`) | no | clustered | scattered at the current version | [decision](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order) |
@@ -249,16 +250,72 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v17-t512-c512{,-pf,-uuid}
 
 ## Memtable at 512 MiB (2026-11-20)
 
-Running.
+**Settings.** Measurement version 18, revision `2275c7446`, images `images-v18-pf`. The pilot is A-seek clustered, K = 10, dbgen keys, prefix filters on, target 512 MiB, cgroup 1 GiB, one repetition per arm. The arms, from the [decision](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable):
+- **c512:** 512 MiB cache with the memtable off;
+- **c448:** 448 MiB cache with the memtable off (the control for the smaller cache);
+- **m64:** 448 MiB cache with `--memtable-mib 64`.
 
-**Settings.** Measurement version 18, revision `2275c7446`, images `images-v18-pf`. The pilot is A-seek clustered, K = 10, dbgen keys, prefix filters on, target 512 MiB, cgroup 1 GiB. The arms, from the [decision](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable):
-- 512 MiB cache with the memtable off;
-- 448 MiB cache with the memtable off;
-- 448 MiB cache with `--memtable-mib 64`.
+Each timed run was followed by a `--diagnostics` rerun in 2 GiB, used only for writes by kind. All twelve runs completed. Figures are over refreshes 2 to 6 (30,145 transactions), per transaction.
 
-Each is followed by a `--diagnostics` rerun in 2 GiB, for writes by kind (`spill_kinds.py`).
+**Pressure differs by arm, so read the native rows with care.**
+- **Merged index:** `low` in refresh 1 and `critical` from refresh 2 in all three arms, so its rows compare like with like.
+- **Native, c512 and c448:** `critical` from refresh 4.
+- **Native, m64:** `low` in every refresh, and its window peak RSS was 404 MiB, against 622 (c448) and 689 (c512).
 
-Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448-m64}{,-diag}/`.
+**The view circuit (`ivm_ms`, ms):**
+
+| | RF1 native | RF1 merged-index | RF2 native | RF2 merged-index |
+| --- | ---: | ---: | ---: | ---: |
+| p50 / p95 / p99, c512 | 3.04 / 5.49 / 6.74 | 4.18 / 6.93 / 8.60 | 1.78 / 5.85 / 7.07 | 3.19 / 5.25 / 6.77 |
+| p50 / p95 / p99, c448 | 3.00 / 6.34 / 8.10 | 3.91 / 6.57 / 8.19 | 1.60 / 6.58 / 8.31 | 3.16 / 5.17 / 6.58 |
+| p50 / p95 / p99, m64 | 1.71 / 1.98 / 2.07 | 3.83 / 4.75 / 5.28 | 1.87 / 2.37 / 2.91 | 3.18 / 4.23 / 4.78 |
+| worker-thread device reads, c448 → m64 | 10.7 → 10.0 | 10.0 → 10.0 | 24.8 → 19.7 | 58.6 → 36.7 |
+| index per-run seeks, c448 → m64 | | 2.5 → 3.5 | | 7.0 → 8.4 |
+| runs skipped by the prefix filter, c448 → m64 | | 7.4 → 1.1 | | 21.7 → 2.9 |
+| index device reads (`other/merged_index`), c448 → m64 | | 5.86 → 4.58 | | 1.51 → 1.34 |
+| `base_ms` p50, c448 → m64 (amortized) | 3.22 → 3.14 | 3.38 → 3.89 | 6.11 → 5.62 | 15.20 → 11.07 |
+
+- **The smaller cache alone changes little.** From c512 to c448 the medians move by at most 10% and the p99s by at most 20%, both native's.
+- **The memtable cuts the tail.**
+  - Merged index: p95 falls 28% (RF1) and 18% (RF2), and p99 36% and 27%. The medians move by 2% or less.
+  - Native: p95 falls 69% and 64%. Its RF1 median falls 43%, while its RF2 median rises 17%. Native also stayed at `low` pressure, so this row mixes the memtable's effect with a different pressure regime.
+- **Total view time,** refreshes 2 to 6: native 83 s (c448) against 55 s (m64), merged-index 113 s against 104 s.
+- **Fewer runs.**
+  - The index spine ended with 4 runs, against 8 (c448) and 11 (c512).
+  - Native's spines ended with 2 to 11 runs each, against 2 to 17.
+  - So a group read probes fewer runs: seeks plus skipped runs fall from 9.9 to 4.6 (RF1) and from 28.7 to 11.3 (RF2). The filter has fewer runs to skip, so the seeks per transaction rise slightly.
+- **Compaction nearly stops.** Completed merges in refreshes 2 to 6 fell from 25,501 to 1 (native) and from 17,076 to 0 (merged index). The merger threads' real time fell from 424 s to 3 s and from 582 s to 0.
+
+**Writes by kind** (`spill_kinds.py`, diagnostics reruns, KiB per transaction over the window's 36,170 transactions):
+
+| | native c448 | native m64 | merged-index c448 | merged-index m64 |
+| --- | ---: | ---: | ---: | ---: |
+| view background compaction | 266.7 | 1.0 | 176.9 | 0 |
+| view step-built | 13.5 | 12.3 | 9.2 | 9.1 |
+| view insert spill | 3.6 | 3.4 | 7.6 | 7.5 |
+| view memtable flush | — | 1.4 | — | 1.0 |
+| base background compaction | 110.3 | 0 | 114.3 | 0 |
+| base memtable flush | — | 0.6 | — | 0.5 |
+| **total** | **394.1** | **18.7** | **308.0** | **18.1** |
+
+- Background compaction was 95 to 96% of c448's writes in both modes, and the memtable removes almost all of it.
+- **Not removed:** step-built files and insert spills, about 4 to 7 files per transaction of about 2 KiB each, as [memtable.md](../../../docs/design/merged-index/memtable.md#the-arm-and-its-limits) expected.
+- c512's diagnostics differ from c448's by under 1%.
+
+**The memtable itself** (timed runs):
+- **Flushes.** All of them came in refresh 4, when the budget was reached: 6 seals in native and 4 in the merged index. Each flushed file is 10 to 18 MiB. The diagnostics reruns give a mean seal time of 218 to 236 ms (native) and 207 to 640 ms (merged index, the 640 ms being the view side). The largest view transaction in refresh 4 was 10.4 ms (native) and 30.1 ms (merged index), so no seal shows up whole in a transaction's latency. The report does not say which thread sealed.
+- **Bytes held** at refresh ends: 17 to 50 MiB (native) and 19 to 57 MiB (merged index), refilling after the flush.
+- **Copies while a snapshot was held:** 69,000 to 130,000 node copies per refresh, taking 1.0 to 2.2 s. That is 0.16 to 0.37 ms per transaction. The report does not split this time between the base and view phases.
+- **RSS.** The window peak RSS, c448 → m64, went from 660 to 699 MiB in the merged index (+39 MiB, against a memtable of up to 57 MiB) and from 622 to 404 MiB in native. The native drop is measured, but its cause is not; native also never left `low` pressure.
+
+**Base (amortized).** The merged index's RF2 base median fell 27% (15.20 → 11.07 ms) and its total base time from 330 s to 254 s. Native's base changed by under 10%. Base eviction took 24 to 35 s per refresh in the merged index in both arms. In native it took 4 to 10 s with m64, against 7 to 31 s with c448.
+
+**Limits.**
+- This is one repetition at K = 10, clustered, dbgen keys.
+- The budget was reached once, so only one round of seals was measured.
+- Native's m64 run is at a different pressure level from its controls.
+
+Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448-m64}{,-diag}/manifest.json`.
 
 ## Pending: Linux campaign
 
@@ -272,7 +329,7 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448
 - each run a fresh process from a copy of its image, with the inputs evicted.
 
 **Remaining, by active dimension:**
-1. **The memtable.** Report the three arms, then the user decides.
+1. **The memtable.** The three arms are [measured](#memtable-at-512-mib-2026-11-20). The user decides whether the campaign uses it.
 2. **The prefix filter's default.** The user's decision. Every later arm records `configuration.index_prefix_filter`.
 3. **Scattered, uuid, and K = 100 and 1,000.** Pilots at the current version. Every arm needs its own inputs, and uuid its own images.
 4. **The campaign.** `--runs 3` per chosen arm, after its pilot passes. `summarize.py` pools the manifests.
