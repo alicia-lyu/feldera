@@ -1,0 +1,13 @@
+# R5 environment for the Linux campaign. Copy to ~/r5-env.sh and edit the paths:
+#   cp linux/r5-env.sh.example ~/r5-env.sh
+# Every script in linux/ sources it. A fresh non-login shell (an agent's tool call) has no
+# cargo on PATH, so this file sources ~/.cargo/env.
+. "$HOME/.cargo/env"
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+export RUSTUP_TOOLCHAIN=1.96.1
+export DBGEN_OUT=/mnt/ssd/dbgen-sf10      # dbgen -s 10 output: *.tbl, *.u1..u4, delete.1..4
+export R5_INPUTS=/mnt/ssd/r5-inputs       # prepare_inputs.py outputs: k10/, k100/, uuid-k10/, ...
+export R5_OUT=/mnt/ssd/r5-out             # image sets and pilot outputs
+export HDD_MOUNT=/mnt/hdd                 # the hard-disk probe only
+export REPO=$HOME/feldera

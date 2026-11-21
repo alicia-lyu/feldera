@@ -1,0 +1,6 @@
+# The memtable arms of 2026-11-20 (MEASUREMENT.md, "Memtable at 512 MiB"), on images-v18-pf:
+#   linux/run-arms.sh "$R5_OUT/images-v18-pf" linux/arms/memtable-2026-11-20.txt
+# <tag> <cache MiB> [extra measure.py flags]
+v18-pf-t512-c512 512 --index-prefix-filter
+v18-pf-t512-c448 448 --index-prefix-filter
+v18-pf-t512-c448-m64 448 --index-prefix-filter --memtable-mib 64

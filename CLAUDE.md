@@ -90,6 +90,17 @@ Each code directory has a short `CLAUDE.md` that Claude loads when it works ther
   - Code identifiers keep their names.
   - "Residual execution" is an acceptable term.
 
+### Working with the user
+
+Lessons from the 2026-11-17 to 2026-11-21 sessions. The user corrected each of these at least once.
+
+- **Lead with the view circuit.** Report IVM figures and view-side reads first. Base cost, index upkeep included, is amortized over the many views one index serves, so it comes last. A base effect that leaks into the view, such as flooding the shared cache, is something to mitigate in both modes alike, not a result.
+- **Define every term a choice turns on,** kernel and DBSP terms included, the first time it appears. Name the program (the Q3 driver, `measure.py`, the load program, the refresh program), never "harness". Say "memory-resident" (always in RAM) or "storage-resident" (on disk, read through the buffer cache), never a bare "resident"; that ambiguity once nearly flipped a default.
+- **Prefer the simplest separation of phases** over in-process workarounds. Separate load and refresh programs sharing an image replaced a staged-reclaim plan. Question inherited constraints instead of designing around them.
+- **Designs are reuse-first.** Present a design's existing components first: key and value types, the spine, how data becomes a file run. Then present the bridging pieces, and only then what is genuinely new. Ground a new data structure in a paper or an existing crate (RocksDB, LMDB, imbl, ART, Masstree), and offer options after checking `std` and existing crates.
+- **A request to update or reorganize a doc means a full pass** for consistency and tightness: one fact in one place, stale facts fixed, and a note on where future changes go. Settled items read "Decided ‹date›: ‹setting›", never "archived".
+- **Settings are the user's to choose.** Measure, report, and stop. Open as of 2026-11-21: the prefix-filter default, and whether the memtable joins the campaign.
+
 ### Trusting the docs
 
 - Prefer code and tests. Docs cite code by symbol name, since line anchors drift.

@@ -319,6 +319,8 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448
 
 ## Pending: Linux campaign
 
+**The first Linux host expired on 2026-11-21.** Every `/mnt/ssd/...` artifact path in this file is gone with it; the tables here are the record. A new host starts from [LINUX-HANDOFF.md](LINUX-HANDOFF.md#quick-start-for-an-agent), with new inputs and images.
+
 **Settings of every run.** These are the decided settings above, on the SSD:
 - arm A-seek, with prefix truncation and value-header elision on;
 - cgroup `memory.max` 1 GiB with swap 0;

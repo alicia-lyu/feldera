@@ -14,6 +14,29 @@ The commands for running R5 on a Linux machine, in the order they are run. It is
 - two Xeon Silver 4114 (40 logical cores) and 187 GiB RAM;
 - an Intel SSDSC2BB48 SSD (480 GB) and a Seagate ST1200MM0088 hard disk (1.2 TB), both with 512-byte logical sectors.
 
+## Quick start for an agent
+
+The scripts in [`linux/`](linux/) are what ran on the first host, set to the decided settings. Each one's header gives its use and variables. Times are from the first host.
+
+1. **Check the machine:** "Machine and OS" and "Pre-flight checks" below.
+2. **Disks:** only with the user's approval ("Prepare the disks").
+3. **Toolchain:** about 1 h cold. `cp linux/r5-env.sh.example ~/r5-env.sh` and edit the paths. A fresh agent shell has no `cargo` on `PATH`, so every command starts with `. ~/r5-env.sh`.
+4. **Inputs:** dbgen takes about 10 min, then `prepare_inputs.py` per transaction size ("Generate TPC-H inputs", "Prepare the workloads").
+5. **The cgroup tree:** `linux/setup-cgroup.sh` (`sudo`). Rerun it after every reboot.
+6. **Images:** `linux/build-images.sh images-v<version>-pf --index-prefix-filter`, about 1.5 h and 35 GB.
+7. **Arms:** list them in a file like [`linux/arms/memtable-2026-11-20.txt`](linux/arms/memtable-2026-11-20.txt), then run `linux/run-arms.sh "$R5_OUT/<images>" <arms file>`. Three arms with their diagnostics reruns took about 6 h. One pilot alone is `linux/run-pilot.sh clustered 10`, with `R5_IMAGES` set.
+8. **Analysis:**
+   - `python3 compare_arms.py <manifest.json>...` gives the view-first tables: latency per phase, reads, index seeks and skips, base, pressure, merges, runs, the memtable and RSS.
+   - `python3 spill_kinds.py <diag manifest.json>` gives the writes by kind. It takes the manifest file, not its directory.
+9. **Record:** a dated section of [MEASUREMENT.md](MEASUREMENT.md) and its Synopsis row. Settings the user has not chosen stay open: report, then ask.
+
+**Agent habits that saved time:**
+- **Long jobs** (builds, images, arms) run as background shell tasks with a log file. Auto mode refuses `nohup` and `setsid`, and the task's notification says when it ends. Don't poll more often than the job's natural step: an arm takes 40–80 min.
+- **Keep the checkout clean** from the first pilot to "all done". Each manifest records `revision` and `git_status_short`, and `run-pilot.sh` refuses a dirty checkout. Edit docs in a separate worktree, `git worktree add ../feldera-docs origin/main`, and push from there.
+- **New measurement versions** need new images when an image source changed (`IMAGE_SOURCE_PATHS`). Smoke a new version at SF 0.01 first ("Prepare the workloads"). A version mismatch fails the run at once, with "measurement_version is N, expected M".
+- **librdkafka** may be missing. Check the adapters crate without `with-kafka` (see "Toolchain").
+- **Write multi-line edit scripts to a file** instead of a shell heredoc: a doc that quotes `<<'EOF'` ends the heredoc early.
+
 ## Machine and OS
 
 - **Architecture: x86_64.** The dbgen build and the JDK path assume it; aarch64 is untested.
@@ -123,17 +146,10 @@ rustup toolchain install 1.96.1 --profile minimal -c rustfmt -c clippy
 
 - **Python** 3.9 or later, with no third-party imports. Also `git`, `make` and `gcc` for dbgen.
 
-**A shell setup file.** Agent harnesses start a fresh shell for each command, so put the environment in one file:
+**A shell setup file.** Agent harnesses start a fresh shell for each command, so put the environment in one file, and edit its paths:
 
 ```bash
-cat > ~/r5-env.sh <<'EOF'
-. "$HOME/.cargo/env"
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-export PATH="$JAVA_HOME/bin:$PATH"
-export RUSTUP_TOOLCHAIN=1.96.1
-export DBGEN_OUT=/mnt/ssd/dbgen-sf10 R5_INPUTS=/mnt/ssd/r5-inputs R5_OUT=/mnt/ssd/r5-out
-export HDD_MOUNT=/mnt/hdd REPO=$HOME/feldera
-EOF
+cp linux/r5-env.sh.example ~/r5-env.sh
 ```
 
 **Pre-build the release executables** with `-j"$(nproc)"`: `measure.py` builds with `-j2`, which took 56 minutes from a cold target (verified). Build both modes:
@@ -222,6 +238,8 @@ How each active dimension is selected, and whether it needs its own images. The 
 
 Loading is not measured. It runs once per image set, with no cgroup limit and no memory target, and every measured run starts a new process from its own copy of an image.
 
+`linux/build-images.sh <name> [flags]` wraps the command below. It refuses a dirty checkout or an existing set.
+
 ```bash
 # in sql-to-dbsp-compiler/experiments/q3-ivm-baseline; a new directory on the SSD
 python3 measure.py --build-images "$R5_OUT/images-v18-pf" \
@@ -253,7 +271,7 @@ python3 measure.py --build-images "$R5_OUT/images-v18-pf" \
 - each child's `memory.max` and `memory.swap.max` (0) written and read back;
 - the child moves itself in from a `preexec_fn`. The kernel requires write access to the common ancestor's `cgroup.procs`, so `measure.py` must sit in a leaf next to the run cgroups.
 
-The recipe (verified, Ubuntu 24.04, kernel 6.8):
+The recipe (verified, Ubuntu 24.04, kernel 6.8). `linux/setup-cgroup.sh` runs it with the delegation and swap checks; `--clean` also removes the finished runs' children:
 
 ```bash
 sudo mkdir -p /sys/fs/cgroup/r5/driver
@@ -293,7 +311,9 @@ The first move needs `sudo`, since the source and destination share only the rea
 
 ## Pilot command
 
-Run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`, inside the cgroup tree (see above), with fresh `--report` and `--storage-path` values each time. The current baseline pilot:
+`linux/run-pilot.sh <workload> <rows>` runs it. That script moves itself into the cgroup, refuses existing outputs and a dirty checkout, and takes the arm from `R5_IMAGES`, `R5_TAG`, `R5_EXTRA` and `R5_CACHE_BYTES`. `linux/run-arms.sh` runs a list of arms, then their diagnostics reruns.
+
+By hand: run from `sql-to-dbsp-compiler/experiments/q3-ivm-baseline`, inside the cgroup tree (see above), with fresh `--report` and `--storage-path` values each time. The current baseline pilot:
 
 ```bash
 python3 measure.py \
@@ -365,7 +385,7 @@ The hard disk gets only pilots, as a probe ([decision](DECISIONS.md#2026-11-16-t
 
 ## Campaign
 
-Run a campaign per arm the user chooses, after its pilot passes: the pilot command with `--runs 3` and fresh destinations, `campaign-<arm>-<workload>-<tag>`. The remaining arms are listed in [MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign).
+Run a campaign per arm the user chooses, after its pilot passes: the pilot command with `--runs 3` and fresh destinations, `campaign-<arm>-<workload>-<tag>`. `R5_RUNS=3 linux/run-pilot.sh …` does both. The remaining arms are listed in [MEASUREMENT.md](MEASUREMENT.md#pending-linux-campaign).
 
 **Then check:**
 - each manifest's `configuration`, which must show the arm;
@@ -390,7 +410,7 @@ python3 summarize.py "$R5_OUT"/campaign-*/manifest.json --out "$R5_OUT/summary"
   - `git_status_short`, which must be empty: don't edit the checkout during a campaign, and use a separate worktree for edits;
   - `measurement_version`, `storage_device`, and the arm's `configuration`.
 - **Timing.** Per refresh: `delta_ms`, `q3_ms`, `ivm_ms` and their percentiles first, then `base_ms`, amortized.
-- **Reads, writes and spines.** The run reads as `summarize.py` prints them, `block_expansions`, `run_counts`, and for diagnostics runs the `spill_kinds.py` table.
+- **Reads, writes and spines.** The run reads as `summarize.py` prints them, `block_expansions`, the per-phase and spine tables of `compare_arms.py`, and for diagnostics runs the `spill_kinds.py` table.
 - **Pressure** per refresh, in both modes.
 - **Paths** of the manifests and of `summary.md`. The raw artifacts stay on the machine.
 
@@ -406,6 +426,8 @@ Then record the results in a dated section of [MEASUREMENT.md](MEASUREMENT.md) a
 - **The campaign runs with Q3's routing hook** (`Routing::hook` in `merged-index-col/src/q3.rs`). Generic-reader work ([deferred.md](../../../docs/design/merged-index/deferred.md#generic-readers-before-and-after-state-and-declared-join-readers)) must not land on a campaign's revision while it runs.
 - **A seek expands at most one encoded block, in full, on a cache miss**, and the cache holds the expanded bytes ([storage-layout.md](../../../docs/design/merged-index/storage-layout.md#prefix-truncation-on-the-read-path)).
 - **`FelderaCache` needs whole 512-byte sectors.** Under `O_DIRECT` every read and write must be whole sectors. The fix (verified, 2026-11-17): whole-file metadata (the checkpoint catalog, operator state) goes through the page cache (`PosixBackend::read` and `write`), and batch files keep `O_DIRECT`.
+- **`summarize.py` pools percentiles over every refresh** and prints no memtable, spine or skipped-run fields. For arm comparisons over refreshes 2 to 6, use `compare_arms.py`.
+- **The first host expired on 2026-11-21,** and its inputs, images and raw artifacts went with it. The figures survive only in [MEASUREMENT.md](MEASUREMENT.md). A new host rebuilds the inputs and images, at the then-current measurement version.
 - **Claims.** Make none without raw artifacts: of runtime pressure, of reclaim, of beyond-memory behavior, of equal-memory performance, of a disk saving, or of a maintenance-only I/O figure.
   - **The pilots are one repetition each.** No three-repetition campaign has run.
   - **The window fields are evidence, not proof.**

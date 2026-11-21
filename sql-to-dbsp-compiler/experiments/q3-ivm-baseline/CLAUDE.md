@@ -13,7 +13,8 @@ This harness maintains `V = Customer ⋈ Orders ⋈ Lineitem` (TPC-H Q3 without 
 | `BaseState` (snapshots of the base tables before a transaction), `BaseState::validate`, `workload::enable_net_delta`, `workload::net_delta`, the `.tbl` parser | `src/workload.rs`, `src/data.rs` |
 | `ManualIndex` (auxiliary thread), `reconstruction::prepare`, `OrphanLines` (`Pipeline.orphans`) | `src/reconstruction.rs` |
 | R4 tests of both modes; R5 report and runner | `src/verification.rs`; `src/measurement.rs`, `measure.py` |
-| Median, minimum and maximum of `measure.py` manifests; RF1/RF2 inputs for the Linux SF 10 campaign; files written in a `--diagnostics` window by write kind (module docstrings give the CLIs and rules) | `summarize.py`, `prepare_inputs.py`, `spill_kinds.py` |
+| Median, minimum and maximum of `measure.py` manifests; RF1/RF2 inputs for the Linux SF 10 campaign; files written in a `--diagnostics` window by write kind; view-first tables comparing pilot arms over refreshes 2 to 6 (module docstrings give the CLIs and rules) | `summarize.py`, `prepare_inputs.py`, `spill_kinds.py`, `compare_arms.py` |
+| Linux scripts: environment, cgroup tree, image sets, one pilot, a list of arms with their diagnostics reruns ([LINUX-HANDOFF.md](LINUX-HANDOFF.md#quick-start-for-an-agent)) | `linux/` |
 | Generates the native pair and `plan.json` (Catalog mode, optimization level 2); strips the generated allocator, which `src/main.rs` defines once | `generate.sh` |
 
 The Cargo feature `merged-index` builds the reconstructed mode (`q3-trie-view-circuit` in place of `q3-view-circuit`). The COL library is [../merged-index-col/CLAUDE.md](../merged-index-col/CLAUDE.md).
