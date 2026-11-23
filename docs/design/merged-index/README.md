@@ -116,6 +116,7 @@ circuit and its state reads). Human landing pages:
 - [deferred.md](deferred.md): designs not implemented, such as shared scan sessions and generic readers.
 - [compaction.md](compaction.md): compaction options for small transactions, against the K = 10 measurements (documentation only; deferred on 2026-11-18).
 - [memtable.md](memtable.md): a B+-tree memtable on integral spines under one soft budget, copied into the file builder at seal (phase 1 built 2026-11-20; phase 2, the measurement, logged).
+- [memory-model.md](memory-model.md): `rss` (pressure on RSS places every run) against `budgets` (cache and memtable budgets, fixed rules for every other run), with compaction memory charged as a sub-arm (designed 2026-11-23, not built).
 - [references.md](references.md): sibling-repository sources and their roles.
 - [history.md](history.md): dated, non-authoritative records of superseded measurements, gaps, and plans.
 - [slides-oct-8/](slides-oct-8/README.md): the 2026-10-08 advisor deck.
