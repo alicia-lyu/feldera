@@ -32,7 +32,10 @@ use crate::{
     dynamic::{DynVec, Factory},
     profile::{ParkReason, ParkingFor},
     storage::{
-        attribution::{Component, current_write_owner, scope_write_owner, with_write_owner},
+        attribution::{
+            CacheFill, Component, current_write_owner, scope_write_owner, with_cache_fill,
+            with_write_owner,
+        },
         buffer_cache::{BufferCache, CacheStats},
         diagnostics::{
             self, CompactionRecord, RunContents, RunWriteKind, SpineContents, now_micros,
@@ -65,6 +68,7 @@ use feldera_storage::{
     FileCommitter, StoragePath,
     fbuf::slab::{FBufSlabs, TOKIO_FBUF_SLABS},
 };
+use feldera_types::config::MemoryModel;
 use feldera_types::memory_pressure::MemoryPressure;
 use feldera_types::{checkpoint::PSpineBatches, config::dev_tweaks::MergerType};
 use ouroboros::self_referencing;
@@ -131,6 +135,17 @@ pub(crate) const MAX_LEVEL0_BATCH_SIZE_RECORDS: u16 = 14_999;
 /// A spine holding fewer level-0 batches than this merges nothing until
 /// something else asks it to, such as a compaction request or memory pressure.
 pub(crate) const MIN_LEVEL0_MERGE_BATCHES: usize = 8;
+
+/// Runs one synchronous step of a merger task: a merge step or a seal. Under
+/// the `budgets` memory model the step does not fill the buffer cache, so
+/// compaction does not displace the blocks that queries read; under `rss` it
+/// runs as it always did.
+fn with_merge_cache_fill<R>(f: impl FnOnce() -> R) -> R {
+    match Runtime::memory_model() {
+        MemoryModel::Budgets => with_cache_fill(CacheFill::NoFill, f),
+        MemoryModel::Rss => f(),
+    }
+}
 
 /// Sets up the task-local variables of a tokio merger task.
 ///
@@ -1487,7 +1502,7 @@ where
     }
 
     fn is_background_merge_idle(&self) -> bool {
-        let pressure = self.merge_workers.runtime.current_memory_pressure();
+        let pressure = self.merge_workers.runtime.effective_memory_pressure();
         self.state
             .lock()
             .unwrap()
@@ -1669,7 +1684,7 @@ where
                 buffer_cache,
                 slab_allocator,
                 async move {
-                    this.seal_memtable();
+                    with_merge_cache_fill(|| this.seal_memtable());
                 },
             )
             .await;
@@ -1700,7 +1715,10 @@ where
         let sealed = taken.is_some();
         if let Some((flushing, factories, (key_filter, value_filter), name)) = taken {
             self.report_memtable_bytes();
-            let output = match pick_merge_destination([&*flushing], None) {
+            // Under the budgets model a seal is always a file, whatever the thresholds say.
+            let destination_hint =
+                (Runtime::memory_model() == MemoryModel::Budgets).then_some(BatchLocation::Storage);
+            let output = match pick_merge_destination([&*flushing], destination_hint) {
                 BatchLocation::Storage => {
                     let builder = B::Builder::for_merge(
                         &factories,
@@ -1796,7 +1814,9 @@ where
                     let notify = self.state.lock().unwrap().slots[level].notify.clone();
 
                     loop {
-                        let work = self.merge_step(&mut merger, merger_type, level);
+                        let work = with_merge_cache_fill(|| {
+                            self.merge_step(&mut merger, merger_type, level)
+                        });
 
                         {
                             let state = self.state.lock().unwrap();
@@ -1847,7 +1867,7 @@ where
             // lock.
             let mut state = self.state.lock().unwrap();
             let min_merge_batches = state.min_merge_batches;
-            let memory_pressure = self.runtime.current_memory_pressure();
+            let memory_pressure = self.runtime.effective_memory_pressure();
             let batches = if let Some(batches) =
                 state.slots[level].try_start_merge(level, min_merge_batches, memory_pressure)
             {
@@ -3034,7 +3054,7 @@ where
             let started_micros = now_micros();
             let was_in_memory = batch.location() == BatchLocation::Memory;
             let input_records = batch.len() as u64;
-            let batch = Self::maybe_flush_batch(batch, &self.factories, || {
+            let batch = Self::maybe_flush_batch(batch, self.role(), &self.factories, || {
                 self.merger.state.lock().unwrap().get_filters()
             });
             if was_in_memory && batch.location() == BatchLocation::Storage {
@@ -3081,9 +3101,11 @@ where
 
     /// Returns `batch`, first pushing it to storage if it exceeds the
     /// user-configured `min_storage_bytes` or if we're under high memory
-    /// pressure.
+    /// pressure. Under the `budgets` memory model, `role` decides instead (see
+    /// [pick_insert_destination]).
     pub fn maybe_flush_batch<F>(
         batch: impl Into<Arc<B>>,
+        role: TraceRole,
         factories: &B::Factories,
         filters: F,
     ) -> Arc<B>
@@ -3092,7 +3114,7 @@ where
     {
         let batch = batch.into();
         if batch.location() == BatchLocation::Memory
-            && pick_insert_destination(&batch) == BatchLocation::Storage
+            && pick_insert_destination(&batch, role) == BatchLocation::Storage
         {
             let _span = Span::new("eager spill")
                 .with_category("Spine")

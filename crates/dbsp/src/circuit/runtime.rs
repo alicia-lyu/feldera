@@ -30,7 +30,7 @@ use feldera_samply::{LongSpanBuilder, Span};
 use feldera_storage::fbuf::FBuf;
 use feldera_storage::fbuf::slab::{FBufSlabs, FBufSlabsStats, set_thread_slab_pool};
 use feldera_types::config::{
-    DevTweaks, FilterResidency, StorageCompression, StorageConfig, StorageOptions,
+    DevTweaks, FilterResidency, MemoryModel, StorageCompression, StorageConfig, StorageOptions,
 };
 use feldera_types::memory_pressure::{
     CRITICAL_MEMORY_PRESSURE_THRESHOLD, HIGH_MEMORY_PRESSURE_THRESHOLD,
@@ -93,6 +93,9 @@ pub enum Error {
         budget_bytes: usize,
         max_rss_bytes: u64,
     },
+    /// `storage.memory_model` is `budgets`, but `storage.memtable_mib` is unset:
+    /// the model needs the memtable budget for its write side.
+    MemoryModelNeedsMemtableBudget,
     Terminated,
 }
 
@@ -106,6 +109,7 @@ impl DetailedError for Error {
             Self::CheckpointParseError(_) => Cow::from("CheckpointParseError"),
             Self::BootstrapCircuit(_) => Cow::from("BootstrapCircuit"),
             Self::MemtableBudgetTooLarge { .. } => Cow::from("MemtableBudgetTooLarge"),
+            Self::MemoryModelNeedsMemtableBudget => Cow::from("MemoryModelNeedsMemtableBudget"),
         }
     }
 }
@@ -145,6 +149,10 @@ impl Display for Error {
                 budget_bytes / MEMTABLE_BYTES_PER_MIB,
                 max_rss_bytes / MEMTABLE_BYTES_PER_MIB as u64,
             ),
+            Self::MemoryModelNeedsMemtableBudget => f.write_str(
+                "storage.memory_model is budgets, which needs storage.memtable_mib for its write \
+                 budget; set storage.memtable_mib",
+            ),
         }
     }
 }
@@ -172,6 +180,16 @@ fn validate_memtable_budget(
             })
         }
         _ => Ok(budget_bytes),
+    }
+}
+
+/// Refuses `memory_model: budgets` without a memtable budget: under that model
+/// the memtable budget is the write side of the memory model.
+fn validate_memory_model(options: &StorageOptions) -> Result<(), Error> {
+    if options.memory_model == MemoryModel::Budgets && options.memtable_mib.is_none() {
+        Err(Error::MemoryModelNeedsMemtableBudget)
+    } else {
+        Ok(())
     }
 }
 
@@ -609,6 +627,10 @@ impl RuntimeInner {
             None
         };
 
+        if let Some(storage) = &storage {
+            validate_memory_model(&storage.options)?;
+        }
+
         // Memtables exist only with storage, which their seal writes to.
         let memtable_budget = match storage
             .as_ref()
@@ -736,6 +758,25 @@ impl RuntimeInner {
 
     fn memory_pressure(&self) -> MemoryPressure {
         MemoryPressure::try_from(self.memory_pressure.load(Ordering::Relaxed)).unwrap()
+    }
+
+    /// The pressure level that merge scheduling reads. Under
+    /// [`MemoryModel::Budgets`] it is always `Low`: the budgets, not RSS,
+    /// decide, so pressure forces no merge. `memory_pressure` stays the raw
+    /// level.
+    fn effective_memory_pressure(&self) -> MemoryPressure {
+        if self.memory_model() == MemoryModel::Budgets {
+            MemoryPressure::Low
+        } else {
+            self.memory_pressure()
+        }
+    }
+
+    /// The configured memory model; [`MemoryModel::Rss`] without storage.
+    fn memory_model(&self) -> MemoryModel {
+        self.storage
+            .as_ref()
+            .map_or(MemoryModel::Rss, |storage| storage.options.memory_model)
     }
 
     /// Compute memory pressure based on the current process RSS.
@@ -961,6 +1002,8 @@ impl Runtime {
                     .store(new_memory_pressure as u8, Ordering::Relaxed);
 
                 // At high and critical levels, wakeup merger threads to push all in-memory batches to disk.
+                // Under the budgets model pressure forces no merge, so the epoch still counts but
+                // nobody is woken.
                 if previous_pressure < MemoryPressure::High
                     && new_memory_pressure >= MemoryPressure::High
                 {
@@ -968,7 +1011,9 @@ impl Runtime {
                         .inner()
                         .memory_pressure_epoch
                         .fetch_add(1, Ordering::Relaxed);
-                    runtime.inner().memory_pressure_notify.notify_waiters();
+                    if runtime.inner().memory_model() == MemoryModel::Rss {
+                        runtime.inner().memory_pressure_notify.notify_waiters();
+                    }
                 }
                 parker.park_timeout(Duration::from_secs(1));
             }
@@ -1357,6 +1402,17 @@ impl Runtime {
             .unwrap_or(FilterResidency::Memory)
     }
 
+    /// Returns how this runtime decides where a new batch goes
+    /// (`storage.memory_model`).
+    ///
+    /// Off a runtime thread, or on a runtime without storage, this is
+    /// [`MemoryModel::Rss`], the model of a runtime that sets nothing.
+    pub fn memory_model() -> MemoryModel {
+        RUNTIME
+            .with(|rt| Some(rt.borrow().as_ref()?.inner().memory_model()))
+            .unwrap_or(MemoryModel::Rss)
+    }
+
     /// Returns the memory budget of the integral traces' memtables, in bytes
     /// (`storage.memtable_mib`), or `None` if memtables are off.
     ///
@@ -1420,8 +1476,15 @@ impl Runtime {
         RUNTIME.with(|rt| Some(rt.borrow().as_ref()?.inner().memory_pressure()))
     }
 
+    /// The raw pressure level, computed on RSS whatever the memory model.
     pub fn current_memory_pressure(&self) -> MemoryPressure {
         self.inner().memory_pressure()
+    }
+
+    /// The level that merge scheduling reads: `Low` under
+    /// [`MemoryModel::Budgets`], else the raw level.
+    pub(crate) fn effective_memory_pressure(&self) -> MemoryPressure {
+        self.inner().effective_memory_pressure()
     }
 
     pub fn max_rss_bytes(&self) -> Option<u64> {
@@ -1473,7 +1536,10 @@ impl Runtime {
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
 
-            if inner.memory_pressure() >= MemoryPressure::Moderate {
+            // Under the budgets model every merge output is a file, at any pressure.
+            if inner.memory_model() == MemoryModel::Budgets
+                || inner.memory_pressure() >= MemoryPressure::Moderate
+            {
                 Some(0)
             } else {
                 // The default reduces the files stored on disk to a reasonable
@@ -1490,6 +1556,10 @@ impl Runtime {
 
     /// Returns the minimum number of bytes in a batch inserted into a spine by a foreground worker to spill it to storage.
     ///
+    /// Under [`MemoryModel::Budgets`] this is the threshold of an accumulator's
+    /// insert, `usize::MAX`: it stays in memory. The integral spines' rule is
+    /// by role, in `pick_insert_destination`.
+    ///
     /// The output is determined by the current memory pressure level and the user-configured `min_storage_bytes` option.
     /// When memory pressure is low the output is `usize::MAX`, when memory pressure is moderate, the output is `min_storage_bytes`,
     /// when memory pressure is high or critical, the output is `0`, meaning all batches are spilled to storage.
@@ -1505,7 +1575,9 @@ impl Runtime {
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
 
-            if inner.memory_pressure() >= MemoryPressure::High {
+            if inner.memory_model() == MemoryModel::Budgets {
+                Some(usize::MAX)
+            } else if inner.memory_pressure() >= MemoryPressure::High {
                 Some(0)
             } else if inner.memory_pressure() >= MemoryPressure::Moderate {
                 // Moderate pressure: spill large batches to storage in the foreground; the merger will take care of the rest.
@@ -1541,7 +1613,11 @@ impl Runtime {
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
 
-            if inner.memory_pressure() >= MemoryPressure::Critical {
+            // Under the budgets model a step's batches stay in memory, bounded by the
+            // transaction, at any pressure.
+            if inner.memory_model() == MemoryModel::Budgets {
+                Some(usize::MAX)
+            } else if inner.memory_pressure() >= MemoryPressure::Critical {
                 Some(0)
             } else {
                 Some(storage.options.min_step_storage_bytes.unwrap_or(usize::MAX))

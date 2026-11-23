@@ -1,8 +1,9 @@
 use crate::{
     Runtime,
     dynamic::WeightTrait,
-    trace::{Batch, BatchLocation, BatchReader, Builder, Cursor},
+    trace::{Batch, BatchLocation, BatchReader, Builder, Cursor, TraceRole},
 };
+use feldera_types::config::MemoryModel;
 
 /// Reads all of the data from `cursor` and writes it to `builder`.
 pub(super) fn copy_to_builder<B, Output, C, K, V, T, R>(builder: &mut B, mut cursor: C)
@@ -133,12 +134,24 @@ where
     }
 }
 
-pub fn pick_insert_destination<B>(batch: &B) -> BatchLocation
+/// Where a batch inserted into a spine of `role` goes.
+///
+/// Under [`MemoryModel::Budgets`] the role decides: an accumulator's batch
+/// stays in memory, bounded by the transaction, and an integral batch that
+/// reaches here, that is, one that the memtable did not absorb, is written to
+/// storage. Under [`MemoryModel::Rss`] the memory pressure decides.
+pub fn pick_insert_destination<B>(batch: &B, role: TraceRole) -> BatchLocation
 where
     B: BatchReader,
 {
     if batch.is_empty() {
         return BatchLocation::Memory;
+    }
+    if Runtime::memory_model() == MemoryModel::Budgets {
+        return match role {
+            TraceRole::Accumulator => BatchLocation::Memory,
+            TraceRole::Integral => BatchLocation::Storage,
+        };
     }
     match Runtime::min_insert_storage_bytes().unwrap_or(usize::MAX) {
         0 => BatchLocation::Storage,

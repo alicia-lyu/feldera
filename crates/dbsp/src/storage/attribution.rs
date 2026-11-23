@@ -109,6 +109,43 @@ pub fn with_write_owner<R>(owner: Component, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether the file reader and writer on this thread insert the blocks they
+/// build into the buffer cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheFill {
+    /// Insert a block after a miss and after writing it (the default).
+    #[default]
+    Fill,
+
+    /// Look the cache up, and use a block found, but insert nothing. A merge or
+    /// a seal runs under this policy in the `budgets` memory model, so that
+    /// compaction does not displace the blocks that queries read.
+    NoFill,
+}
+
+thread_local! {
+    static CACHE_FILL: Cell<CacheFill> = const { Cell::new(CacheFill::Fill) };
+}
+
+/// The cache-fill policy of this thread.
+pub fn current_cache_fill() -> CacheFill {
+    CACHE_FILL.get()
+}
+
+/// Runs `f` with `policy` as the cache-fill policy of this thread, then
+/// restores the previous policy, even if `f` panics. `f` must not await: a
+/// tokio task can resume on another thread.
+pub fn with_cache_fill<R>(policy: CacheFill, f: impl FnOnce() -> R) -> R {
+    struct Restore(CacheFill);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CACHE_FILL.set(self.0);
+        }
+    }
+    let _restore = Restore(CACHE_FILL.replace(policy));
+    f()
+}
+
 pin_project! {
     /// A future that runs each of its polls under a fixed [`Component`].
     pub struct WithWriteOwner<F> {

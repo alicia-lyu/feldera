@@ -7,6 +7,7 @@
 use super::format::Compression;
 use super::{AnyFactories, BatchKeyFilter, Factories, reader::Reader};
 use crate::storage::{
+    attribution::{CacheFill, current_cache_fill},
     backend::{BlockLocation, FileReader, FileWriter, StorageBackend, StorageError},
     buffer_cache::{BufferCache, FBuf, FBufSerializer, LimitExceeded},
     file::{
@@ -391,18 +392,23 @@ impl ColumnWriter {
             encoding,
         )?;
 
-        super::reader::DataBlock::<K, A>::from_raw_with_cache(
-            block,
-            &TreeNode {
-                location,
-                node_type: NodeType::Data,
-                rows,
-            },
-            &block_writer.cache,
-            block_writer.file_handle.file_id(),
-            VERSION_NUMBER,
-        )
-        .unwrap();
+        // The block is cached only to be read back without a device read.
+        // Under `NoFill` (a merge or a seal under the `budgets` memory model)
+        // it is not.
+        if current_cache_fill() == CacheFill::Fill {
+            super::reader::DataBlock::<K, A>::from_raw_with_cache(
+                block,
+                &TreeNode {
+                    location,
+                    node_type: NodeType::Data,
+                    rows,
+                },
+                &block_writer.cache,
+                block_writer.file_handle.file_id(),
+                VERSION_NUMBER,
+            )
+            .unwrap();
+        }
 
         if let Some(index_block) = self.get_index_block(0).add_entry(
             location,
@@ -430,18 +436,20 @@ impl ColumnWriter {
             let n_rows = index_block.n_rows();
             let (block, location) =
                 block_writer.write_block(index_block.raw, self.parameters.compression)?;
-            super::reader::IndexBlock::<K>::from_raw_with_cache(
-                block,
-                &TreeNode {
-                    location,
-                    node_type: NodeType::Index,
-                    rows,
-                },
-                &block_writer.cache,
-                block_writer.file_handle.file_id(),
-                VERSION_NUMBER,
-            )
-            .unwrap();
+            if current_cache_fill() == CacheFill::Fill {
+                super::reader::IndexBlock::<K>::from_raw_with_cache(
+                    block,
+                    &TreeNode {
+                        location,
+                        node_type: NodeType::Index,
+                        rows,
+                    },
+                    &block_writer.cache,
+                    block_writer.file_handle.file_id(),
+                    VERSION_NUMBER,
+                )
+                .unwrap();
+            }
 
             level += 1;
             let opt_index_block = self.get_index_block(level).add_entry(

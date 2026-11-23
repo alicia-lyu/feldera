@@ -429,6 +429,37 @@ pub struct StorageOptions {
     ///
     /// If unset, which is the default, there are no memtables.
     pub memtable_mib: Option<usize>,
+
+    /// How the runtime decides where a new batch goes: memory or storage.
+    ///
+    /// With `rss`, the default, the process's resident memory decides: the
+    /// four memory pressure levels computed against `max_rss_bytes` set the
+    /// thresholds that send batches, merge outputs, and step batches to
+    /// storage, and force merges under high pressure.
+    ///
+    /// With `budgets`, two budgets decide instead: the storage cache
+    /// (`cache_mib`) for reads and the memtables (`memtable_mib`) for writes.
+    /// Every merge output and every memtable seal is written to storage, and
+    /// an integral batch too large for its memtable is too; batches of a
+    /// single step, and the insertions of an accumulator, stay in memory.
+    /// Merges are not forced under memory pressure, and merges and seals do
+    /// not fill the storage cache. The pressure level is still computed and
+    /// reported. Requires `memtable_mib`, and the circuit refuses to start
+    /// without it.
+    pub memory_model: MemoryModel,
+}
+
+/// How the runtime decides where a new batch goes. See
+/// [`StorageOptions::memory_model`].
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryModel {
+    /// The process's resident memory against `max_rss_bytes` decides.
+    #[default]
+    Rss,
+
+    /// The cache and memtable budgets decide.
+    Budgets,
 }
 
 /// Where the Bloom filters of batches on storage are kept. See

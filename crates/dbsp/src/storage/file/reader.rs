@@ -19,6 +19,7 @@ use super::{
     format::{PREFIX_BLOOM_FILTER_BLOCK_MAGIC, PrefixBloomFilterHeader},
 };
 use crate::dynamic::{DynVec, WeightTrait};
+use crate::storage::attribution::{CacheFill, current_cache_fill};
 use crate::storage::buffer_cache::CacheAccess;
 use crate::storage::{
     backend::StorageError,
@@ -609,7 +610,10 @@ where
             node.rows.start,
             version,
         )?);
-        cache.insert(file_id, node.location.offset, block.clone());
+        // Under `NoFill` the block is used but not kept.
+        if current_cache_fill() == CacheFill::Fill {
+            cache.insert(file_id, node.location.offset, block.clone());
+        }
         Ok(block)
     }
 
@@ -1079,7 +1083,10 @@ where
             node.rows.start,
             version,
         )?);
-        cache.insert(file_id, node.location.offset, block.clone());
+        // Under `NoFill` the block is used but not kept.
+        if current_cache_fill() == CacheFill::Fill {
+            cache.insert(file_id, node.location.offset, block.clone());
+        }
         Ok(block)
     }
 
