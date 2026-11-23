@@ -5,6 +5,9 @@ use super::CircuitConfig;
 use super::dbsp_handle::{Layout, Mode};
 use crate::SchedulerError;
 use crate::circuit::checkpointer::Checkpointer;
+use crate::circuit::compaction_jobs::{
+    CompactionJobStats, CompactionJobs, DEFAULT_COMPACTION_JOBS,
+};
 use crate::circuit::dbsp_handle::StepSize;
 use crate::circuit::memtable_budget::MemtableBudget;
 use crate::error::Error as DbspError;
@@ -30,7 +33,8 @@ use feldera_samply::{LongSpanBuilder, Span};
 use feldera_storage::fbuf::FBuf;
 use feldera_storage::fbuf::slab::{FBufSlabs, FBufSlabsStats, set_thread_slab_pool};
 use feldera_types::config::{
-    DevTweaks, FilterResidency, MemoryModel, StorageCompression, StorageConfig, StorageOptions,
+    CompactionMemory, DevTweaks, FilterResidency, MemoryModel, StorageCompression, StorageConfig,
+    StorageOptions,
 };
 use feldera_types::memory_pressure::{
     CRITICAL_MEMORY_PRESSURE_THRESHOLD, HIGH_MEMORY_PRESSURE_THRESHOLD,
@@ -96,10 +100,18 @@ pub enum Error {
     /// `storage.memory_model` is `budgets`, but `storage.memtable_mib` is unset:
     /// the model needs the memtable budget for its write side.
     MemoryModelNeedsMemtableBudget,
-    /// `storage.charge_compaction_memory` is set, but `storage.memory_model` is
+    /// `storage.compaction_memory` is `charge`, but `storage.memory_model` is
     /// not `budgets`: the charge reserves compaction memory in the cache's budget,
     /// which only that model has.
     CompactionChargeNeedsBudgets,
+    /// `storage.compaction_jobs` is set, but `storage.memory_model` is not
+    /// `budgets`: only that model limits the merges open at once.
+    CompactionJobsNeedBudgets,
+    /// `storage.compaction_jobs` is set, but `storage.compaction_memory` is
+    /// `charge`, which has no job limit.
+    CompactionJobsNeedPool,
+    /// `storage.compaction_jobs` is 0, which would let no merge start.
+    CompactionJobsZero,
     Terminated,
 }
 
@@ -115,6 +127,9 @@ impl DetailedError for Error {
             Self::MemtableBudgetTooLarge { .. } => Cow::from("MemtableBudgetTooLarge"),
             Self::MemoryModelNeedsMemtableBudget => Cow::from("MemoryModelNeedsMemtableBudget"),
             Self::CompactionChargeNeedsBudgets => Cow::from("CompactionChargeNeedsBudgets"),
+            Self::CompactionJobsNeedBudgets => Cow::from("CompactionJobsNeedBudgets"),
+            Self::CompactionJobsNeedPool => Cow::from("CompactionJobsNeedPool"),
+            Self::CompactionJobsZero => Cow::from("CompactionJobsZero"),
         }
     }
 }
@@ -159,8 +174,19 @@ impl Display for Error {
                  budget; set storage.memtable_mib",
             ),
             Self::CompactionChargeNeedsBudgets => f.write_str(
-                "storage.charge_compaction_memory reserves compaction memory in the cache budget, \
+                "storage.compaction_memory charge reserves compaction memory in the cache budget, \
                  which needs storage.memory_model budgets; set storage.memory_model",
+            ),
+            Self::CompactionJobsNeedBudgets => f.write_str(
+                "storage.compaction_jobs limits the merges open at once, which needs \
+                 storage.memory_model budgets; set storage.memory_model",
+            ),
+            Self::CompactionJobsNeedPool => f.write_str(
+                "storage.compaction_jobs is the limit of storage.compaction_memory pool, but \
+                 storage.compaction_memory is charge; unset storage.compaction_jobs",
+            ),
+            Self::CompactionJobsZero => f.write_str(
+                "storage.compaction_jobs is 0, which would let no merge start; set at least 1",
             ),
         }
     }
@@ -194,16 +220,40 @@ fn validate_memtable_budget(
 
 /// Refuses `memory_model: budgets` without a memtable budget, since under that
 /// model the memtable budget is the write side of the memory model, and
-/// `charge_compaction_memory` without `budgets`, since the charge draws on the
-/// cache budget that only that model has.
+/// `compaction_memory: charge` without `budgets`, since the charge draws on the
+/// cache budget that only that model has, and `compaction_jobs` when it limits
+/// nothing (without `budgets`, or under `charge`) or everything (zero).
+///
+/// Under `rss`, `compaction_memory` `pool` is the default and stands for no limit.
 fn validate_memory_model(options: &StorageOptions) -> Result<(), Error> {
-    if options.memory_model == MemoryModel::Budgets && options.memtable_mib.is_none() {
+    let budgets = options.memory_model == MemoryModel::Budgets;
+    if budgets && options.memtable_mib.is_none() {
         Err(Error::MemoryModelNeedsMemtableBudget)
-    } else if options.charge_compaction_memory && options.memory_model != MemoryModel::Budgets {
+    } else if options.compaction_memory == CompactionMemory::Charge && !budgets {
         Err(Error::CompactionChargeNeedsBudgets)
+    } else if options.compaction_jobs.is_some() && !budgets {
+        Err(Error::CompactionJobsNeedBudgets)
+    } else if options.compaction_jobs.is_some()
+        && options.compaction_memory == CompactionMemory::Charge
+    {
+        Err(Error::CompactionJobsNeedPool)
+    } else if options.compaction_jobs == Some(0) {
+        Err(Error::CompactionJobsZero)
     } else {
         Ok(())
     }
+}
+
+/// The limit of the merges open at once: `compaction_jobs` (default
+/// [`DEFAULT_COMPACTION_JOBS`]) under `budgets` with `compaction_memory` `pool`,
+/// and none otherwise. The options are validated.
+fn compaction_job_limit(options: Option<&StorageOptions>) -> Option<usize> {
+    options
+        .filter(|options| {
+            options.memory_model == MemoryModel::Budgets
+                && options.compaction_memory == CompactionMemory::Pool
+        })
+        .map(|options| options.compaction_jobs.unwrap_or(DEFAULT_COMPACTION_JOBS))
 }
 
 // Thread-local variables set for all threads in the DBSP runtime (foreground and background).
@@ -382,6 +432,9 @@ struct RuntimeInner {
 
     /// The budget of the integral spines' memtables, when `storage.memtable_mib` is set.
     memtable_budget: Option<Arc<MemtableBudget>>,
+
+    /// The pool that limits the merges open at once, and the counters of them.
+    compaction_jobs: Arc<CompactionJobs>,
 
     store: LocalStore,
     kill_signal: KillSignal,
@@ -656,6 +709,10 @@ impl RuntimeInner {
             None => None,
         };
 
+        let compaction_jobs = Arc::new(CompactionJobs::new(compaction_job_limit(
+            storage.as_ref().map(|storage| &storage.options),
+        )));
+
         let total_cache_bytes = if let Some(storage) = &storage {
             match storage.options.cache_mib {
                 Some(cache_mib) => cache_mib.saturating_mul(1024 * 1024),
@@ -722,6 +779,7 @@ impl RuntimeInner {
             memory_pressure_notify: Arc::new(Notify::new()),
             storage,
             memtable_budget,
+            compaction_jobs,
             store: TypedDashMap::new(),
             kill_signal: KillSignal::default(),
             aux_threads: Mutex::new(Vec::new()),
@@ -797,7 +855,7 @@ impl RuntimeInner {
     fn charge_compaction_memory(&self) -> bool {
         self.storage
             .as_ref()
-            .is_some_and(|storage| storage.options.charge_compaction_memory)
+            .is_some_and(|storage| storage.options.compaction_memory == CompactionMemory::Charge)
     }
 
     /// Compute memory pressure based on the current process RSS.
@@ -1301,7 +1359,7 @@ impl Runtime {
     }
 
     /// Returns the waits and the peak of pinned bytes of the compaction-memory
-    /// reservations (`storage.charge_compaction_memory`), summed over the
+    /// reservations (`storage.compaction_memory` `charge`), summed over the
     /// distinct cache backends; all zero when the charge is off.
     pub fn compaction_reservation_stats(&self) -> ReservationStats {
         let mut seen = HashSet::new();
@@ -1312,6 +1370,20 @@ impl Runtime {
             .filter(|cache| seen.insert(cache.backend_id()))
             .map(|cache| cache.reservation_stats())
             .fold(ReservationStats::default(), |total, stats| total + stats)
+    }
+
+    /// Returns the waits for a compaction permit and the peak of merges open at
+    /// once (`storage.compaction_memory` `pool`). The peak is counted under every
+    /// memory model; the waits are zero without the pool.
+    pub fn compaction_job_stats(&self) -> CompactionJobStats {
+        self.0.compaction_jobs.stats()
+    }
+
+    /// Starts a new peak of open merges, so that
+    /// [`compaction_job_stats`](Self::compaction_job_stats) reports the peak since
+    /// this call.
+    pub fn reset_peak_open_merges(&self) {
+        self.0.compaction_jobs.reset_peak_open_merges();
     }
 
     /// Starts a new peak of pinned reservation bytes on every cache backend, so
@@ -1465,7 +1537,7 @@ impl Runtime {
     }
 
     /// Returns whether merges and seals charge their buffer memory to the
-    /// cache (`storage.charge_compaction_memory`); false off a runtime thread.
+    /// cache (`storage.compaction_memory` `charge`); false off a runtime thread.
     pub fn charge_compaction_memory() -> bool {
         RUNTIME
             .with(|rt| Some(rt.borrow().as_ref()?.inner().charge_compaction_memory()))
@@ -1557,6 +1629,11 @@ impl Runtime {
     /// The budget that this runtime's memtables share, or `None` if memtables are off.
     pub(crate) fn memtable_budget(&self) -> Option<Arc<MemtableBudget>> {
         self.inner().memtable_budget.clone()
+    }
+
+    /// The pool that limits this runtime's open merges, and counts them.
+    pub(crate) fn compaction_jobs(&self) -> Arc<CompactionJobs> {
+        self.inner().compaction_jobs.clone()
     }
 
     /// The live leaf bytes of every memtable in this runtime, old copies that a
@@ -2179,8 +2256,8 @@ impl ExactSizeIterator for WorkerLocations {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        BUFFER_CACHE, BufferCache, Error, Parker, Runtime, RuntimeInner, validate_memory_model,
-        validate_memtable_budget,
+        BUFFER_CACHE, BufferCache, DEFAULT_COMPACTION_JOBS, Error, Parker, Runtime, RuntimeInner,
+        compaction_job_limit, validate_memory_model, validate_memtable_budget,
     };
     use crate::{
         Circuit, RootCircuit,
@@ -2199,7 +2276,7 @@ pub(crate) mod tests {
     use feldera_buffer_cache::{CacheEntry, ThreadType};
     use feldera_storage::fbuf::{FBuf, slab::set_thread_slab_pool};
     use feldera_types::config::{
-        MemoryModel, StorageCacheConfig, StorageConfig, StorageOptions,
+        CompactionMemory, MemoryModel, StorageCacheConfig, StorageConfig, StorageOptions,
         dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy},
     };
     use feldera_types::memory_pressure::MemoryPressure;
@@ -2960,7 +3037,7 @@ pub(crate) mod tests {
     #[test]
     fn compaction_charge_needs_the_budgets_model() {
         let mut options = StorageOptions {
-            charge_compaction_memory: true,
+            compaction_memory: CompactionMemory::Charge,
             ..StorageOptions::default()
         };
         let error = validate_memory_model(&options).unwrap_err();
@@ -2970,6 +3047,77 @@ pub(crate) mod tests {
         options.memory_model = MemoryModel::Budgets;
         options.memtable_mib = Some(64);
         assert!(validate_memory_model(&options).is_ok());
+    }
+
+    #[test]
+    fn compaction_jobs_need_budgets_the_pool_and_a_positive_limit() {
+        let budgets = StorageOptions {
+            memory_model: MemoryModel::Budgets,
+            memtable_mib: Some(64),
+            ..StorageOptions::default()
+        };
+
+        // Under rss there is no pool to limit.
+        let rss = StorageOptions {
+            compaction_jobs: Some(2),
+            ..StorageOptions::default()
+        };
+        let error = validate_memory_model(&rss).unwrap_err();
+        assert!(matches!(error, Error::CompactionJobsNeedBudgets));
+        assert!(error.to_string().contains("storage.memory_model"));
+
+        // The charge has no job limit.
+        let charge = StorageOptions {
+            compaction_memory: CompactionMemory::Charge,
+            compaction_jobs: Some(2),
+            ..budgets.clone()
+        };
+        let error = validate_memory_model(&charge).unwrap_err();
+        assert!(matches!(error, Error::CompactionJobsNeedPool));
+        assert!(error.to_string().contains("unset storage.compaction_jobs"));
+
+        // A pool of zero permits would start no merge.
+        let zero = StorageOptions {
+            compaction_jobs: Some(0),
+            ..budgets.clone()
+        };
+        assert!(matches!(
+            validate_memory_model(&zero).unwrap_err(),
+            Error::CompactionJobsZero
+        ));
+
+        for jobs in [None, Some(1), Some(8)] {
+            let options = StorageOptions {
+                compaction_jobs: jobs,
+                ..budgets.clone()
+            };
+            assert!(validate_memory_model(&options).is_ok(), "{jobs:?}");
+        }
+    }
+
+    #[test]
+    fn the_job_limit_exists_only_under_budgets_with_the_pool() {
+        let budgets = StorageOptions {
+            memory_model: MemoryModel::Budgets,
+            memtable_mib: Some(64),
+            ..StorageOptions::default()
+        };
+        assert_eq!(compaction_job_limit(None), None);
+        assert_eq!(compaction_job_limit(Some(&StorageOptions::default())), None);
+        assert_eq!(
+            compaction_job_limit(Some(&budgets)),
+            Some(DEFAULT_COMPACTION_JOBS)
+        );
+        let five = StorageOptions {
+            compaction_jobs: Some(5),
+            ..budgets.clone()
+        };
+        assert_eq!(compaction_job_limit(Some(&five)), Some(5));
+        let charge = StorageOptions {
+            compaction_memory: CompactionMemory::Charge,
+            ..budgets
+        };
+        assert_eq!(compaction_job_limit(Some(&charge)), None);
     }
 
     #[test]

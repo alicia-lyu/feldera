@@ -1,5 +1,5 @@
 //! The compaction-memory charge: what a merge or a seal reserves in the buffer
-//! cache under `storage.charge_compaction_memory` (see
+//! cache under `storage.compaction_memory` `charge` (see
 //! `docs/design/merged-index/memory-model.md`).
 
 use crate::{

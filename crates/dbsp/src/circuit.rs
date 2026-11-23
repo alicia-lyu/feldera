@@ -23,6 +23,7 @@ pub mod metadata;
 pub mod cache;
 pub mod checkpointer;
 pub mod circuit_builder;
+pub mod compaction_jobs;
 mod fingerprinter;
 pub mod memtable_budget;
 pub mod metrics;

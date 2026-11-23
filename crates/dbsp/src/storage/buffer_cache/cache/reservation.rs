@@ -2,7 +2,7 @@
 //!
 //! A merge or a memtable seal holds buffers that the cache does not see: one
 //! data block per input run, the output writer's open blocks, and its filter.
-//! `charge_compaction_memory` makes the job reserve those bytes in the cache's
+//! `compaction_memory` `charge` makes the job reserve those bytes in the cache's
 //! budget for its whole length, as RocksDB's `CacheReservationManager` does.
 //!
 //! A reservation is a set of pinned dummy entries, which the cache never

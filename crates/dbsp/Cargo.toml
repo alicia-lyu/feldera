@@ -49,7 +49,7 @@ rkyv = { workspace = true, features = ["std", "size_64", "validation", "uuid"] }
 size-of = { workspace = true, features = [ "hashbrown", "xxhash-xxh3" ] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
 paste = { workspace = true }
 seq-macro = { workspace = true }
 derive_more = { workspace = true, features = ["add", "add_assign", "sum", "not", "from", "debug"] }

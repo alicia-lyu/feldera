@@ -448,21 +448,37 @@ pub struct StorageOptions {
     /// without it.
     pub memory_model: MemoryModel,
 
-    /// Whether each merge and memtable seal charges the memory of its
-    /// buffers to the storage cache for the length of the job.
+    /// How compaction's working memory is bounded under `memory_model`
+    /// `budgets`. Compaction is the merges of the integral spines' runs and
+    /// the seals of their memtables.
     ///
-    /// A job reserves its estimated buffer bytes (one data block per input
-    /// run, the output builder's open blocks and filter, and the writer's
-    /// buffer) before it opens its cursors and builder, and releases them
-    /// when it ends. The reservation is a pinned entry in the cache, which
-    /// evicts other blocks to make room, so compaction takes its memory from
-    /// the cache's budget. A reservation that would push the pinned bytes
-    /// past a quarter of the cache makes the job wait until another job
-    /// releases its reservation; a job larger than that quarter runs alone.
+    /// With `pool`, the default, a runtime-wide pool of `compaction_jobs`
+    /// permits limits the merges open at once; a merge waits for a permit
+    /// before it opens its cursors and builder, and releases it when its
+    /// output is closed. Seals take no permit.
     ///
-    /// Requires `memory_model` `budgets`, and the circuit refuses to start
-    /// otherwise. The default is `false`.
-    pub charge_compaction_memory: bool,
+    /// With `charge`, each merge and each seal reserves the estimated bytes of
+    /// its buffers (one data block per input run, the output builder's open
+    /// blocks and filter, and the writer's buffer) in the storage cache before
+    /// it opens its cursors and builder, and releases them when it ends. The
+    /// reservation is a pinned entry in the cache, which evicts other blocks
+    /// to make room, so compaction takes its memory from the cache's budget. A
+    /// reservation that would push the pinned bytes past a quarter of the
+    /// cache makes the job wait until another job releases its reservation; a
+    /// job larger than that quarter runs alone.
+    ///
+    /// The circuit refuses to start with `charge` unless `memory_model` is
+    /// `budgets`. Under `rss` compaction is not bounded, whatever this is.
+    pub compaction_memory: CompactionMemory,
+
+    /// The most merges that `compaction_memory` `pool` lets run at once, as
+    /// RocksDB's `max_background_jobs`. If unset, which is the default, it
+    /// is 2.
+    ///
+    /// The circuit refuses to start if this is 0, if it is set under
+    /// `compaction_memory` `charge`, or if it is set while `memory_model` is
+    /// `rss`.
+    pub compaction_jobs: Option<usize>,
 }
 
 /// How the runtime decides where a new batch goes. See
@@ -476,6 +492,19 @@ pub enum MemoryModel {
 
     /// The cache and memtable budgets decide.
     Budgets,
+}
+
+/// How compaction's working memory is bounded under `memory_model` `budgets`.
+/// See [`StorageOptions::compaction_memory`].
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMemory {
+    /// A pool of `compaction_jobs` permits limits the merges open at once.
+    #[default]
+    Pool,
+
+    /// Each merge and seal reserves its buffer bytes in the storage cache.
+    Charge,
 }
 
 /// Where the Bloom filters of batches on storage are kept. See

@@ -9,7 +9,9 @@
 use crate::{
     Error, NumEntries, Runtime,
     circuit::{
-        ElapsedTime, max_level0_batch_size_records,
+        ElapsedTime,
+        compaction_jobs::OpenMerge,
+        max_level0_batch_size_records,
         memtable_budget::{MemtableBudget, MemtableHandle},
         metadata::{
             BLOOM_FILTER_BITS_PER_KEY, BLOOM_FILTER_HIT_RATE_PERCENT, BLOOM_FILTER_HITS_COUNT,
@@ -96,7 +98,7 @@ use std::{
 use std::{ops::RangeInclusive, sync::Mutex};
 use textwrap::indent;
 use tokio::{
-    sync::{Notify, futures::OwnedNotified},
+    sync::{Notify, OwnedSemaphorePermit, futures::OwnedNotified},
     task::yield_now,
 };
 use tracing::trace;
@@ -1837,9 +1839,10 @@ where
                 slab_allocator,
                 async move {
                     let mut merger = None;
-                    // Inputs taken from the spine that wait for their reservation,
-                    // and the reservation granted for them.
+                    // Inputs taken from the spine that wait for a compaction permit or
+                    // a reservation, and what has been granted for them.
                     let mut pending: Option<MergeStart<B>> = None;
+                    let mut granted_permit: Option<OwnedSemaphorePermit> = None;
                     let mut granted: Option<Reservation> = None;
                     let merger_type = Runtime::with_dev_tweaks(|tweaks| tweaks.merger());
                     let notify = self.state.lock().unwrap().slots[level].notify.clone();
@@ -1849,6 +1852,7 @@ where
                             self.merge_step(
                                 &mut merger,
                                 &mut pending,
+                                &mut granted_permit,
                                 &mut granted,
                                 merger_type,
                                 level,
@@ -1867,11 +1871,18 @@ where
                             }
                         }
 
-                        // Under the compaction-memory charge, wait for room in the cache
-                        // before the merge opens its cursors and builder. The wait is an
-                        // `await`, so it does not hold this merger thread.
-                        if let MergeStep::NeedsReservation(bytes) = step {
-                            granted = Some(reserve_in_merger_cache(bytes).await);
+                        // Under the compaction pool, wait for a permit; under the
+                        // compaction-memory charge, wait for room in the cache. Either
+                        // is before the merge opens its cursors and builder, and the
+                        // wait is an `await`, so it does not hold this merger thread.
+                        match step {
+                            MergeStep::NeedsPermit => {
+                                granted_permit = self.runtime.compaction_jobs().acquire().await;
+                            }
+                            MergeStep::NeedsReservation(bytes) => {
+                                granted = Some(reserve_in_merger_cache(bytes).await);
+                            }
+                            MergeStep::Worked | MergeStep::Idle => {}
                         }
 
                         if !work {
@@ -1898,16 +1909,18 @@ where
     /// maintain state.  Creates mergers of type `merger_type`.
     ///
     /// A new merge first takes its inputs from the spine into `pending`. Under
-    /// the compaction-memory charge it then needs a reservation before it opens
-    /// its cursors and builder: the step returns
-    /// [`MergeStep::NeedsReservation`], the caller reserves, hands the
-    /// reservation back in `granted`, and calls again. The merge holds the
-    /// reservation until its output is closed, which spans many steps at the
-    /// higher levels.
+    /// the compaction pool it then needs a permit, and under the
+    /// compaction-memory charge a reservation, before it opens its cursors and
+    /// builder: the step returns [`MergeStep::NeedsPermit`] or
+    /// [`MergeStep::NeedsReservation`], the caller waits for it, hands it back in
+    /// `granted_permit` or `granted`, and calls again. The merge holds the permit
+    /// and the reservation until its output is closed, which spans many steps at
+    /// the higher levels.
     fn merge_step(
         self: &Arc<Self>,
         opt_merger: &mut Option<Merge<B>>,
         pending: &mut Option<MergeStart<B>>,
+        granted_permit: &mut Option<OwnedSemaphorePermit>,
         granted: &mut Option<Reservation>,
         merger_type: MergerType,
         level: usize,
@@ -1922,6 +1935,10 @@ where
                 }
             }
             let start = pending.as_ref().unwrap();
+            let compaction_jobs = self.runtime.compaction_jobs();
+            if granted_permit.is_none() && compaction_jobs.limit().is_some() {
+                return MergeStep::NeedsPermit;
+            }
             if granted.is_none()
                 && let Some(bytes) = compaction_charge_bytes(
                     start.batches.len(),
@@ -1939,6 +1956,8 @@ where
                 merger_type,
                 pending.take().unwrap(),
                 granted.take(),
+                granted_permit.take(),
+                compaction_jobs.open_merge(),
             ))
         };
 
@@ -1960,8 +1979,10 @@ where
             }
             let mut merger = opt_merger.take().unwrap();
             let new_batch = merger.elapsed.record(|| Arc::new(merger.builder.done()));
-            // The output is closed: its buffers are gone.
+            // The output is closed: its buffers are gone, and the job is over.
             drop(merger.reservation.take());
+            drop(merger.permit.take());
+            drop(merger.open.take());
             let new_level =
                 Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
             let mut state = self.state.lock().unwrap();
@@ -2040,6 +2061,10 @@ enum MergeStep {
 
     /// There was no merge work at this level.
     Idle,
+
+    /// A merge has taken its inputs and needs a permit of the compaction pool
+    /// before it starts.
+    NeedsPermit,
 
     /// A merge has taken its inputs and needs a reservation of this many bytes
     /// of the buffer cache before it starts.
@@ -2126,6 +2151,14 @@ where
     /// compaction-memory charge. Released when the output is closed, or when
     /// the merge is dropped.
     reservation: Option<Reservation>,
+
+    /// The permit of the compaction pool, under `compaction_memory` `pool`.
+    /// Released when the output is closed, or when the merge is dropped.
+    permit: Option<OwnedSemaphorePermit>,
+
+    /// Counts this merge as open, under every memory model. Released with the
+    /// permit.
+    open: Option<OpenMerge>,
 }
 
 /// Which slot a merge works on, and why it started.
@@ -2174,6 +2207,8 @@ where
         merger_type: MergerType,
         start: MergeStart<B>,
         reservation: Option<Reservation>,
+        permit: Option<OwnedSemaphorePermit>,
+        open: OpenMerge,
     ) -> Self {
         let MergeStart {
             batches,
@@ -2200,6 +2235,8 @@ where
             },
             builder,
             reservation,
+            permit,
+            open: Some(open),
             fuel: 0,
             start: Instant::now(),
             elapsed: ElapsedTime::default(),
@@ -3710,7 +3747,10 @@ mod memtable_test {
     use crate::{
         DynZWeight, OrdIndexedZSet as TypedOrdIndexedZSet, Runtime, ZWeight,
         algebra::OrdIndexedZSet,
-        circuit::{CircuitConfig, mkconfig, runtime::tests::with_mock_process_rss},
+        circuit::{
+            CircuitConfig, compaction_jobs::CompactionJobStats, mkconfig,
+            runtime::tests::with_mock_process_rss,
+        },
         dynamic::{DowncastTrait, DynData},
         storage::buffer_cache::{BufferCache, ReservationStats},
         trace::{
@@ -3721,7 +3761,10 @@ mod memtable_test {
     };
     use feldera_buffer_cache::ThreadType;
     use feldera_storage::tokio::TOKIO;
-    use feldera_types::{config::MemoryModel, memory_pressure::MemoryPressure};
+    use feldera_types::{
+        config::{CompactionMemory, MemoryModel},
+        memory_pressure::MemoryPressure,
+    };
     use std::{
         collections::BTreeMap,
         path::Path,
@@ -3938,6 +3981,19 @@ mod memtable_test {
         (locations, cache_growth)
     }
 
+    /// Inserts batches into an integral spine until the memtable budget starts a seal.
+    fn insert_until_sealed(spine: &mut Spine<B>, model: &mut Model) {
+        let mut next = 0;
+        while spine.merger.state.lock().unwrap().memtable_flushes == 0
+            && spine.merger.state.lock().unwrap().flushing.is_none()
+        {
+            let tuples: Vec<_> = (next..next + 2_000).map(|i| (i, -i, 1)).collect();
+            next += 2_000;
+            insert(spine, model, &tuples);
+            assert!(next < 2_000_000, "the budget never sealed the memtable");
+        }
+    }
+
     /// [`fill_until_sealed_under`] under `config`; it also returns the merger cache's
     /// reservation counters, read once the seal has released its reservation.
     fn fill_until_sealed_with(
@@ -3956,15 +4012,7 @@ mod memtable_test {
             let occupancy_before = cache.occupancy().0;
             let mut spine = spine(TraceRole::Integral);
             let mut model = Model::new();
-            let mut next = 0;
-            while spine.merger.state.lock().unwrap().memtable_flushes == 0
-                && spine.merger.state.lock().unwrap().flushing.is_none()
-            {
-                let tuples: Vec<_> = (next..next + 2_000).map(|i| (i, -i, 1)).collect();
-                next += 2_000;
-                insert(&mut spine, &mut model, &tuples);
-                assert!(next < 2_000_000, "the budget never sealed the memtable");
-            }
+            insert_until_sealed(&mut spine, &mut model);
             wait_for_flushes(&spine, 1);
             wait_for_no_reservation(&cache);
             let cache_growth = cache.occupancy().0 - occupancy_before;
@@ -4176,12 +4224,16 @@ mod memtable_test {
         assert_eq!(integral, (Some(TRANSACTIONS[0].len()), 0));
     }
 
-    /// [`model_config`] under `budgets` with the compaction-memory charge on or off,
-    /// and a storage cache of `cache_mib` if given.
-    fn charge_config(path: &Path, charge: bool, cache_mib: Option<usize>) -> CircuitConfig {
+    /// [`model_config`] under `budgets` with `compaction_memory`, and a storage
+    /// cache of `cache_mib` if given.
+    fn charge_config(
+        path: &Path,
+        compaction_memory: CompactionMemory,
+        cache_mib: Option<usize>,
+    ) -> CircuitConfig {
         let mut config = model_config(path, MemoryModel::Budgets, 0);
         let options = &mut config.storage.as_mut().unwrap().options;
-        options.charge_compaction_memory = charge;
+        options.compaction_memory = compaction_memory;
         options.cache_mib = cache_mib;
         config
     }
@@ -4189,16 +4241,22 @@ mod memtable_test {
     #[test]
     fn a_charged_seal_reserves_its_buffers_and_releases_them() {
         let directory = tempdir().unwrap();
-        let (locations, _, charged) =
-            fill_until_sealed_with(charge_config(directory.path(), true, None));
+        let (locations, _, charged) = fill_until_sealed_with(charge_config(
+            directory.path(),
+            CompactionMemory::Charge,
+            None,
+        ));
         assert!(locations.contains(&BatchLocation::Storage));
         assert!(charged.peak_pinned_bytes > 0, "{charged:?}");
         assert_eq!(charged.waits, 0);
 
-        // Control: the same seal without the charge reserves nothing.
+        // Control: the same seal under the pool reserves nothing.
         let directory = tempdir().unwrap();
-        let (_, _, uncharged) =
-            fill_until_sealed_with(charge_config(directory.path(), false, None));
+        let (_, _, uncharged) = fill_until_sealed_with(charge_config(
+            directory.path(),
+            CompactionMemory::Pool,
+            None,
+        ));
         assert_eq!(uncharged, ReservationStats::default());
     }
 
@@ -4230,7 +4288,11 @@ mod memtable_test {
     #[test]
     fn a_charged_merge_reserves_its_buffers_and_releases_them() {
         let directory = tempdir().unwrap();
-        let (locations, cap, stats) = merge_under(charge_config(directory.path(), true, None));
+        let (locations, cap, stats) = merge_under(charge_config(
+            directory.path(),
+            CompactionMemory::Charge,
+            None,
+        ));
         assert_eq!(locations, vec![BatchLocation::Storage]);
         assert!(stats.peak_pinned_bytes > 0, "{stats:?}");
         assert!(
@@ -4243,7 +4305,8 @@ mod memtable_test {
     #[test]
     fn a_charged_merge_that_does_not_fit_waits_for_a_release() {
         let directory = tempdir().unwrap();
-        run_in_circuit_with_storage_config(charge_config(directory.path(), true, None), || {
+        let config = charge_config(directory.path(), CompactionMemory::Charge, None);
+        run_in_circuit_with_storage_config(config, || {
             let cache = Runtime::runtime()
                 .unwrap()
                 .get_buffer_cache(0, ThreadType::Background);
@@ -4291,6 +4354,162 @@ mod memtable_test {
             let stats = cache.reservation_stats();
             assert_eq!(stats.waits, 1);
             assert!(stats.wait >= Duration::from_millis(200), "{stats:?}");
+        });
+    }
+
+    /// [`model_config`] under `budgets` with the compaction pool of `jobs` permits.
+    fn pool_config(path: &Path, jobs: usize) -> CircuitConfig {
+        let mut config = model_config(path, MemoryModel::Budgets, 0);
+        let options = &mut config.storage.as_mut().unwrap().options;
+        options.compaction_jobs = Some(jobs);
+        config
+    }
+
+    /// The job pool of the runtime that the test's circuit runs in.
+    fn compaction_jobs() -> Arc<crate::circuit::compaction_jobs::CompactionJobs> {
+        Runtime::runtime().unwrap().compaction_jobs()
+    }
+
+    /// Waits until `condition` holds, or fails with `what` after ten seconds.
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_full_compaction_pool_makes_a_merge_wait_for_a_permit() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(pool_config(directory.path(), 1), || {
+            let jobs = compaction_jobs();
+            assert_eq!(jobs.limit(), Some(1));
+            // Another merge holds the only permit.
+            let held = TOKIO.block_on(jobs.acquire()).expect("a pool of one");
+            let mut spine = spine(TraceRole::Accumulator);
+            let mut model = Model::new();
+            for i in 0..8 {
+                insert(&mut spine, &mut model, &[(i, i, 1)]);
+            }
+            wait_until("the merge never asked for a permit", || {
+                jobs.stats().waits == 1
+            });
+
+            // The merge has taken its inputs, and has not started.
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                spine
+                    .get_batches()
+                    .iter()
+                    .all(|batch| batch.location() == BatchLocation::Memory)
+            );
+            assert_eq!(contents(spine.cursor()), model);
+            assert_eq!(jobs.stats().peak_open_merges, 0);
+
+            drop(held);
+            wait_until("the merge never ran after the release", || {
+                spine
+                    .get_batches()
+                    .iter()
+                    .map(|batch| batch.location())
+                    .collect::<Vec<_>>()
+                    == [BatchLocation::Storage]
+            });
+            assert_eq!(contents(spine.cursor()), model);
+
+            // The merge returned its permit when its output closed.
+            wait_until("the merge never released its permit", || {
+                jobs.available_permits() == Some(1)
+            });
+            let stats = jobs.stats();
+            assert_eq!(stats.waits, 1);
+            assert!(stats.wait >= Duration::from_millis(200), "{stats:?}");
+            assert_eq!(stats.peak_open_merges, 1);
+        });
+    }
+
+    /// Merges eight level-0 runs of an accumulator under `config`; returns the
+    /// pool's limit, the locations of the resulting runs, and the job counters.
+    fn merge_jobs_under(
+        config: CircuitConfig,
+    ) -> (Option<usize>, Vec<BatchLocation>, CompactionJobStats) {
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let report = outcome.clone();
+        run_in_circuit_with_storage_config(config, move || {
+            let locations = accumulator_runs_after(8, Duration::from_secs(2));
+            let jobs = compaction_jobs();
+            *report.lock().unwrap() = Some((jobs.limit(), locations, jobs.stats()));
+        });
+        Arc::try_unwrap(outcome)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_merge_takes_no_permit_under_the_charge_or_rss() {
+        let directory = tempdir().unwrap();
+        let charge = charge_config(directory.path(), CompactionMemory::Charge, None);
+        let directory = tempdir().unwrap();
+        let rss = model_config(directory.path(), MemoryModel::Rss, usize::MAX);
+        for (name, config) in [("charge", charge), ("rss", rss)] {
+            let (limit, locations, stats) = merge_jobs_under(config);
+            assert_eq!(limit, None, "{name}");
+            assert_eq!(locations.len(), 1, "{name}");
+            // No wait, yet the one merge is counted, under every model.
+            assert_eq!(stats.waits, 0, "{name}");
+            assert_eq!(stats.peak_open_merges, 1, "{name}");
+        }
+
+        // Control: the pool, which the default `budgets` model has.
+        let directory = tempdir().unwrap();
+        let config = model_config(directory.path(), MemoryModel::Budgets, 0);
+        let (limit, _, stats) = merge_jobs_under(config);
+        assert_eq!(limit, Some(2));
+        assert_eq!((stats.waits, stats.peak_open_merges), (0, 1));
+    }
+
+    #[test]
+    fn a_seal_takes_no_permit_while_the_pool_is_full() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(pool_config(directory.path(), 1), || {
+            let jobs = compaction_jobs();
+            let held = TOKIO.block_on(jobs.acquire()).expect("a pool of one");
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            insert_until_sealed(&mut spine, &mut model);
+            wait_for_flushes(&spine, 1);
+            assert_eq!(contents(spine.cursor()), model);
+            assert_eq!(jobs.stats().waits, 0);
+            drop(held);
+        });
+    }
+
+    #[test]
+    fn without_a_pool_merges_at_two_levels_are_open_together() {
+        let directory = tempdir().unwrap();
+        let rss = model_config(directory.path(), MemoryModel::Rss, usize::MAX);
+        run_in_circuit_with_storage_config(rss, || {
+            let jobs = compaction_jobs();
+            assert_eq!(jobs.limit(), None);
+            let mut spine = spine(TraceRole::Accumulator);
+            let mut model = Model::new();
+            // A level-1 merge takes several steps, so level-0 merges that
+            // later batches start overlap it. Keep inserting until they do.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut next = 0;
+            while jobs.stats().peak_open_merges < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "no two merges were ever open together"
+                );
+                let tuples: Vec<_> = (next..next + 200).map(|i| (i, i, 1)).collect();
+                next += 200;
+                insert(&mut spine, &mut model, &tuples);
+            }
+            assert_eq!(contents(spine.cursor()), model);
         });
     }
 }
