@@ -352,7 +352,7 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448
 - each run a fresh process from a copy of its image, with the inputs evicted.
 
 **Remaining, by active dimension:**
-1. **The memory model.** The `rss` arms are [measured](#memtable-at-512-mib-2026-11-20). `budgets` (decided 2026-11-23) is built, uncharged (v20) and charged (v21, `--charge-compaction-memory`; the cap of a quarter of the cache is proposed); it is to be piloted against `rss` with the memtable on, on new images.
+1. **The memory model.** The `rss` arms are [measured](#memtable-at-512-mib-2026-11-20). `budgets` (decided 2026-11-23) is built, uncharged (v20) and charged (v21, `--charge-compaction-memory`; the cap of a quarter of the cache, decided 2026-11-23); it is to be piloted against `rss` with the memtable on, on new images.
 2. **The prefix filter's default.** The user's decision. Every later arm records `configuration.index_prefix_filter`.
 3. **Scattered, uuid, and K = 100 and 1,000.** Pilots at the current version. Every arm needs its own inputs, and uuid its own images.
 4. **The campaign.** `--runs 3` per chosen arm, after its pilot passes. `summarize.py` pools the manifests.
@@ -575,7 +575,7 @@ The driver takes complete dbgen base files and the refresh list.
 - `--index-prefix-filter`: the prefix-filter arm. Images record it, so each arm needs its own.
 - `--memtable-mib N`: the memtable arm. It must stay below half of the memory target, and is refused when building images.
 - `--memory-model rss|budgets` (version 20, default `rss`): how DBSP places runs. `budgets` needs `--memtable-mib`, is refused when building images (they are built under `rss`), and is checked against `configuration.memory_model` of the driver's report.
-- `--charge-compaction-memory` (version 21): each merge and memtable seal reserves its estimated buffer bytes in the cache's budget while it runs. It needs `--memory-model budgets`, is refused when building images, and is checked against `configuration.charge_compaction_memory`. Each refresh reports `compaction_reservations`: `waits`, `wait_ms` and `peak_pinned_bytes` (all zero when off). A reservation over a quarter of the cache (proposed) waits.
+- `--charge-compaction-memory` (version 21): each merge and memtable seal reserves its estimated buffer bytes in the cache's budget while it runs. It needs `--memory-model budgets`, is refused when building images, and is checked against `configuration.charge_compaction_memory`. Each refresh reports `compaction_reservations`: `waits`, `wait_ms` and `peak_pinned_bytes` (all zero when off). A reservation over a quarter of the cache (decided 2026-11-23) waits.
 - `--session-pass seek`: the only pass offered.
 - `--setup-full-compaction`: compact fully after loading.
 - `--warm-up LIST`: run one pair before the window, untimed.

@@ -192,7 +192,7 @@ cache (reads) and the memtable (writes) are the budgets, and RSS places nothing:
     (`storage/buffer_cache/cache/reservation.rs`) whose `Drop` removes its pinned entries and wakes
     the waiters. Its entries are chunks of at most a sixteenth of a shard, keyed by a fresh
     `FileId`. One `ReservationLedger` per cache backend. The cap is a quarter of the cache
-    (`RESERVATION_CAP_DIVISOR`, proposed); a request over it waits, except when nothing is reserved.
+    (`RESERVATION_CAP_DIVISOR`, decided 2026-11-23); a request over it waits, except when nothing is reserved.
     Counters: `BufferCache::reservation_stats` and `Runtime::compaction_reservation_stats`
     (waits, wait time, peak pinned bytes since `reset_peak_pinned_bytes`).
   - *Where.* The wait is an `await`, since merges run as tokio tasks. `merge_step` returns
