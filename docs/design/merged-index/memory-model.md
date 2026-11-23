@@ -88,10 +88,25 @@ Sources checked on 2026-11-23:
 - the output builder's open data and index blocks and its filter;
 - the writer's buffer.
 
-Neither backend can pin an entry or change its capacity. Two ways to hold a reservation, to be chosen before this sub-arm is built:
+**A reservation is a pinned dummy entry, as in RocksDB.**
 
-- **Dummy entries**, as `WriteBufferManager` does. A `CacheEntry` with the reserved cost and no data, under a key space no file uses. It may be evicted early, which ends the charge early; the counter reports how often.
-- **A reserved-capacity counter in the backend.** The backends evict as if their capacity were less the reservations. This is exact, but it changes both `lru.rs` and `s3_fifo.rs` (via `quick_cache`).
+- **RocksDB.** `CacheReservationManagerImpl` keeps the handles of its dummy entries (`dummy_handles_`) until it releases the reservation (`cache/cache_reservation_manager.h`). A referenced entry is not evicted: per `cache.h`, an insert must fit "along with all the existing referenced (pinned) cache entries".
+- **Why pinning is required.** A dummy entry the cache could evict would end the charge while the job's real buffers stay allocated. The cache would then count less than the process holds, which is the very gap the charge exists to close.
+- **In DBSP.**
+  - A dummy is a `CacheEntry` with the reserved cost and no data, under a key space no file uses.
+  - S3-FIFO pins it through `quick_cache`'s `Lifecycle::is_pinned` (0.6.19: "Items that are pinned can't be evicted"), which `s3_fifo.rs` does not use today.
+  - The LRU backend's `evict_to` (`lru.rs`) skips pinned entries.
+  - The reservation is released when the job ends, including on error, through a guard's `Drop`.
+- **Reserve, then allocate.** The job reserves its estimated buffer bytes before it opens its cursors and builder. The cache evicts unpinned blocks to make room, so compaction takes its memory from the cache's budget at the cache manager's discretion: it does not add to RSS beside it.
+
+**When the reservation does not fit: the job waits** (decided 2026-11-23, against RocksDB's default overshoot, where "Insert() never fails").
+
+- The cache refuses a reservation that would push its pinned bytes past a cap. The merge or seal then waits until another reservation is released.
+- A job larger than the cap alone is admitted once no other reservation is held, so it cannot wait forever.
+- A merge is background work, so waiting is cheap. A seal that waits lets the memtable overshoot its soft cap, as it may today, since inserts never stall.
+- So the cache manager is the admission control for compaction.
+- Reported: the reservations' wait time and the peak of pinned bytes.
+- The cap's default is not decided; a quarter of the cache's capacity is the proposal.
 
 **(c) Compaction on its own axis.** The Q3 report gains the merger threads' CPU and device time per refresh, beside `ivm_ms` and `base_ms`, if `run_counts` does not already give them.
 
@@ -113,6 +128,6 @@ Neither backend can pin an entry or change its capacity. Two ways to hold a rese
 
 ## Open questions
 
-- How a charge is held (above).
+- The cap on pinned reservation bytes (proposed: a quarter of the cache's capacity).
 - Whether step memory needs its own cap, once K = 1,000 or the TPC-H batch is measured.
 - Whether `budgets` should warm the cache with seal outputs (`kFlushOnly`).

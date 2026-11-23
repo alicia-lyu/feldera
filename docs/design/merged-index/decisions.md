@@ -528,7 +528,7 @@ The user decided on 2026-11-23, after reading the v18 memtable arms, that the me
 
 The reason: with the memtable on, an integral insert never reaches pressure, but the memtable's bytes still raise RSS, and `critical` then writes step and accumulator runs as 2 KiB files. Two controls relieve the same memory, and a cache sized near the target reaches `critical` by construction. The reading behind it is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20).
 
-The design is in [memory-model.md](memory-model.md). Unconfirmed choices of the design: the names `rss` and `budgets`; whether a seal's output stays cached (RocksDB's `prepopulate_block_cache = kFlushOnly`); how a charge is held in DBSP's buffer cache (a reservation entry, as RocksDB's `CacheReservationManager`, still to be designed); no cap on step memory until a large-transaction run shows a need.
+The design is in [memory-model.md](memory-model.md). Unconfirmed choices of the design: the names `rss` and `budgets`; whether a seal's output stays cached (RocksDB's `prepopulate_block_cache = kFlushOnly`); how a charge is held in DBSP's buffer cache (proposed 2026-11-23: a pinned dummy entry, as RocksDB's `CacheReservationManager` holds its handles; on 2026-11-23 the user decided that a reservation that does not fit waits; the cap on pinned bytes is not yet decided); no cap on step memory until a large-transaction run shows a need.
 
 ## Superseded and withdrawn
 
