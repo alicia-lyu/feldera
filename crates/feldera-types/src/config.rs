@@ -447,6 +447,22 @@ pub struct StorageOptions {
     /// reported. Requires `memtable_mib`, and the circuit refuses to start
     /// without it.
     pub memory_model: MemoryModel,
+
+    /// Whether each merge and memtable seal charges the memory of its
+    /// buffers to the storage cache for the length of the job.
+    ///
+    /// A job reserves its estimated buffer bytes (one data block per input
+    /// run, the output builder's open blocks and filter, and the writer's
+    /// buffer) before it opens its cursors and builder, and releases them
+    /// when it ends. The reservation is a pinned entry in the cache, which
+    /// evicts other blocks to make room, so compaction takes its memory from
+    /// the cache's budget. A reservation that would push the pinned bytes
+    /// past a quarter of the cache makes the job wait until another job
+    /// releases its reservation; a job larger than that quarter runs alone.
+    ///
+    /// Requires `memory_model` `budgets`, and the circuit refuses to start
+    /// otherwise. The default is `false`.
+    pub charge_compaction_memory: bool,
 }
 
 /// How the runtime decides where a new batch goes. See

@@ -15936,6 +15936,11 @@
             "nullable": true,
             "minimum": 0
           },
+          "charge_compaction_memory": {
+            "type": "boolean",
+            "description": "Whether each merge and memtable seal charges the memory of its\nbuffers to the storage cache for the length of the job.\n\nA job reserves its estimated buffer bytes (one data block per input\nrun, the output builder's open blocks and filter, and the writer's\nbuffer) before it opens its cursors and builder, and releases them\nwhen it ends. The reservation is a pinned entry in the cache, which\nevicts other blocks to make room, so compaction takes its memory from\nthe cache's budget. A reservation that would push the pinned bytes\npast a quarter of the cache makes the job wait until another job\nreleases its reservation; a job larger than that quarter runs alone.\n\nRequires `memory_model` `budgets`, and the circuit refuses to start\notherwise. The default is `false`.",
+            "default": false
+          },
           "compression": {
             "allOf": [
               {

@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+mod reservation;
+
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::ops::{Add, AddAssign};
@@ -22,6 +24,9 @@ use crate::circuit::metadata::{
 };
 use crate::circuit::runtime::current_thread_type;
 use crate::storage::backend::{BlockLocation, FileId, FileReader};
+
+pub use reservation::{Reservation, ReservationStats};
+use reservation::{RESERVATION_CAP_DIVISOR, ReservationLedger, Reserver};
 
 /// A key for the block cache.
 ///
@@ -55,6 +60,9 @@ impl CacheKey {
 /// A cache on top of a storage [backend](crate::storage::backend).
 pub struct BufferCache {
     inner: SharedBufferCache<CacheKey, Arc<dyn CacheEntry>>,
+
+    /// The reservations on `inner`, shared by every handle on the same backend.
+    ledger: Arc<ReservationLedger>,
 }
 
 impl Debug for BufferCache {
@@ -136,9 +144,64 @@ impl BufferCache {
         (self.inner.total_charge(), self.inner.total_capacity())
     }
 
-    /// Builds a wrapper around an already-constructed cache backend.
+    /// Builds a wrapper around an already-constructed cache backend, with a
+    /// reservation ledger of its own.
     fn from_inner(inner: SharedBufferCache<CacheKey, Arc<dyn CacheEntry>>) -> Self {
-        Self { inner }
+        let ledger = Arc::new(Self::new_ledger(&inner));
+        Self { inner, ledger }
+    }
+
+    /// Builds a ledger whose cap is a fraction of `inner`'s capacity.
+    fn new_ledger(inner: &SharedBufferCache<CacheKey, Arc<dyn CacheEntry>>) -> ReservationLedger {
+        ReservationLedger::new(inner.total_capacity() / RESERVATION_CAP_DIVISOR)
+    }
+
+    fn reserver(&self) -> Reserver<'_> {
+        Reserver {
+            cache: &self.inner,
+            ledger: &self.ledger,
+        }
+    }
+
+    /// Reserves `bytes` of the cache's budget if they fit under the cap on
+    /// pinned bytes, or if nothing else is reserved; returns `None` otherwise.
+    ///
+    /// The reservation is a set of pinned entries that the cache never
+    /// evicts; it evicts other blocks to make room for them. Dropping the
+    /// [`Reservation`] removes the entries.
+    pub fn try_reserve(&self, bytes: usize) -> Option<Reservation> {
+        self.reserver().try_reserve(bytes)
+    }
+
+    /// Reserves `bytes` as [`try_reserve`](Self::try_reserve) does, but waits
+    /// for another reservation to be released if they do not fit.
+    ///
+    /// The wait is an `await`, so it does not hold an executor thread. It
+    /// counts in [`reservation_stats`](Self::reservation_stats).
+    pub async fn reserve(&self, bytes: usize) -> Reservation {
+        self.reserver().reserve(bytes).await
+    }
+
+    /// The most bytes that reservations may pin before a further one waits.
+    pub fn reservation_cap_bytes(&self) -> usize {
+        self.ledger.cap_bytes()
+    }
+
+    /// The bytes reserved now.
+    pub fn pinned_bytes(&self) -> usize {
+        self.ledger.pinned_bytes()
+    }
+
+    /// The waits and the peak of pinned bytes of this cache backend.
+    pub fn reservation_stats(&self) -> ReservationStats {
+        self.ledger.stats()
+    }
+
+    /// Starts a new peak of pinned bytes from the current level, so that the
+    /// next [`reservation_stats`](Self::reservation_stats) reports the peak
+    /// since this call.
+    pub fn reset_peak_pinned_bytes(&self) {
+        self.ledger.reset_peak_pinned_bytes()
     }
 
     /// Returns an identifier for the shared cache backend used by this wrapper.
@@ -161,6 +224,9 @@ pub(crate) fn build_buffer_caches(
     max_buckets: Option<usize>,
     allocation_strategy: BufferCacheAllocationStrategy,
 ) -> Vec<EnumMap<ThreadType, Arc<BufferCache>>> {
+    // Slots that share a backend share its reservation ledger, so that the
+    // cap bounds the pinned bytes of the backend, not of each handle.
+    let mut ledgers: HashMap<usize, Arc<ReservationLedger>> = HashMap::new();
     BufferCacheBuilder::<CacheKey, Arc<dyn CacheEntry>>::new()
         .with_buffer_cache_strategy(strategy)
         .with_buffer_max_buckets(max_buckets)
@@ -169,7 +235,13 @@ pub(crate) fn build_buffer_caches(
         .into_iter()
         .map(|caches| {
             EnumMap::from_fn(|thread_type| {
-                Arc::new(BufferCache::from_inner(caches[thread_type].clone()))
+                let inner = caches[thread_type].clone();
+                let backend_id = Arc::as_ptr(&inner) as *const () as usize;
+                let ledger = ledgers
+                    .entry(backend_id)
+                    .or_insert_with(|| Arc::new(BufferCache::new_ledger(&inner)))
+                    .clone();
+                Arc::new(BufferCache { inner, ledger })
             })
         })
         .collect()

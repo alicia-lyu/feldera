@@ -96,6 +96,10 @@ pub enum Error {
     /// `storage.memory_model` is `budgets`, but `storage.memtable_mib` is unset:
     /// the model needs the memtable budget for its write side.
     MemoryModelNeedsMemtableBudget,
+    /// `storage.charge_compaction_memory` is set, but `storage.memory_model` is
+    /// not `budgets`: the charge reserves compaction memory in the cache's budget,
+    /// which only that model has.
+    CompactionChargeNeedsBudgets,
     Terminated,
 }
 
@@ -110,6 +114,7 @@ impl DetailedError for Error {
             Self::BootstrapCircuit(_) => Cow::from("BootstrapCircuit"),
             Self::MemtableBudgetTooLarge { .. } => Cow::from("MemtableBudgetTooLarge"),
             Self::MemoryModelNeedsMemtableBudget => Cow::from("MemoryModelNeedsMemtableBudget"),
+            Self::CompactionChargeNeedsBudgets => Cow::from("CompactionChargeNeedsBudgets"),
         }
     }
 }
@@ -153,6 +158,10 @@ impl Display for Error {
                 "storage.memory_model is budgets, which needs storage.memtable_mib for its write \
                  budget; set storage.memtable_mib",
             ),
+            Self::CompactionChargeNeedsBudgets => f.write_str(
+                "storage.charge_compaction_memory reserves compaction memory in the cache budget, \
+                 which needs storage.memory_model budgets; set storage.memory_model",
+            ),
         }
     }
 }
@@ -183,11 +192,15 @@ fn validate_memtable_budget(
     }
 }
 
-/// Refuses `memory_model: budgets` without a memtable budget: under that model
-/// the memtable budget is the write side of the memory model.
+/// Refuses `memory_model: budgets` without a memtable budget, since under that
+/// model the memtable budget is the write side of the memory model, and
+/// `charge_compaction_memory` without `budgets`, since the charge draws on the
+/// cache budget that only that model has.
 fn validate_memory_model(options: &StorageOptions) -> Result<(), Error> {
     if options.memory_model == MemoryModel::Budgets && options.memtable_mib.is_none() {
         Err(Error::MemoryModelNeedsMemtableBudget)
+    } else if options.charge_compaction_memory && options.memory_model != MemoryModel::Budgets {
+        Err(Error::CompactionChargeNeedsBudgets)
     } else {
         Ok(())
     }
@@ -777,6 +790,14 @@ impl RuntimeInner {
         self.storage
             .as_ref()
             .map_or(MemoryModel::Rss, |storage| storage.options.memory_model)
+    }
+
+    /// Whether merges and seals reserve their buffer memory in the cache;
+    /// always false without storage.
+    fn charge_compaction_memory(&self) -> bool {
+        self.storage
+            .as_ref()
+            .is_some_and(|storage| storage.options.charge_compaction_memory)
     }
 
     /// Compute memory pressure based on the current process RSS.
@@ -1411,6 +1432,14 @@ impl Runtime {
         RUNTIME
             .with(|rt| Some(rt.borrow().as_ref()?.inner().memory_model()))
             .unwrap_or(MemoryModel::Rss)
+    }
+
+    /// Returns whether merges and seals charge their buffer memory to the
+    /// cache (`storage.charge_compaction_memory`); false off a runtime thread.
+    pub fn charge_compaction_memory() -> bool {
+        RUNTIME
+            .with(|rt| Some(rt.borrow().as_ref()?.inner().charge_compaction_memory()))
+            .unwrap_or(false)
     }
 
     /// Returns the memory budget of the integral traces' memtables, in bytes
@@ -2894,6 +2923,21 @@ pub(crate) mod tests {
         assert!(matches!(error, Error::MemoryModelNeedsMemtableBudget));
         assert!(error.to_string().contains("storage.memtable_mib"));
 
+        options.memtable_mib = Some(64);
+        assert!(validate_memory_model(&options).is_ok());
+    }
+
+    #[test]
+    fn compaction_charge_needs_the_budgets_model() {
+        let mut options = StorageOptions {
+            charge_compaction_memory: true,
+            ..StorageOptions::default()
+        };
+        let error = validate_memory_model(&options).unwrap_err();
+        assert!(matches!(error, Error::CompactionChargeNeedsBudgets));
+        assert!(error.to_string().contains("storage.memory_model"));
+
+        options.memory_model = MemoryModel::Budgets;
         options.memtable_mib = Some(64);
         assert!(validate_memory_model(&options).is_ok());
     }
