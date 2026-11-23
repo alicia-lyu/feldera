@@ -41,7 +41,7 @@ Nothing here infers an unmeasured quantity.
 | Base eviction | on (v16) | not measured in isolation (it came with the 512 MiB cache) | eviction 5.5–6 ms, in neither phase | **Decided 2026-11-18:** on, always |
 | Prefix filter | off, on (v17) | merged-index off 4.56 / 3.36, on 3.98 / 3.06; index seeks 9.8 → 2.5 and 26.6 → 7.0 | off 3.77 / 15.57, on 3.56 / 14.68 | **Active:** the default awaits the user |
 | Order keys | dbgen (v16–17), uuid (v17), sequence (stopped) | uuid: native 3.88 → 5.76 / 4.46 → 9.28; merged-index 4.56 → 4.15 / 3.36 → 3.49 | uuid: native 13.86 / 11.44, merged-index 11.92 / 20.20 | **Decided:** dbgen is the default, and `sequence` and timestamp IDs are out. **Active:** uuid |
-| Memtable | 512/512; 448 cache; 448 + 64 MiB memtable (v18) | 448 off → 448 + 64: merged-index 3.91 → 3.83 / 3.16 → 3.18, p99 8.19 → 5.28 / 6.58 → 4.78; native 3.00 → 1.71 / 1.60 → 1.87, but native stayed `low` with the memtable | merged-index 3.38 → 3.89 / 15.20 → 11.07; native 3.22 → 3.14 / 6.11 → 5.62 | **Active:** [measured](#memtable-at-512-mib-2026-11-20); the user decides |
+| Memory model (was: memtable) | `rss`: 512/512; 448 cache; 448 + 64 MiB memtable (v18). `budgets` not yet built | 448 off → 448 + 64: merged-index 3.91 → 3.83 / 3.16 → 3.18, p99 8.19 → 5.28 / 6.58 → 4.78; native 3.00 → 1.71 / 1.60 → 1.87, but native stayed `low` with the memtable | merged-index 3.38 → 3.89 / 15.20 → 11.07; native 3.22 → 3.14 / 6.11 → 5.62 | **Active:** `rss` [measured](#memtable-at-512-mib-2026-11-20); `budgets` [decided 2026-11-23](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) as the arm to compare |
 | Workload | clustered, scattered (v14) | clustered: native 3.77 / 4.63, merged-index 4.51 / 3.07; scattered: native 4.30 / 4.44, merged-index 8.06 / 3.14 | 1.0–1.4 / 1.1–1.9 | **Active:** scattered not run since v14 |
 | Transaction size | K = 10 | as above | — | **Active:** K = 100 and 1,000 next |
 | Device | SSD | as above | — | **Active:** the hard-disk probe has not run |
@@ -59,7 +59,7 @@ What the rows add up to, so far:
 
 | Dimension | Arms | Selected by | Own images? | Now | Next | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| Memtable | off; `--memtable-mib N` | the campaign's `--memtable-mib` | no | off; 448 + 64 [measured](#memtable-at-512-mib-2026-11-20) | the user decides whether it joins the campaign | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget) |
+| Memory model | `rss` (memtable off, or `--memtable-mib N`); `budgets`, with compaction memory uncharged or charged | `--memtable-mib`; the `budgets` flag is not built yet | no for `rss`; `budgets` changes image sources | `rss`, memtable off; 448 + 64 [measured](#memtable-at-512-mib-2026-11-20) | build `budgets`, then pilot it against `rss` with the memtable on | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget), [memory model](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) |
 | Prefix filter | off, on | `--index-prefix-filter` on `--build-images` and on the campaign | yes | on in the memtable arms | the user sets the default | [decision](../../../docs/design/merged-index/decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter) |
 | Order keys | `dbgen` (default), `uuid` | `prepare_inputs.py --order-keys`; images from `<out>/base` | yes | dbgen | uuid as an arm of later runs | [decision](DECISIONS.md#2026-11-19-order-keys-are-a-dimension-dbgen-sequence-uuid) |
 | Workload | clustered, scattered | the refresh list (`clustered/`, `scattered/`) | no | clustered | scattered at the current version | [decision](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order) |
@@ -352,7 +352,7 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448
 - each run a fresh process from a copy of its image, with the inputs evicted.
 
 **Remaining, by active dimension:**
-1. **The memtable.** The three arms are [measured](#memtable-at-512-mib-2026-11-20). The user decides whether the campaign uses it.
+1. **The memory model.** The `rss` arms are [measured](#memtable-at-512-mib-2026-11-20). `budgets` (decided 2026-11-23), with compaction memory uncharged and charged, is to be built and piloted against `rss` with the memtable on.
 2. **The prefix filter's default.** The user's decision. Every later arm records `configuration.index_prefix_filter`.
 3. **Scattered, uuid, and K = 100 and 1,000.** Pilots at the current version. Every arm needs its own inputs, and uuid its own images.
 4. **The campaign.** `--runs 3` per chosen arm, after its pilot passes. `summarize.py` pools the manifests.
