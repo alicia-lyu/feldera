@@ -300,13 +300,34 @@ Each timed run was followed by a `--diagnostics` rerun in 2 GiB, used only for w
 
 - Background compaction was 95 to 96% of c448's writes in both modes, and the memtable removes almost all of it.
 - **Not removed:** step-built files and insert spills, about 4 to 7 files per transaction of about 2 KiB each, as [memtable.md](../../../docs/design/merged-index/memtable.md#the-arm-and-its-limits) expected.
+  - These are the runs the memtable does not hold: runs passed between operators within a step, and deltas inserted into accumulator spines. An integral spine's insert goes into the memtable at any pressure (`Spine::insert`).
+  - Only pressure writes them: step runs at `critical`, accumulator inserts from `high`.
+- **Caveat on the native m64 column.** It shows 12.3 KiB of step-built files per transaction, and step runs become files only at `critical`. Its diagnostics rerun (2 GiB, logs held in memory) was therefore probably at `critical`, unlike the timed m64 run, which stayed `low`. The rerun's pressure is not in this table, and its manifest is gone.
 - c512's diagnostics differ from c448's by under 1%.
 
 **The memtable itself** (timed runs):
 - **Flushes.** All of them came in refresh 4, when the budget was reached: 6 seals in native and 4 in the merged index. Each flushed file is 10 to 18 MiB. The diagnostics reruns give a mean seal time of 218 to 236 ms (native) and 207 to 640 ms (merged index, the 640 ms being the view side). The largest view transaction in refresh 4 was 10.4 ms (native) and 30.1 ms (merged index), so no seal shows up whole in a transaction's latency. The report does not say which thread sealed.
 - **Bytes held** at refresh ends: 17 to 50 MiB (native) and 19 to 57 MiB (merged index), refilling after the flush.
+  - Each figure is runtime-wide, summed over every integral spine of both circuits.
+  - Native has eight such spines: three base tables, four join traces and `V`.
+  - The merged index has five: three base tables, the index and `V`. `J` is a stream, not a trace.
+  - The figures measure what was inserted since the last seal, not the size of any table. The per-spine split (`memtable_bytes_at_end` in `run_counts`) was not tabulated.
 - **Copies while a snapshot was held:** 69,000 to 130,000 node copies per refresh, taking 1.0 to 2.2 s. That is 0.16 to 0.37 ms per transaction. The report does not split this time between the base and view phases.
 - **RSS.** The window peak RSS, c448 → m64, went from 660 to 699 MiB in the merged index (+39 MiB, against a memtable of up to 57 MiB) and from 622 to 404 MiB in native. The native drop is measured, but its cause is not; native also never left `low` pressure.
+
+**Reading the native m64 row (hypotheses, not results).**
+- **A write effect.** Native m64's worker-thread device reads barely moved (10.7 → 10.0 RF1), so its gain is not from reading less. It is not an in-memory workload: the state is 17 to 20 GB of restored file runs.
+- **A loop the memtable may break.**
+  - In c448, compaction wrote about 377 KiB per transaction, and every written block enters the buffer cache (`from_raw_with_cache`).
+  - A full cache pushes RSS past 95% of the target. `critical` then writes each transaction's step and accumulator runs as files on the worker, and those files feed more compaction.
+  - With compaction gone, native's cache fills only from reads. If its read working set fits, RSS stays below `critical`.
+
+  Untested: the report records cache occupancy only at the window's end.
+- **Why the merged index stays `critical` (candidates).** Its first-touch group reads fill the cache faster, since index blocks are never evicted with the base tables'; or its heap outside the spines is larger.
+- **Refresh order.** Refreshes alternate RF1 and RF2, starting with RF1. The merged index's one `low` refresh is refresh 1, which the tables leave out, so its published RF1 is all at `critical`.
+- **Tests:**
+  - per-refresh cache occupancy and memtable bytes;
+  - native m64 with scattered RF1 or uuid keys, where a larger working set should bring `critical` back.
 
 **Base (amortized).** The merged index's RF2 base median fell 27% (15.20 → 11.07 ms) and its total base time from 330 s to 254 s. Native's base changed by under 10%. Base eviction took 24 to 35 s per refresh in the merged index in both arms. In native it took 4 to 10 s with m64, against 7 to 31 s with c448.
 

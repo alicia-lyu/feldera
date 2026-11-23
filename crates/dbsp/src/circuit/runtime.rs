@@ -156,8 +156,9 @@ const MEMTABLE_BYTES_PER_MIB: usize = 1024 * 1024;
 /// Converts `storage.memtable_mib` to bytes, and refuses a budget of half of
 /// `max_rss_bytes` or more.
 ///
-/// Memory pressure is measured against `max_rss_bytes` less the budget, so a
-/// budget that large would leave the rest of the process almost no room.
+/// The memtable counts in RSS, and memory pressure compares RSS with
+/// `max_rss_bytes`, so a budget that large would leave the rest of the process
+/// almost no room.
 fn validate_memtable_budget(
     memtable_mib: usize,
     max_rss_bytes: Option<u64>,
