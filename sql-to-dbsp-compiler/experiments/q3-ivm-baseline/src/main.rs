@@ -31,6 +31,7 @@ use dbsp::circuit::{
 };
 use dbsp::monitor::visual_graph::CircuitNodeStyle;
 use dbsp::storage::attribution::Component;
+use dbsp::storage::buffer_cache::ReservationStats;
 use dbsp::storage::file::writer::{
     ELIDED_VALUE_HEADER_BLOCKS, FRONT_CODED_BLOCKS, FRONT_CODING_LAYOUT_FALLBACKS,
     FRONT_CODING_SIZE_FALLBACKS, VALUE_ELISION_LAYOUT_FALLBACKS, VALUE_ELISION_SIZE_FALLBACKS,
@@ -1286,6 +1287,10 @@ struct Config {
     /// version 20): `rss` is the default, the pressure levels on RSS; `budgets` places runs by
     /// the cache and memtable budgets and needs `--memtable-mib`. Images are built under `rss`.
     memory_model: MemoryModel,
+    /// Whether each merge and seal reserves its buffer bytes in the cache's budget while it
+    /// runs (`--charge-compaction-memory`, measurement version 21). Needs `--memory-model
+    /// budgets`; images are built without it.
+    charge_compaction_memory: bool,
     /// How the reconstructed build's scan session passes untouched groups
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
@@ -1383,6 +1388,7 @@ impl Config {
                         &args.next().context("--memory-model needs rss or budgets")?,
                     )?
                 }
+                "--charge-compaction-memory" => config.charge_compaction_memory = true,
                 "--session-pass" => {
                     config.session_pass = Some(parse_pass(
                         &args.next().context("--session-pass needs seek or step")?,
@@ -1472,6 +1478,15 @@ impl Config {
         }
         if config.write_image.is_some() && config.memory_model != MemoryModel::Rss {
             bail!("--write-image loads under --memory-model rss: images are built under rss");
+        }
+        if config.charge_compaction_memory && config.memory_model != MemoryModel::Budgets {
+            bail!(
+                "--charge-compaction-memory needs --memory-model budgets: the charge draws on the \
+                 cache budget that model has"
+            );
+        }
+        if config.write_image.is_some() && config.charge_compaction_memory {
+            bail!("--write-image loads without --charge-compaction-memory: images are built without it");
         }
         if config.write_image.is_some() && config.from_image.is_some() {
             bail!("--write-image and --from-image are the load and the refresh program; pass one");
@@ -1806,6 +1821,18 @@ fn memory_state(pipeline: &Pipeline) -> Result<Value> {
         "cache_occupancy_bytes": cache_occupancy,
         "memtable_bytes": runtime.memtable_live_bytes(),
     }))
+}
+
+/// What the compaction-memory reservations cost during one refresh (measurement version 21):
+/// how many waited and for how long, and the most bytes pinned at once. All zero when
+/// `--charge-compaction-memory` is off. `before` and `after` are the cumulative counters at the
+/// refresh's two ends; `after.peak_pinned_bytes` is the peak since the refresh began.
+fn reservations_json(before: ReservationStats, after: ReservationStats) -> Value {
+    json!({
+        "waits": after.waits - before.waits,
+        "wait_ms": milliseconds(after.wait - before.wait),
+        "peak_pinned_bytes": after.peak_pinned_bytes,
+    })
 }
 
 /// The refreshes of the refresh list at `path`, with relative file names resolved against the
@@ -2316,6 +2343,7 @@ fn storage_options(config: &Config) -> StorageOptions {
         compression: feldera_types::config::StorageCompression::None,
         memtable_mib: config.memtable_mib,
         memory_model: config.memory_model,
+        charge_compaction_memory: config.charge_compaction_memory,
         ..StorageOptions::default()
     }
 }
@@ -2595,6 +2623,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         // around each of its transactions, so a refresh cut into small transactions does not
         // pay them per transaction (measurement version 14).
         let resources_before = measurement::ResourceSnapshot::capture()?;
+        let reservations_before = pipeline.runtime().compaction_reservation_stats();
+        pipeline.runtime().reset_peak_pinned_bytes();
         let phase_started = Instant::now();
         let mut measurement = Measurements::default();
         let mut customers = HashSet::new();
@@ -2674,6 +2704,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "after": memory_pressure_after,
         });
         report["transaction_latency"] = latencies.json();
+        report["compaction_reservations"] = reservations_json(
+            reservations_before,
+            pipeline.runtime().compaction_reservation_stats(),
+        );
         report["run_counts_sampling_ms"] = json!(milliseconds(run_counts.sampling));
         report["run_counts"] = run_counts.json();
         report["absent_orders"] = json!(absent);
@@ -2814,7 +2848,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 20,
+        "measurement_version": 21,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2849,6 +2883,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "index_prefix_filter": config.index_prefix_filter,
             "memtable_mib": config.memtable_mib,
             "memory_model": memory_model_name(config.memory_model),
+            "charge_compaction_memory": config.charge_compaction_memory,
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
@@ -3064,6 +3099,31 @@ mod tests {
             "budgets",
             "--memtable-mib",
             "64"
+        ])
+        .is_err());
+        // The charge defaults off, and needs the budgets model.
+        assert!(!parse(&[]).unwrap().charge_compaction_memory);
+        assert!(parse(&["--charge-compaction-memory"]).is_err());
+        assert!(parse(&["--memtable-mib", "64", "--charge-compaction-memory"]).is_err());
+        assert!(
+            parse(&[
+                "--memory-model",
+                "budgets",
+                "--memtable-mib",
+                "64",
+                "--charge-compaction-memory"
+            ])
+            .unwrap()
+            .charge_compaction_memory
+        );
+        assert!(parse(&[
+            "--write-image",
+            "i",
+            "--memory-model",
+            "budgets",
+            "--memtable-mib",
+            "64",
+            "--charge-compaction-memory"
         ])
         .is_err());
         // The load and the refresh program take disjoint inputs.
@@ -4181,7 +4241,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 20);
+        assert_eq!(output["measurement_version"], 21);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4348,7 +4408,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 20);
+        assert_eq!(output["measurement_version"], 21);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -4585,6 +4645,11 @@ mod measurement_tests {
             assert!(sequence["cgroup"].is_null());
         }
         for refresh in refreshes {
+            // The charge is off in this run: no reservation was made, and none waited.
+            let reservations = &refresh["compaction_reservations"];
+            assert_eq!(reservations["waits"], 0, "{refresh}");
+            assert_eq!(reservations["wait_ms"], 0.0, "{refresh}");
+            assert_eq!(reservations["peak_pinned_bytes"], 0, "{refresh}");
             for side in ["before", "after"] {
                 let state = &refresh["memory_pressure"][side];
                 assert!(state["runtime"].is_string(), "{refresh}");

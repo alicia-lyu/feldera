@@ -421,7 +421,15 @@ type Fixture = (&'static str, Change, bool);
 /// `session_pass` is the reconstructed build's scan-session pass; the native build has no
 /// session.
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
-    replay_with_image(fixtures, session_pass, None, false, None, MemoryModel::Rss)
+    replay_with_image(
+        fixtures,
+        session_pass,
+        None,
+        false,
+        None,
+        MemoryModel::Rss,
+        false,
+    )
 }
 
 /// A scratch storage directory for one test, removed when dropped.
@@ -454,6 +462,8 @@ impl Drop for ScratchStorage {
 /// `memtable_mib` gives the integral spines memtables (`--memtable-mib`); a memtable needs
 /// storage, so it keeps the state in a scratch directory even without an image.
 /// `memory_model` is DBSP's (`--memory-model`); `Budgets` needs `memtable_mib`.
+/// `charge_compaction_memory` makes merges and seals reserve their buffers in the cache
+/// (`--charge-compaction-memory`); it needs `Budgets`.
 fn replay_with_image(
     fixtures: Vec<Fixture>,
     session_pass: Pass,
@@ -461,12 +471,13 @@ fn replay_with_image(
     index_prefix_filter: bool,
     memtable_mib: Option<usize>,
     memory_model: MemoryModel,
+    charge_compaction_memory: bool,
 ) -> Result<Vec<Value>> {
     let storage = (image_after.is_some() || memtable_mib.is_some())
         .then(|| {
             // Tests run concurrently in one process: name the directory by every parameter.
             ScratchStorage::new(&format!(
-                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}-{memory_model:?}"
+                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}-{memory_model:?}-charge-{charge_compaction_memory}"
             ))
         })
         .transpose()?;
@@ -482,6 +493,7 @@ fn replay_with_image(
                 StorageOptions {
                     memtable_mib,
                     memory_model,
+                    charge_compaction_memory,
                     ..StorageOptions::default()
                 },
             )?)),
@@ -583,6 +595,7 @@ fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
                 false,
                 None,
                 MemoryModel::Rss,
+                false,
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -609,7 +622,8 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
                 None,
                 true,
                 None,
-                MemoryModel::Rss
+                MemoryModel::Rss,
+                false
             )?)?,
             whole
         );
@@ -621,6 +635,7 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
                 true,
                 None,
                 MemoryModel::Rss,
+                false,
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -645,7 +660,8 @@ fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
                 None,
                 false,
                 Some(1),
-                MemoryModel::Rss
+                MemoryModel::Rss,
+                false
             )?)?,
             whole
         );
@@ -657,6 +673,7 @@ fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Rss,
+                false,
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -681,7 +698,8 @@ fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
                 None,
                 false,
                 Some(1),
-                MemoryModel::Budgets
+                MemoryModel::Budgets,
+                false
             )?)?,
             whole
         );
@@ -693,11 +711,50 @@ fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Budgets,
+                false,
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
                 "an image after {split} fixtures, under budgets"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The compaction-memory charge leaves every transcript unchanged, whole and across an image:
+/// it changes when a merge or a seal starts, not what it computes.
+#[test]
+fn transcripts_do_not_depend_on_the_compaction_charge() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
+        assert_eq!(
+            serde_json::to_vec(&replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                None,
+                false,
+                Some(1),
+                MemoryModel::Budgets,
+                true
+            )?)?,
+            whole
+        );
+        for split in [1, fixtures().len() / 2] {
+            let reopened = replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                Some(split),
+                false,
+                Some(1),
+                MemoryModel::Budgets,
+                true,
+            )?;
+            assert_eq!(
+                serde_json::to_vec(&reopened)?,
+                whole,
+                "an image after {split} fixtures, under budgets with the charge"
             );
         }
     }

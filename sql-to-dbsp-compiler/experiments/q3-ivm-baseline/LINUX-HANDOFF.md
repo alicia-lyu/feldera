@@ -225,6 +225,7 @@ How each active dimension is selected, and whether it needs its own images. The 
 | Prefix filter | `--index-prefix-filter`, on `--build-images` and on every campaign that reopens those images | yes |
 | Memtable | `--memtable-mib N` on the campaign; below half of `--memory-target-bytes` | no |
 | Memory model | `--memory-model rss\|budgets` on the campaign (default `rss`); `budgets` needs `--memtable-mib`, and is refused when building images | no, but version 20 images are new |
+| Compaction charge | `--charge-compaction-memory` on the campaign, with `--memory-model budgets`; refused when building images | no, but version 21 images are new |
 | Memory budget | `--cache-bytes` and `--memory-target-bytes` (decided: one budget, 512/512) | no |
 | Device | `--storage-path` and `--device-label ssd\|hdd` | no |
 | Repetitions | `--runs` (1 for a pilot, 3 for the campaign) | no |

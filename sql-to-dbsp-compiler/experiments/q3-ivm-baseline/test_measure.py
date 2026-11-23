@@ -766,7 +766,7 @@ class MeasureTest(unittest.TestCase):
         resources.update(changes)
         return {"mode": mode,
                 "configuration": {"index_prefix_filter": False, "memtable_mib": None,
-                                  "memory_model": "rss"},
+                                  "memory_model": "rss", "charge_compaction_memory": False},
                 "sequence": {"resources": resources},
                 "refreshes": [{"refresh": 1, "resources": resources}]}
 
@@ -1193,6 +1193,57 @@ class MeasureTest(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             measure.parse_args(args)
 
+    def test_reported_compaction_charge_must_be_the_requested_one(self) -> None:
+        def report(mode: str, configuration: dict) -> dict:
+            return {"mode": mode, "configuration": configuration}
+        for mode in ("native", "reconstructed"):
+            for asked in (False, True):
+                self.assertEqual(
+                    measure.charge_compaction_memory_problems(
+                        report(mode, {"charge_compaction_memory": asked}), asked), [])
+            self.assertIn("is False, expected True", measure.charge_compaction_memory_problems(
+                report(mode, {"charge_compaction_memory": False}), True)[0])
+            self.assertIn("is True, expected False", measure.charge_compaction_memory_problems(
+                report(mode, {"charge_compaction_memory": True}), False)[0])
+            # A driver older than measurement version 21 does not report it at all.
+            self.assertIn("missing",
+                          measure.charge_compaction_memory_problems(report(mode, {}), False)[0])
+        self.assertEqual(measure.charge_compaction_memory_problems({}, True), [])
+
+    def test_charge_compaction_memory_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "memtable_mib": 64, "memory_model": "budgets",
+                         "charge_compaction_memory": True}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        self.assertIn("--charge-compaction-memory", measure.driver_command(spec, inputs))
+        spec["args"]["charge_compaction_memory"] = False
+        self.assertNotIn("--charge-compaction-memory", measure.driver_command(spec, inputs))
+        del spec["args"]["charge_compaction_memory"]
+        self.assertNotIn("--charge-compaction-memory", measure.driver_command(spec, inputs))
+        self.assertFalse(measure.parse_args(self.args).charge_compaction_memory)
+
+    def test_charge_compaction_memory_needs_the_budgets_model(self) -> None:
+        args = list(self.args)
+        args[args.index("--memory-target-bytes") + 1] = str(512 * 1024 * 1024)
+        budgets = ["--memory-model", "budgets", "--memtable-mib", "64"]
+        self.assertTrue(measure.parse_args(
+            args + budgets + ["--charge-compaction-memory"]).charge_compaction_memory)
+        for refused in (["--charge-compaction-memory"],
+                        ["--memtable-mib", "64", "--charge-compaction-memory"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                measure.parse_args(args + refused)
+
+    def test_charge_compaction_memory_is_refused_when_loading(self) -> None:
+        args = ["--build-images", str(self.root / "images"),
+                "--customer", str(self.root / "customer"),
+                "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem"),
+                "--charge-compaction-memory"]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            measure.parse_args(args)
+
     def test_session_pass_flag_reaches_the_driver(self) -> None:
         spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
@@ -1451,7 +1502,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 20,
+        return {"mode": mode, "measurement_version": 21,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1558,7 +1609,7 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure.measurement_version_problems(report), [])
         report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 13, expected 20"])
+                         ["measurement_version is 13, expected 21"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])
