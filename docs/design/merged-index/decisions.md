@@ -546,3 +546,11 @@ Rows that concern the Q3 harness are in the [owner log](../../../sql-to-dbsp-com
 
 - **Is the interesting-ordering shape required?** Reconstructing state from a merged index may require the circuit to read state in the merged index's order (customer > order > line). If so, the compiler cannot always produce that shape, and some queries will need hand-written circuits.
 - **Clustered primary storage.** Deferred; see the secondary-storage decision.
+
+### 2026-11-20: Q14's measurement leaves the Q3 harness unchanged
+
+The user decided on 2026-11-20 that Q14's measurement shares no code with the Q3 harness and does not change it: `q14-ivm-baseline/` gets its own driver, which takes from Q3 only what it needs. The first version runs TPC-H's refreshes, which reach Q14 only through Lineitem (RF1 inserts line items; RF2 deletes the line items of the named orders, found in the base circuit's Lineitem in both modes, since MI_P is keyed by part), as a smoke run at a small scale factor. Its timing follows Q3's accounting (`base_ms` with `index_ms`, `forward_ms`, `delta_ms`, `q14_ms`, `ivm_ms = delta_ms + q14_ms`), with base and IVM side by side. Images, cgroups, base-block eviction, run counts, diagnostics, and Q3's other workloads are left out until they are needed.
+
+### 2026-11-22: Q14 is measured with Q3's image and cgroup method
+
+The user decided on 2026-11-22 that Q14 is measured with nearly the same method as Q3, after being told that the merged index is designed for disk-resident state. The SF 1 runs without a memory limit kept native's Part trace in memory, which favored native. The Q14 driver gained a load program and a refresh program that meet at an image (`--write-image`, `--from-image`), base-block eviction after each base transaction, and Q3's arm A storage format. Its own runner, `q14-ivm-baseline/measure.py`, runs each refresh program in a cgroup with a 1 GiB `memory.max` and no swap, a 256 MiB cache, and a 512 MiB memory target, from a fresh copy of its image with the inputs dropped from the page cache. The Q3 harness stays unchanged. SF 1 goes first; SF 10 waits for its results.

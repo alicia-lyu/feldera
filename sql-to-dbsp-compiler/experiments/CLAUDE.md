@@ -8,7 +8,7 @@ Rules here apply to any merged index and any IVM harness in this directory. The 
 | --- | --- |
 | `merged-index-col/` | The index library for Customer–Orders–Lineitem (COL): its spec `col.mi`, the generated definition, storage tests, and the Q3 readers. |
 | `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, encoding and storage tests, and the Q14 readers. Payloads serve Q14 for now. |
-| `q14-ivm-baseline/` | The Q14 correctness harness over MI_P: the circuits (base, native view, hand-written reconstructed view `q14-trie-view-circuit`), the index upkeep thread, and the transcript comparison. No measurement yet. |
+| `q14-ivm-baseline/` | The Q14 harness over MI_P: the circuits (base, native view, hand-written reconstructed view `q14-trie-view-circuit`), the index upkeep thread, the transcript comparison, a driver that loads dbgen's files and times TPC-H's refreshes, and Q3's image and cgroup method (`measure.py`). |
 | `q3-ivm-baseline/` | The Q3 harness: loading, RF1/RF2 refreshes, the index upkeep thread, measurement, and the circuits (base, native view, hand-written reconstructed view). |
 
 How the pieces relate:
@@ -17,7 +17,7 @@ How the pieces relate:
 - A **hand-written view circuit** (`q3-trie-view-circuit`, `q14-trie-view-circuit`) takes the readers' batches and the driving deltas through DBSP's `Input` operator handles.
 - A **harness** runs the base circuit and a view circuit in one runtime, maintains the index, and measures. It is the only place that wires index, circuits, and measurement together.
 
-A new index adds sibling crates here. MI_P (for Q2, Q9, Q14, Q16, Q17, Q19, Q20) has its index crate, `merged-index-p/` (user decision of 2026-11-19). Its readers live there too, and the query-independent transaction state is DBSP's `merged_index::transaction` (user decision of 2026-11-20). Its Q14 view circuit and correctness harness are in `q14-ivm-baseline/`, a small driver of its own that follows the Q3 harness's structure (user decisions of 2026-11-20). Whether Q14's measurement shares code with the Q3 harness is an open question, decided when measurement starts.
+A new index adds sibling crates here. MI_P (for Q2, Q9, Q14, Q16, Q17, Q19, Q20) has its index crate, `merged-index-p/` (user decision of 2026-11-19). Its readers live there too, and the query-independent transaction state is DBSP's `merged_index::transaction` (user decision of 2026-11-20). Its Q14 view circuit and correctness harness are in `q14-ivm-baseline/`, a small driver of its own that follows the Q3 harness's structure (user decisions of 2026-11-20). Q14's measurement shares no code with the Q3 harness and leaves it unchanged (user decision of 2026-11-20).
 
 ## Rules for any index and harness
 
