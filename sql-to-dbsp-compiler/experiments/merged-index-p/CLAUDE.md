@@ -53,7 +53,8 @@ cargo +1.96.1 test --offline --locked     # this directory
 - The hook is the part step only: `route` copies `Old`'s rows, and the step adds `ΔP`'s rows to `P⁺` in the part's entry, or in an entry of their own if `Old` has no part row. Nothing is computed at routing.
 - The types: `PartByPartkeyVector` (`Tup1<i64>` → `Tup1<p_type>`), `LineitemByPartkeyVector` (`Tup1<i64>` → `LineValue`, `Tup6<l_suppkey, l_orderkey, l_linenumber, l_extendedprice, l_discount, l_shipdate>`). `LineValue` starts with `l_suppkey` so a part's lines arrive in value order (rule in the merged-index CLAUDE.md).
 - `join_lineitems_parts` is the join for the view circuit (`join_with_snapshot_readers`).
-- A Partsupp-only change touches its part's group; the scan visits it and keeps nothing.
+- A Partsupp-only change touches its part's group; the scan enters it and keeps nothing.
+- A group that `L⁻` does not request is left after its first entry (`Routing::scan`), since `P⁺` keeps only the part's row, which comes first. A refresh of line items alone reads one entry per touched part; the session steps no further.
 
 `src/tests.rs`: golden key and payload bytes, record order, malformed keys, the trie and its constants (`check_against_trie`), prefix widths and ranges, payload validation, and batch consolidation.
 

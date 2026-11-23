@@ -25,7 +25,11 @@
 //! an entry of their own if `Old` has none (a part inserted in this
 //! transaction). That is the whole hook: Q14 has one join, so nothing is
 //! computed at routing. A Partsupp-only change touches its part's group,
-//! which the scan visits and nobody keeps anything from.
+//! which the scan enters and nobody keeps anything from.
+//!
+//! Only `L⁻` reads past a group's first entry, so a group that `L⁻` does not
+//! request is left after it (`Routing::scan`): for a refresh that changes only
+//! line items, the session reads one entry per touched part.
 //!
 //! The query-independent state (the publication, the sealed readers, the
 //! contract check, and the session reads) is DBSP's
@@ -203,8 +207,16 @@ struct Routing<'r> {
 
 impl Routing<'_> {
     /// Scans every touched group of `session`.
+    ///
+    /// Only `L⁻` keeps entries past a group's first: `P⁺` keeps the part's
+    /// row, whose key (the group prefix, the terminator, the part's stream
+    /// id) sorts below every child's, since the terminator is below every
+    /// tag. So a group that `L⁻` does not request is left after its first
+    /// entry, and the session moves on to the next group without reading the
+    /// rest of this one.
     fn scan(&mut self, session: &mut ScanSession<'_, Definition>) -> Result<(), String> {
         while let Some(prefix) = session.next_group() {
+            let whole_group = self.lines.requests().contains(prefix);
             let mut group = self.begin(prefix)?;
             while let Some(key) = session.key() {
                 let is_part = key.last() == Some(&INDEX_ID_PART_BY_PARTKEY);
@@ -218,6 +230,9 @@ impl Routing<'_> {
                     let readers: &mut [&mut dyn StoredReader<Definition>] =
                         &mut [&mut *self.parts, &mut *self.lines];
                     route(&mut position, readers)?;
+                }
+                if !whole_group {
+                    break;
                 }
                 session.step();
             }
