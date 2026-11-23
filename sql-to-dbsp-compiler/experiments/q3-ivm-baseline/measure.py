@@ -49,8 +49,13 @@ SESSION_PASSES = ("seek",)
 # 15 writes Bloom filters storage-resident (`configuration.filter_residency`) and adds each
 # refresh's `run_counts` (runs per spine after each transaction, merges, device reads by owner).
 # 16 evicts the base tables' blocks from the cache after each base transaction (`base_eviction_ms`,
-# `base_evicted_bytes`, `configuration.evict_base_after_transaction`).
-MEASUREMENT_VERSION = 19
+# `base_evicted_bytes`, `configuration.evict_base_after_transaction`). 20 adds the memory model
+# (`configuration.memory_model`, `--memory-model`), which changes `spine_async.rs` and
+# `storage/file/`: new images.
+MEASUREMENT_VERSION = 20
+# The memory models (`--memory-model`): `rss` is DBSP's pressure levels on process RSS, `budgets`
+# the cache and memtable budgets (`docs/design/merged-index/memory-model.md`).
+MEMORY_MODELS = ("rss", "budgets")
 # The fields of `BlockExpansions` (measurement version 12), by encoding. Prefix truncation is
 # `--front-code-byte-keys` (the `front_code_byte_keys` configuration); elision is
 # `--elide-value-headers`.
@@ -451,6 +456,20 @@ def memtable_mib_problems(report: dict[str, Any], asked: int | None) -> list[str
         return [f"configuration.memtable_mib is missing, expected {asked!r}"]
     if configuration["memtable_mib"] != asked:
         return [f"configuration.memtable_mib is {configuration['memtable_mib']!r}, "
+                f"expected {asked!r}"]
+    return []
+
+
+def memory_model_problems(report: dict[str, Any], asked: str) -> list[str]:
+    """List a mismatch between the memory model the runner asked for (`--memory-model`) and the
+    one the driver reports. A report that names neither mode is not checked."""
+    if report.get("mode") not in ("native", "reconstructed"):
+        return []
+    configuration = report.get("configuration", {})
+    if "memory_model" not in configuration:
+        return [f"configuration.memory_model is missing, expected {asked!r}"]
+    if configuration["memory_model"] != asked:
+        return [f"configuration.memory_model is {configuration['memory_model']!r}, "
                 f"expected {asked!r}"]
     return []
 
@@ -879,6 +898,8 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.append("--index-prefix-filter")
     if args.get("memtable_mib") is not None:
         command.extend(["--memtable-mib", str(args["memtable_mib"])])
+    if args.get("memory_model", "rss") != "rss":
+        command.extend(["--memory-model", args["memory_model"]])
     command.extend(["--session-pass", args.get("session_pass", "seek")])
     return command
 
@@ -1044,6 +1065,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "(measurement version 18; off by default); memtables count in RSS, "
                              "so the budget must stay below half of --memory-target-bytes; not "
                              "a storage setting, so images need no rebuild per budget")
+    parser.add_argument("--memory-model", choices=MEMORY_MODELS, default="rss",
+                        help="how DBSP decides where a new run goes (measurement version 20; "
+                             "default rss): rss is the pressure levels on process RSS, budgets "
+                             "the cache and memtable budgets, which needs --memtable-mib and "
+                             "writes every merge output and seal to a file without filling the "
+                             "cache; a campaign setting, since images are built under rss")
     parser.add_argument("--session-pass", choices=SESSION_PASSES, default="seek",
                         help="how the reconstructed build's scan session passes the untouched "
                              "groups (default seek); native runs have no scan session")
@@ -1103,6 +1130,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 args.memtable_mib * MIB * 2 >= args.memory_target_bytes:
             parser.error("--memtable-mib must be below half of --memory-target-bytes, which the "
                          "driver's runtime refuses at startup")
+    if args.memory_model == "budgets":
+        if loading:
+            parser.error("--memory-model budgets applies to a campaign: images are built "
+                         "under rss")
+        if args.memtable_mib is None:
+            parser.error("--memory-model budgets needs --memtable-mib: the memtable is its "
+                         "write budget")
     if args.cache_bytes is not None and args.cache_bytes % MIB:
         parser.error("cache bytes must be a whole MiB")
     if not math.isfinite(args.compaction_timeout_secs) or args.compaction_timeout_secs <= 0:
@@ -1529,6 +1563,7 @@ def run(argv: list[str]) -> int:
                           "elide_value_headers": args.elide_value_headers,
                           "index_prefix_filter": args.index_prefix_filter,
                           "memtable_mib": args.memtable_mib,
+                          "memory_model": args.memory_model,
                           "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None,
@@ -1601,6 +1636,7 @@ def run(argv: list[str]) -> int:
                                  "elide_value_headers": args.elide_value_headers,
                                  "index_prefix_filter": args.index_prefix_filter,
                                  "memtable_mib": args.memtable_mib,
+                                 "memory_model": args.memory_model,
                                  "session_pass": args.session_pass,
                                  "warm_up": str(args.warm_up.resolve()) if args.warm_up else None}}
                 if images:
@@ -1645,7 +1681,8 @@ def run(argv: list[str]) -> int:
                     raise RuntimeError(f"{mode} run {repetition} reported {raw['status']}")
                 problems = (report_problems(raw, args.session_pass)
                             + index_prefix_filter_problems(raw, args.index_prefix_filter)
-                            + memtable_mib_problems(raw, args.memtable_mib))
+                            + memtable_mib_problems(raw, args.memtable_mib)
+                            + memory_model_problems(raw, args.memory_model))
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

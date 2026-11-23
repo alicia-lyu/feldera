@@ -1,6 +1,6 @@
 # The memory model: RSS pressure against budgets
 
-**Status:** designed 2026-11-23; not built. Decision: [2026-11-23](decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets). The reading that motivates it is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20). The memtable itself is in [memtable.md](memtable.md).
+**Status:** designed 2026-11-23; built 2026-11-23 (`--memory-model rss|budgets`, measurement version 20); the charge sub-arm not built. Decision: [2026-11-23](decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets). The reading that motivates it is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20). The memtable itself is in [memtable.md](memtable.md).
 
 **Goal.** One knob, `StorageOptions::memory_model`, chooses how DBSP decides where a new run goes:
 

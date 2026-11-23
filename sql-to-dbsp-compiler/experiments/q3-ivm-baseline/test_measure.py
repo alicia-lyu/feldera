@@ -764,7 +764,9 @@ class MeasureTest(unittest.TestCase):
             resources["backend_write_by_owner"]["query"] = {"operations": 7, "bytes": 700}
             resources["backend_write_by_owner"]["merged_index"] = {"operations": 0, "bytes": 0}
         resources.update(changes)
-        return {"mode": mode, "configuration": {"index_prefix_filter": False, "memtable_mib": None},
+        return {"mode": mode,
+                "configuration": {"index_prefix_filter": False, "memtable_mib": None,
+                                  "memory_model": "rss"},
                 "sequence": {"resources": resources},
                 "refreshes": [{"refresh": 1, "resources": resources}]}
 
@@ -1139,6 +1141,58 @@ class MeasureTest(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             measure.parse_args(args)
 
+    def test_reported_memory_model_must_be_the_requested_one(self) -> None:
+        def report(mode: str, configuration: dict) -> dict:
+            return {"mode": mode, "configuration": configuration}
+        for mode in ("native", "reconstructed"):
+            for model in measure.MEMORY_MODELS:
+                self.assertEqual(
+                    measure.memory_model_problems(report(mode, {"memory_model": model}), model),
+                    [])
+            self.assertIn("is 'rss', expected 'budgets'",
+                          measure.memory_model_problems(report(mode, {"memory_model": "rss"}),
+                                                        "budgets")[0])
+            self.assertIn("is 'budgets', expected 'rss'",
+                          measure.memory_model_problems(report(mode, {"memory_model": "budgets"}),
+                                                        "rss")[0])
+            # A driver older than measurement version 20 does not report it at all.
+            self.assertIn("missing", measure.memory_model_problems(report(mode, {}), "rss")[0])
+        self.assertEqual(measure.memory_model_problems({}, "budgets"), [])
+
+    def test_memory_model_flag_reaches_the_driver(self) -> None:
+        spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
+                "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
+                         "compaction_timeout_secs": 5, "no_verify": True,
+                         "memtable_mib": 64, "memory_model": "budgets"}}
+        inputs = {key: key for key in ("customer", "orders", "lineitem", "refresh_list")}
+        command = measure.driver_command(spec, inputs)
+        self.assertEqual(command[command.index("--memory-model") + 1], "budgets")
+        # The default is the driver's own, so it is not passed.
+        spec["args"]["memory_model"] = "rss"
+        self.assertNotIn("--memory-model", measure.driver_command(spec, inputs))
+        del spec["args"]["memory_model"]
+        self.assertNotIn("--memory-model", measure.driver_command(spec, inputs))
+        self.assertEqual(measure.parse_args(self.args).memory_model, "rss")
+
+    def test_memory_model_budgets_needs_the_memtable_budget(self) -> None:
+        args = list(self.args)
+        args[args.index("--memory-target-bytes") + 1] = str(512 * 1024 * 1024)
+        self.assertEqual(
+            measure.parse_args(args + ["--memory-model", "budgets",
+                                       "--memtable-mib", "64"]).memory_model, "budgets")
+        for refused in (["--memory-model", "budgets"], ["--memory-model", "other"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                measure.parse_args(args + refused)
+
+    def test_memory_model_budgets_is_refused_when_loading(self) -> None:
+        args = ["--build-images", str(self.root / "images"),
+                "--customer", str(self.root / "customer"),
+                "--orders", str(self.root / "orders"),
+                "--lineitem", str(self.root / "lineitem"),
+                "--memory-model", "budgets", "--memtable-mib", "64"]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            measure.parse_args(args)
+
     def test_session_pass_flag_reaches_the_driver(self) -> None:
         spec = {"run_dir": str(self.root / "run"), "executable": "/bin/driver",
                 "args": {"cache_bytes": 1024, "memory_target_bytes": 2048,
@@ -1397,7 +1451,7 @@ class MeasureTest(unittest.TestCase):
             driver = {**zero, "merged_index": self.expansion_count(number, number)}
             return {"view_worker": view, "driver": driver,
                     "index_upkeep": self.expansion_count(number, 0)}
-        return {"mode": mode, "measurement_version": 19,
+        return {"mode": mode, "measurement_version": 20,
                 "configuration": {"front_code_byte_keys": truncation,
                                   "elide_value_headers": elision},
                 "sequence": {"block_expansions": block_expansions(3)},
@@ -1504,7 +1558,7 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(measure.measurement_version_problems(report), [])
         report["measurement_version"] = 13
         self.assertEqual(measure.measurement_version_problems(report),
-                         ["measurement_version is 13, expected 19"])
+                         ["measurement_version is 13, expected 20"])
         del report["measurement_version"]
         self.assertIn("is None", measure.measurement_version_problems(report)[0])
         self.assertEqual(measure.measurement_version_problems({"mode": "other"}), [])

@@ -421,7 +421,7 @@ type Fixture = (&'static str, Change, bool);
 /// `session_pass` is the reconstructed build's scan-session pass; the native build has no
 /// session.
 fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
-    replay_with_image(fixtures, session_pass, None, false, None)
+    replay_with_image(fixtures, session_pass, None, false, None, MemoryModel::Rss)
 }
 
 /// A scratch storage directory for one test, removed when dropped.
@@ -453,18 +453,20 @@ impl Drop for ScratchStorage {
 /// `index_prefix_filter` gives the merged index's files prefix filters (`--index-prefix-filter`).
 /// `memtable_mib` gives the integral spines memtables (`--memtable-mib`); a memtable needs
 /// storage, so it keeps the state in a scratch directory even without an image.
+/// `memory_model` is DBSP's (`--memory-model`); `Budgets` needs `memtable_mib`.
 fn replay_with_image(
     fixtures: Vec<Fixture>,
     session_pass: Pass,
     image_after: Option<usize>,
     index_prefix_filter: bool,
     memtable_mib: Option<usize>,
+    memory_model: MemoryModel,
 ) -> Result<Vec<Value>> {
     let storage = (image_after.is_some() || memtable_mib.is_some())
         .then(|| {
             // Tests run concurrently in one process: name the directory by every parameter.
             ScratchStorage::new(&format!(
-                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}"
+                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}-{memory_model:?}"
             ))
         })
         .transpose()?;
@@ -479,6 +481,7 @@ fn replay_with_image(
                 },
                 StorageOptions {
                     memtable_mib,
+                    memory_model,
                     ..StorageOptions::default()
                 },
             )?)),
@@ -573,7 +576,14 @@ fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
     for fixtures in [rf1_rf2_fixtures, general_fixtures] {
         let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
         for split in [1, fixtures().len() / 2, fixtures().len() - 1] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false, None)?;
+            let reopened = replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                Some(split),
+                false,
+                None,
+                MemoryModel::Rss,
+            )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
@@ -603,7 +613,14 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
             whole
         );
         for split in [1, fixtures().len() / 2] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), true, None)?;
+            let reopened = replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                Some(split),
+                true,
+                None,
+                MemoryModel::Rss,
+            )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
@@ -626,16 +643,60 @@ fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
                 Pass::Seek,
                 None,
                 false,
-                Some(1)
+                Some(1),
+                MemoryModel::Rss
             )?)?,
             whole
         );
         for split in [1, fixtures().len() / 2] {
-            let reopened = replay_with_image(fixtures(), Pass::Seek, Some(split), false, Some(1))?;
+            let reopened = replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                Some(split),
+                false,
+                Some(1),
+                MemoryModel::Rss,
+            )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
                 whole,
                 "an image after {split} fixtures, with memtables"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `budgets` memory model leaves every transcript unchanged, whole and across an image: it
+/// changes where runs live and what the cache holds, not what the circuits compute.
+#[test]
+fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
+    for fixtures in [rf1_rf2_fixtures, general_fixtures] {
+        let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
+        assert_eq!(
+            serde_json::to_vec(&replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                None,
+                false,
+                Some(1),
+                MemoryModel::Budgets
+            )?)?,
+            whole
+        );
+        for split in [1, fixtures().len() / 2] {
+            let reopened = replay_with_image(
+                fixtures(),
+                Pass::Seek,
+                Some(split),
+                false,
+                Some(1),
+                MemoryModel::Budgets,
+            )?;
+            assert_eq!(
+                serde_json::to_vec(&reopened)?,
+                whole,
+                "an image after {split} fixtures, under budgets"
             );
         }
     }

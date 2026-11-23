@@ -152,6 +152,43 @@ A memtable on integral spines when `StorageOptions::memtable_mib` is set (design
 - Tests: filter `memtable` (tree, leaves, cursor conformance, budget, and
   `trace::spine_async::memtable_test`).
 
+## Memory model
+
+`StorageOptions::memory_model` (`feldera-types`), `rss` (default) or `budgets`, read through
+`Runtime::memory_model` (`rss` off a runtime thread). Design:
+[memory-model.md](../../docs/design/merged-index/memory-model.md). `budgets` needs `memtable_mib`;
+startup refuses it otherwise (`Error::MemoryModelNeedsMemtableBudget`). Under `budgets` the
+cache (reads) and the memtable (writes) are the budgets, and RSS places nothing:
+
+- **Placement.** `Runtime::min_merge_storage_bytes` is `Some(0)` (every merge output and seal is a
+  file), `min_step_storage_bytes` and `min_insert_storage_bytes` are `Some(usize::MAX)`. An
+  insert goes by the spine's role (`pick_insert_destination(batch, role)`, passed through
+  `Spine::maybe_flush_batch`): an accumulator's stays in memory, an integral batch that the
+  memtable did not absorb is written to storage. `MergeWorkers::seal_memtable` passes
+  `Some(BatchLocation::Storage)`.
+- **Scheduling.** Merge eligibility and `is_background_merge_idle` read
+  `Runtime::effective_memory_pressure`, always `Low`, so pressure forces no merge; the monitor
+  still counts the epoch but no longer wakes the mergers. `current_memory_pressure` stays the raw
+  level.
+- **Cache fill.** `CacheFill { Fill, NoFill }` and `with_cache_fill(policy, f)`
+  (`storage/attribution.rs`, a thread-local like the write owner; `f` must not await). Under
+  `NoFill` the file reader still looks the cache up and uses a hit, but a miss builds its data or
+  index block without inserting it (`DataBlock`/`IndexBlock::from_raw_with_cache`, which every
+  reader path calls), and the writer skips its data and index block inserts. Trailers and filter
+  partitions keep today's path. The merger loop runs each merge step and each seal under `NoFill`
+  (`with_merge_cache_fill`, `spine_async.rs`).
+- **Compaction on its own axis.** `run_counts` already gives it: per spine `merge_real_ms` and
+  `merge_cpu_ms` (merger threads), and `device_reads` by the `background` thread. Seals are
+  outside `merge_real_ms`; device writes are by owner only, not by thread.
+- **Not built:** the compaction-memory charge (`charge_compaction_memory`); how a charge is held
+  is open.
+- Tests (filters `budgets`, `no_fill`): `runtime::tests::budgets_memory_model_*` and
+  `runtime_refuses_budgets_without_a_memtable_budget`; `spine_async::memtable_test::under_budgets_*`
+  (seal, merge output, integral and accumulator inserts, no forced merge at mock critical
+  pressure, a seal leaves the cache unfilled); `storage::file::test::no_fill_inserts_no_block_yet_hits_a_cached_one`.
+  A test that pins the mock RSS must hold `MOCK_RSS_LOCK` (`with_mock_process_rss`), and a test
+  that does not must set no `max_rss_bytes`, or it reads the mock value.
+
 ## Evicting a set of files from the buffer cache
 
 `BufferCache::evict_files(&HashSet<FileId>)` removes every entry of those files (blocks, trailers,
@@ -174,5 +211,6 @@ From the repository root, `cargo +1.96.1 test --offline -p dbsp --lib <filter>`:
 
 - `merged_index` and its sub-filters (see the merged-index CLAUDE.md);
 - `memtable` (the spine memtable);
+- `budgets`, `no_fill`, `memory_pressure` (the memory model);
 - `supplied_snapshot_join`, `run_reads`, `read_owner_cursor`;
 - `init_circuits`, `separate_runtimes_miss_each_others_blocks`.

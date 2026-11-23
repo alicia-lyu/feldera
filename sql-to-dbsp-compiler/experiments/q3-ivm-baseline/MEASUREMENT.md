@@ -41,7 +41,7 @@ Nothing here infers an unmeasured quantity.
 | Base eviction | on (v16) | not measured in isolation (it came with the 512 MiB cache) | eviction 5.5–6 ms, in neither phase | **Decided 2026-11-18:** on, always |
 | Prefix filter | off, on (v17) | merged-index off 4.56 / 3.36, on 3.98 / 3.06; index seeks 9.8 → 2.5 and 26.6 → 7.0 | off 3.77 / 15.57, on 3.56 / 14.68 | **Active:** the default awaits the user |
 | Order keys | dbgen (v16–17), uuid (v17), sequence (stopped) | uuid: native 3.88 → 5.76 / 4.46 → 9.28; merged-index 4.56 → 4.15 / 3.36 → 3.49 | uuid: native 13.86 / 11.44, merged-index 11.92 / 20.20 | **Decided:** dbgen is the default, and `sequence` and timestamp IDs are out. **Active:** uuid |
-| Memory model (was: memtable) | `rss`: 512/512; 448 cache; 448 + 64 MiB memtable (v18). `budgets` not yet built | 448 off → 448 + 64: merged-index 3.91 → 3.83 / 3.16 → 3.18, p99 8.19 → 5.28 / 6.58 → 4.78; native 3.00 → 1.71 / 1.60 → 1.87, but native stayed `low` with the memtable | merged-index 3.38 → 3.89 / 15.20 → 11.07; native 3.22 → 3.14 / 6.11 → 5.62 | **Active:** `rss` [measured](#memtable-at-512-mib-2026-11-20); `budgets` [decided 2026-11-23](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) as the arm to compare |
+| Memory model (was: memtable) | `rss`: 512/512; 448 cache; 448 + 64 MiB memtable (v18). `budgets`: built 2026-11-23 (v20), not yet measured | 448 off → 448 + 64: merged-index 3.91 → 3.83 / 3.16 → 3.18, p99 8.19 → 5.28 / 6.58 → 4.78; native 3.00 → 1.71 / 1.60 → 1.87, but native stayed `low` with the memtable | merged-index 3.38 → 3.89 / 15.20 → 11.07; native 3.22 → 3.14 / 6.11 → 5.62 | **Active:** `rss` [measured](#memtable-at-512-mib-2026-11-20); `budgets` [decided 2026-11-23](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) as the arm to compare; `budgets` is built (v20, the charge sub-arm is not) |
 | Workload | clustered, scattered (v14) | clustered: native 3.77 / 4.63, merged-index 4.51 / 3.07; scattered: native 4.30 / 4.44, merged-index 8.06 / 3.14 | 1.0–1.4 / 1.1–1.9 | **Active:** scattered not run since v14 |
 | Transaction size | K = 10 | as above | — | **Active:** K = 100 and 1,000 next |
 | Device | SSD | as above | — | **Active:** the hard-disk probe has not run |
@@ -59,7 +59,7 @@ What the rows add up to, so far:
 
 | Dimension | Arms | Selected by | Own images? | Now | Next | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| Memory model | `rss` (memtable off, or `--memtable-mib N`); `budgets`, with compaction memory uncharged or charged | `--memtable-mib`; the `budgets` flag is not built yet | no for `rss`; `budgets` changes image sources | `rss`, memtable off; 448 + 64 [measured](#memtable-at-512-mib-2026-11-20) | build `budgets`, then pilot it against `rss` with the memtable on | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget), [memory model](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) |
+| Memory model | `rss` (memtable off, or `--memtable-mib N`); `budgets`, with compaction memory uncharged or charged | `--memtable-mib`; `--memory-model rss\|budgets` (v20) | no for `rss`; `budgets` changes image sources | `rss`, memtable off; 448 + 64 [measured](#memtable-at-512-mib-2026-11-20) | pilot `budgets` against `rss` with the memtable on, on new images | [split](DECISIONS.md#2026-11-20-the-memtable-arm-splits-one-512-mib-budget-448-mib-cache-64-mib-memtable), [design](../../../docs/design/merged-index/decisions.md#2026-11-19-the-memtable-counts-in-rss-soft-capped-by-its-budget), [memory model](../../../docs/design/merged-index/decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets) |
 | Prefix filter | off, on | `--index-prefix-filter` on `--build-images` and on the campaign | yes | on in the memtable arms | the user sets the default | [decision](../../../docs/design/merged-index/decisions.md#2026-11-19-group-reads-skip-runs-by-a-prefix-filter) |
 | Order keys | `dbgen` (default), `uuid` | `prepare_inputs.py --order-keys`; images from `<out>/base` | yes | dbgen | uuid as an arm of later runs | [decision](DECISIONS.md#2026-11-19-order-keys-are-a-dimension-dbgen-sequence-uuid) |
 | Workload | clustered, scattered | the refresh list (`clustered/`, `scattered/`) | no | clustered | scattered at the current version | [decision](DECISIONS.md#2026-11-17-clustered-rf1-draws-tpc-cs-nurand-in-sessions-only-eligible-customers-order) |
@@ -352,7 +352,7 @@ Artifacts: `/mnt/ssd/r5-out/pilot-A-seek-clustered-k10-v18-pf-t512-c{512,448,448
 - each run a fresh process from a copy of its image, with the inputs evicted.
 
 **Remaining, by active dimension:**
-1. **The memory model.** The `rss` arms are [measured](#memtable-at-512-mib-2026-11-20). `budgets` (decided 2026-11-23), with compaction memory uncharged and charged, is to be built and piloted against `rss` with the memtable on.
+1. **The memory model.** The `rss` arms are [measured](#memtable-at-512-mib-2026-11-20). `budgets` (decided 2026-11-23) is built, uncharged (v20); it is to be piloted against `rss` with the memtable on, on new images. The charged sub-arm is not built.
 2. **The prefix filter's default.** The user's decision. Every later arm records `configuration.index_prefix_filter`.
 3. **Scattered, uuid, and K = 100 and 1,000.** Pilots at the current version. Every arm needs its own inputs, and uuid its own images.
 4. **The campaign.** `--runs 3` per chosen arm, after its pilot passes. `summarize.py` pools the manifests.
@@ -574,6 +574,7 @@ The driver takes complete dbgen base files and the refresh list.
 - `--front-code-byte-keys`, `--elide-value-headers`: the merged index's key and value encodings, with prefix truncation for keys and header elision for values. Native writes the same files either way.
 - `--index-prefix-filter`: the prefix-filter arm. Images record it, so each arm needs its own.
 - `--memtable-mib N`: the memtable arm. It must stay below half of the memory target, and is refused when building images.
+- `--memory-model rss|budgets` (version 20, default `rss`): how DBSP places runs. `budgets` needs `--memtable-mib`, is refused when building images (they are built under `rss`), and is checked against `configuration.memory_model` of the driver's report.
 - `--session-pass seek`: the only pass offered.
 - `--setup-full-compaction`: compact fully after loading.
 - `--warm-up LIST`: run one pair before the window, untimed.
@@ -628,4 +629,5 @@ Each version changed what the report means. `measure.py` and `summarize.py` acce
 - **16** (2026-11-18). Base tables evicted after each base transaction (`base_eviction_ms`, `base_evicted_bytes`). `BaseState` moved out of the image sources. New images.
 - **17** (2026-11-19). The prefix-filter arm (`--index-prefix-filter`, `filtered_prefix_probes`), with its own images. The file format changed. New images.
 - **18** (2026-11-20). The memtable arm (`--memtable-mib`, `configuration.memtable_mib`, `run_counts` memtable fields). `spine_async.rs` and `trace/ord/**` changed, so new images. `measure.py` accepts 18 from `2275c7446`.
+- **20** (2026-11-23). The memory model (`--memory-model`, `configuration.memory_model`). `spine_async.rs` and `storage/file/` changed, so new images. The merger threads' CPU and device time per refresh were already in `run_counts` (`merge_real_ms`, `merge_cpu_ms`, `device_reads` by the `background` thread), so nothing was added for them.
 - **19** (2026-11-23). `memory_pressure.before` and `.after` gain `rss_bytes`, `cache_occupancy_bytes` and `memtable_bytes` (`Runtime::memtable_live_bytes`). No image source changed, so version 18 images are reused.

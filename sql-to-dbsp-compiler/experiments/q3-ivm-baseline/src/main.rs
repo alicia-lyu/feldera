@@ -42,6 +42,7 @@ use dbsp::trace::{BlockExpansions, RunReads};
 use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::checkpoint::CheckpointMetadata;
+use feldera_types::config::MemoryModel;
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
 use merged_index_col::q3::{Collection, DrivingDeltas, Q3State, SessionReads};
@@ -1218,6 +1219,22 @@ fn parse_pass(name: &str) -> Result<Pass> {
     }
 }
 
+fn parse_memory_model(value: &str) -> Result<MemoryModel> {
+    match value {
+        "rss" => Ok(MemoryModel::Rss),
+        "budgets" => Ok(MemoryModel::Budgets),
+        other => bail!("--memory-model must be rss or budgets, not {other}"),
+    }
+}
+
+/// The name of a memory model in the report, as `--memory-model` spells it.
+fn memory_model_name(memory_model: MemoryModel) -> &'static str {
+    match memory_model {
+        MemoryModel::Rss => "rss",
+        MemoryModel::Budgets => "budgets",
+    }
+}
+
 /// The name of a pass in the report, as `--session-pass` spells it.
 fn pass_name(pass: Pass) -> &'static str {
     match pass {
@@ -1265,6 +1282,10 @@ struct Config {
     /// The integral spines' memtable budget in MiB (`--memtable-mib`, measurement version 18);
     /// `None` leaves memtables off. The budget is a soft cap whose memtables count in RSS.
     memtable_mib: Option<usize>,
+    /// How DBSP decides where a new run goes (`--memory-model rss|budgets`, measurement
+    /// version 20): `rss` is the default, the pressure levels on RSS; `budgets` places runs by
+    /// the cache and memtable budgets and needs `--memtable-mib`. Images are built under `rss`.
+    memory_model: MemoryModel,
     /// How the reconstructed build's scan session passes untouched groups
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
@@ -1357,6 +1378,11 @@ impl Config {
                             .parse()?,
                     )
                 }
+                "--memory-model" => {
+                    config.memory_model = parse_memory_model(
+                        &args.next().context("--memory-model needs rss or budgets")?,
+                    )?
+                }
                 "--session-pass" => {
                     config.session_pass = Some(parse_pass(
                         &args.next().context("--session-pass needs seek or step")?,
@@ -1440,6 +1466,12 @@ impl Config {
         }
         if config.refresh_list.is_some() && (config.rf1_orders.is_some() || config.rf2.is_some()) {
             bail!("refresh list cannot be combined with individual refresh arguments");
+        }
+        if config.memory_model == MemoryModel::Budgets && config.memtable_mib.is_none() {
+            bail!("--memory-model budgets needs --memtable-mib: the memtable is its write budget");
+        }
+        if config.write_image.is_some() && config.memory_model != MemoryModel::Rss {
+            bail!("--write-image loads under --memory-model rss: images are built under rss");
         }
         if config.write_image.is_some() && config.from_image.is_some() {
             bail!("--write-image and --from-image are the load and the refresh program; pass one");
@@ -2283,6 +2315,7 @@ fn storage_options(config: &Config) -> StorageOptions {
         cache_mib: cache_mib(config.cache_bytes),
         compression: feldera_types::config::StorageCompression::None,
         memtable_mib: config.memtable_mib,
+        memory_model: config.memory_model,
         ..StorageOptions::default()
     }
 }
@@ -2781,7 +2814,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 19,
+        "measurement_version": 20,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2815,6 +2848,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "elide_value_headers": config.elide_value_headers,
             "index_prefix_filter": config.index_prefix_filter,
             "memtable_mib": config.memtable_mib,
+            "memory_model": memory_model_name(config.memory_model),
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
@@ -3008,6 +3042,30 @@ mod tests {
         assert!(parse(&["--session-pass"]).is_err());
         assert!(parse(&["--session-pass", "Seek"]).is_err());
         assert_eq!(parse(&[]).unwrap().session_pass(), Pass::Seek);
+        // The memory model defaults to rss; budgets needs the memtable budget and no image.
+        assert_eq!(parse(&[]).unwrap().memory_model, MemoryModel::Rss);
+        assert!(parse(&["--memory-model"]).is_err());
+        assert!(parse(&["--memory-model", "Budgets"]).is_err());
+        assert_eq!(
+            parse(&["--memory-model", "rss"]).unwrap().memory_model,
+            MemoryModel::Rss
+        );
+        assert!(parse(&["--memory-model", "budgets"]).is_err());
+        assert_eq!(
+            parse(&["--memory-model", "budgets", "--memtable-mib", "64"])
+                .unwrap()
+                .memory_model,
+            MemoryModel::Budgets
+        );
+        assert!(parse(&[
+            "--write-image",
+            "i",
+            "--memory-model",
+            "budgets",
+            "--memtable-mib",
+            "64"
+        ])
+        .is_err());
         // The load and the refresh program take disjoint inputs.
         assert!(parse(&["--write-image", "i", "--from-image", "j", "--no-verify"]).is_err());
         assert!(parse(&["--write-image", "i", "--refresh-list", "r.json"]).is_err());
@@ -4123,7 +4181,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 19);
+        assert_eq!(output["measurement_version"], 20);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4290,7 +4348,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 19);
+        assert_eq!(output["measurement_version"], 20);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
