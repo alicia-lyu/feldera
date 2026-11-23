@@ -3594,9 +3594,9 @@ mod single_batch_compaction_test {
 #[cfg(test)]
 mod memtable_test {
     use crate::{
-        DynZWeight, OrdIndexedZSet as TypedOrdIndexedZSet, ZWeight,
+        DynZWeight, OrdIndexedZSet as TypedOrdIndexedZSet, Runtime, ZWeight,
         algebra::OrdIndexedZSet,
-        circuit::{CircuitConfig, mkconfig},
+        circuit::{CircuitConfig, mkconfig, runtime::tests::with_mock_process_rss},
         dynamic::{DowncastTrait, DynData},
         trace::{
             BatchLocation, BatchReader, BatchReaderFactories, Cursor, Spine, Trace, TraceRole,
@@ -3604,7 +3604,9 @@ mod memtable_test {
         },
         utils::Tup2,
     };
+    use feldera_buffer_cache::ThreadType;
     use feldera_storage::tokio::TOKIO;
+    use feldera_types::{config::MemoryModel, memory_pressure::MemoryPressure};
     use std::{
         collections::BTreeMap,
         path::Path,
@@ -3623,6 +3625,18 @@ mod memtable_test {
         let options = &mut config.storage.as_mut().unwrap().options;
         options.memtable_mib = memtable_mib;
         options.min_storage_bytes = Some(min_storage_bytes);
+        config
+    }
+
+    /// [`config`] with a 1 MiB memtable and `memory_model`. It sets no memory limit, so the
+    /// pressure stays low whatever the mock RSS that other tests pin.
+    fn model_config(
+        path: &Path,
+        memory_model: MemoryModel,
+        min_storage_bytes: usize,
+    ) -> CircuitConfig {
+        let mut config = config(path, Some(1), min_storage_bytes);
+        config.storage.as_mut().unwrap().options.memory_model = memory_model;
         config
     }
 
@@ -3781,12 +3795,25 @@ mod memtable_test {
     /// Fills a 1 MiB memtable with batches below the bypass size until the
     /// budget seals it, and returns the locations of the runs.
     fn fill_until_sealed(min_storage_bytes: usize) -> Vec<BatchLocation> {
+        fill_until_sealed_under(MemoryModel::Rss, min_storage_bytes).0
+    }
+
+    /// [`fill_until_sealed`] under `memory_model`; it also returns the bytes that the seal added
+    /// to the merger's buffer cache.
+    fn fill_until_sealed_under(
+        memory_model: MemoryModel,
+        min_storage_bytes: usize,
+    ) -> (Vec<BatchLocation>, usize) {
         let directory = tempdir().unwrap();
-        let result = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = Arc::new(std::sync::Mutex::new((Vec::new(), 0)));
         let report = result.clone();
         run_in_circuit_with_storage_config(
-            config(directory.path(), Some(1), min_storage_bytes),
+            model_config(directory.path(), memory_model, min_storage_bytes),
             move || {
+                let cache = Runtime::runtime()
+                    .unwrap()
+                    .get_buffer_cache(0, ThreadType::Background);
+                let occupancy_before = cache.occupancy().0;
                 let mut spine = spine(TraceRole::Integral);
                 let mut model = Model::new();
                 let mut next = 0;
@@ -3799,14 +3826,16 @@ mod memtable_test {
                     assert!(next < 2_000_000, "the budget never sealed the memtable");
                 }
                 wait_for_flushes(&spine, 1);
+                let cache_growth = cache.occupancy().0 - occupancy_before;
                 assert_eq!(contents(spine.cursor()), model);
                 let state = spine.merger.state.lock().unwrap();
-                *report.lock().unwrap() = state
+                let locations = state
                     .slots
                     .iter()
                     .flat_map(|slot| slot.all_batches())
                     .map(|batch| batch.location())
                     .collect();
+                *report.lock().unwrap() = (locations, cache_growth);
             },
         );
         Arc::try_unwrap(result).unwrap().into_inner().unwrap()
@@ -3861,5 +3890,149 @@ mod memtable_test {
             insert(&mut spine, &mut model, &[(4, 40, 1)]);
             assert_ne!(contents(fork.cursor()), model, "the fork is independent");
         });
+    }
+
+    #[test]
+    fn under_budgets_a_seal_is_a_file_whatever_the_threshold() {
+        // The merge threshold alone would keep the seal in memory.
+        assert!(
+            fill_until_sealed_under(MemoryModel::Rss, usize::MAX)
+                .0
+                .iter()
+                .all(|location| *location == BatchLocation::Memory)
+        );
+        let (locations, _) = fill_until_sealed_under(MemoryModel::Budgets, usize::MAX);
+        assert!(!locations.is_empty());
+        assert!(
+            locations
+                .iter()
+                .all(|location| *location == BatchLocation::Storage)
+        );
+    }
+
+    #[test]
+    fn under_budgets_a_batch_past_the_memtable_is_a_file() {
+        for (memory_model, expected) in [
+            (MemoryModel::Rss, BatchLocation::Memory),
+            (MemoryModel::Budgets, BatchLocation::Storage),
+        ] {
+            let directory = tempdir().unwrap();
+            let config = model_config(directory.path(), memory_model, usize::MAX);
+            run_in_circuit_with_storage_config(config, move || {
+                let mut spine = spine(TraceRole::Integral);
+                let mut model = Model::new();
+                let large: Vec<_> = (0..40_000).map(|i| (i, i, 1)).collect();
+                insert(&mut spine, &mut model, &large);
+                assert_eq!(memtable_and_runs(&spine), (Some(0), 1), "{memory_model:?}");
+                assert_eq!(
+                    spine.get_batches()[0].location(),
+                    expected,
+                    "{memory_model:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn under_budgets_a_seal_does_not_fill_the_cache() {
+        // Under rss the seal's blocks enter the cache as the writer finishes them.
+        let (_, rss_growth) = fill_until_sealed_under(MemoryModel::Rss, 0);
+        assert!(rss_growth > 100_000, "{rss_growth} bytes");
+        // Under budgets only the trailer does.
+        let (locations, budgets_growth) = fill_until_sealed_under(MemoryModel::Budgets, 0);
+        assert!(locations.contains(&BatchLocation::Storage));
+        assert!(
+            budgets_growth * 10 < rss_growth,
+            "budgets {budgets_growth} bytes, rss {rss_growth}"
+        );
+    }
+
+    /// Inserts `n` small batches into an accumulator spine and returns the
+    /// locations of the runs once the merger has settled.
+    fn accumulator_runs_after(n: i32, settle: Duration) -> Vec<BatchLocation> {
+        let mut spine = spine(TraceRole::Accumulator);
+        let mut model = Model::new();
+        for i in 0..n {
+            insert(&mut spine, &mut model, &[(i, i, 1)]);
+        }
+        std::thread::sleep(settle);
+        assert_eq!(contents(spine.cursor()), model);
+        let state = spine.merger.state.lock().unwrap();
+        state
+            .slots
+            .iter()
+            .flat_map(|slot| slot.all_batches())
+            .map(|batch| batch.location())
+            .collect()
+    }
+
+    #[test]
+    fn under_budgets_a_merge_output_is_a_file_at_low_pressure() {
+        for (memory_model, expected) in [
+            (MemoryModel::Rss, BatchLocation::Memory),
+            (MemoryModel::Budgets, BatchLocation::Storage),
+        ] {
+            let directory = tempdir().unwrap();
+            let config = model_config(directory.path(), memory_model, usize::MAX);
+            run_in_circuit_with_storage_config(config, move || {
+                // Eight level-0 runs start a merge; its output replaces them.
+                let locations = accumulator_runs_after(8, Duration::from_secs(2));
+                assert_eq!(locations, vec![expected], "{memory_model:?}");
+            });
+        }
+    }
+
+    /// At mock critical pressure, inserts three small batches into an
+    /// accumulator spine and one into an integral spine, and returns the
+    /// locations of the accumulator's runs and the integral spine's
+    /// memtable and run counts.
+    fn at_critical_pressure(
+        memory_model: MemoryModel,
+    ) -> (Vec<BatchLocation>, (Option<usize>, usize)) {
+        const MIB: u64 = 1 << 20;
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let report = outcome.clone();
+        // 9.8 GiB of the 10 GiB limit is past the 95% where Critical starts.
+        with_mock_process_rss(9800 * MIB, || {
+            let directory = tempdir().unwrap();
+            let config =
+                model_config(directory.path(), memory_model, 0).with_max_rss_bytes(Some(10 << 30));
+            run_in_circuit_with_storage_config(config, move || {
+                // The runtime samples the process size once a second.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Runtime::memory_pressure() != Some(MemoryPressure::Critical) {
+                    assert!(Instant::now() < deadline, "no critical pressure");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let accumulator = accumulator_runs_after(3, Duration::from_secs(1));
+                let mut integral = spine(TraceRole::Integral);
+                let mut model = Model::new();
+                insert(&mut integral, &mut model, TRANSACTIONS[0]);
+                *report.lock().unwrap() = Some((accumulator, memtable_and_runs(&integral)));
+            });
+        });
+        Arc::try_unwrap(outcome)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn under_budgets_critical_pressure_places_and_merges_nothing() {
+        // Control: under rss, critical pressure writes each insert as a file.
+        let (accumulator, _) = at_critical_pressure(MemoryModel::Rss);
+        assert!(!accumulator.is_empty());
+        assert!(
+            accumulator
+                .iter()
+                .all(|location| *location == BatchLocation::Storage)
+        );
+
+        // Under budgets, the accumulator's runs stay in memory, all three of them:
+        // pressure forces no merge. The integral insert goes into the memtable.
+        let (accumulator, integral) = at_critical_pressure(MemoryModel::Budgets);
+        assert_eq!(accumulator, vec![BatchLocation::Memory; 3]);
+        assert_eq!(integral, (Some(TRANSACTIONS[0].len()), 0));
     }
 }

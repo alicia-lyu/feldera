@@ -2120,7 +2120,8 @@ impl ExactSizeIterator for WorkerLocations {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        BUFFER_CACHE, BufferCache, Error, Parker, Runtime, RuntimeInner, validate_memtable_budget,
+        BUFFER_CACHE, BufferCache, Error, Parker, Runtime, RuntimeInner, validate_memory_model,
+        validate_memtable_budget,
     };
     use crate::{
         Circuit, RootCircuit,
@@ -2139,7 +2140,7 @@ pub(crate) mod tests {
     use feldera_buffer_cache::{CacheEntry, ThreadType};
     use feldera_storage::fbuf::{FBuf, slab::set_thread_slab_pool};
     use feldera_types::config::{
-        StorageCacheConfig, StorageConfig, StorageOptions,
+        MemoryModel, StorageCacheConfig, StorageConfig, StorageOptions,
         dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy},
     };
     use feldera_types::memory_pressure::MemoryPressure;
@@ -2869,6 +2870,111 @@ pub(crate) mod tests {
             }
             circuit.kill().unwrap();
         }
+    }
+
+    /// [`memtable_config`] with `memory_model`.
+    fn memory_model_config(
+        path: &std::path::Path,
+        memory_model: MemoryModel,
+        memtable_mib: Option<usize>,
+        max_rss_bytes: Option<u64>,
+    ) -> CircuitConfig {
+        let mut config = memtable_config(path, memtable_mib, max_rss_bytes);
+        config.storage.as_mut().unwrap().options.memory_model = memory_model;
+        config
+    }
+
+    #[test]
+    fn budgets_memory_model_needs_a_memtable_budget() {
+        let mut options = StorageOptions::default();
+        assert!(validate_memory_model(&options).is_ok());
+
+        options.memory_model = MemoryModel::Budgets;
+        let error = validate_memory_model(&options).unwrap_err();
+        assert!(matches!(error, Error::MemoryModelNeedsMemtableBudget));
+        assert!(error.to_string().contains("storage.memtable_mib"));
+
+        options.memtable_mib = Some(64);
+        assert!(validate_memory_model(&options).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn runtime_refuses_budgets_without_a_memtable_budget() {
+        let storage_dir = tempfile::tempdir().unwrap();
+
+        let refused = RuntimeInner::new(memory_model_config(
+            storage_dir.path(),
+            MemoryModel::Budgets,
+            None,
+            None,
+        ));
+        assert!(matches!(
+            refused,
+            Err(DbspError::Runtime(Error::MemoryModelNeedsMemtableBudget))
+        ));
+
+        // The refusal released the storage directory's lock; each valid pair starts.
+        for (memory_model, memtable_mib) in [
+            (MemoryModel::Rss, None),
+            (MemoryModel::Rss, Some(64)),
+            (MemoryModel::Budgets, Some(64)),
+        ] {
+            RuntimeInner::new(memory_model_config(
+                storage_dir.path(),
+                memory_model,
+                memtable_mib,
+                None,
+            ))
+            .unwrap();
+        }
+    }
+
+    // Under `budgets` the thresholds are fixed and pressure forces no merge, while the raw
+    // pressure level is still reported.
+    #[test]
+    fn budgets_memory_model_ignores_memory_pressure() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        let _mock_guard = MOCK_RSS_LOCK.lock().unwrap();
+        let _clear_mock_rss = MockRssVarGuard;
+        set_mock_process_rss_bytes(0);
+
+        let storage_dir = tempfile::tempdir().unwrap();
+        let config = memory_model_config(
+            storage_dir.path(),
+            MemoryModel::Budgets,
+            Some(64),
+            Some(10 * GIB),
+        );
+        let (circuit, ()) = Runtime::init_circuit(config, |_| Ok(())).unwrap();
+
+        for (rss_mib, raw_pressure) in [
+            (0, MemoryPressure::Low),
+            (9400, MemoryPressure::High),
+            (9800, MemoryPressure::Critical),
+        ] {
+            set_mock_process_rss_bytes(rss_mib * MIB);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while circuit.runtime().current_memory_pressure() != raw_pressure {
+                assert!(Instant::now() < deadline, "no {raw_pressure:?} pressure");
+                sleep(Duration::from_millis(100));
+            }
+
+            let (pressure, min_merge, min_insert, min_step) =
+                query_runtime_memory_state(circuit.runtime());
+            assert_eq!(pressure, raw_pressure);
+            assert_eq!(min_merge, 0);
+            assert_eq!(min_insert, usize::MAX);
+            assert_eq!(min_step, usize::MAX);
+            assert_eq!(
+                circuit.runtime().effective_memory_pressure(),
+                MemoryPressure::Low
+            );
+        }
+
+        circuit.kill().unwrap();
     }
 
     // Test the memory pressure thresholds and how merger threads behave under different memory pressure levels.

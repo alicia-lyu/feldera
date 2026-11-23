@@ -257,7 +257,8 @@ where
         flush: bool,
     ) -> bool {
         // Spill the batch to disk, if we should, without taking the rxq lock.
-        let batch = Spine::maybe_flush_batch(batch, TraceRole::Accumulator, factories, || (None, None));
+        let batch =
+            Spine::maybe_flush_batch(batch, TraceRole::Accumulator, factories, || (None, None));
         if flush || !batch.is_empty() {
             self.rxq(receiver).deliver(factories, sender, batch, flush)
         } else {

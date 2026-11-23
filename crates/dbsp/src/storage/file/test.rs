@@ -43,6 +43,8 @@ use super::{
     writer::{Parameters, Writer1, Writer2},
 };
 
+use crate::storage::attribution::{CacheFill, with_cache_fill};
+use crate::storage::buffer_cache::CacheAccess;
 use crate::storage::file::FilterKind;
 use crate::storage::{backend::StorageError, buffer_cache::FBuf};
 use crate::{
@@ -3469,5 +3471,91 @@ fn storage_residency_with_a_rate_of_one_writes_no_filter() {
         let (filters, magic, _) = open_u32_batch(&dir, &path);
         assert_eq!(magic, None);
         assert_eq!(filters.membership_filter_kind(), FilterKind::None);
+    });
+}
+
+type U32Reader = Reader<(&'static DynData, &'static DynData, ())>;
+
+/// Writes `keys` through `large_test_buffer_cache` and returns a reader on the file just
+/// written, which shares its cache entries.
+fn write_u32_file_through_large_cache(dir: &str, keys: &[u32]) -> U32Reader {
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let storage_backend = backend_at(dir);
+    let mut writer = Writer1::new(
+        &factories,
+        large_test_buffer_cache,
+        &*storage_backend,
+        Parameters::default(),
+        FilterPlan::<DynData>::decide_filter(None, keys.len()),
+    )
+    .unwrap();
+    for key in keys {
+        writer.write0((key, &())).unwrap();
+    }
+    let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
+    reader
+}
+
+/// Reads every row of `reader`, block by block.
+fn read_every_row(reader: &U32Reader) {
+    let mut bulk = reader.bulk_rows().unwrap();
+    while !bulk.at_eof() {
+        bulk.wait().unwrap();
+        bulk.step();
+    }
+}
+
+fn cache_hits(reader: &U32Reader) -> u64 {
+    reader
+        .cache_stats()
+        .0
+        .values()
+        .map(|accesses| accesses[CacheAccess::Hit].count)
+        .sum()
+}
+
+/// Under `NoFill` the writer inserts no data or index block and the reader
+/// inserts none after a miss, but the reader still uses a block that is cached.
+#[test]
+fn no_fill_inserts_no_block_yet_hits_a_cached_one() {
+    init_test_logger();
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    with_filter_options(1.0, FilterResidency::Memory, move || {
+        let keys = even_keys(20_000);
+        let occupancy = || large_test_buffer_cache().unwrap().occupancy().0;
+
+        // A file written under `Fill` leaves its blocks in the cache, and a read of it
+        // under `NoFill` hits them without changing the occupancy.
+        let start = occupancy();
+        let cached = write_u32_file_through_large_cache(&dir, &keys);
+        let after_cached_write = occupancy();
+        let filled_by_write = after_cached_write - start;
+        assert!(filled_by_write > 10_000, "{filled_by_write} bytes cached");
+        with_cache_fill(CacheFill::NoFill, || read_every_row(&cached));
+        assert!(cache_hits(&cached) > 0, "a cached block was not used");
+        assert_eq!(occupancy(), after_cached_write);
+
+        // A file written under `NoFill` caches no block. Only the trailer, which keeps
+        // today's path, enters the cache.
+        let uncached = with_cache_fill(CacheFill::NoFill, || {
+            write_u32_file_through_large_cache(&dir, &keys)
+        });
+        let after_uncached_write = occupancy();
+        assert!(
+            (after_uncached_write - after_cached_write) * 10 < filled_by_write,
+            "NoFill write cached {} bytes, Fill {filled_by_write}",
+            after_uncached_write - after_cached_write
+        );
+
+        // A read of it under `NoFill` misses and inserts nothing.
+        let hits_before = cache_hits(&uncached);
+        with_cache_fill(CacheFill::NoFill, || read_every_row(&uncached));
+        assert_eq!(cache_hits(&uncached), hits_before);
+        assert_eq!(occupancy(), after_uncached_write);
+
+        // The same read under `Fill` inserts the blocks it misses.
+        read_every_row(&uncached);
+        assert!(occupancy() - after_uncached_write > 10_000);
     });
 }
