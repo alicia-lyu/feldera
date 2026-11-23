@@ -1763,9 +1763,16 @@ impl TransactionLatencies {
 
 /// The current memory-pressure level of the runtime. The level comes from the process's RSS
 /// against the memory target, not from cgroup memory.
-fn memory_pressure_levels(pipeline: &Pipeline) -> Result<Value> {
+/// The runtime's memory state at a refresh boundary: its pressure level, and the parts of RSS
+/// that a budget holds, so the rest of RSS is measured rather than inferred.
+fn memory_state(pipeline: &Pipeline) -> Result<Value> {
+    let runtime = pipeline.runtime();
+    let (cache_occupancy, _) = runtime.cache_occupancy();
     Ok(json!({
-        "runtime": serde_json::to_value(pipeline.runtime().current_memory_pressure())?,
+        "runtime": serde_json::to_value(runtime.current_memory_pressure())?,
+        "rss_bytes": dbsp::utils::process_rss_bytes(),
+        "cache_occupancy_bytes": cache_occupancy,
+        "memtable_bytes": runtime.memtable_live_bytes(),
     }))
 }
 
@@ -2532,7 +2539,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     // the window is recorded beside its state at the end.
     let (cache_occupancy_at_start, _) = pipeline.runtime().cache_occupancy();
     pipeline.profile_cpu = true;
-    let mut memory_pressure_before = memory_pressure_levels(&pipeline)?;
+    let mut memory_pressure_before = memory_state(&pipeline)?;
     let sequence_started = Instant::now();
     let mut sequence_finished = sequence_started;
     let mut resources_after = sequence_resources;
@@ -2624,7 +2631,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         resources_after = measurement::ResourceSnapshot::capture()?;
         window_finished_micros = dbsp::storage::diagnostics::now_micros();
         window_evidence.sample_boundary();
-        let memory_pressure_after = memory_pressure_levels(&pipeline)?;
+        let memory_pressure_after = memory_state(&pipeline)?;
         let resource_delta = resources_before.delta(&resources_after);
         let mut report = phase_json(&measurement);
         report["refresh"] = json!(number + 1);
@@ -2774,7 +2781,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 18,
+        "measurement_version": 19,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -4116,7 +4123,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 18);
+        assert_eq!(output["measurement_version"], 19);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4283,7 +4290,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 18);
+        assert_eq!(output["measurement_version"], 19);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -4521,10 +4528,11 @@ mod measurement_tests {
         }
         for refresh in refreshes {
             for side in ["before", "after"] {
-                assert!(
-                    refresh["memory_pressure"][side]["runtime"].is_string(),
-                    "{refresh}"
-                );
+                let state = &refresh["memory_pressure"][side];
+                assert!(state["runtime"].is_string(), "{refresh}");
+                assert!(state["cache_occupancy_bytes"].is_u64(), "{refresh}");
+                // This driver runs with the memtable off.
+                assert!(state["memtable_bytes"].is_null(), "{refresh}");
             }
         }
         assert!(sequence["cache_occupancy_at_window_start_bytes"]

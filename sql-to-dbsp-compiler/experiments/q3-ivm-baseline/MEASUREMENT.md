@@ -426,6 +426,7 @@ The driver's JSON report (`src/main.rs`). `measure.py` rejects a report that fai
 - **Phases.** As defined in [Timing definitions](#timing-definitions). With `transactions` and `transaction_latency`: each transaction's `total_ms`, `base_ms` and `ivm_ms`, with nearest-rank p50, p95, p99, maximum and mean.
 - `base_eviction_ms` and `base_evicted_bytes`.
 - `memory_pressure.before` and `.after`: DBSP's level (`low`, `moderate`, `high`, `critical`), sampled at the refresh's boundaries. It is updated about once a second, so a sample can lag.
+  - From version 19, each sample also holds `rss_bytes`, `cache_occupancy_bytes` (the buffer cache's current cost), and `memtable_bytes` (every memtable's live leaf bytes, old copies included; `null` with the memtable off). So the part of RSS outside the two budgets is measured at each boundary.
 - **Run reads** (`RunReads`):
   - **Fields:** seeks, `filtered_probes` (exact probes a file run's filters answered), `filtered_prefix_probes` (runs a group seek skipped), key, value and weight decodes, and `memory_*_reads` for in-memory runs, which are never added to decodes.
   - **Decodes are not disk reads;** compare device reads for storage traffic.
@@ -627,3 +628,4 @@ Each version changed what the report means. `measure.py` and `summarize.py` acce
 - **16** (2026-11-18). Base tables evicted after each base transaction (`base_eviction_ms`, `base_evicted_bytes`). `BaseState` moved out of the image sources. New images.
 - **17** (2026-11-19). The prefix-filter arm (`--index-prefix-filter`, `filtered_prefix_probes`), with its own images. The file format changed. New images.
 - **18** (2026-11-20). The memtable arm (`--memtable-mib`, `configuration.memtable_mib`, `run_counts` memtable fields). `spine_async.rs` and `trace/ord/**` changed, so new images. `measure.py` accepts 18 from `2275c7446`.
+- **19** (2026-11-23). `memory_pressure.before` and `.after` gain `rss_bytes`, `cache_occupancy_bytes` and `memtable_bytes` (`Runtime::memtable_live_bytes`). No image source changed, so version 18 images are reused.

@@ -1437,6 +1437,15 @@ impl Runtime {
         self.inner().memtable_budget.clone()
     }
 
+    /// The live leaf bytes of every memtable in this runtime, old copies that a
+    /// snapshot still holds included, or `None` if memtables are off.
+    pub fn memtable_live_bytes(&self) -> Option<usize> {
+        self.inner()
+            .memtable_budget
+            .as_ref()
+            .map(|budget| budget.live_bytes())
+    }
+
     pub(crate) fn memory_pressure_notify(&self) -> Arc<Notify> {
         self.inner().memory_pressure_notify.clone()
     }
@@ -2751,6 +2760,39 @@ pub(crate) mod tests {
         }
         // Off a runtime thread there is no budget.
         assert_eq!(Runtime::memtable_budget_bytes(), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn memtable_live_bytes_counts_an_integral_insert() {
+        for memtable_mib in [None, Some(64)] {
+            let storage_dir = tempfile::tempdir().unwrap();
+            let (mut circuit, input_handle) = Runtime::init_circuit(
+                memtable_config(storage_dir.path(), memtable_mib, None),
+                move |circuit| {
+                    let (stream, input_handle) = circuit.add_input_zset::<u64>();
+                    stream.accumulate_integrate_trace();
+                    Ok(input_handle)
+                },
+            )
+            .unwrap();
+            let before = circuit.runtime().memtable_live_bytes();
+
+            for key in 0..100u64 {
+                input_handle.push(key, 1);
+            }
+            circuit.transaction().unwrap();
+            let after = circuit.runtime().memtable_live_bytes();
+
+            match memtable_mib {
+                None => assert_eq!((before, after), (None, None)),
+                Some(_) => {
+                    assert_eq!(before, Some(0));
+                    assert!(after.unwrap() > 0, "{after:?}");
+                }
+            }
+            circuit.kill().unwrap();
+        }
     }
 
     // Test the memory pressure thresholds and how merger threads behave under different memory pressure levels.

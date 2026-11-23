@@ -145,6 +145,8 @@ A memtable on integral spines when `StorageOptions::memtable_mib` is set (design
   asked to seal; the seal runs on the merger runtime (`MergeWorkers::seal_memtable`), copies the
   memtable through `ListMerger` into a file where `pick_merge_destination` says storage, and logs
   `RunWriteKind::MemtableFlush`. Memtable bytes count in RSS; memory pressure is unchanged.
+  `Runtime::memtable_live_bytes` reports the live total (test
+  `memtable_live_bytes_counts_an_integral_insert`).
 - **Counters.** `SpineRunCounts::memtable_*` and `flushing`; metrics `MEMTABLE_FLUSHES` and
   `MEMTABLE_STALL_NANOSECONDS` (inserts never stall, by decision of 2026-11-20, so the latter stays zero).
 - Tests: filter `memtable` (tree, leaves, cursor conformance, budget, and
