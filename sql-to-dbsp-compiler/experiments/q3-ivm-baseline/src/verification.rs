@@ -608,7 +608,8 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
                 Pass::Seek,
                 None,
                 true,
-                None
+                None,
+                MemoryModel::Rss
             )?)?,
             whole
         );
