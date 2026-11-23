@@ -8,7 +8,7 @@ Rules here apply to any merged index and any IVM harness in this directory. The 
 | --- | --- |
 | `merged-index-col/` | The index library for Customer–Orders–Lineitem (COL): its spec `col.mi`, the generated definition, storage tests, and the Q3 readers. |
 | `merged-index-p/` | The index library for Part–Partsupp–Lineitem (MI_P): its spec `mi_p.mi`, the schema `schema.sql`, the generated definition, encoding and storage tests, and the Q14 readers. Payloads serve Q14 for now. |
-| `q14-ivm-baseline/` | The Q14 harness over MI_P: the circuits (base, native view, hand-written reconstructed view `q14-trie-view-circuit`), the index upkeep thread, the transcript comparison, and a driver that loads dbgen's files and runs TPC-H's refreshes (no timing yet). |
+| `q14-ivm-baseline/` | The Q14 harness over MI_P: the circuits (base, native view, hand-written reconstructed view `q14-trie-view-circuit`), the index upkeep thread, the transcript comparison, a driver that loads dbgen's files and times TPC-H's refreshes, and Q3's image and cgroup method (`measure.py`). |
 | `q3-ivm-baseline/` | The Q3 harness: loading, RF1/RF2 refreshes, the index upkeep thread, measurement, and the circuits (base, native view, hand-written reconstructed view). |
 
 How the pieces relate:

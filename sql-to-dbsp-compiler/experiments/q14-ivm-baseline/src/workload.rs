@@ -11,12 +11,13 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::data::{delete_order_key, Change, Line, Part, Partsupp};
 
 /// dbgen's base files.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaseFiles {
     pub part: PathBuf,
     pub partsupp: PathBuf,

@@ -214,19 +214,21 @@ fn the_net_delta_has_whole_rows_for_upserts_and_deletions() -> Result<()> {
         },
         false,
     )?;
-    let net_delta = pipeline.transact(
-        Change {
-            parts: inserted([part(1, "B")]),
-            lines: deleted([Line {
-                // A deletion by key: the other columns do not matter.
-                part_key: 0,
-                supplier_key: 0,
-                ..line(100, 1, 1, 10)
-            }]),
-            ..Change::default()
-        },
-        false,
-    )?;
+    let net_delta = pipeline
+        .transact(
+            Change {
+                parts: inserted([part(1, "B")]),
+                lines: deleted([Line {
+                    // A deletion by key: the other columns do not matter.
+                    part_key: 0,
+                    supplier_key: 0,
+                    ..line(100, 1, 1, 10)
+                }]),
+                ..Change::default()
+            },
+            false,
+        )?
+        .net_delta;
     let mut parts = net_delta.parts;
     parts.sort();
     assert_eq!(parts, [(part(1, "A"), false), (part(1, "B"), true)]);

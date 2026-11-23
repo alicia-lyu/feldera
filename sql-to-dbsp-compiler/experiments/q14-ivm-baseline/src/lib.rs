@@ -5,7 +5,7 @@
 //! It is step 5 of `docs/design/merged-index/new-merged-index.md`. The tests
 //! run both modes on the same transactions, and their transcripts of `V` must
 //! be byte-identical. The driver (`driver`, the binary) loads dbgen's files
-//! and runs TPC-H's refreshes; it times nothing yet.
+//! and runs TPC-H's refreshes, timing each refresh's phases.
 
 pub mod data;
 pub mod driver;

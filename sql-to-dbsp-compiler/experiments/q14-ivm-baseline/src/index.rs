@@ -2,8 +2,9 @@
 //! folding of a net delta into the index's `Dlt`.
 //!
 //! The thread follows the Q3 harness's `ManualIndex`, reduced to what the
-//! correctness harness needs (a snapshot and an append): no checkpoint, no
-//! compaction control, no prefix-filter arm.
+//! harness needs (a snapshot, an append, whether background merges are idle,
+//! and saving into and restoring from an image's checkpoint): no compaction
+//! request, no prefix-filter arm.
 //!
 //! Every MI_P path is made of its own row's columns (a line item's part and
 //! supplier are its `l_partkey` and `l_suppkey`), so the net delta folds row by
@@ -24,6 +25,7 @@ use dbsp::{
     DynZWeight, Runtime, ZWeight,
 };
 use feldera_sqllib::{Date, SqlDecimal};
+use feldera_storage::StoragePath;
 use merged_index_p::{
     build_batch_in, Key, LineitemByPartkeySuppkeyOrderkeyLinenumberKey,
     LineitemByPartkeySuppkeyOrderkeyLinenumberPayload, PartByPartkeyKey, PartByPartkeyPayload,
@@ -44,7 +46,17 @@ enum Request {
         Vec<IndexRow>,
         mpsc::SyncSender<Result<Arc<MergedIndexBatch>, String>>,
     ),
+    /// Whether the spine's background merges are idle.
+    BackgroundIdle(mpsc::SyncSender<bool>),
+    /// Saves the spine into a checkpoint directory and commits its files.
+    Save(StoragePath, mpsc::SyncSender<Result<(), String>>),
+    /// Replaces the (empty) spine with the one saved in a checkpoint
+    /// directory.
+    Restore(StoragePath, mpsc::SyncSender<Result<(), String>>),
 }
+
+/// The spine's name in a checkpoint.
+const SPINE_NAME: &str = "q14_manual_merged_index";
 
 /// The index's owner thread, on the runtime's buffer cache.
 pub struct ManualIndex {
@@ -79,7 +91,7 @@ impl ManualIndex {
                     >();
                     let mut trace = Spine::<MergedIndexBatch>::new(
                         &factories,
-                        Arc::new("q14_manual_merged_index".to_owned()),
+                        Arc::new(SPINE_NAME.to_owned()),
                         TraceRole::Integral,
                     );
                     while !Runtime::kill_in_progress() {
@@ -94,6 +106,28 @@ impl ManualIndex {
                                         .block_on(trace.insert(dlt.clone()));
                                     dlt
                                 });
+                                let _ = reply.send(result);
+                            }
+                            Ok(Request::BackgroundIdle(reply)) => {
+                                let _ = reply.send(trace.is_background_merge_idle());
+                            }
+                            Ok(Request::Save(path, reply)) => {
+                                let result = (|| {
+                                    let mut files = Vec::new();
+                                    trace
+                                        .save(&path, SPINE_NAME, &mut files)
+                                        .map_err(|error| error.to_string())?;
+                                    Runtime::storage_backend()
+                                        .map_err(|error| error.to_string())?
+                                        .commit_all(&files)
+                                        .map_err(|error| error.to_string())
+                                })();
+                                let _ = reply.send(result);
+                            }
+                            Ok(Request::Restore(path, reply)) => {
+                                let result = trace
+                                    .restore(&path, SPINE_NAME)
+                                    .map_err(|error| error.to_string());
                                 let _ = reply.send(result);
                             }
                             Err(mpsc::TryRecvError::Empty) => parker.park(),
@@ -125,6 +159,26 @@ impl ManualIndex {
         let old = self.request(Request::Snapshot)?;
         let dlt = self.request(|reply| Request::Append(rows, reply))?;
         Ok((old, dlt.map_err(anyhow::Error::msg)?))
+    }
+
+    /// Whether the index's background merges are idle.
+    pub fn is_background_merge_idle(&self) -> Result<bool> {
+        self.request(Request::BackgroundIdle)
+    }
+
+    /// Saves the index into the checkpoint directory `path` and commits its
+    /// files. The checkpoint's own commit, which must follow, then records
+    /// them as the checkpoint's.
+    pub fn save(&self, path: StoragePath) -> Result<()> {
+        self.request(|reply| Request::Save(path, reply))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Replaces the index's (empty) spine with the one saved in the
+    /// checkpoint directory `path`, before the first append.
+    pub fn restore(&self, path: StoragePath) -> Result<()> {
+        self.request(|reply| Request::Restore(path, reply))?
+            .map_err(anyhow::Error::msg)
     }
 }
 
