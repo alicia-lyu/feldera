@@ -51,10 +51,18 @@ SESSION_PASSES = ("seek",)
 # 16 evicts the base tables' blocks from the cache after each base transaction (`base_eviction_ms`,
 # `base_evicted_bytes`, `configuration.evict_base_after_transaction`). 20 adds the memory model
 # (`configuration.memory_model`, `--memory-model`), which changes `spine_async.rs` and
-# `storage/file/`: new images. 21 adds the compaction-memory charge (`--charge-compaction-memory`,
-# `configuration.charge_compaction_memory`, each refresh's `compaction_reservations`), which
-# changes `spine_async.rs` and the buffer cache: new images.
-MEASUREMENT_VERSION = 21
+# `storage/file/`: new images. 21 adds the compaction-memory charge (each refresh's
+# `compaction_reservations`), which changes `spine_async.rs` and the buffer cache: new images. 22
+# adds the compaction pool, the default under `budgets` (`--compaction-memory pool|charge`,
+# `--compaction-jobs`, `configuration.compaction_memory` and `.compaction_jobs`, each refresh's
+# `compaction_jobs`), which replaces the flag `--charge-compaction-memory` and changes
+# `spine_async.rs`: new images.
+MEASUREMENT_VERSION = 22
+# How compaction's memory is bounded under `budgets` (`--compaction-memory`): a pool of merge
+# permits, the default, or a reservation of the buffer bytes in the cache. The pool's default limit
+# is DBSP's (`DEFAULT_COMPACTION_JOBS`).
+COMPACTION_MEMORIES = ("pool", "charge")
+DEFAULT_COMPACTION_JOBS = 2
 # The memory models (`--memory-model`): `rss` is DBSP's pressure levels on process RSS, `budgets`
 # the cache and memtable budgets (`docs/design/merged-index/memory-model.md`).
 MEMORY_MODELS = ("rss", "budgets")
@@ -476,19 +484,35 @@ def memory_model_problems(report: dict[str, Any], asked: str) -> list[str]:
     return []
 
 
-def charge_compaction_memory_problems(report: dict[str, Any], asked: bool) -> list[str]:
-    """List a mismatch between the compaction-memory charge the runner asked for
-    (`--charge-compaction-memory`) and the one the driver reports. A report that names neither
-    mode is not checked."""
+def compaction_settings(memory_model: str, compaction_memory: str | None,
+                       compaction_jobs: int | None) -> tuple[str | None, int | None]:
+    """The compaction memory and the pool's limit that a run has: none under `rss`, which
+    bounds nothing; under `budgets` the chosen memory, `pool` by default, and for the pool its
+    limit, DBSP's default unless `--compaction-jobs` sets it."""
+    if memory_model != "budgets":
+        return None, None
+    memory = compaction_memory or "pool"
+    return memory, (compaction_jobs or DEFAULT_COMPACTION_JOBS) if memory == "pool" else None
+
+
+def compaction_memory_problems(report: dict[str, Any], memory_model: str,
+                               compaction_memory: str | None,
+                               compaction_jobs: int | None) -> list[str]:
+    """List a mismatch between the compaction memory and pool limit the runner asked for
+    (`--compaction-memory`, `--compaction-jobs`) and those the driver reports. A report that
+    names neither mode is not checked."""
     if report.get("mode") not in ("native", "reconstructed"):
         return []
     configuration = report.get("configuration", {})
-    if "charge_compaction_memory" not in configuration:
-        return [f"configuration.charge_compaction_memory is missing, expected {asked!r}"]
-    if configuration["charge_compaction_memory"] != asked:
-        return [f"configuration.charge_compaction_memory is "
-                f"{configuration['charge_compaction_memory']!r}, expected {asked!r}"]
-    return []
+    problems = []
+    asked = compaction_settings(memory_model, compaction_memory, compaction_jobs)
+    for key, expected in zip(("compaction_memory", "compaction_jobs"), asked):
+        if key not in configuration:
+            problems.append(f"configuration.{key} is missing, expected {expected!r}")
+        elif configuration[key] != expected:
+            problems.append(f"configuration.{key} is {configuration[key]!r}, "
+                            f"expected {expected!r}")
+    return problems
 
 
 def report_problems(report: dict[str, Any], session_pass: str) -> list[str]:
@@ -917,8 +941,10 @@ def driver_command(spec: dict[str, Any], inputs: dict[str, str]) -> list[str]:
         command.extend(["--memtable-mib", str(args["memtable_mib"])])
     if args.get("memory_model", "rss") != "rss":
         command.extend(["--memory-model", args["memory_model"]])
-    if args.get("charge_compaction_memory"):
-        command.append("--charge-compaction-memory")
+    if args.get("compaction_memory") is not None:
+        command.extend(["--compaction-memory", args["compaction_memory"]])
+    if args.get("compaction_jobs") is not None:
+        command.extend(["--compaction-jobs", str(args["compaction_jobs"])])
     command.extend(["--session-pass", args.get("session_pass", "seek")])
     return command
 
@@ -1090,12 +1116,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "the cache and memtable budgets, which needs --memtable-mib and "
                              "writes every merge output and seal to a file without filling the "
                              "cache; a campaign setting, since images are built under rss")
-    parser.add_argument("--charge-compaction-memory", action="store_true",
-                        help="each merge and memtable seal reserves its estimated buffer bytes "
-                             "in the cache's budget while it runs (measurement version 21; off "
-                             "by default); a reservation that would pin more than a quarter of "
-                             "the cache waits; needs --memory-model budgets, a campaign setting "
-                             "like it")
+    parser.add_argument("--compaction-memory", choices=COMPACTION_MEMORIES, default=None,
+                        help="how compaction's memory is bounded under --memory-model budgets "
+                             "(measurement version 22; default pool): pool limits the merges "
+                             "open at once to --compaction-jobs, charge makes each merge and "
+                             "memtable seal reserve its estimated buffer bytes in the cache's "
+                             "budget while it runs, and a reservation that would pin more than a "
+                             "quarter of the cache waits; needs --memory-model budgets, a "
+                             "campaign setting like it")
+    parser.add_argument("--compaction-jobs", type=int, default=None,
+                        help="the pool's limit on the merges open at once (measurement version "
+                             f"22; default {DEFAULT_COMPACTION_JOBS}, as RocksDB's "
+                             "max_background_jobs); seals take no permit; needs --memory-model "
+                             "budgets and --compaction-memory pool")
     parser.add_argument("--session-pass", choices=SESSION_PASSES, default="seek",
                         help="how the reconstructed build's scan session passes the untouched "
                              "groups (default seek); native runs have no scan session")
@@ -1162,13 +1195,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if args.memtable_mib is None:
             parser.error("--memory-model budgets needs --memtable-mib: the memtable is its "
                          "write budget")
-    if args.charge_compaction_memory:
+    if args.compaction_memory is not None or args.compaction_jobs is not None:
         if loading:
-            parser.error("--charge-compaction-memory applies to a campaign: images are built "
-                         "without it")
+            parser.error("--compaction-memory and --compaction-jobs apply to a campaign: "
+                         "images are built without them")
         if args.memory_model != "budgets":
-            parser.error("--charge-compaction-memory needs --memory-model budgets: the charge "
-                         "draws on the cache budget that model has")
+            parser.error("--compaction-memory and --compaction-jobs need --memory-model "
+                         "budgets: they bound compaction under the budgets that model has")
+    if args.compaction_jobs is not None:
+        if args.compaction_jobs < 1:
+            parser.error("--compaction-jobs must be at least 1: a pool of no permits starts "
+                         "no merge")
+        if args.compaction_memory == "charge":
+            parser.error("--compaction-jobs limits --compaction-memory pool; the charge has "
+                         "no job limit")
     if args.cache_bytes is not None and args.cache_bytes % MIB:
         parser.error("cache bytes must be a whole MiB")
     if not math.isfinite(args.compaction_timeout_secs) or args.compaction_timeout_secs <= 0:
@@ -1596,7 +1636,8 @@ def run(argv: list[str]) -> int:
                           "index_prefix_filter": args.index_prefix_filter,
                           "memtable_mib": args.memtable_mib,
                           "memory_model": args.memory_model,
-                          "charge_compaction_memory": args.charge_compaction_memory,
+                          "compaction_memory": args.compaction_memory,
+                          "compaction_jobs": args.compaction_jobs,
                           "session_pass": args.session_pass,
                           "total_memory_bytes": args.total_memory_bytes,
                           "cgroup_root": str(args.cgroup_root) if args.cgroup_root else None,
@@ -1670,7 +1711,8 @@ def run(argv: list[str]) -> int:
                                  "index_prefix_filter": args.index_prefix_filter,
                                  "memtable_mib": args.memtable_mib,
                                  "memory_model": args.memory_model,
-                                 "charge_compaction_memory": args.charge_compaction_memory,
+                                 "compaction_memory": args.compaction_memory,
+                                 "compaction_jobs": args.compaction_jobs,
                                  "session_pass": args.session_pass,
                                  "warm_up": str(args.warm_up.resolve()) if args.warm_up else None}}
                 if images:
@@ -1717,8 +1759,9 @@ def run(argv: list[str]) -> int:
                             + index_prefix_filter_problems(raw, args.index_prefix_filter)
                             + memtable_mib_problems(raw, args.memtable_mib)
                             + memory_model_problems(raw, args.memory_model)
-                            + charge_compaction_memory_problems(
-                                raw, args.charge_compaction_memory))
+                            + compaction_memory_problems(
+                                raw, args.memory_model, args.compaction_memory,
+                                args.compaction_jobs))
                 if problems:
                     raise RuntimeError(f"{mode} run {repetition} report is inconsistent: "
                                        + "; ".join(problems))

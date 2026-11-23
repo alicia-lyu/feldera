@@ -428,7 +428,7 @@ fn replay(fixtures: Vec<Fixture>, session_pass: Pass) -> Result<Vec<Value>> {
         false,
         None,
         MemoryModel::Rss,
-        false,
+        (CompactionMemory::Pool, None),
     )
 }
 
@@ -462,8 +462,8 @@ impl Drop for ScratchStorage {
 /// `memtable_mib` gives the integral spines memtables (`--memtable-mib`); a memtable needs
 /// storage, so it keeps the state in a scratch directory even without an image.
 /// `memory_model` is DBSP's (`--memory-model`); `Budgets` needs `memtable_mib`.
-/// `charge_compaction_memory` makes merges and seals reserve their buffers in the cache
-/// (`--charge-compaction-memory`); it needs `Budgets`.
+/// `compaction_memory` is how compaction's memory is bounded (`--compaction-memory`, with
+/// `--compaction-jobs` as the pool's limit); `Charge`, and any limit, need `Budgets`.
 fn replay_with_image(
     fixtures: Vec<Fixture>,
     session_pass: Pass,
@@ -471,13 +471,13 @@ fn replay_with_image(
     index_prefix_filter: bool,
     memtable_mib: Option<usize>,
     memory_model: MemoryModel,
-    charge_compaction_memory: bool,
+    (compaction_memory, compaction_jobs): (CompactionMemory, Option<usize>),
 ) -> Result<Vec<Value>> {
     let storage = (image_after.is_some() || memtable_mib.is_some())
         .then(|| {
             // Tests run concurrently in one process: name the directory by every parameter.
             ScratchStorage::new(&format!(
-                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}-{memory_model:?}-charge-{charge_compaction_memory}"
+                "{session_pass:?}-prefix-{index_prefix_filter}-image-{image_after:?}-memtable-{memtable_mib:?}-{memory_model:?}-compaction-{compaction_memory:?}-{compaction_jobs:?}"
             ))
         })
         .transpose()?;
@@ -493,7 +493,8 @@ fn replay_with_image(
                 StorageOptions {
                     memtable_mib,
                     memory_model,
-                    charge_compaction_memory,
+                    compaction_memory,
+                    compaction_jobs,
                     ..StorageOptions::default()
                 },
             )?)),
@@ -595,7 +596,7 @@ fn an_image_reopens_where_its_writer_stopped() -> Result<()> {
                 false,
                 None,
                 MemoryModel::Rss,
-                false,
+                (CompactionMemory::Pool, None),
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -623,7 +624,7 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
                 true,
                 None,
                 MemoryModel::Rss,
-                false
+                (CompactionMemory::Pool, None)
             )?)?,
             whole
         );
@@ -635,7 +636,7 @@ fn transcripts_do_not_depend_on_the_index_prefix_filter() -> Result<()> {
                 true,
                 None,
                 MemoryModel::Rss,
-                false,
+                (CompactionMemory::Pool, None),
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -661,7 +662,7 @@ fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Rss,
-                false
+                (CompactionMemory::Pool, None)
             )?)?,
             whole
         );
@@ -673,7 +674,7 @@ fn transcripts_do_not_depend_on_the_memtable() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Rss,
-                false,
+                (CompactionMemory::Pool, None),
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -699,7 +700,7 @@ fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Budgets,
-                false
+                (CompactionMemory::Pool, None)
             )?)?,
             whole
         );
@@ -711,7 +712,7 @@ fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
                 false,
                 Some(1),
                 MemoryModel::Budgets,
-                false,
+                (CompactionMemory::Pool, None),
             )?;
             assert_eq!(
                 serde_json::to_vec(&reopened)?,
@@ -723,39 +724,48 @@ fn transcripts_do_not_depend_on_the_memory_model() -> Result<()> {
     Ok(())
 }
 
-/// The compaction-memory charge leaves every transcript unchanged, whole and across an image:
-/// it changes when a merge or a seal starts, not what it computes.
+/// Compaction memory leaves every transcript unchanged, whole and across an image: the pool
+/// (at limits 1 and 2) and the charge change when a merge or a seal starts, not what it
+/// computes.
 #[test]
-fn transcripts_do_not_depend_on_the_compaction_charge() -> Result<()> {
+fn transcripts_do_not_depend_on_compaction_memory() -> Result<()> {
+    let settings = [
+        (CompactionMemory::Pool, Some(1)),
+        (CompactionMemory::Pool, Some(2)),
+        (CompactionMemory::Charge, None),
+    ];
     for fixtures in [rf1_rf2_fixtures, general_fixtures] {
         let whole = serde_json::to_vec(&replay(fixtures(), Pass::Seek)?)?;
-        assert_eq!(
-            serde_json::to_vec(&replay_with_image(
-                fixtures(),
-                Pass::Seek,
-                None,
-                false,
-                Some(1),
-                MemoryModel::Budgets,
-                true
-            )?)?,
-            whole
-        );
-        for split in [1, fixtures().len() / 2] {
-            let reopened = replay_with_image(
-                fixtures(),
-                Pass::Seek,
-                Some(split),
-                false,
-                Some(1),
-                MemoryModel::Budgets,
-                true,
-            )?;
+        for setting in settings {
             assert_eq!(
-                serde_json::to_vec(&reopened)?,
+                serde_json::to_vec(&replay_with_image(
+                    fixtures(),
+                    Pass::Seek,
+                    None,
+                    false,
+                    Some(1),
+                    MemoryModel::Budgets,
+                    setting
+                )?)?,
                 whole,
-                "an image after {split} fixtures, under budgets with the charge"
+                "{setting:?}"
             );
+            for split in [1, fixtures().len() / 2] {
+                let reopened = replay_with_image(
+                    fixtures(),
+                    Pass::Seek,
+                    Some(split),
+                    false,
+                    Some(1),
+                    MemoryModel::Budgets,
+                    setting,
+                )?;
+                assert_eq!(
+                    serde_json::to_vec(&reopened)?,
+                    whole,
+                    "an image after {split} fixtures, under budgets with {setting:?}"
+                );
+            }
         }
     }
     Ok(())

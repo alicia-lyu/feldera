@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use data::{Customer, Line, Order};
 #[cfg(feature = "merged-index")]
 use dbsp::circuit::checkpointer::Checkpointer;
+use dbsp::circuit::compaction_jobs::{CompactionJobStats, DEFAULT_COMPACTION_JOBS};
 use dbsp::circuit::metadata::{MetaItem, CIRCUIT_CPU_TIME_SECONDS};
 use dbsp::circuit::{
     CircuitConfig, CircuitConstructor, CircuitStorageConfig, GlobalNodeId, StorageCacheConfig,
@@ -43,7 +44,7 @@ use dbsp::trace::{BlockExpansions, RunReads};
 use dbsp::{DBSPHandle, RootCircuit, Runtime};
 use dbsp_adapters::{Catalog, CircuitCatalog, RecordFormat};
 use feldera_types::checkpoint::CheckpointMetadata;
-use feldera_types::config::MemoryModel;
+use feldera_types::config::{CompactionMemory, MemoryModel};
 use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "merged-index")]
 use merged_index_col::q3::{Collection, DrivingDeltas, Q3State, SessionReads};
@@ -1220,6 +1221,22 @@ fn parse_pass(name: &str) -> Result<Pass> {
     }
 }
 
+fn parse_compaction_memory(value: &str) -> Result<CompactionMemory> {
+    match value {
+        "pool" => Ok(CompactionMemory::Pool),
+        "charge" => Ok(CompactionMemory::Charge),
+        other => bail!("--compaction-memory must be pool or charge, not {other}"),
+    }
+}
+
+/// The name of a compaction memory in the report, as `--compaction-memory` spells it.
+fn compaction_memory_name(compaction_memory: CompactionMemory) -> &'static str {
+    match compaction_memory {
+        CompactionMemory::Pool => "pool",
+        CompactionMemory::Charge => "charge",
+    }
+}
+
 fn parse_memory_model(value: &str) -> Result<MemoryModel> {
     match value {
         "rss" => Ok(MemoryModel::Rss),
@@ -1287,10 +1304,13 @@ struct Config {
     /// version 20): `rss` is the default, the pressure levels on RSS; `budgets` places runs by
     /// the cache and memtable budgets and needs `--memtable-mib`. Images are built under `rss`.
     memory_model: MemoryModel,
-    /// Whether each merge and seal reserves its buffer bytes in the cache's budget while it
-    /// runs (`--charge-compaction-memory`, measurement version 21). Needs `--memory-model
-    /// budgets`; images are built without it.
-    charge_compaction_memory: bool,
+    /// How compaction's memory is bounded under `--memory-model budgets` (`--compaction-memory
+    /// pool|charge`, measurement version 22): `None` is the default, `pool`. Setting it needs
+    /// `budgets`, and images are built under `rss`.
+    compaction_memory: Option<CompactionMemory>,
+    /// The pool's limit on the merges open at once (`--compaction-jobs`, measurement version
+    /// 22); `None` is DBSP's default of 2. Needs `budgets` and `pool`, and at least 1.
+    compaction_jobs: Option<usize>,
     /// How the reconstructed build's scan session passes untouched groups
     /// (`--session-pass seek|step`); `None` means `Seek`. The native build has
     /// no session and ignores it.
@@ -1312,6 +1332,19 @@ struct Config {
 }
 
 impl Config {
+    /// How compaction's memory is bounded in this run: `None` under `rss`, which bounds nothing,
+    /// else the chosen memory, `pool` by default.
+    fn effective_compaction_memory(&self) -> Option<CompactionMemory> {
+        (self.memory_model == MemoryModel::Budgets)
+            .then(|| self.compaction_memory.unwrap_or_default())
+    }
+
+    /// The limit on the merges open at once in this run: `None` unless the pool is on.
+    fn effective_compaction_jobs(&self) -> Option<usize> {
+        (self.effective_compaction_memory() == Some(CompactionMemory::Pool))
+            .then(|| self.compaction_jobs.unwrap_or(DEFAULT_COMPACTION_JOBS))
+    }
+
     fn parse() -> Result<Self> {
         Self::from_args(std::env::args().skip(1))
     }
@@ -1388,7 +1421,20 @@ impl Config {
                         &args.next().context("--memory-model needs rss or budgets")?,
                     )?
                 }
-                "--charge-compaction-memory" => config.charge_compaction_memory = true,
+                "--compaction-memory" => {
+                    config.compaction_memory = Some(parse_compaction_memory(
+                        &args
+                            .next()
+                            .context("--compaction-memory needs pool or charge")?,
+                    )?)
+                }
+                "--compaction-jobs" => {
+                    config.compaction_jobs = Some(
+                        args.next()
+                            .context("--compaction-jobs needs number")?
+                            .parse()?,
+                    )
+                }
                 "--session-pass" => {
                     config.session_pass = Some(parse_pass(
                         &args.next().context("--session-pass needs seek or step")?,
@@ -1479,14 +1525,21 @@ impl Config {
         if config.write_image.is_some() && config.memory_model != MemoryModel::Rss {
             bail!("--write-image loads under --memory-model rss: images are built under rss");
         }
-        if config.charge_compaction_memory && config.memory_model != MemoryModel::Budgets {
+        if (config.compaction_memory.is_some() || config.compaction_jobs.is_some())
+            && config.memory_model != MemoryModel::Budgets
+        {
             bail!(
-                "--charge-compaction-memory needs --memory-model budgets: the charge draws on the \
-                 cache budget that model has"
+                "--compaction-memory and --compaction-jobs need --memory-model budgets: they bound \
+                 compaction under the budgets that model has, and images, built under rss, have none"
             );
         }
-        if config.write_image.is_some() && config.charge_compaction_memory {
-            bail!("--write-image loads without --charge-compaction-memory: images are built without it");
+        if config.compaction_jobs.is_some()
+            && config.compaction_memory == Some(CompactionMemory::Charge)
+        {
+            bail!("--compaction-jobs limits --compaction-memory pool; the charge has no job limit");
+        }
+        if config.compaction_jobs == Some(0) {
+            bail!("--compaction-jobs must be at least 1: a pool of no permits starts no merge");
         }
         if config.write_image.is_some() && config.from_image.is_some() {
             bail!("--write-image and --from-image are the load and the refresh program; pass one");
@@ -1824,14 +1877,27 @@ fn memory_state(pipeline: &Pipeline) -> Result<Value> {
 }
 
 /// What the compaction-memory reservations cost during one refresh (measurement version 21):
-/// how many waited and for how long, and the most bytes pinned at once. All zero when
-/// `--charge-compaction-memory` is off. `before` and `after` are the cumulative counters at the
+/// how many waited and for how long, and the most bytes pinned at once. All zero unless
+/// `--compaction-memory charge` is on. `before` and `after` are the cumulative counters at the
 /// refresh's two ends; `after.peak_pinned_bytes` is the peak since the refresh began.
 fn reservations_json(before: ReservationStats, after: ReservationStats) -> Value {
     json!({
         "waits": after.waits - before.waits,
         "wait_ms": milliseconds(after.wait - before.wait),
         "peak_pinned_bytes": after.peak_pinned_bytes,
+    })
+}
+
+/// What the compaction pool cost during one refresh (measurement version 22): how many merges
+/// waited for a permit and for how long, and the most merges open at once. The waits are zero
+/// unless the pool is on (`budgets`, `--compaction-memory pool`); the peak is counted under every
+/// memory model. `before` and `after` are the cumulative counters at the refresh's two ends;
+/// `after.peak_open_merges` is the peak since the refresh began.
+fn compaction_jobs_json(before: CompactionJobStats, after: CompactionJobStats) -> Value {
+    json!({
+        "waits": after.waits - before.waits,
+        "wait_ms": milliseconds(after.wait - before.wait),
+        "peak_open_merges": after.peak_open_merges,
     })
 }
 
@@ -2343,7 +2409,8 @@ fn storage_options(config: &Config) -> StorageOptions {
         compression: feldera_types::config::StorageCompression::None,
         memtable_mib: config.memtable_mib,
         memory_model: config.memory_model,
-        charge_compaction_memory: config.charge_compaction_memory,
+        compaction_memory: config.compaction_memory.unwrap_or_default(),
+        compaction_jobs: config.compaction_jobs,
         ..StorageOptions::default()
     }
 }
@@ -2625,6 +2692,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         let resources_before = measurement::ResourceSnapshot::capture()?;
         let reservations_before = pipeline.runtime().compaction_reservation_stats();
         pipeline.runtime().reset_peak_pinned_bytes();
+        let compaction_jobs_before = pipeline.runtime().compaction_job_stats();
+        pipeline.runtime().reset_peak_open_merges();
         let phase_started = Instant::now();
         let mut measurement = Measurements::default();
         let mut customers = HashSet::new();
@@ -2707,6 +2776,10 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
         report["compaction_reservations"] = reservations_json(
             reservations_before,
             pipeline.runtime().compaction_reservation_stats(),
+        );
+        report["compaction_jobs"] = compaction_jobs_json(
+            compaction_jobs_before,
+            pipeline.runtime().compaction_job_stats(),
         );
         report["run_counts_sampling_ms"] = json!(milliseconds(run_counts.sampling));
         report["run_counts"] = run_counts.json();
@@ -2848,7 +2921,7 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
     }
     let mut report = json!({
         "status": "complete",
-        "measurement_version": 21,
+        "measurement_version": 22,
         "os": std::env::consts::OS,
         "mode": mode_name(),
         "qualification": "runner determines cgroup qualification; macOS is smoke only",
@@ -2883,7 +2956,8 @@ fn run(config: &Config, run_number: usize) -> Result<()> {
             "index_prefix_filter": config.index_prefix_filter,
             "memtable_mib": config.memtable_mib,
             "memory_model": memory_model_name(config.memory_model),
-            "charge_compaction_memory": config.charge_compaction_memory,
+            "compaction_memory": config.effective_compaction_memory().map(compaction_memory_name),
+            "compaction_jobs": config.effective_compaction_jobs(),
             "session_pass": cfg!(feature = "merged-index").then(|| pass_name(config.session_pass())),
             "durability": "no checkpoint is taken during the refreshes; an image (--write-image) is the checkpoint the refresh program starts from; refresh completion is not a durability guarantee",
             "diagnostics": config.diagnostics,
@@ -3101,31 +3175,49 @@ mod tests {
             "64"
         ])
         .is_err());
-        // The charge defaults off, and needs the budgets model.
-        assert!(!parse(&[]).unwrap().charge_compaction_memory);
-        assert!(parse(&["--charge-compaction-memory"]).is_err());
-        assert!(parse(&["--memtable-mib", "64", "--charge-compaction-memory"]).is_err());
-        assert!(
-            parse(&[
-                "--memory-model",
-                "budgets",
-                "--memtable-mib",
-                "64",
-                "--charge-compaction-memory"
-            ])
-            .unwrap()
-            .charge_compaction_memory
+        // Compaction memory defaults to the pool of two jobs under budgets, and to nothing
+        // under rss; setting it needs the budgets model.
+        let budgets = ["--memory-model", "budgets", "--memtable-mib", "64"];
+        let with_budgets = |extra: &[&str]| parse(&[&budgets[..], extra].concat());
+        let unset = parse(&[]).unwrap();
+        assert_eq!(unset.effective_compaction_memory(), None);
+        assert_eq!(unset.effective_compaction_jobs(), None);
+        let pool = with_budgets(&[]).unwrap();
+        assert_eq!(
+            pool.effective_compaction_memory(),
+            Some(CompactionMemory::Pool)
         );
-        assert!(parse(&[
-            "--write-image",
-            "i",
-            "--memory-model",
-            "budgets",
-            "--memtable-mib",
-            "64",
-            "--charge-compaction-memory"
-        ])
-        .is_err());
+        assert_eq!(
+            pool.effective_compaction_jobs(),
+            Some(DEFAULT_COMPACTION_JOBS)
+        );
+        let one_job = with_budgets(&["--compaction-jobs", "1"]).unwrap();
+        assert_eq!(one_job.effective_compaction_jobs(), Some(1));
+        let charge = with_budgets(&["--compaction-memory", "charge"]).unwrap();
+        assert_eq!(
+            charge.effective_compaction_memory(),
+            Some(CompactionMemory::Charge)
+        );
+        assert_eq!(charge.effective_compaction_jobs(), None);
+        for refused in [
+            &["--compaction-memory", "charge"][..],
+            &["--compaction-memory", "pool"],
+            &["--compaction-jobs", "2"],
+            &["--memtable-mib", "64", "--compaction-memory", "charge"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
+        assert!(with_budgets(&["--compaction-memory", "other"]).is_err());
+        assert!(with_budgets(&["--compaction-jobs", "0"]).is_err());
+        assert!(with_budgets(&["--compaction-jobs", "x"]).is_err());
+        // The charge has no job limit.
+        assert!(
+            with_budgets(&["--compaction-memory", "charge", "--compaction-jobs", "2"]).is_err()
+        );
+        assert!(with_budgets(&["--compaction-memory", "pool", "--compaction-jobs", "2"]).is_ok());
+        // Images are built under rss, without compaction memory.
+        assert!(with_budgets(&["--write-image", "i"]).is_err());
+        assert!(parse(&["--write-image", "i", "--compaction-jobs", "2"]).is_err());
         // The load and the refresh program take disjoint inputs.
         assert!(parse(&["--write-image", "i", "--from-image", "j", "--no-verify"]).is_err());
         assert!(parse(&["--write-image", "i", "--refresh-list", "r.json"]).is_err());
@@ -4241,7 +4333,7 @@ mod measurement_tests {
         let output: Value = serde_json::from_reader(File::open(&image_report)?)?;
         assert!(output["load"].is_null());
         assert_eq!(output["image"]["settings"]["mode"], mode_name());
-        assert_eq!(output["measurement_version"], 21);
+        assert_eq!(output["measurement_version"], 22);
         // The refreshes evicted the base tables' blocks after each base transaction.
         assert_eq!(
             output["configuration"]["evict_base_after_transaction"],
@@ -4408,7 +4500,7 @@ mod measurement_tests {
                 .unwrap()
                 > 0
         );
-        assert_eq!(output["measurement_version"], 21);
+        assert_eq!(output["measurement_version"], 22);
         let session_pass = &output["configuration"]["session_pass"];
         if cfg!(feature = "merged-index") {
             assert_eq!(session_pass, "seek");
@@ -4650,6 +4742,11 @@ mod measurement_tests {
             assert_eq!(reservations["waits"], 0, "{refresh}");
             assert_eq!(reservations["wait_ms"], 0.0, "{refresh}");
             assert_eq!(reservations["peak_pinned_bytes"], 0, "{refresh}");
+            // Nor is there a pool, under rss: no permit wait, though the open merges are counted.
+            let jobs = &refresh["compaction_jobs"];
+            assert_eq!(jobs["waits"], 0, "{refresh}");
+            assert_eq!(jobs["wait_ms"], 0.0, "{refresh}");
+            assert!(jobs["peak_open_merges"].is_u64(), "{refresh}");
             for side in ["before", "after"] {
                 let state = &refresh["memory_pressure"][side];
                 assert!(state["runtime"].is_string(), "{refresh}");
