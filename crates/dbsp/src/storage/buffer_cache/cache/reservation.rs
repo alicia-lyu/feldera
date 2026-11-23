@@ -327,8 +327,14 @@ mod tests {
                 );
             }
             let (occupied, capacity) = cache.occupancy();
-            assert!(occupied >= MIB, "{strategy:?}: the pin is part of the charge");
-            assert!(occupied <= capacity, "{strategy:?}: blocks were not evicted");
+            assert!(
+                occupied >= MIB,
+                "{strategy:?}: the pin is part of the charge"
+            );
+            assert!(
+                occupied <= capacity,
+                "{strategy:?}: blocks were not evicted"
+            );
 
             drop(reservation);
             assert_eq!(cache.pinned_bytes(), 0);

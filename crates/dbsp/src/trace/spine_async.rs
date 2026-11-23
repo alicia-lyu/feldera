@@ -36,7 +36,7 @@ use crate::{
             CacheFill, Component, current_write_owner, scope_write_owner, with_cache_fill,
             with_write_owner,
         },
-        buffer_cache::{BufferCache, CacheStats},
+        buffer_cache::{BufferCache, CacheStats, Reservation},
         diagnostics::{
             self, CompactionRecord, RunContents, RunWriteKind, SpineContents, now_micros,
         },
@@ -100,6 +100,7 @@ use tokio::{
     task::yield_now,
 };
 use tracing::trace;
+mod compaction_charge;
 mod index_set;
 mod list_merger;
 mod push_merger;
@@ -107,6 +108,7 @@ mod snapshot;
 pub use snapshot::{BatchReaderWithSnapshot, SpineSnapshot, WithSnapshot};
 
 use super::{BatchLocation, cursor::CursorFactory};
+use compaction_charge::{compaction_charge_bytes, reserve_in_merger_cache};
 
 pub use list_merger::ListMerger;
 
@@ -1684,11 +1686,36 @@ where
                 buffer_cache,
                 slab_allocator,
                 async move {
+                    // Under the compaction-memory charge, the seal reserves its
+                    // buffers before it opens its cursor and builder, and holds
+                    // them until it ends.
+                    let reservation = match this.seal_charge_bytes() {
+                        Some(bytes) => Some(reserve_in_merger_cache(bytes).await),
+                        None => None,
+                    };
                     with_merge_cache_fill(|| this.seal_memtable());
+                    drop(reservation);
                 },
             )
             .await;
         });
+    }
+
+    /// The bytes that a seal of the memtable reserves under the compaction-memory
+    /// charge; `None` when the charge is off or the memtable is empty, which
+    /// seals nothing. The memtable's tuples bound the keys of the filter.
+    fn seal_charge_bytes(&self) -> Option<usize> {
+        let tuples = self
+            .state
+            .lock()
+            .unwrap()
+            .memtable
+            .as_ref()
+            .map_or(0, |memtable| memtable.tuples());
+        if tuples == 0 {
+            return None;
+        }
+        compaction_charge_bytes(1, tuples)
     }
 
     /// Seals the memtable: copies it, in key order, into a file run, or keeps it
@@ -1810,13 +1837,24 @@ where
                 slab_allocator,
                 async move {
                     let mut merger = None;
+                    // Inputs taken from the spine that wait for their reservation,
+                    // and the reservation granted for them.
+                    let mut pending: Option<MergeStart<B>> = None;
+                    let mut granted: Option<Reservation> = None;
                     let merger_type = Runtime::with_dev_tweaks(|tweaks| tweaks.merger());
                     let notify = self.state.lock().unwrap().slots[level].notify.clone();
 
                     loop {
-                        let work = with_merge_cache_fill(|| {
-                            self.merge_step(&mut merger, merger_type, level)
+                        let step = with_merge_cache_fill(|| {
+                            self.merge_step(
+                                &mut merger,
+                                &mut pending,
+                                &mut granted,
+                                merger_type,
+                                level,
+                            )
                         });
+                        let work = !matches!(step, MergeStep::Idle);
 
                         {
                             let state = self.state.lock().unwrap();
@@ -1827,6 +1865,13 @@ where
                             if state.count_loose_batches().should_relieve_backpressure() {
                                 self.no_backpressure.notify_waiters();
                             }
+                        }
+
+                        // Under the compaction-memory charge, wait for room in the cache
+                        // before the merge opens its cursors and builder. The wait is an
+                        // `await`, so it does not hold this merger thread.
+                        if let MergeStep::NeedsReservation(bytes) = step {
+                            granted = Some(reserve_in_merger_cache(bytes).await);
                         }
 
                         if !work {
@@ -1852,54 +1897,39 @@ where
     /// Tries to do some merging at the given `level`, using `opt_merger` to
     /// maintain state.  Creates mergers of type `merger_type`.
     ///
-    /// Returns true if some merging work was done, false if there was no work
-    /// to do.
+    /// A new merge first takes its inputs from the spine into `pending`. Under
+    /// the compaction-memory charge it then needs a reservation before it opens
+    /// its cursors and builder: the step returns
+    /// [`MergeStep::NeedsReservation`], the caller reserves, hands the
+    /// reservation back in `granted`, and calls again. The merge holds the
+    /// reservation until its output is closed, which spans many steps at the
+    /// higher levels.
     fn merge_step(
         self: &Arc<Self>,
         opt_merger: &mut Option<Merge<B>>,
+        pending: &mut Option<MergeStart<B>>,
+        granted: &mut Option<Reservation>,
         merger_type: MergerType,
         level: usize,
-    ) -> bool {
+    ) -> MergeStep {
         let merger = if let Some(merger) = opt_merger {
             merger
         } else {
-            // Get all the state we need to create the merger, then drop the
-            // lock.
-            let mut state = self.state.lock().unwrap();
-            let min_merge_batches = state.min_merge_batches;
-            let memory_pressure = self.runtime.effective_memory_pressure();
-            let batches = if let Some(batches) =
-                state.slots[level].try_start_merge(level, min_merge_batches, memory_pressure)
-            {
-                batches
-            } else {
-                // There is nothing to merge at the current level - initiate compaction at the next level.
-                if state.slots[level].compaction_status == CompactionStatus::Requested {
-                    state.slots[level].compaction_status = CompactionStatus::None;
-
-                    if let Some(last_level) = state.last_non_empty_slot()
-                        && last_level > level
-                    {
-                        // There can still be 1 batch in the current slot - move this batch to the next level.
-                        let batches = state.slots[level].loose_batches.drain(..).collect();
-
-                        state.initiate_compaction_at_level(level + 1, batches);
-                    }
+            if pending.is_none() {
+                match self.take_merge_inputs(level) {
+                    Some(start) => *pending = Some(start),
+                    None => return MergeStep::Idle,
                 }
-                return false;
-            };
-
-            // `try_start_merge` marks the slot in progress when this merge is
-            // part of a requested full compaction.
-            let requested = state.slots[level].compaction_status == CompactionStatus::InProgress;
-            let key_filter = state.key_filter.clone();
-            let value_filter = state.value_filter.clone();
-            let frontier = state.frontier.clone();
-            let snapshot = value_filter
-                .as_ref()
-                .is_some_and(|value_filter| value_filter.requires_snapshot())
-                .then(|| Arc::new(state.get_snapshot()));
-            drop(state);
+            }
+            let start = pending.as_ref().unwrap();
+            if granted.is_none()
+                && let Some(bytes) = compaction_charge_bytes(
+                    start.batches.len(),
+                    start.batches.iter().map(|batch| batch.key_count()).sum(),
+                )
+            {
+                return MergeStep::NeedsReservation(bytes);
+            }
 
             // Create the merger.
             //
@@ -1907,12 +1937,8 @@ where
             // not to hold the lock.
             opt_merger.insert(Merge::new(
                 merger_type,
-                batches,
-                &key_filter,
-                &value_filter,
-                snapshot,
-                frontier,
-                MergeOrigin { level, requested },
+                pending.take().unwrap(),
+                granted.take(),
             ))
         };
 
@@ -1934,6 +1960,8 @@ where
             }
             let mut merger = opt_merger.take().unwrap();
             let new_batch = merger.elapsed.record(|| Arc::new(merger.builder.done()));
+            // The output is closed: its buffers are gone.
+            drop(merger.reservation.take());
             let new_level =
                 Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
             let mut state = self.state.lock().unwrap();
@@ -1953,8 +1981,83 @@ where
             drop(state);
             self.start(new_level);
         }
-        true
+        MergeStep::Worked
     }
+
+    /// Takes the inputs of the next merge at `level` from the spine, or
+    /// initiates compaction at the next level and returns `None` if there is
+    /// nothing to merge at this level.
+    fn take_merge_inputs(self: &Arc<Self>, level: usize) -> Option<MergeStart<B>> {
+        // Get all the state we need to create the merger, then drop the
+        // lock.
+        let mut state = self.state.lock().unwrap();
+        let min_merge_batches = state.min_merge_batches;
+        let memory_pressure = self.runtime.effective_memory_pressure();
+        let Some(batches) =
+            state.slots[level].try_start_merge(level, min_merge_batches, memory_pressure)
+        else {
+            // There is nothing to merge at the current level - initiate compaction at the next level.
+            if state.slots[level].compaction_status == CompactionStatus::Requested {
+                state.slots[level].compaction_status = CompactionStatus::None;
+
+                if let Some(last_level) = state.last_non_empty_slot()
+                    && last_level > level
+                {
+                    // There can still be 1 batch in the current slot - move this batch to the next level.
+                    let batches = state.slots[level].loose_batches.drain(..).collect();
+
+                    state.initiate_compaction_at_level(level + 1, batches);
+                }
+            }
+            return None;
+        };
+
+        // `try_start_merge` marks the slot in progress when this merge is
+        // part of a requested full compaction.
+        let requested = state.slots[level].compaction_status == CompactionStatus::InProgress;
+        let key_filter = state.key_filter.clone();
+        let value_filter = state.value_filter.clone();
+        let frontier = state.frontier.clone();
+        let snapshot = value_filter
+            .as_ref()
+            .is_some_and(|value_filter| value_filter.requires_snapshot())
+            .then(|| Arc::new(state.get_snapshot()));
+        Some(MergeStart {
+            batches,
+            key_filter,
+            value_filter,
+            snapshot,
+            frontier,
+            origin: MergeOrigin { level, requested },
+        })
+    }
+}
+
+/// What one call of [`AsyncMerger::merge_step`] did.
+enum MergeStep {
+    /// Merged some of the inputs.
+    Worked,
+
+    /// There was no merge work at this level.
+    Idle,
+
+    /// A merge has taken its inputs and needs a reservation of this many bytes
+    /// of the buffer cache before it starts.
+    NeedsReservation(usize),
+}
+
+/// The inputs of a merge that has not started: taken from the spine, with the
+/// filters and frontier it merges under.
+struct MergeStart<B>
+where
+    B: Batch,
+{
+    batches: Vec<Arc<B>>,
+    key_filter: Option<Filter<B::Key>>,
+    value_filter: Option<GroupFilter<B::Val>>,
+    snapshot: Option<Arc<SpineSnapshot<B>>>,
+    frontier: B::Time,
+    origin: MergeOrigin,
 }
 
 /// State shared among all of the workers in a background thread.
@@ -2018,6 +2121,11 @@ where
 
     /// What the compaction log says about this merge's inputs.
     log: MergeLogInfo,
+
+    /// The cache bytes reserved for this merge's buffers, under the
+    /// compaction-memory charge. Released when the output is closed, or when
+    /// the merge is dropped.
+    reservation: Option<Reservation>,
 }
 
 /// Which slot a merge works on, and why it started.
@@ -2064,13 +2172,18 @@ where
 {
     fn new(
         merger_type: MergerType,
-        batches: Vec<Arc<B>>,
-        key_filter: &Option<Filter<B::Key>>,
-        value_filter: &Option<GroupFilter<B::Val>>,
-        snapshot: Option<Arc<SpineSnapshot<B>>>,
-        frontier: B::Time,
-        origin: MergeOrigin,
+        start: MergeStart<B>,
+        reservation: Option<Reservation>,
     ) -> Self {
+        let MergeStart {
+            batches,
+            key_filter,
+            value_filter,
+            snapshot,
+            frontier,
+            origin,
+        } = start;
+        let (key_filter, value_filter) = (&key_filter, &value_filter);
         let factories = batches[0].factories();
         let batch_refs: Vec<&B> = batches.iter().map(|b| b.as_ref()).collect();
         let start_micros = now_micros();
@@ -2086,6 +2199,7 @@ where
                 input_records,
             },
             builder,
+            reservation,
             fuel: 0,
             start: Instant::now(),
             elapsed: ElapsedTime::default(),
@@ -3598,6 +3712,7 @@ mod memtable_test {
         algebra::OrdIndexedZSet,
         circuit::{CircuitConfig, mkconfig, runtime::tests::with_mock_process_rss},
         dynamic::{DowncastTrait, DynData},
+        storage::buffer_cache::{BufferCache, ReservationStats},
         trace::{
             BatchLocation, BatchReader, BatchReaderFactories, Cursor, Spine, Trace, TraceRole,
             WithSnapshot, test::run_in_circuit_with_storage_config,
@@ -3700,6 +3815,19 @@ mod memtable_test {
             state.memtable.as_ref().map(|memtable| memtable.tuples()),
             state.count_all_batches(),
         )
+    }
+
+    /// Waits until every reservation on `cache` is released: a seal releases its
+    /// reservation just after it publishes its run.
+    fn wait_for_no_reservation(cache: &BufferCache) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.pinned_bytes() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a reservation was never released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Waits until `n` seals have finished.
@@ -3805,39 +3933,51 @@ mod memtable_test {
         min_storage_bytes: usize,
     ) -> (Vec<BatchLocation>, usize) {
         let directory = tempdir().unwrap();
-        let result = Arc::new(std::sync::Mutex::new((Vec::new(), 0)));
+        let config = model_config(directory.path(), memory_model, min_storage_bytes);
+        let (locations, cache_growth, _) = fill_until_sealed_with(config);
+        (locations, cache_growth)
+    }
+
+    /// [`fill_until_sealed_under`] under `config`; it also returns the merger cache's
+    /// reservation counters, read once the seal has released its reservation.
+    fn fill_until_sealed_with(
+        config: CircuitConfig,
+    ) -> (Vec<BatchLocation>, usize, ReservationStats) {
+        let result = Arc::new(std::sync::Mutex::new((
+            Vec::new(),
+            0,
+            ReservationStats::default(),
+        )));
         let report = result.clone();
-        run_in_circuit_with_storage_config(
-            model_config(directory.path(), memory_model, min_storage_bytes),
-            move || {
-                let cache = Runtime::runtime()
-                    .unwrap()
-                    .get_buffer_cache(0, ThreadType::Background);
-                let occupancy_before = cache.occupancy().0;
-                let mut spine = spine(TraceRole::Integral);
-                let mut model = Model::new();
-                let mut next = 0;
-                while spine.merger.state.lock().unwrap().memtable_flushes == 0
-                    && spine.merger.state.lock().unwrap().flushing.is_none()
-                {
-                    let tuples: Vec<_> = (next..next + 2_000).map(|i| (i, -i, 1)).collect();
-                    next += 2_000;
-                    insert(&mut spine, &mut model, &tuples);
-                    assert!(next < 2_000_000, "the budget never sealed the memtable");
-                }
-                wait_for_flushes(&spine, 1);
-                let cache_growth = cache.occupancy().0 - occupancy_before;
-                assert_eq!(contents(spine.cursor()), model);
-                let state = spine.merger.state.lock().unwrap();
-                let locations = state
-                    .slots
-                    .iter()
-                    .flat_map(|slot| slot.all_batches())
-                    .map(|batch| batch.location())
-                    .collect();
-                *report.lock().unwrap() = (locations, cache_growth);
-            },
-        );
+        run_in_circuit_with_storage_config(config, move || {
+            let cache = Runtime::runtime()
+                .unwrap()
+                .get_buffer_cache(0, ThreadType::Background);
+            let occupancy_before = cache.occupancy().0;
+            let mut spine = spine(TraceRole::Integral);
+            let mut model = Model::new();
+            let mut next = 0;
+            while spine.merger.state.lock().unwrap().memtable_flushes == 0
+                && spine.merger.state.lock().unwrap().flushing.is_none()
+            {
+                let tuples: Vec<_> = (next..next + 2_000).map(|i| (i, -i, 1)).collect();
+                next += 2_000;
+                insert(&mut spine, &mut model, &tuples);
+                assert!(next < 2_000_000, "the budget never sealed the memtable");
+            }
+            wait_for_flushes(&spine, 1);
+            wait_for_no_reservation(&cache);
+            let cache_growth = cache.occupancy().0 - occupancy_before;
+            assert_eq!(contents(spine.cursor()), model);
+            let state = spine.merger.state.lock().unwrap();
+            let locations = state
+                .slots
+                .iter()
+                .flat_map(|slot| slot.all_batches())
+                .map(|batch| batch.location())
+                .collect();
+            *report.lock().unwrap() = (locations, cache_growth, cache.reservation_stats());
+        });
         Arc::try_unwrap(result).unwrap().into_inner().unwrap()
     }
 
@@ -4034,5 +4174,123 @@ mod memtable_test {
         let (accumulator, integral) = at_critical_pressure(MemoryModel::Budgets);
         assert_eq!(accumulator, vec![BatchLocation::Memory; 3]);
         assert_eq!(integral, (Some(TRANSACTIONS[0].len()), 0));
+    }
+
+    /// [`model_config`] under `budgets` with the compaction-memory charge on or off,
+    /// and a storage cache of `cache_mib` if given.
+    fn charge_config(path: &Path, charge: bool, cache_mib: Option<usize>) -> CircuitConfig {
+        let mut config = model_config(path, MemoryModel::Budgets, 0);
+        let options = &mut config.storage.as_mut().unwrap().options;
+        options.charge_compaction_memory = charge;
+        options.cache_mib = cache_mib;
+        config
+    }
+
+    #[test]
+    fn a_charged_seal_reserves_its_buffers_and_releases_them() {
+        let directory = tempdir().unwrap();
+        let (locations, _, charged) =
+            fill_until_sealed_with(charge_config(directory.path(), true, None));
+        assert!(locations.contains(&BatchLocation::Storage));
+        assert!(charged.peak_pinned_bytes > 0, "{charged:?}");
+        assert_eq!(charged.waits, 0);
+
+        // Control: the same seal without the charge reserves nothing.
+        let directory = tempdir().unwrap();
+        let (_, _, uncharged) =
+            fill_until_sealed_with(charge_config(directory.path(), false, None));
+        assert_eq!(uncharged, ReservationStats::default());
+    }
+
+    /// Runs the merge of eight level-0 runs of an accumulator under `config` and
+    /// returns the locations of the resulting runs and the merger cache's counters
+    /// once the merge has released its reservation.
+    fn merge_under(config: CircuitConfig) -> (Vec<BatchLocation>, usize, ReservationStats) {
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let report = outcome.clone();
+        run_in_circuit_with_storage_config(config, move || {
+            let cache = Runtime::runtime()
+                .unwrap()
+                .get_buffer_cache(0, ThreadType::Background);
+            let locations = accumulator_runs_after(8, Duration::from_secs(2));
+            wait_for_no_reservation(&cache);
+            *report.lock().unwrap() = Some((
+                locations,
+                cache.reservation_cap_bytes(),
+                cache.reservation_stats(),
+            ));
+        });
+        Arc::try_unwrap(outcome)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_charged_merge_reserves_its_buffers_and_releases_them() {
+        let directory = tempdir().unwrap();
+        let (locations, cap, stats) = merge_under(charge_config(directory.path(), true, None));
+        assert_eq!(locations, vec![BatchLocation::Storage]);
+        assert!(stats.peak_pinned_bytes > 0, "{stats:?}");
+        assert!(
+            stats.peak_pinned_bytes <= cap,
+            "{stats:?} under a cap of {cap}"
+        );
+        assert_eq!(stats.waits, 0);
+    }
+
+    #[test]
+    fn a_charged_merge_that_does_not_fit_waits_for_a_release() {
+        let directory = tempdir().unwrap();
+        run_in_circuit_with_storage_config(charge_config(directory.path(), true, None), || {
+            let cache = Runtime::runtime()
+                .unwrap()
+                .get_buffer_cache(0, ThreadType::Background);
+            // Another job holds the whole cap.
+            let held = cache.try_reserve(cache.reservation_cap_bytes()).unwrap();
+            let mut spine = spine(TraceRole::Accumulator);
+            let mut model = Model::new();
+            for i in 0..8 {
+                insert(&mut spine, &mut model, &[(i, i, 1)]);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while cache.reservation_stats().waits == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the merge never asked to reserve"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The merge has taken its inputs, and has not opened its builder.
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                spine
+                    .get_batches()
+                    .iter()
+                    .all(|batch| batch.location() == BatchLocation::Memory)
+            );
+            assert_eq!(contents(spine.cursor()), model);
+
+            drop(held);
+            while spine
+                .get_batches()
+                .iter()
+                .map(|batch| batch.location())
+                .collect::<Vec<_>>()
+                != [BatchLocation::Storage]
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the merge never ran after the release"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(contents(spine.cursor()), model);
+            wait_for_no_reservation(&cache);
+            let stats = cache.reservation_stats();
+            assert_eq!(stats.waits, 1);
+            assert!(stats.wait >= Duration::from_millis(200), "{stats:?}");
+        });
     }
 }

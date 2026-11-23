@@ -17,7 +17,7 @@ use crate::{
     DetailedError,
     storage::{
         backend::StorageError,
-        buffer_cache::{BufferCache, build_buffer_caches},
+        buffer_cache::{BufferCache, ReservationStats, build_buffer_caches},
         dirlock::LockedDirectory,
     },
 };
@@ -1297,6 +1297,36 @@ impl Runtime {
                 })
         } else {
             (0, 0)
+        }
+    }
+
+    /// Returns the waits and the peak of pinned bytes of the compaction-memory
+    /// reservations (`storage.charge_compaction_memory`), summed over the
+    /// distinct cache backends; all zero when the charge is off.
+    pub fn compaction_reservation_stats(&self) -> ReservationStats {
+        let mut seen = HashSet::new();
+        self.0
+            .buffer_caches
+            .iter()
+            .flat_map(|map| map.values())
+            .filter(|cache| seen.insert(cache.backend_id()))
+            .map(|cache| cache.reservation_stats())
+            .fold(ReservationStats::default(), |total, stats| total + stats)
+    }
+
+    /// Starts a new peak of pinned reservation bytes on every cache backend, so
+    /// that [`compaction_reservation_stats`](Self::compaction_reservation_stats)
+    /// reports the peak since this call.
+    pub fn reset_peak_pinned_bytes(&self) {
+        let mut seen = HashSet::new();
+        for cache in self
+            .0
+            .buffer_caches
+            .iter()
+            .flat_map(|map| map.values())
+            .filter(|cache| seen.insert(cache.backend_id()))
+        {
+            cache.reset_peak_pinned_bytes();
         }
     }
 

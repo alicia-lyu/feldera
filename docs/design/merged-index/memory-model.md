@@ -1,6 +1,6 @@
 # The memory model: RSS pressure against budgets
 
-**Status:** designed 2026-11-23; built 2026-11-23 (`--memory-model rss|budgets`, measurement version 20); the charge sub-arm not built. Decision: [2026-11-23](decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets). The reading that motivates it is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20). The memtable itself is in [memtable.md](memtable.md).
+**Status:** designed 2026-11-23; built 2026-11-23 (`--memory-model rss|budgets`, measurement version 20; the charge sub-arm, `--charge-compaction-memory`, version 21, with its cap proposed and not yet confirmed). Decision: [2026-11-23](decisions.md#2026-11-23-the-memtable-dimension-becomes-the-memory-model-rss-pressure-against-budgets). The reading that motivates it is in [MEASUREMENT.md](../../../sql-to-dbsp-compiler/experiments/q3-ivm-baseline/MEASUREMENT.md#memtable-at-512-mib-2026-11-20). The memtable itself is in [memtable.md](memtable.md).
 
 **Goal.** One knob, `StorageOptions::memory_model`, chooses how DBSP decides where a new run goes:
 
@@ -107,6 +107,20 @@ Sources checked on 2026-11-23:
 - So the cache manager is the admission control for compaction.
 - Reported: the reservations' wait time and the peak of pinned bytes.
 - The cap's default is not decided; a quarter of the cache's capacity is the proposal.
+
+**Built 2026-11-23 (measurement version 21).** `StorageOptions::charge_compaction_memory` (refused without `Budgets`: `Error::CompactionChargeNeedsBudgets`).
+
+- **The pin.** `CacheEntry::is_pinned` (default false). S3-FIFO passes it to `quick_cache` through a `Lifecycle` (`PinnedEntryLifecycle`); the LRU backend's `evict_to` skips pinned entries. Pinned bytes count in the cache's charge, so the cache evicts blocks around them. A pinned entry heavier than the rest of its shard makes the shard exceed its capacity, since `quick_cache` then has nothing left to evict.
+- **The reservation.** `BufferCache::try_reserve` and `reserve` (`storage/buffer_cache/cache/reservation.rs`). A reservation is split into pinned entries of at most a sixteenth of a shard, so the hash spreads it over the shards; its keys use a fresh `FileId`, which no file has, so `evict_files` and per-file eviction never touch it. The ledger is per cache backend (handles that share a backend share it). Dropping the `Reservation` removes its entries and wakes the waiters.
+- **The cap** is a quarter of the cache's capacity (`RESERVATION_CAP_DIVISOR`, proposed). A request that would pin more waits; a request is admitted when nothing is reserved. A large job can wait behind a stream of small ones: the wait is not first-come, first-served. Counters per cache backend: waits, wait time, peak pinned bytes (`ReservationStats`; the Q3 refresh report's `compaction_reservations`).
+- **The wait is an `await`.** The merger runs each merge step and seal as a tokio task, so a blocking wait would hold a worker thread, and with it a runnable merge. A merge takes its inputs from the spine, then asks the loop for a reservation (`MergeStep::NeedsReservation`), which the loop awaits and hands back before the merge opens its cursors and builder. A merge holds its reservation from then until its output is closed, across all its steps, so a merge step does not re-reserve per slice of fuel. A seal reserves once, before `seal_memtable`, and releases when it ends. A job holds at most one reservation and waits only while holding none, so waiting cannot deadlock.
+- **The estimate** (`compaction_buffer_bytes`, `spine_async/compaction_charge.rs`), from the writer's parameters (`Runtime::file_writer_parameters`):
+  - one data block per column (2) of each input run's cursor, at `min_data_block`;
+  - the output builder's open data block and 3 open index blocks per column, at `min_data_block` and `min_index_block`;
+  - the writer's buffers, 2 data blocks;
+  - the key filter, sized for all input keys at the configured false positive rate (`-ln(rate) / ln(2)^2` bits per key).
+
+  The column count, the 3 index levels, and the 2 writer blocks are assumptions, not measurements. It omits the input runs' index blocks along a cursor's path, which the cache holds as ordinary blocks, and the transient allocations of one key.
 
 **(c) Compaction on its own axis.** The Q3 report gains the merger threads' CPU and device time per refresh, beside `ivm_ms` and `base_ms`, if `run_counts` does not already give them.
 

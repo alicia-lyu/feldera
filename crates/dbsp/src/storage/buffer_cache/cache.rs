@@ -25,8 +25,8 @@ use crate::circuit::metadata::{
 use crate::circuit::runtime::current_thread_type;
 use crate::storage::backend::{BlockLocation, FileId, FileReader};
 
-pub use reservation::{Reservation, ReservationStats};
 use reservation::{RESERVATION_CAP_DIVISOR, ReservationLedger, Reserver};
+pub use reservation::{Reservation, ReservationStats};
 
 /// A key for the block cache.
 ///

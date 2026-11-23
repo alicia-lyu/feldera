@@ -180,10 +180,32 @@ cache (reads) and the memtable (writes) are the budgets, and RSS places nothing:
 - **Compaction on its own axis.** `run_counts` already gives it: per spine `merge_real_ms` and
   `merge_cpu_ms` (merger threads), and `device_reads` by the `background` thread. Seals are
   outside `merge_real_ms`; device writes are by owner only, not by thread.
-- **Not built:** the compaction-memory charge (`charge_compaction_memory`); how a charge is held
-  is open.
-- Tests (filters `budgets`, `no_fill`): `runtime::tests::budgets_memory_model_*` and
-  `runtime_refuses_budgets_without_a_memtable_budget`; `spine_async::memtable_test::under_budgets_*`
+- **The charge** (`StorageOptions::charge_compaction_memory`, off by default, refused without
+  `budgets`: `Error::CompactionChargeNeedsBudgets`, read through `Runtime::charge_compaction_memory`).
+  A merge and a seal reserve their estimated buffer bytes in the merger's cache before they open
+  cursors and a builder, and release them when the output is closed. Design and the estimate:
+  [memory-model.md](../../docs/design/merged-index/memory-model.md).
+  - *Pin.* `CacheEntry::is_pinned` (`buffer-cache`): S3-FIFO tells `quick_cache` through
+    `PinnedEntryLifecycle`, the LRU `evict_to` skips pinned entries. Pinned bytes count in
+    `occupancy`.
+  - *Reservation.* `BufferCache::try_reserve` / `reserve(bytes).await` return a `Reservation`
+    (`storage/buffer_cache/cache/reservation.rs`) whose `Drop` removes its pinned entries and wakes
+    the waiters. Its entries are chunks of at most a sixteenth of a shard, keyed by a fresh
+    `FileId`. One `ReservationLedger` per cache backend. The cap is a quarter of the cache
+    (`RESERVATION_CAP_DIVISOR`, proposed); a request over it waits, except when nothing is reserved.
+    Counters: `BufferCache::reservation_stats` and `Runtime::compaction_reservation_stats`
+    (waits, wait time, peak pinned bytes since `reset_peak_pinned_bytes`).
+  - *Where.* The wait is an `await`, since merges run as tokio tasks. `merge_step` returns
+    `MergeStep::NeedsReservation(bytes)` once it holds the inputs (`MergeStart`); the merger loop in
+    `run` awaits the reservation and passes it back, and the `Merge` keeps it until `builder.done()`.
+    `spawn_seal` reserves before `seal_memtable`. The estimate is `compaction_buffer_bytes`
+    (`trace/spine_async/compaction_charge.rs`).
+- Tests (filters `budgets`, `no_fill`, `reservation`, `charged`, `compaction_buffer`):
+  `runtime::tests::budgets_memory_model_*`, `compaction_charge_needs_the_budgets_model` and
+  `runtime_refuses_budgets_without_a_memtable_budget`; `storage::buffer_cache::cache::reservation::tests`
+  (survives pressure, cap and run-alone rule, an awaited wait, shared ledger); the `buffer-cache`
+  crate's `pinned_*` tests (both backends); `spine_async::memtable_test::a_charged_*` (a seal and a
+  merge reserve and release; a merge waits while the cap is held); `compaction_charge::tests`; `spine_async::memtable_test::under_budgets_*`
   (seal, merge output, integral and accumulator inserts, no forced merge at mock critical
   pressure, a seal leaves the cache unfilled); `storage::file::test::no_fill_inserts_no_block_yet_hits_a_cached_one`.
   A test that pins the mock RSS must hold `MOCK_RSS_LOCK` (`with_mock_process_rss`), and a test
@@ -211,6 +233,6 @@ From the repository root, `cargo +1.96.1 test --offline -p dbsp --lib <filter>`:
 
 - `merged_index` and its sub-filters (see the merged-index CLAUDE.md);
 - `memtable` (the spine memtable);
-- `budgets`, `no_fill`, `memory_pressure` (the memory model);
+- `budgets`, `no_fill`, `memory_pressure`, `reservation`, `charged` (the memory model and its charge);
 - `supplied_snapshot_join`, `run_reads`, `read_owner_cursor`;
 - `init_circuits`, `separate_runtimes_miss_each_others_blocks`.
