@@ -7,17 +7,33 @@ use std::thread;
 struct Weighted<T> {
     value: T,
     charge: usize,
+    pinned: bool,
 }
 
 impl<T> Weighted<T> {
     fn new(value: T, charge: usize) -> Self {
-        Self { value, charge }
+        Self {
+            value,
+            charge,
+            pinned: false,
+        }
+    }
+
+    fn pinned(value: T, charge: usize) -> Self {
+        Self {
+            pinned: true,
+            ..Self::new(value, charge)
+        }
     }
 }
 
 impl<T: Send + Sync + 'static> CacheEntry for Weighted<T> {
     fn cost(&self) -> usize {
         self.charge
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pinned
     }
 }
 
@@ -199,5 +215,44 @@ fn zero_charge_entries_do_not_increase_budget_usage() {
     assert_eq!(cache.total_charge(), 0);
     assert_eq!(cache.len(), 3);
     assert_eq!(cache.get(&1).unwrap().value, 10);
+    cache.validate_invariants();
+}
+
+/// A pinned entry survives pressure that evicts unpinned entries around it,
+/// and removing it frees its cost.
+#[test]
+fn pinned_entry_survives_eviction_pressure() {
+    let cache = TestCache::<u64, &'static str>::with_shards(100, 1);
+    cache.insert(0, Weighted::pinned("reservation", 40));
+    for key in 1..=200 {
+        cache.insert(key, Weighted::new("block", 10));
+        // Touch the block so that the cache would promote it, not the pinned entry.
+        let _ = cache.get(&key);
+        cache.validate_invariants();
+    }
+    assert!(cache.contains_key(&0), "the pinned entry was evicted");
+    assert!(cache.total_charge() <= 100);
+    assert!(!cache.contains_key(&1), "an old unpinned entry survived");
+
+    cache.remove(&0);
+    assert!(cache.total_charge() <= 60);
+    cache.validate_invariants();
+}
+
+/// Pinned entries spread over shards leave each shard its unpinned share.
+#[test]
+fn pinned_entries_in_every_shard_survive() {
+    let cache = TestCache::<u64, &'static str>::with_shards(4096, 4);
+    let pinned: Vec<u64> = (0..16).collect();
+    for key in &pinned {
+        cache.insert(*key, Weighted::pinned("reservation", 16));
+    }
+    for key in 1000..3000 {
+        cache.insert(key, Weighted::new("block", 32));
+    }
+    for key in &pinned {
+        assert!(cache.contains_key(key), "pinned entry {key} was evicted");
+    }
+    assert!(cache.total_charge() <= cache.total_capacity());
     cache.validate_invariants();
 }

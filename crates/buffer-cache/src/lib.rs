@@ -18,6 +18,16 @@ pub use thread_type::ThreadType;
 pub trait CacheEntry: Any + Send + Sync {
     /// Returns the cost of this value in bytes.
     fn cost(&self) -> usize;
+
+    /// Returns `true` if the cache must not evict this value.
+    ///
+    /// A pinned value still counts toward the cache's charge, so the cache
+    /// evicts other entries to make room for it. It leaves the cache only when
+    /// its key is removed or replaced. Cached blocks are never pinned; a
+    /// reservation of memory is (see `BufferCache::reserve` in `dbsp`).
+    fn is_pinned(&self) -> bool {
+        false
+    }
 }
 
 impl<T> CacheEntry for Arc<T>
@@ -26,6 +36,10 @@ where
 {
     fn cost(&self) -> usize {
         (**self).cost()
+    }
+
+    fn is_pinned(&self) -> bool {
+        (**self).is_pinned()
     }
 }
 

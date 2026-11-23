@@ -7,17 +7,33 @@ use std::thread;
 struct Weighted<T> {
     value: T,
     charge: usize,
+    pinned: bool,
 }
 
 impl<T> Weighted<T> {
     fn new(value: T, charge: usize) -> Self {
-        Self { value, charge }
+        Self {
+            value,
+            charge,
+            pinned: false,
+        }
+    }
+
+    fn pinned(value: T, charge: usize) -> Self {
+        Self {
+            pinned: true,
+            ..Self::new(value, charge)
+        }
     }
 }
 
 impl<T: Send + Sync + 'static> CacheEntry for Weighted<T> {
     fn cost(&self) -> usize {
         self.charge
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pinned
     }
 }
 
@@ -144,5 +160,41 @@ fn concurrency_smoke_test() {
     for thread in threads {
         thread.join().unwrap();
     }
+    cache.validate_invariants();
+}
+
+/// A pinned entry survives pressure that evicts every unpinned entry, unpinned
+/// entries are evicted around it, and removing it frees its cost.
+#[test]
+fn pinned_entry_survives_eviction_pressure() {
+    let cache = TestCache::<u64, &'static str>::new(100);
+    cache.insert(0, Weighted::pinned("reservation", 40));
+    for key in 1..=20 {
+        cache.insert(key, Weighted::new("block", 10));
+        cache.validate_invariants();
+    }
+    assert!(cache.contains_key(&0), "the pinned entry was evicted");
+    // 40 pinned plus the six most recent blocks of 10 fill the capacity.
+    assert_eq!(cache.total_charge(), 100);
+    assert!(!cache.contains_key(&1), "an old unpinned entry survived");
+    assert!(cache.contains_key(&20));
+
+    cache.remove(&0);
+    assert_eq!(cache.total_charge(), 60);
+    cache.validate_invariants();
+}
+
+/// A pinned entry larger than the capacity displaces every unpinned entry but
+/// is not evicted itself, so the cache stays above capacity.
+#[test]
+fn pinned_entries_alone_may_exceed_capacity() {
+    let cache = TestCache::<u64, &'static str>::new(50);
+    cache.insert(1, Weighted::new("block", 10));
+    cache.insert(2, Weighted::pinned("reservation", 80));
+    assert!(!cache.contains_key(&1));
+    assert_eq!(cache.total_charge(), 80);
+    cache.insert(3, Weighted::new("block", 10));
+    assert!(cache.contains_key(&2));
+    assert_eq!(cache.total_charge(), 90);
     cache.validate_invariants();
 }

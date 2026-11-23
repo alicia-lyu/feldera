@@ -251,12 +251,25 @@ where
     }
 
     /// Evicts least-recently-used entries until `cur_cost <= max_cost`.
+    ///
+    /// Pinned entries are skipped, so `cur_cost` stays above `max_cost` when
+    /// the pinned entries alone outweigh it.
     fn evict_to(&mut self, max_cost: usize) {
-        while self.cur_cost > max_cost {
-            // lru and cache are kept in sync by all mutating methods;
-            // since cur_cost > max_cost >= 0, at least one entry exists.
-            let (_serial, key) = self.lru.pop_first().unwrap();
+        let mut victims = Vec::new();
+        let mut cost_after_eviction = self.cur_cost;
+        for key in self.lru.values() {
+            if cost_after_eviction <= max_cost {
+                break;
+            }
+            let value = &self.cache[key];
+            if !value.aux.is_pinned() {
+                cost_after_eviction -= value.aux.cost();
+                victims.push(key.clone());
+            }
+        }
+        for key in victims {
             let value = self.cache.remove(&key).unwrap();
+            self.lru.remove(&value.serial).unwrap();
             self.cur_cost -= value.aux.cost();
         }
         self.debug_check_invariants();

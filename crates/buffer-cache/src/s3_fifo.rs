@@ -1,6 +1,6 @@
 use crate::{BufferCache, CacheEntry};
 use feldera_types::config::dev_tweaks::BufferCacheStrategy;
-use quick_cache::{OptionsBuilder, Weighter, sync::Cache as QuickCache};
+use quick_cache::{Lifecycle, OptionsBuilder, Weighter, sync::Cache as QuickCache};
 use std::any::Any;
 use std::hash::{BuildHasher, Hash, RandomState};
 
@@ -24,11 +24,35 @@ where
     }
 }
 
+/// Tells `quick_cache` to skip the entries whose [`CacheEntry::is_pinned`] is
+/// true when it looks for an entry to evict.
+///
+/// Pinned entries keep their weight in their shard. A pinned entry that
+/// outweighs the rest of its shard makes the shard exceed its capacity, since
+/// the cache then has nothing left to evict; callers pin small entries.
+#[derive(Clone, Copy, Default)]
+struct PinnedEntryLifecycle;
+
+impl<K, V> Lifecycle<K, V> for PinnedEntryLifecycle
+where
+    V: CacheEntry,
+{
+    type RequestState = ();
+
+    fn is_pinned(&self, _key: &K, value: &V) -> bool {
+        value.is_pinned()
+    }
+
+    fn begin_request(&self) -> Self::RequestState {}
+
+    fn on_evict(&self, _state: &mut Self::RequestState, _key: K, _value: V) {}
+}
+
 /// A sharded, weighted, thread-safe S3-FIFO cache backed directly by
 /// `quick_cache`.
 pub struct S3FifoCache<K, V, S = RandomState> {
     /// Shared `quick_cache` backend.
-    cache: QuickCache<K, V, CacheEntryWeighter, S>,
+    cache: QuickCache<K, V, CacheEntryWeighter, S, PinnedEntryLifecycle>,
     /// Hash builder retained only so tests can mirror `quick_cache`'s shard
     /// selection.
     #[cfg(test)]
@@ -102,7 +126,7 @@ where
                 options,
                 CacheEntryWeighter,
                 hash_builder,
-                Default::default(),
+                PinnedEntryLifecycle,
             ),
         }
     }
