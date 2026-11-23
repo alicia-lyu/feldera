@@ -99,13 +99,14 @@ Sources checked on 2026-11-23:
   - The reservation is released when the job ends, including on error, through a guard's `Drop`.
 - **Reserve, then allocate.** The job reserves its estimated buffer bytes before it opens its cursors and builder. The cache evicts unpinned blocks to make room, so compaction takes its memory from the cache's budget at the cache manager's discretion: it does not add to RSS beside it.
 
-**When the reservation does not fit.** This is the user's choice, before the sub-arm is built:
+**When the reservation does not fit: the job waits** (decided 2026-11-23, against RocksDB's default overshoot, where "Insert() never fails").
 
-- **Overshoot (RocksDB's default, `strict_capacity_limit = false`).** "Insert() never fails": the pinned dummy is admitted and the cache runs over capacity until the job ends.
-- **Wait (strict).** The cache refuses a reservation that would push pinned bytes past a cap, such as a fraction of capacity, and the merge waits for one to be released.
-  - A merge is background work, so waiting is cheap.
-  - A seal that waits lets the memtable overshoot its soft cap, as it may today, since inserts never stall.
-  - This makes the cache manager the admission control for compaction.
+- The cache refuses a reservation that would push its pinned bytes past a cap. The merge or seal then waits until another reservation is released.
+- A job larger than the cap alone is admitted once no other reservation is held, so it cannot wait forever.
+- A merge is background work, so waiting is cheap. A seal that waits lets the memtable overshoot its soft cap, as it may today, since inserts never stall.
+- So the cache manager is the admission control for compaction.
+- Reported: the reservations' wait time and the peak of pinned bytes.
+- The cap's default is not decided; a quarter of the cache's capacity is the proposal.
 
 **(c) Compaction on its own axis.** The Q3 report gains the merger threads' CPU and device time per refresh, beside `ivm_ms` and `base_ms`, if `run_counts` does not already give them.
 
@@ -127,6 +128,6 @@ Sources checked on 2026-11-23:
 
 ## Open questions
 
-- With the charge on, whether a reservation that does not fit overshoots or waits (above).
+- The cap on pinned reservation bytes (proposed: a quarter of the cache's capacity).
 - Whether step memory needs its own cap, once K = 1,000 or the TPC-H batch is measured.
 - Whether `budgets` should warm the cache with seal outputs (`kFlushOnly`).
